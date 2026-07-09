@@ -1,0 +1,33 @@
+from sqlalchemy import String, Text, ForeignKey, Integer
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import List, Optional
+from .base import TenantBase
+
+class Project(TenantBase):
+    __tablename__ = "projects"
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="created")
+
+    documents: Mapped[List["Document"]] = relationship("Document", back_populates="project", cascade="all, delete-orphan")
+
+class Document(TenantBase):
+    __tablename__ = "documents"
+
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    parse_status: Mapped[str] = mapped_column(String(50), default="pending")
+
+    project: Mapped["Project"] = relationship("Project", back_populates="documents")
+    chunks: Mapped[List["DocChunk"]] = relationship("DocChunk", back_populates="document", cascade="all, delete-orphan")
+
+class DocChunk(TenantBase):
+    __tablename__ = "doc_chunks"
+
+    document_id: Mapped[str] = mapped_column(String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    page_num: Mapped[int | None] = mapped_column(Integer)
+    # embedding: Mapped[...] = mapped_column(Vector(1536)) # Reserved for pgvector in production
+    
+    document: Mapped["Document"] = relationship("Document", back_populates="chunks")

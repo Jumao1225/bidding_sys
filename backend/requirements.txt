@@ -1,0 +1,25 @@
+fastapi>=0.109.2
+uvicorn[standard]>=0.27.1
+sqlalchemy>=2.0.25
+psycopg2-binary>=2.9.9
+pydantic>=2.6.1
+pydantic-settings>=2.1.0
+alembic>=1.13.1
+python-multipart>=0.0.9
+loguru>=0.7.2
+
+# 异步队列与缓存中间件
+celery>=5.3.6
+redis>=5.0.1
+
+# 文档解析与生成
+docling>=2.0.0
+pdfplumber>=0.10.4
+python-docx>=1.1.0
+
+# AI 库
+openai>=1.12.0
+langchain>=0.1.7
+langchain-openai>=0.1.3
+langgraph>=0.1.8
+tenacity>=8.2.3

@@ -1,0 +1,23 @@
+{
+  "cost_node_response": {
+    "items": [
+      {
+        "name": "服务器",
+        "qty": 2,
+        "matched_name": "高性能服务器",
+        "ref_price": 45000,
+        "subtotal": 90000,
+        "warning": ""
+      }
+    ]
+  },
+  "strategy_node_qualifications_response": {
+    "match_score": 85,
+    "items": []
+  },
+  "strategy_node_risks_response": {
+    "risks": [
+      {"risk_type": "财务", "severity": "高"}
+    ]
+  }
+}

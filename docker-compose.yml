@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  # ----------------------------------------------------
+  # PostgreSQL 数据库服务 (用于持久化所有业务及 AI 数据)
+  # ----------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: bidding_sys_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: bidding_user
+      POSTGRES_PASSWORD: bidding_password
+      POSTGRES_DB: bidding_sys
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bidding_user -d bidding_sys"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------
+  # Redis 服务 (用于 Celery 异步队列与 SSE 消息发布订阅)
+  # ----------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: bidding_sys_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
