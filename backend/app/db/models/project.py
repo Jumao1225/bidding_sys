@@ -1,6 +1,7 @@
 from sqlalchemy import String, Text, ForeignKey, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from typing import List, Optional
+from pgvector.sqlalchemy import Vector
 from .base import TenantBase
 
 class Project(TenantBase):
@@ -28,6 +29,8 @@ class DocChunk(TenantBase):
     document_id: Mapped[str] = mapped_column(String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     page_num: Mapped[int | None] = mapped_column(Integer)
-    # embedding: Mapped[...] = mapped_column(Vector(1536)) # Reserved for pgvector in production
+    section_title: Mapped[str | None] = mapped_column(String(255))
+    content_type: Mapped[str | None] = mapped_column(String(50))
+    embedding: Mapped[list[float]] = mapped_column(Vector(1024))
     
     document: Mapped["Document"] = relationship("Document", back_populates="chunks")

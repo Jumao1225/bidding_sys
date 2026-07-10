@@ -6,10 +6,15 @@ export function ChatPanel() {
   ]);
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTo({
+        top: scrollContainerRef.current.scrollHeight,
+        behavior: 'smooth'
+      });
+    }
   };
 
   useEffect(() => {
@@ -31,7 +36,7 @@ export function ChatPanel() {
 
   return (
     <div className="bg-white/90 backdrop-blur-xl rounded-3xl shadow-lg border border-white flex flex-col h-full overflow-hidden transition-all">
-      <div className="p-5 border-b border-slate-100 bg-white/50 backdrop-blur-md flex items-center gap-3 relative z-10">
+      <div className="chat-header cursor-move p-5 border-b border-slate-100 bg-white/50 backdrop-blur-md flex items-center gap-3 relative z-10">
         <div className="relative">
           <div className="w-10 h-10 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-full flex items-center justify-center text-white text-lg shadow-md">🤖</div>
           <div className="absolute bottom-0 right-0 w-3 h-3 bg-green-400 border-2 border-white rounded-full"></div>
@@ -43,7 +48,10 @@ export function ChatPanel() {
       </div>
       
       {/* 消息区 */}
-      <div className="flex-1 overflow-y-auto p-5 space-y-6 bg-slate-50/50 custom-scrollbar relative">
+      <div 
+        ref={scrollContainerRef}
+        className="flex-1 overflow-y-auto p-5 space-y-6 bg-slate-50/50 scrollbar-hide relative"
+      >
         {/* 背景装饰 */}
         <div className="absolute top-20 left-10 w-40 h-40 bg-purple-400/5 rounded-full blur-3xl pointer-events-none"></div>
         <div className="absolute bottom-20 right-10 w-40 h-40 bg-blue-400/5 rounded-full blur-3xl pointer-events-none"></div>
@@ -72,7 +80,6 @@ export function ChatPanel() {
              </div>
           </div>
         )}
-        <div ref={messagesEndRef} />
       </div>
 
       {/* 输入区 */}

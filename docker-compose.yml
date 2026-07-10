@@ -5,7 +5,7 @@ services:
   # PostgreSQL 数据库服务 (用于持久化所有业务及 AI 数据)
   # ----------------------------------------------------
   postgres:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:pg15
     container_name: bidding_sys_postgres
     restart: always
     environment:

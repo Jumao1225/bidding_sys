@@ -1,0 +1,37 @@
+# 项目专属 Agent 规则 (Project-Scoped Rules)
+
+您可以在这里为我（AI 助手）定义专门针对当前 `bidding_sys` 项目的行为准则。
+任何写在这里的规则，我在帮您处理这个项目时都会严格遵守！
+
+## 运行环境规则
+- 本项目后端开发依赖于 conda 的 `fastapi` 环境。
+- 在执行任何终端命令之前，必须先执行 `conda activate fastapi`。
+
+# Agent Skills (代理技能) 使用规范
+- 本项目在 `.agents/skills/` 目录下存放了大量专业的 AI 专家技能（如 `senior-fullstack`, `senior-backend`, `requirement-analyzer` 等）。
+- **技能自动发现**：Agent 会自动扫描并发现这些技能，无需在此手动注册。
+- **触发与使用原则**：
+  1. 在接收到复杂的设计、架构评估、代码审查或特定领域的编码任务时，Agent **必须优先**调用 `view_file` 工具读取对应技能目录下的 `SKILL.md`。
+  2. 读取后，必须**严格遵循**该技能文件中定义的工作流、检查清单和架构原则进行开发。
+  3. 严禁在没有阅读相关 `SKILL.md` 的情况下，仅凭通用知识臆造代码。
+
+# 编码与规范规则
+- **语言要求**：在编写或修改任何业务逻辑代码时，必须加入注释。所有的代码注释、文档（Docstrings）必须全部使用中文编写，确保团队阅读无障碍。
+- **日志记录**：在编写或修改任何业务逻辑代码时，必须适当地加入日志记录（如使用项目内已配置好的 `loguru`），以便于后续的调试与线上排错。
+- **单一职责**：一个函数只做一件事。如果函数逻辑过长或包含多个独立步骤，必须进行合理的拆分。
+- **防御性编程与尽早返回 (Early Return)**：不满足前置条件的逻辑应优先拦截并直接返回或抛出异常，避免产生深层嵌套的 if-else 结构。
+- **严禁吞掉异常**：所有的 try-except / try-catch 块必须有明确的处理逻辑，严禁编写空的异常捕获块。若暂不处理，必须至少通过 logger.exception() 将错误及堆栈写入日志。
+- **命名规范**：变量和函数名统一使用 `snake_case`，类名使用 `PascalCase`，全局常量使用 `UPPER_CASE`。
+- **类型提示 (Type Hints)**：Python 代码中必须尽可能全面地使用类型提示 (Type Hints)，以提升代码可读性与可维护性，充分利用 FastAPI 的 Pydantic 验证特性。
+- **统一接口响应**：所有对外 API 的返回数据格式必须保持统一（例如标准化包含 `code`, `message`, `data` 等字段），并利用 FastAPI 提供完善的 OpenAPI 文档描述。
+- **异常处理**：禁止使用裸露的 `except:` 或 `except Exception:` 而不记录原始错误信息。需精确捕获异常，并统一交给全局异常处理器转换为标准的 HTTP 响应。
+- **代码结构与模块化**：保持低耦合与高内聚，路由层（Routers）、业务逻辑层（Services）和数据访问层（CRUD/Repositories）必须严格分离。
+- **改动记录 (Changelog)**：记录每次完成的代码改动，并按照当天的日期输出成一个 Markdown 文档（例如 `docs/changelog/YYYY-MM-DD.md`），以追踪项目修改历史。
+
+# 测试规范 (Testing Rules)
+- **测试目标与原则**：新增功能必写测试，测试代码必须与业务代码同步提交。严禁只交业务代码、删除旧用例或提交无法运行的死代码。
+- **目录划分**：`tests/` 目录下需严格区分 `unit/` (单元测试)、`integration/` (集成测试)、`api/` (API接口) 和 `fixtures/` (数据源)。全局配置置于 `conftest.py`。
+- **命名规范**：文件必须以 `test_` 开头（如 `test_document_parser.py`），严禁 `_test.py`。测试函数必须遵循 `test_<功能>_<场景>_<期望结果>` 格式（如 `test_parse_invalid_pdf_should_raise_error`）。
+- **场景覆盖度**：核心逻辑的单元测试必须至少覆盖三种场景：正常情况、异常情况、边界情况。
+- **异步与 API 测试**：FastAPI 接口与异步服务测试，必须标记 `@pytest.mark.asyncio` 并使用 `await`。API 接口测试必须统一使用 `httpx.AsyncClient`。
+- **数据管理 (Fixtures)**：严禁在测试代码中硬编码长串的字典或 JSON 数据。必须将测试假数据存放在 `fixtures/` 目录下，在测试运行时动态加载。

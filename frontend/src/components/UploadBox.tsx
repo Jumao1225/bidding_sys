@@ -1,4 +1,7 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import DocViewer, { DocViewerRenderers } from "@cyntler/react-doc-viewer";
+import "@cyntler/react-doc-viewer/dist/index.css";
+import { LocalDocxRenderer } from './LocalDocxRenderer';
 
 export function UploadBox() {
   const [isDragging, setIsDragging] = useState(false);
@@ -6,10 +9,70 @@ export function UploadBox() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [statusText, setStatusText] = useState("");
-  const [result, setResult] = useState<any>(null);
+  
+  // 核心结果与文件信息 (从 localStorage 初始化)
+  const [result, setResult] = useState<any>(() => {
+    try {
+      const saved = localStorage.getItem('bidding_analysis_result');
+      return saved ? JSON.parse(saved) : null;
+    } catch { return null; }
+  });
+  const [taskId, setTaskId] = useState<string | null>(() => localStorage.getItem('bidding_task_id'));
+  const [fileName, setFileName] = useState<string | null>(() => localStorage.getItem('bidding_file_name'));
+  
+  // 视图与布局状态 (从 localStorage 初始化)
+  const [viewMode, setViewMode] = useState<'text' | 'original'>(() => 
+    (localStorage.getItem('bidding_view_mode') as 'text'|'original') || 'original'
+  );
+  const [activeTab, setActiveTab] = useState<'qual' | 'risk'>(() => 
+    (localStorage.getItem('bidding_active_tab') as 'qual'|'risk') || 'qual'
+  );
+  const [splitRatio, setSplitRatio] = useState(() => 
+    Number(localStorage.getItem('bidding_split_ratio')) || 60
+  ); 
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const splitContainerRef = useRef<HTMLDivElement>(null);
+  const draggingSplitRef = useRef(false);
 
-  // 展开状态控制
-  const [activeTab, setActiveTab] = useState<'qual' | 'risk'>('qual');
+  // 状态自动持久化 (LocalStorage)
+  useEffect(() => {
+    if (result) {
+      localStorage.setItem('bidding_analysis_result', JSON.stringify(result));
+      localStorage.setItem('bidding_task_id', taskId || '');
+      localStorage.setItem('bidding_file_name', fileName || '');
+    }
+  }, [result, taskId, fileName]);
+
+  useEffect(() => {
+    localStorage.setItem('bidding_view_mode', viewMode);
+    localStorage.setItem('bidding_active_tab', activeTab);
+    localStorage.setItem('bidding_split_ratio', splitRatio.toString());
+  }, [viewMode, activeTab, splitRatio]);
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!draggingSplitRef.current || !splitContainerRef.current) return;
+      
+      const rect = splitContainerRef.current.getBoundingClientRect();
+      const newRatio = ((e.clientX - rect.left) / rect.width) * 100;
+      setSplitRatio(Math.max(30, Math.min(newRatio, 80)));
+    };
+    const handleMouseUp = () => {
+      draggingSplitRef.current = false;
+      document.body.style.cursor = '';
+    };
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
+
+  const handleSplitMouseDown = () => {
+    draggingSplitRef.current = true;
+    document.body.style.cursor = 'col-resize';
+  };
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -61,6 +124,8 @@ export function UploadBox() {
       const data = await response.json();
       if (data.code === 200 && data.data.task_id) {
         const taskId = data.data.task_id;
+        setTaskId(taskId);
+        setFileName(file.name);
         setStatusText("任务已提交，排队中...");
         
         // 开启 SSE 监听
@@ -158,14 +223,45 @@ export function UploadBox() {
     return <div className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-slate-700">{nodes}</div>;
   };
 
+  const handleClear = () => {
+    setResult(null);
+    setFile(null);
+    setTaskId(null);
+    setFileName(null);
+    localStorage.removeItem('bidding_analysis_result');
+    localStorage.removeItem('bidding_task_id');
+    localStorage.removeItem('bidding_file_name');
+  };
+
   return (
-    <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 h-full flex flex-col transition-all duration-300 hover:shadow-md">
-      {/* 顶部上传区域 */}
-      <div className="flex-shrink-0">
-        <h3 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">
-          <span className="bg-blue-100 p-1.5 rounded-lg text-blue-600">🤖</span>
-          招标文件智能解析
-        </h3>
+    <div className="bg-white/80 backdrop-blur-sm p-8 rounded-3xl shadow-sm border border-emerald-100 relative overflow-hidden group hover:shadow-md transition-all h-full flex flex-col">
+      <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/10 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-110 transition-transform duration-500"></div>
+      
+      {/* Header section with optional Clear button */}
+      <div className="relative z-10 flex justify-between items-start">
+        <div className="flex items-center gap-3 mb-2">
+          <div className="w-12 h-12 bg-blue-100 rounded-2xl flex items-center justify-center shadow-inner group-hover:scale-110 transition-transform">
+            <span className="text-2xl">🤖</span>
+          </div>
+          <div>
+            <h2 className="text-xl font-bold text-slate-800 tracking-tight">招标文件智能解析</h2>
+            <p className="text-sm text-slate-500">v2.4 Agentic Flow</p>
+          </div>
+        </div>
+        
+        {/* 重新上传按钮 */}
+        {result && !isAnalyzing && (
+          <button 
+            onClick={handleClear}
+            className="flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 rounded-xl transition-all text-sm font-bold shadow-sm"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+            重新解析新文档
+          </button>
+        )}
+      </div>
+
+      <div className="mt-8 relative z-10 flex-shrink-0">
         
         {!result && !isAnalyzing && (
           <div
@@ -230,23 +326,85 @@ export function UploadBox() {
 
       {/* 结果分屏区域 */}
       {result && !isAnalyzing && (
-        <div className="mt-8 flex gap-6 flex-1 min-h-[500px] animate-fade-in-up">
+        <div ref={splitContainerRef} className="mt-8 flex flex-1 min-h-[500px] animate-fade-in-up relative">
+          
           {/* 左侧原文对照区 */}
-          <div className="w-1/2 flex flex-col border border-slate-200 rounded-2xl overflow-hidden bg-slate-50 shadow-sm transition-all hover:shadow-md">
+          <div 
+            style={{ width: isFullscreen ? '100%' : `${splitRatio}%` }} 
+            className="flex flex-col border border-slate-200 rounded-2xl overflow-hidden bg-slate-50 shadow-sm transition-all duration-300 hover:shadow-md"
+          >
             <div className="bg-white px-5 py-4 border-b border-slate-200 font-bold text-slate-800 flex justify-between items-center">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-4">
                 <span className="text-blue-500">🔍</span>
                 <span>原文对照区</span>
+                {/* 切换按钮 */}
+                <div className="flex bg-slate-100 p-1 rounded-lg">
+                  <button onClick={() => setViewMode('text')} className={viewMode === 'text' ? 'bg-white shadow-sm px-3 py-1 rounded text-blue-600 text-sm transition-all' : 'px-3 py-1 text-slate-500 text-sm hover:text-slate-700 transition-all'}>提取文本</button>
+                  <button onClick={() => setViewMode('original')} className={viewMode === 'original' ? 'bg-white shadow-sm px-3 py-1 rounded text-blue-600 text-sm transition-all' : 'px-3 py-1 text-slate-500 text-sm hover:text-slate-700 transition-all'}>原文件预览</button>
+                </div>
               </div>
-              <span className="text-xs text-slate-400 font-medium bg-slate-100 px-2 py-1 rounded-md">悬浮高亮查看说明</span>
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-slate-400 font-medium bg-slate-100 px-2 py-1 rounded-md">悬浮高亮查看说明</span>
+                
+                {/* 全屏切换按钮 */}
+                <button 
+                  onClick={() => setIsFullscreen(!isFullscreen)}
+                  className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                  title={isFullscreen ? "退出沉浸模式" : "沉浸阅读模式"}
+                >
+                  {isFullscreen ? (
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                  ) : (
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"></path></svg>
+                  )}
+                </button>
+              </div>
             </div>
-            <div className="p-6 overflow-y-auto flex-1 h-[600px] custom-scrollbar">
-              <HighlightText text={result.extracted_text || ""} resultData={result} />
+            <div className={`flex-1 flex flex-col min-h-[700px] ${viewMode === 'text' ? 'p-6 overflow-y-auto custom-scrollbar' : ''}`}>
+              {viewMode === 'text' ? (
+                <HighlightText text={result.extracted_text || ""} resultData={result} />
+              ) : (
+                taskId ? (
+                  <div className="flex-1 w-full bg-[#f3f4f6]">
+                    <DocViewer 
+                      documents={[{ 
+                        uri: `${import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"}/api/v1/analysis/download/${taskId}`,
+                        fileName: fileName || "document",
+                        fileType: fileName?.split('.').pop() || "docx"
+                      }]}
+                      pluginRenderers={[LocalDocxRenderer, ...DocViewerRenderers]}
+                      style={{ height: "100%", width: "100%" }}
+                      config={{
+                        header: {
+                          disableHeader: true,
+                          disableFileName: true,
+                          retainURLParams: false
+                        }
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-center h-full text-slate-400">正在加载原文件...</div>
+                )
+              )}
             </div>
           </div>
 
+          {/* 可拖拽分割线 */}
+          {!isFullscreen && (
+            <div 
+              onMouseDown={handleSplitMouseDown}
+              className="w-6 -mx-3 flex items-center justify-center cursor-col-resize group z-10"
+            >
+              <div className="w-1 h-12 bg-slate-200 rounded-full group-hover:bg-blue-400 group-hover:shadow-[0_0_8px_rgba(96,165,250,0.5)] transition-all duration-300"></div>
+            </div>
+          )}
+
           {/* 右侧分析结论区 */}
-          <div className="w-1/2 flex flex-col border border-slate-200 rounded-2xl overflow-hidden bg-white shadow-sm transition-all hover:shadow-md">
+          <div 
+            style={{ width: isFullscreen ? '0%' : `${100 - splitRatio}%`, opacity: isFullscreen ? 0 : 1, pointerEvents: isFullscreen ? 'none' : 'auto' }}
+            className="flex flex-col border border-slate-200 rounded-2xl overflow-hidden bg-white shadow-sm transition-all hover:shadow-md"
+          >
             <div className="bg-slate-50 flex border-b border-slate-200 p-1 gap-1">
               <button 
                 className={`flex-1 py-3 px-4 font-bold text-sm transition-all rounded-xl ${activeTab === 'qual' ? 'text-blue-700 bg-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'}`}

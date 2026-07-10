@@ -1,31 +1,58 @@
-# 项目待办与演进路线 (TODO List & Roadmap)
+# 智能投标系统项目待办与演进路线 (TODO List & Roadmap)
 
-这是一个供你手动维护的待办清单。结合当前的架构状态，我已为你重新规划了后续任务优先级。
+该文档记录了基于 Multi-Agent 架构的后端核心链路落地步骤与历史完成事项。
 
-## 📝 待办事项 (To Do - 高优先级)
+## 📝 待办事项 (To Do)
 
-- [ ] **真实的文档解析与 OCR 接入 (Doc Parsing & Storage)**
-  - 完善 `doc_parser.py` 和 `skills/ocr_skill.py`，支持提取真实大型 PDF 的文本与表格。
-  - 接入 MinIO，将用户上传的文件转存至对象存储而不是本地临时文件夹。
-- [ ] **真实大模型打通与 Prompt 调优 (LLM & Prompt Tuning)**
-  - 去除 `UploadBox.tsx` 和后端大模型服务中的演示 Mock 数据。
-  - 针对 `strategy_agent.py` 和 `cost_agent.py`，设计并调优结构化系统提示词 (System Prompt)，确保大模型能稳定吐出匹配的 JSON。
-- [ ] **RAG 向量检索接入 (RAG Setup)**
-  - 完善数据库设计中预留的 `doc_chunks` 向量表（引入 `pgvector`）。
-  - 在大模型接入层实现真实的相似度查询，让前端的 `ChatPanel` 能够基于真实文档内容回答问题。
+### 阶段一：数据基石 - Extractor Agent (拆解智能体) 搭建
+- [x] **文件解析模块开发**
+  - [x] 编写 PDF 解析服务（基础文本提取使用 `Docling` 和 `PyMuPDF`）。
+  - [x] 编写 Word 解析服务（使用 `Docling` 统一处理）。
+  - [ ] 集成开源的 `MinerU` 进行扫描件与复杂版面的本地部署解析（目前已写好路由架构与桩代码，待接入实体模型）。
+  - [ ] 引入视觉大模型 (VLM) 兜底：当检测到极其复杂的扫描版跨页表格（MinerU 效果不佳时），截取该页图片，直接调用多模态视觉模型（如 Qwen-VL, GPT-4o）强制输出 Markdown 表格。
+- [x] **语义切片与元数据处理**
+  - [x] 使用 `LangChain` 实现基于语义和逻辑结构的切片 (Chunking)。
+  - [x] 为文本块打入追踪溯源的核心 Metadata (`page_num`, `section_title`, `content_type`)。
+- [x] **向量数据库打通**
+  - [x] 完善 `DOC_CHUNK` 表模型。
+  - [x] 接入 Embedding 模型，实现 Chunk 的批量向量化入库（**PostgreSQL + pgvector**，并使用本地魔搭 `BGE-M3` 懒加载）。
 
-## 🚀 待办事项 (To Do - 中低优先级)
+### 阶段二：单兵作战 - 专家 Agent (快车道 API) 开发
+- [ ] **Compliance Agent (排雷智能体)**
+  - [ ] 编写核心 System Prompt，强化对“无星号”条款的语义识别（检索“必须”、“违约金”等强限制性词汇，调用 LLM 推理判定实质性壁垒）。
+  - [ ] 开发双路召回检索（Hybrid Search），提取高危段落。
+  - [ ] 提供无状态的独立 FastAPI 路由（如 `/api/analyze/risk`），供前端直接调用。
+- [ ] **Strategy Agent (策略与计分智能体)**
+  - [ ] 提取打分表、生成资质匹配红绿灯。
+- [ ] **Writer Agent (标书撰写智能体)**
+  - [ ] 自动起草偏离表与标书草稿。
+- [ ] **避坑指南知识库 [低优先级 / 延后]**
+  - [ ] 梳理一份内部的《隐蔽陷阱避坑指南》（例如不合理的付款条件、资质壁垒），作为后续 RAG 的增强参考。
 
-- [ ] **标书自动生成与导出 (Word Generation)**
-  - 完善 `writer_agent.py`，利用前面各个 Agent 收集到的结论，自动套用 Word 模板并支持用户在前端一键下载草案。
-- [ ] **用户权限与多租户 (Auth & Multi-tenancy)**
-  - 在 `api/` 层加入真正的 JWT 鉴权。
-  - 确保底层数据访问严格遵循 `tenant_id` 隔离（参考已通过测试的 `test_db_models.py`）。
+### 阶段三：神经中枢 - 多智能体编排 (LangGraph)
+- [ ] **状态机与工作流设计**
+  - [ ] 在 LangGraph 中定义统一的 State (Blackboard) 数据结构。
+  - [ ] 串联上述专家 Agent，形成标准的审批与撰写流水线。
+- [ ] **Supervisor Agent (智能主控)**
+  - [ ] 编写意图识别模型，将底层 Agent 注册为可调用的 Tools。
+  - [ ] 提供自然语言处理接口（慢车道 `/api/chat/supervisor`）。
+- [ ] **异步调度与 SSE 流式推送**
+  - [ ] 将耗时任务放入 Celery 中执行后台推理。
+  - [ ] 搭建 FastAPI 的 SSE 接口，实时向前端推送 Agent 思考状态。
 
-## 🚧 进行中 (In Progress)
-- [ ] **全链路沙盒联调**：即将把真实的 LLM Key 填入 `.env` 并做真实文件链路测试。
+### 阶段四：前后端大联动 (UI Integration)
+- [ ] **溯源联动高亮**
+  - [ ] 改造前端文档渲染器（如 `LocalDocxRenderer`），暴露页面/章节跳转的 API。
+  - [ ] 联调后端返回的风险项 JSON，实现点击前端卡片，文档自动滚动高亮对应条款。
+- [ ] **智能对话与状态面板**
+  - [ ] 联调 SSE 接口，前端呈现 Agent 正在后台运作的步骤树。
+  - [ ] 测试快车道与慢车道（自然语言聊天）的双轨运行稳定性。
+
+---
 
 ## ✅ 已完成 (Done)
+
+- [x] **架构设计探讨与落地方案确认**：完成了基于 Multi-Agent、LangGraph 的混合路由架构设计，确认了无星号排雷逻辑、视觉模型增强方案及数据库选型 (2026-07-10)。
 - [x] **数据库层连通与基础设施搭建 (Database Integration)**：摒弃了开发环境的 SQLite 妥协方案。通过 `docker-compose` 搭建了原生的 PostgreSQL 与 Redis 容器，配置了严格拒绝退化的 `.env` 鉴权机制，并使用 Alembic `upgrade head` 成功初始化了所有的 DDD 多租户表结构。
 - [x] **架构设计与技术栈选型**：确立 FastAPI + React + Vite 骨架，并完成了 DDD 变体分层架构设计。
 - [x] **多智能体工作流重构**：引入 LangGraph 将散乱逻辑重构为 `BiddingState` 状态图，并使用 `@tool` 简化技能库。

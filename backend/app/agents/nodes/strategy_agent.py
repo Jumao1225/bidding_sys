@@ -49,4 +49,12 @@ def identify_risks_node(state: BiddingState) -> dict:
     """
     
     response = llm_service.generate_structured_json(prompt)
-    return {"risks_analysis": response.get("risks", [])}
+    
+    if isinstance(response, list):
+        risks = response
+    elif isinstance(response, dict):
+        risks = response.get("risks", [])
+    else:
+        risks = []
+        
+    return {"risks_analysis": risks}

@@ -31,36 +31,61 @@ def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, compa
     logger.info(f"Task {task_id} started for file {filename}")
     publish_progress(task_id, "开始处理", 10)
     
+    from app.db.session import SessionLocal
+    from app.db.models.project import Project, Document
+    
+    db = SessionLocal()
+    doc_id = None
     try:
-        # 1. 解析文档
-        publish_progress(task_id, "提取文本", 20)
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
-            
-        extracted_text = DocumentParser.extract_text_from_word(
-            file_bytes=file_bytes, 
-            filename=filename
-        )
+        # 1. 创建默认 Project (如果需要) 并插入 Document 记录供 Extractor 使用
+        publish_progress(task_id, "初始化任务与数据库...", 15)
         
-        if not extracted_text:
-            raise Exception("未能提取到有效文本")
+        project = db.query(Project).filter(Project.name == "Frontend Uploads").first()
+        if not project:
+            project = Project(tenant_id="default-tenant", name="Frontend Uploads", status="created")
+            db.add(project)
+            db.commit()
+            db.refresh(project)
             
-        publish_progress(task_id, "正在进行资质评估...", 40)
+        doc = Document(
+            tenant_id="default-tenant",
+            project_id=project.id,
+            filename=filename,
+            file_path=file_path,
+            parse_status="pending"
+        )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+        doc_id = doc.id
+        
+        publish_progress(task_id, "正在提取文本与生成向量 (Docling + BGE-M3)...", 20)
         
         # 2. 调用 LangGraph
         initial_state = {
             "task_id": task_id,
-            "doc_text": extracted_text,
+            "document_id": doc_id,
+            "doc_text": "",
             "company_quals": company_quals,
             "status": "RUNNING",
             "error": ""
         }
         
-        # 遍历图的执行，获取中间状态可以用于进度推送，但为简化直接 invoke
         # graph.invoke 会返回最终状态
         final_state = bidding_graph.invoke(initial_state)
         
-        publish_progress(task_id, "完成", 100, result=final_state)
+        # 提取结果用于前端展示
+        result = {
+            "extracted_text": final_state.get("doc_text", ""),
+            "qualifications_analysis": final_state.get("qualifications_analysis", {}),
+            "risks_analysis": final_state.get("risks_analysis", []),
+            "cost_analysis": final_state.get("cost_analysis", {})
+        }
+        
+        if final_state.get("status") == "extractor_failed" or final_state.get("error"):
+            raise Exception(final_state.get("error", "智能体执行失败"))
+            
+        publish_progress(task_id, "完成", 100, result=result)
         logger.info(f"Task {task_id} completed.")
         return final_state
         
@@ -69,6 +94,8 @@ def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, compa
         publish_progress(task_id, f"错误: {str(e)}", 100, result={"error": str(e)})
         raise e
     finally:
-        # 清理临时文件
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        db.close()
+        # 清理临时文件 - 暂时禁用，前端需要读取原文件预览
+        # if os.path.exists(file_path):
+        #     os.remove(file_path)
+        pass

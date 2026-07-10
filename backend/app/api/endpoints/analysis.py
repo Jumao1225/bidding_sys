@@ -1,7 +1,10 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from loguru import logger
 import os
 import uuid
+from pathlib import Path
+import glob
 
 from app.schemas.response.common import ResponseModel, success_response
 from app.worker.tasks import analyze_bidding_doc
@@ -10,6 +13,7 @@ router = APIRouter()
 
 @router.post("/upload-and-analyze", response_model=ResponseModel[dict])
 async def upload_and_analyze(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="上传的招标文件 (Word/PDF 等)"),
     company_quals: str = Form(..., description="我方公司的资质信息文本")
 ):
@@ -26,7 +30,8 @@ async def upload_and_analyze(
         task_id = str(uuid.uuid4())
         
         # 保存文件到临时目录
-        upload_dir = os.path.join(os.getcwd(), "backend", "uploads")
+        base_dir = Path(__file__).resolve().parent.parent.parent.parent
+        upload_dir = os.path.join(base_dir, "uploads")
         os.makedirs(upload_dir, exist_ok=True)
         file_path = os.path.join(upload_dir, f"{task_id}_{file.filename}")
         
@@ -39,10 +44,13 @@ async def upload_and_analyze(
             
         logger.info(f"文件已保存: {file_path}，即将触发 Celery 任务: {task_id}")
         
-        # 异步调用 Celery Task
-        analyze_bidding_doc.apply_async(
-            args=[task_id, file_path, file.filename, company_quals],
-            task_id=task_id
+        # 异步调用 BackgroundTask
+        background_tasks.add_task(
+            analyze_bidding_doc,
+            task_id, 
+            file_path, 
+            file.filename, 
+            company_quals
         )
         
         # 返回 task_id，前端根据这个 task_id 建立 SSE 连接
@@ -53,3 +61,27 @@ async def upload_and_analyze(
     except Exception as e:
         logger.exception(f"提交分析任务失败: {str(e)}")
         raise e
+
+@router.api_route("/download/{task_id}", methods=["GET", "HEAD"])
+async def download_original_file(task_id: str):
+    """
+    根据 task_id 下载原文件
+    """
+    base_dir = Path(__file__).resolve().parent.parent.parent.parent
+    upload_dir = os.path.join(base_dir, "uploads")
+    
+    # 查找匹配 task_id 的文件
+    pattern = os.path.join(upload_dir, f"{task_id}_*")
+    matched_files = glob.glob(pattern)
+    if not matched_files:
+        raise HTTPException(status_code=404, detail="未找到对应的原文件")
+    
+    file_path = matched_files[0]
+    filename = os.path.basename(file_path).replace(f"{task_id}_", "")
+    
+    return FileResponse(
+        path=file_path, 
+        filename=filename,
+        # Content-Disposition "inline" allows browser to try displaying it (good for PDF)
+        content_disposition_type="inline"
+    )
