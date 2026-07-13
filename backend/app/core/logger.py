@@ -54,7 +54,7 @@ def setup_app_logging():
     # 遍历并替换所有已注册的日志器，将其处理器替换为 InterceptHandler
     for name in logging.root.manager.loggerDict.keys():
         logging.getLogger(name).handlers = [InterceptHandler()]
-        logging.getLogger(name).propagate = True
+        logging.getLogger(name).propagate = False
 
     # 配置 Loguru 的输出端 (控制台和文件)
     logger.configure(

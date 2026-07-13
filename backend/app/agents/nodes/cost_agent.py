@@ -2,6 +2,9 @@ import json
 from loguru import logger
 from app.services.llm_service import llm_service
 from app.agents.state import BiddingState
+from sqlalchemy.orm import Session
+from app.db.session import SessionLocal
+from app.db.models.project import Document, DocChunk
 
 def cost_node(state: BiddingState) -> dict:
     """
@@ -10,8 +13,20 @@ def cost_node(state: BiddingState) -> dict:
     或者假设 state 中有一个 bom_items 和 price_book。
     为了简化，直接利用大模型做一次性评估。
     """
-    doc_text = state.get("doc_text", "")
+    document_id = state.get("document_id")
     
+    db: Session = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+        budget_limit = None
+        if document and document.parsed_metadata:
+            budget_limit = document.parsed_metadata.get("budget_limit")
+            
+        chunks = db.query(DocChunk).filter(DocChunk.document_id == document_id).order_by(DocChunk.created_at).all()
+        doc_text = "\n\n".join([chunk.content for chunk in chunks]) if chunks else ""
+    finally:
+        db.close()
+
     # 这里为了演示，硬编码一个简单的价格库。实际应从数据库查询或通过 Skill 查询。
     price_book = {
         "高性能服务器": 45000, 
@@ -66,6 +81,7 @@ def cost_node(state: BiddingState) -> dict:
     return {
         "cost_analysis": {
             "total_cost": total_cost,
+            "budget_limit": budget_limit,
             "items": calculated_items
         }
     }

@@ -31,12 +31,13 @@ class LLMService:
                 
                 # 初始化 LangChain 的 ChatOpenAI 客户端
                 # bind(response_format={"type": "json_object"}) 强制 OpenAI 模型返回 JSON
-                self.llm = ChatOpenAI(
+                self.raw_llm = ChatOpenAI(
                     model_name=settings.LLM_MODEL_NAME,
                     api_key=settings.OPENAI_API_KEY,
                     base_url=settings.OPENAI_API_BASE if settings.OPENAI_API_BASE else None,
                     temperature=0.3,
-                ).bind(response_format={"type": "json_object"})
+                )
+                self.llm = self.raw_llm.bind(response_format={"type": "json_object"})
                 
                 logger.info(f"LLM 引擎初始化成功: {settings.LLM_MODEL_NAME}")
             except ImportError:
@@ -97,6 +98,47 @@ class LLMService:
         except Exception as e:
             logger.error(f"LLM 调用失败: {str(e)}")
             raise e
+
+    @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+    def expand_query(self, query: str, num_variants: int = 3) -> list[str]:
+        """
+        多路查询重写 (Query Expansion)。
+        利用 LLM 将单一关键词扩展为多个相关的语义变体。
+        """
+        if not self.is_configured or self.raw_llm is None:
+            return [query]
+            
+        prompt = f"""
+        你是一个工程招投标领域的搜索专家。
+        用户的原始搜索词是："{query}"
+        
+        为了在向量数据库中尽可能多地召回相关的上下文（避免遗漏隐晦表达或同义词），
+        请给出 {num_variants} 个不同的搜索词变体。
+        变体应该包含原词的同义词、具体场景词或技术术语。
+        
+        【输出格式要求】
+        严格输出一个 JSON 格式，必须包含 "variants" 键，其值为字符串数组。例如：
+        {{"variants": ["变体1", "变体2", "变体3"]}}
+        不要输出任何其他解释。
+        """
+        try:
+            # 调用已经绑定 json_object 格式的 self.llm
+            response = self.llm.invoke(prompt)
+            content = response.content
+            import json
+            result = json.loads(content)
+            
+            variants = result.get("variants", [])
+            if isinstance(variants, list):
+                # 合并原查询词和变体
+                expanded = [query] + [str(v) for v in variants]
+                # 去重并保留顺序，去除空字符串
+                expanded = list(dict.fromkeys([v.strip() for v in expanded if v.strip()]))
+                return expanded
+            return [query]
+        except Exception as e:
+            logger.warning(f"查询扩展失败，回退到原始查询: {str(e)}")
+            return [query]
 
     def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
         """

@@ -142,24 +142,97 @@ class ExtractorService:
             converter = self._get_docling_converter()
             conversion_result = converter.convert(file_path)
             
+            # --- 调试: 将 Docling 提取的完整 Markdown 写入文件 ---
+            try:
+                debug_output_path = file_path + ".debug.md"
+                with open(debug_output_path, "w", encoding="utf-8") as f:
+                    f.write(conversion_result.document.export_to_markdown())
+                logger.info(f"Docling 原始解析结果已保存至: {debug_output_path}")
+            except Exception as inner_e:
+                logger.warning(f"保存 Docling 调试文件失败: {inner_e}")
+            # -----------------------------------------------------
+            
             # 使用 Langchain 的 docling chunker 进行层次化切片
             from docling_core.transforms.chunker.hierarchical_chunker import HierarchicalChunker
             
             chunker = HierarchicalChunker()
             chunks = chunker.chunk(conversion_result.document)
             
-            # 将 Docling 的 Chunks 转换为 Langchain 的 Documents
-            docs = []
+            # 聚合策略：按章节合并 Chunk，并设定单块最大字数限制
+            aggregated_docs = []
+            current_chapter = "无章节/正文"
+            latest_docling_top = ""
+            current_text = ""
+            current_page = 1
+            current_trace = None
+            MAX_CHUNK_LENGTH = 3000
+            
+            import re
+            # 匹配 "第一章", "**第四章 项目需求**", "### 第一部分" 等
+            chapter_pattern = re.compile(r'^\s*[*#]*\s*(第[一二三四五六七八九十百0-9]+[章部分])')
+
+            def commit_chunk(title, text, page, trace):
+                if text.strip():
+                    aggregated_docs.append(Document(
+                        page_content=text,
+                        metadata={
+                            "section_title": title,
+                            "content_type": "chapter_block",
+                            "page_num": page,
+                            "source": file_path,
+                            "trace_info": trace
+                        }
+                    ))
+
             for chunk in chunks:
-                metadata = {
-                    "section_title": chunk.meta.headings[0] if chunk.meta.headings else "",
-                    "content_type": chunk.meta.doc_items[0].label if chunk.meta.doc_items else "text",
-                    "page_num": chunk.meta.doc_items[0].prov[0].page_no if (chunk.meta.doc_items and chunk.meta.doc_items[0].prov) else 1,
-                    "source": file_path
-                }
-                docs.append(Document(page_content=chunk.text, metadata=metadata))
+                page_no = chunk.meta.doc_items[0].prov[0].page_no if (chunk.meta.doc_items and chunk.meta.doc_items[0].prov) else current_page
                 
-            return docs
+                trace_info = {
+                    "headings": chunk.meta.headings if chunk.meta.headings else [],
+                    "element_label": chunk.meta.doc_items[0].label if chunk.meta.doc_items else "text"
+                }
+
+                # --- 核心标题推断状态机 ---
+                docling_top = chunk.meta.headings[0] if chunk.meta.headings else ""
+                chapter_title = current_chapter
+                
+                # 1. 只有当 Docling 识别到【全新】的 Heading 时，才采纳
+                if docling_top and docling_top != latest_docling_top:
+                    if len(docling_top) < 100:
+                        chapter_title = docling_top.replace('*', '').replace('#', '').strip()
+                    latest_docling_top = docling_top
+                
+                # 2. 强力正则兜底：解决原文档样式不规范导致 Docling 漏认的问题
+                match = chapter_pattern.search(chunk.text)
+                if match:
+                    first_line = chunk.text.split('\n')[0].replace('*', '').replace('#', '').strip()
+                    # 排除目录项 (TOC)：如果标题以数字结尾，且包含制表符或多个空格，极大概率是目录中的页码，而不是正文标题
+                    is_toc_entry = bool(re.search(r'\d+\s*$', first_line))
+                    if len(first_line) < 100 and not is_toc_entry:
+                        chapter_title = first_line
+                        # 重置 latest_docling_top，防止稍后 Docling 把旧 Heading 又带回来覆盖
+                        latest_docling_top = docling_top
+                # -----------------------
+
+                # 如果章节相同，且字数没超限，就继续拼接
+                if chapter_title == current_chapter and len(current_text) + len(chunk.text) < MAX_CHUNK_LENGTH:
+                    current_text += "\n" + chunk.text
+                else:
+                    # 结算前一个块
+                    if current_text.strip():
+                        commit_chunk(current_chapter, current_text, current_page, current_trace)
+                    
+                    # 开启新块
+                    current_chapter = chapter_title
+                    current_text = chunk.text
+                    current_page = page_no
+                    current_trace = trace_info
+
+            # 结算最后一个块
+            if current_text.strip():
+                commit_chunk(current_chapter, current_text, current_page, current_trace)
+                
+            return aggregated_docs
             
         except Exception as e:
             logger.error(f"Docling 解析失败: {str(e)}")

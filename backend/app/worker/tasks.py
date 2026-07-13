@@ -32,7 +32,7 @@ def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, compa
     publish_progress(task_id, "开始处理", 10)
     
     from app.db.session import SessionLocal
-    from app.db.models.project import Project, Document
+    from app.db.models.project import Project, Document, DocChunk
     
     db = SessionLocal()
     doc_id = None
@@ -74,9 +74,13 @@ def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, compa
         # graph.invoke 会返回最终状态
         final_state = bidding_graph.invoke(initial_state)
         
+        # 从数据库提取解析出的文本用于前端展示 (DB First)
+        chunks = db.query(DocChunk).filter(DocChunk.document_id == doc_id).order_by(DocChunk.created_at).all()
+        doc_text = "\n\n".join([chunk.content for chunk in chunks]) if chunks else ""
+
         # 提取结果用于前端展示
         result = {
-            "extracted_text": final_state.get("doc_text", ""),
+            "extracted_text": doc_text,
             "qualifications_analysis": final_state.get("qualifications_analysis", {}),
             "risks_analysis": final_state.get("risks_analysis", []),
             "cost_analysis": final_state.get("cost_analysis", {})

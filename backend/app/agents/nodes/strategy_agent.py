@@ -1,13 +1,23 @@
 from app.services.llm_service import llm_service
 from app.agents.state import BiddingState
+from sqlalchemy.orm import Session
+from app.db.session import SessionLocal
+from app.db.models.project import DocChunk
 
 def analyze_qualifications_node(state: BiddingState) -> dict:
     """
     将招标文件文本和公司已有资质发给大模型，进行三级评估。
     返回增量状态字典，用于更新 BiddingState。
     """
-    doc_text = state.get("doc_text", "")
     company_quals = state.get("company_quals", "")
+    document_id = state.get("document_id")
+    
+    db: Session = SessionLocal()
+    try:
+        chunks = db.query(DocChunk).filter(DocChunk.document_id == document_id).order_by(DocChunk.created_at).all()
+        doc_text = "\n\n".join([chunk.content for chunk in chunks]) if chunks else ""
+    finally:
+        db.close()
     
     prompt = f"""
     你是一位资深的投标经理，需要从**投标方视角**盘点招标文件中的要求。
@@ -35,7 +45,14 @@ def identify_risks_node(state: BiddingState) -> dict:
     """
     扫描文本中的法律、财务、商务风险项
     """
-    doc_text = state.get("doc_text", "")
+    document_id = state.get("document_id")
+    
+    db: Session = SessionLocal()
+    try:
+        chunks = db.query(DocChunk).filter(DocChunk.document_id == document_id).order_by(DocChunk.created_at).all()
+        doc_text = "\n\n".join([chunk.content for chunk in chunks]) if chunks else ""
+    finally:
+        db.close()
     
     prompt = f"""
     请分析以下招标文件内容，提取所有可能对投标方不利的风险条款（如违约金过高、账期过长、单方面免责等）。

@@ -9,24 +9,25 @@ from app.db.models.project import Document, DocChunk
 
 logger = logging.getLogger(__name__)
 
-def extractor_agent_node(state: BiddingState) -> Dict[str, Any]:
+def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
     """
-    拆解智能体节点 (Extractor Agent)
-    负责从数据库加载文件记录，进行解析、切片，获取 Embedding，并存入向量库。
+    文档解析流水线节点 (Parser Worker)
+    负责从数据库加载文件记录，进行解析、切片，获取 Embedding 和溯源结构 (trace_info)，并存入 PostgreSQL。
+    这是所有流程的第 0 步。
     """
-    logger.info("--- 启动 Extractor Agent ---")
+    logger.info("--- 启动 Parser Worker ---")
     
     document_id = state.get("document_id")
     if not document_id:
-        logger.error("State 中缺少 document_id，跳过 Extractor Agent")
-        return {"status": "extractor_failed", "error": "Missing document_id"}
+        logger.error("State 中缺少 document_id，跳过 Parser Worker")
+        return {"status": "parser_failed", "error": "Missing document_id"}
 
     db: Session = SessionLocal()
     try:
         # 1. 查找文件记录
         document = db.query(Document).filter(Document.id == document_id).first()
         if not document:
-            return {"status": "extractor_failed", "error": f"未找到文档记录: {document_id}"}
+            return {"status": "parser_failed", "error": f"未找到文档记录: {document_id}"}
             
         file_path = document.file_path
         logger.info(f"开始处理文档: {file_path}")
@@ -36,9 +37,27 @@ def extractor_agent_node(state: BiddingState) -> Dict[str, Any]:
         logger.info(f"文档解析完成，共获得 {len(chunks)} 个切片。")
 
         if not chunks:
-            return {"status": "extractor_failed", "error": "文档解析未获得任何切片"}
+            return {"status": "parser_failed", "error": "文档解析未获得任何切片"}
 
-        # 3. 获取 Embedding
+        # 3. 提取 TOC (Table of Contents)
+        toc_set = []
+        for chunk in chunks:
+            st = chunk.metadata.get("section_title")
+            if st and st != "无章节/正文" and st not in toc_set:
+                toc_set.append(st)
+        
+        toc_str = "\n".join([f"- {t}" for t in toc_set])
+        logger.info(f"生成目录树 (TOC)，共 {len(toc_set)} 个顶级章节。")
+        
+        if document.parsed_metadata is None:
+            document.parsed_metadata = {}
+        
+        # 强制触发 SQLAlchemy JSON 列更新
+        new_meta = dict(document.parsed_metadata)
+        new_meta["table_of_contents"] = toc_str
+        document.parsed_metadata = new_meta
+
+        # 4. 获取 Embedding
         texts_to_embed = [chunk.page_content for chunk in chunks]
         logger.info("开始生成 Embedding 向量...")
         embeddings = llm_service.generate_embeddings(texts_to_embed)
@@ -46,7 +65,9 @@ def extractor_agent_node(state: BiddingState) -> Dict[str, Any]:
 
         # 4. 组装数据入库
         db_chunks = []
-        for chunk, embedding in zip(chunks, embeddings):
+        import datetime
+        base_time = datetime.datetime.utcnow()
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             db_chunk = DocChunk(
                 tenant_id=document.tenant_id,
                 document_id=document.id,
@@ -54,7 +75,9 @@ def extractor_agent_node(state: BiddingState) -> Dict[str, Any]:
                 page_num=chunk.metadata.get("page_num"),
                 section_title=chunk.metadata.get("section_title"),
                 content_type=chunk.metadata.get("content_type"),
-                embedding=embedding
+                trace_info=chunk.metadata.get("trace_info"),
+                embedding=embedding,
+                created_at=base_time + datetime.timedelta(milliseconds=i * 10)
             )
             db_chunks.append(db_chunk)
 
@@ -67,17 +90,14 @@ def extractor_agent_node(state: BiddingState) -> Dict[str, Any]:
         db.commit()
         logger.info(f"成功将 {len(db_chunks)} 个带向量的切片存入 PostgreSQL。")
         
-        # 将解析出的全文也更新到 state 中，供后续简单的非RAG节点（如需要）使用
-        full_text = "\n\n".join(texts_to_embed)
-        
+        # 贯彻 DB First 原则：仅返回状态，不向 State 塞入庞大的文本数据
         return {
-            "status": "extractor_completed",
-            "doc_text": full_text
+            "status": "parser_completed"
         }
         
     except Exception as e:
         db.rollback()
-        logger.exception("Extractor Agent 执行失败")
-        return {"status": "extractor_failed", "error": str(e)}
+        logger.exception("Parser Worker 执行失败")
+        return {"status": "parser_failed", "error": str(e)}
     finally:
         db.close()

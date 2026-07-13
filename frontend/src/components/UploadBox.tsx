@@ -233,6 +233,15 @@ export function UploadBox() {
     localStorage.removeItem('bidding_file_name');
   };
 
+  const viewerDocuments = useMemo(() => {
+    if (!taskId) return [];
+    return [{ 
+      uri: `${import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"}/api/v1/analysis/download/${taskId}`,
+      fileName: fileName || "document",
+      fileType: fileName?.split('.').pop() || "docx"
+    }];
+  }, [taskId, fileName]);
+
   return (
     <div className="bg-white/80 backdrop-blur-sm p-8 rounded-3xl shadow-sm border border-emerald-100 relative overflow-hidden group hover:shadow-md transition-all h-full flex flex-col">
       <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/10 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-110 transition-transform duration-500"></div>
@@ -326,7 +335,7 @@ export function UploadBox() {
 
       {/* 结果分屏区域 */}
       {result && !isAnalyzing && (
-        <div ref={splitContainerRef} className="mt-8 flex flex-1 min-h-[500px] animate-fade-in-up relative">
+        <div ref={splitContainerRef} className="mt-8 flex h-[calc(100vh-200px)] min-h-[800px] animate-fade-in-up relative">
           
           {/* 左侧原文对照区 */}
           <div 
@@ -360,18 +369,14 @@ export function UploadBox() {
                 </button>
               </div>
             </div>
-            <div className={`flex-1 flex flex-col min-h-[700px] ${viewMode === 'text' ? 'p-6 overflow-y-auto custom-scrollbar' : ''}`}>
+            <div className={`flex-1 flex flex-col overflow-y-auto custom-scrollbar ${viewMode === 'text' ? 'p-6' : ''}`}>
               {viewMode === 'text' ? (
                 <HighlightText text={result.extracted_text || ""} resultData={result} />
               ) : (
                 taskId ? (
                   <div className="flex-1 w-full bg-[#f3f4f6]">
                     <DocViewer 
-                      documents={[{ 
-                        uri: `${import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"}/api/v1/analysis/download/${taskId}`,
-                        fileName: fileName || "document",
-                        fileType: fileName?.split('.').pop() || "docx"
-                      }]}
+                      documents={viewerDocuments}
                       pluginRenderers={[LocalDocxRenderer, ...DocViewerRenderers]}
                       style={{ height: "100%", width: "100%" }}
                       config={{
@@ -420,7 +425,7 @@ export function UploadBox() {
               </button>
             </div>
             
-            <div className="p-6 overflow-y-auto flex-1 h-[600px] bg-slate-50/50 custom-scrollbar">
+            <div className="p-6 overflow-y-auto flex-1 bg-slate-50/50 custom-scrollbar">
               {activeTab === 'qual' && (
                 <div className="space-y-4 animate-fade-in">
                   {result.qualifications_analysis?.items?.map((item: any, idx: number) => (

@@ -1,4 +1,4 @@
-from sqlalchemy import String, Text, ForeignKey, Integer
+from sqlalchemy import String, Text, ForeignKey, Integer, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from typing import List, Optional
 from pgvector.sqlalchemy import Vector
@@ -19,6 +19,7 @@ class Document(TenantBase):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
     parse_status: Mapped[str] = mapped_column(String(50), default="pending")
+    parsed_metadata: Mapped[dict | None] = mapped_column(JSON)
 
     project: Mapped["Project"] = relationship("Project", back_populates="documents")
     chunks: Mapped[List["DocChunk"]] = relationship("DocChunk", back_populates="document", cascade="all, delete-orphan")
@@ -31,6 +32,7 @@ class DocChunk(TenantBase):
     page_num: Mapped[int | None] = mapped_column(Integer)
     section_title: Mapped[str | None] = mapped_column(String(255))
     content_type: Mapped[str | None] = mapped_column(String(50))
+    trace_info: Mapped[dict | None] = mapped_column(JSON)
     embedding: Mapped[list[float]] = mapped_column(Vector(1024))
     
     document: Mapped["Document"] = relationship("Document", back_populates="chunks")
