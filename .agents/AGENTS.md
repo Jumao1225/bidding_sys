@@ -30,8 +30,12 @@
 
 # 测试规范 (Testing Rules)
 - **测试目标与原则**：新增功能必写测试，测试代码必须与业务代码同步提交。严禁只交业务代码、删除旧用例或提交无法运行的死代码。
-- **目录划分**：`tests/` 目录下需严格区分 `unit/` (单元测试)、`integration/` (集成测试)、`api/` (API接口) 和 `fixtures/` (数据源)。全局配置置于 `conftest.py`。
+- **目录划分与自动对齐（重要）**：
+  1. `tests/` 目录下严格区分 `unit/` (单元测试)、`integration/` (集成测试)、`api/` (API接口) 和 `fixtures/` (数据源)。
+  2. **编写测试前的强制动作**：在编写或修改任何测试代码之前，Agent **必须优先**使用 `list_dir` 或 `file_search` 工具查看 `tests/` 及其子目录的现有结构与文件。
+  3. **位置对齐原则**：新编写的测试文件必须严格放置在对应的子目录下（例如：组件单元测试放 `tests/unit/`，路由接口测试放 `tests/api/`）。严禁直接将测试文件塞在 `tests/` 根目录。
 - **命名规范**：文件必须以 `test_` 开头（如 `test_document_parser.py`），严禁 `_test.py`。测试函数必须遵循 `test_<功能>_<场景>_<期望结果>` 格式（如 `test_parse_invalid_pdf_should_raise_error`）。
+- **编写参考原则**：在创建新测试文件前，Agent 应当利用 `view_file` 读取同目录下已有的类似测试文件（或全局 `conftest.py`），确保新代码的 `import` 风格、Fixture 使用方式与现有项目测试代码保持高度一致。
 - **场景覆盖度**：核心逻辑的单元测试必须至少覆盖三种场景：正常情况、异常情况、边界情况。
 - **异步与 API 测试**：FastAPI 接口与异步服务测试，必须标记 `@pytest.mark.asyncio` 并使用 `await`。API 接口测试必须统一使用 `httpx.AsyncClient`。
 - **数据管理 (Fixtures)**：严禁在测试代码中硬编码长串的字典或 JSON 数据。必须将测试假数据存放在 `fixtures/` 目录下，在测试运行时动态加载。

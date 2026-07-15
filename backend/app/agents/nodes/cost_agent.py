@@ -22,7 +22,7 @@ def cost_node(state: BiddingState) -> dict:
         if document and document.parsed_metadata:
             budget_limit = document.parsed_metadata.get("budget_limit")
             
-        chunks = db.query(DocChunk).filter(DocChunk.document_id == document_id).order_by(DocChunk.created_at).all()
+        chunks = db.query(DocChunk).filter(DocChunk.document_id == document_id).order_by(DocChunk.chunk_index).all()
         doc_text = "\n\n".join([chunk.content for chunk in chunks]) if chunks else ""
     finally:
         db.close()

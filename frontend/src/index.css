@@ -10,7 +10,9 @@
       radial-gradient(at 100% 0%, hsla(250, 100%, 97%, 1) 0px, transparent 50%),
       radial-gradient(at 100% 100%, hsla(220, 100%, 95%, 1) 0px, transparent 50%),
       radial-gradient(at 0% 100%, hsla(230, 100%, 96%, 1) 0px, transparent 50%);
-    background-attachment: fixed;
+    /* 避免 background-attachment: fixed 引起的每次滚动全屏 Paint 重绘开销 */
+    background-repeat: no-repeat;
+    background-size: cover;
   }
 }
 
@@ -46,6 +48,12 @@
   .scrollbar-hide {
     -ms-overflow-style: none;
     scrollbar-width: none;
+  }
+
+  /* GPU 硬件加速与滚动渲染隔离 */
+  .gpu-layer {
+    transform: translateZ(0);
+    contain: layout style paint;
   }
 }
 

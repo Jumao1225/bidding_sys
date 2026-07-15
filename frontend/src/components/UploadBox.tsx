@@ -3,10 +3,21 @@ import DocViewer, { DocViewerRenderers } from "@cyntler/react-doc-viewer";
 import "@cyntler/react-doc-viewer/dist/index.css";
 import { LocalDocxRenderer } from './LocalDocxRenderer';
 
-export function UploadBox() {
+export interface UploadBoxProps {
+  onTerminalMessage?: (msg: { id: string, type: 'info' | 'tool_call' | 'success' | 'error', content: string }) => void;
+  onAnalysisSuccess?: (result: any) => void;
+  onAnalyzingChange?: (isAnalyzing: boolean) => void;
+}
+
+export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingChange }: UploadBoxProps = {}) {
   const [isDragging, setIsDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isAnalyzing, setIsAnalyzingInternal] = useState(false);
+
+  const setIsAnalyzing = (val: boolean) => {
+    setIsAnalyzingInternal(val);
+    if (onAnalyzingChange) onAnalyzingChange(val);
+  };
   const [progress, setProgress] = useState(0);
   const [statusText, setStatusText] = useState("");
   
@@ -137,9 +148,20 @@ export function UploadBox() {
             if (msgData.status) setStatusText(msgData.status);
             if (msgData.progress) setProgress(msgData.progress);
             
+            if (msgData.agent_log && onTerminalMessage) {
+              onTerminalMessage({
+                id: Date.now().toString() + Math.random().toString(),
+                ...msgData.agent_log
+              });
+            }
             if (msgData.progress === 100) {
               if (msgData.result && !msgData.result.error) {
                 setResult(msgData.result);
+                // 持久化 document_id，供 ChatPanel 聊天接口使用
+                if (msgData.result.document_id) {
+                  localStorage.setItem('bidding_document_id', msgData.result.document_id);
+                }
+                if (onAnalysisSuccess) onAnalysisSuccess(msgData.result);
               } else if (msgData.result && msgData.result.error) {
                 alert("解析出错: " + msgData.result.error);
               }
@@ -231,6 +253,7 @@ export function UploadBox() {
     localStorage.removeItem('bidding_analysis_result');
     localStorage.removeItem('bidding_task_id');
     localStorage.removeItem('bidding_file_name');
+    if (onAnalysisSuccess) onAnalysisSuccess(null);
   };
 
   const viewerDocuments = useMemo(() => {
@@ -369,7 +392,7 @@ export function UploadBox() {
                 </button>
               </div>
             </div>
-            <div className={`flex-1 flex flex-col overflow-y-auto custom-scrollbar ${viewMode === 'text' ? 'p-6' : ''}`}>
+            <div className={`flex-1 flex flex-col overflow-y-auto custom-scrollbar gpu-layer ${viewMode === 'text' ? 'p-6' : ''}`}>
               {viewMode === 'text' ? (
                 <HighlightText text={result.extracted_text || ""} resultData={result} />
               ) : (

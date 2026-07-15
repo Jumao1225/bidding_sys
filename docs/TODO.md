@@ -1,62 +1,60 @@
-# 智能投标系统项目待办与演进路线 (TODO List & Roadmap)
+# 智能投标系统项目待办与演进路线 (V2.0 TODO List & Roadmap)
 
-该文档记录了基于 Multi-Agent 架构的后端核心链路落地步骤与历史完成事项。
+该文档记录了基于 V2.0“确定性流水线控制 + 大模型受控节点提取 + 人机协同最终决策”架构的后端核心链路落地步骤与历史完成事项。
 
 ## 📝 待办事项 (To Do)
 
-### 阶段一：数据基石 - Extractor Agent (拆解智能体) 搭建
-- [x] **文件解析模块开发**
-  - [x] 编写 PDF 解析服务（基础文本提取使用 `Docling` 和 `PyMuPDF`）。
-  - [x] 编写 Word 解析服务（使用 `Docling` 统一处理）。
-  - [ ] 集成开源的 `MinerU` 进行扫描件与复杂版面的本地部署解析（目前已写好路由架构与桩代码，待接入实体模型）。
-  - [ ] 引入视觉大模型 (VLM) 兜底：当检测到极其复杂的扫描版跨页表格（MinerU 效果不佳时），截取该页图片，直接调用多模态视觉模型（如 Qwen-VL, GPT-4o）强制输出 Markdown 表格。
-- [x] **语义切片与元数据处理**
-  - [x] 使用 `LangChain` 实现基于语义和逻辑结构的切片 (Chunking)。
-  - [x] 为文本块打入追踪溯源的核心 Metadata (`page_num`, `section_title`, `content_type`)。
-- [x] **向量数据库打通**
-  - [x] 完善 `DOC_CHUNK` 表模型。
-  - [x] 接入 Embedding 模型，实现 Chunk 的批量向量化入库（**PostgreSQL + pgvector**，并使用本地魔搭 `BGE-M3` 懒加载）。
+### 阶段一：数据基石 - 解析引擎进阶 (Parser Worker)
+- [ ] **集成 MinerU 深度解析**
+  - [ ] 集成开源的 `MinerU` 进行扫描件与复杂版面的本地部署解析，弥补 Docling 在重度图文混排扫描件上的不足。
+- [ ] **视觉大模型 (VLM) 兜底提取**
+  - [ ] 当检测到极其复杂的扫描版跨页表格（如造价表、参数偏离表）时，自动截取该页图片，直接调用多模态视觉模型（如 Qwen-VL, GPT-4o）强制输出高精度的 Markdown 表格。
 
-### 阶段二：单兵作战 - 专家 Agent (快车道 API) 开发
-- [ ] **Compliance Agent (排雷智能体)**
-  - [ ] 编写核心 System Prompt，强化对“无星号”条款的语义识别（检索“必须”、“违约金”等强限制性词汇，调用 LLM 推理判定实质性壁垒）。
-  - [ ] 开发双路召回检索（Hybrid Search），提取高危段落。
-  - [ ] 提供无状态的独立 FastAPI 路由（如 `/api/analyze/risk`），供前端直接调用。
-- [ ] **Strategy Agent (策略与计分智能体)**
-  - [ ] 提取打分表、生成资质匹配红绿灯。
-- [ ] **Writer Agent (标书撰写智能体)**
-  - [ ] 自动起草偏离表与标书草稿。
-- [ ] **避坑指南知识库 [低优先级 / 延后]**
-  - [ ] 梳理一份内部的《隐蔽陷阱避坑指南》（例如不合理的付款条件、资质壁垒），作为后续 RAG 的增强参考。
+### 阶段二：单兵作战 - 专业 Agent 与 Worker 节点打磨
+- [ ] **Business & Qual Agent (商务与资质专家)**
+  - [ ] 接入企业资产库 (Asset_Qualification, Asset_Employee, Asset_ProjectCase)。
+  - [ ] 根据 Master Agent 提取的“硬性资质”，自主调用查询技能匹配公司资质、人员和历史业绩。
+- [ ] **Cost Agent (报价计算专家)**
+  - [ ] 接入主材和辅材的基础价格数据库。
+  - [ ] 结合 Master Agent 提取的 `budget_limit`，实现动态报价平衡与利润率反算，确保不超限价。
+- [ ] **Tech & Service Worker (技术与售后流水线)**
+  - [ ] 利用高级 RAG 检索内部技术规范文档，结合痛点工况（如“彩钢瓦加固”）生成专项技术方案。
+  - [ ] 将标书服务要求转化为标准格式化承诺书与培训大纲。
+- [ ] **Review Engine (合规与红线非 AI 引擎)**
+  - [ ] 编写纯代码逻辑，进行废标词扫描、单一品牌强制校验。
+  - [ ] 实现资金红线拦截（如总价突破限价立即打回）。
 
-### 阶段三：神经中枢 - 多智能体编排 (LangGraph)
-- [ ] **状态机与工作流设计**
-  - [ ] 在 LangGraph 中定义统一的 State (Blackboard) 数据结构。
-  - [ ] 串联上述专家 Agent，形成标准的审批与撰写流水线。
-- [ ] **Supervisor Agent (智能主控)**
-  - [ ] 编写意图识别模型，将底层 Agent 注册为可调用的 Tools。
-  - [ ] 提供自然语言处理接口（慢车道 `/api/chat/supervisor`）。
-- [ ] **异步调度与 SSE 流式推送**
-  - [ ] 将耗时任务放入 Celery 中执行后台推理。
-  - [ ] 搭建 FastAPI 的 SSE 接口，实时向前端推送 Agent 思考状态。
+### 阶段二：神经中枢 - LangGraph 动态路由与人机干预
+- [ ] **【重点演进】Master Agent 动态路由 (Conditional Edges)**
+  - [ ] 废弃目前的串行“单行道”，实现 Master Agent 提取元数据后的任务并发下发 (Fan-out) 与按需跳过。
+  - [ ] 赋予 Master Agent 真正的分发权，基于提取到的标书特征（如是否含报价、痛点类型）决定激活下游哪些专业 Agent。
+- [ ] **人工审批卡点 (Human-in-the-loop)**
+  - [ ] 在 LangGraph 核心环节（如价格超标、疑似废标项）设置 `Interrupt` 中断点。
+  - [ ] 暴露 `Resume` API，允许前端人工修改确认后恢复工作流流转。
 
-### 阶段四：前后端大联动 (UI Integration)
+### 阶段三：前端深度联动 (UI Integration)
 - [ ] **溯源联动高亮**
-  - [ ] 改造前端文档渲染器（如 `LocalDocxRenderer`），暴露页面/章节跳转的 API。
-  - [ ] 联调后端返回的风险项 JSON，实现点击前端卡片，文档自动滚动高亮对应条款。
-- [ ] **智能对话与状态面板**
-  - [ ] 联调 SSE 接口，前端呈现 Agent 正在后台运作的步骤树。
-  - [ ] 测试快车道与慢车道（自然语言聊天）的双轨运行稳定性。
+  - [ ] 改造前端文档渲染器（如 `LocalDocxRenderer`）。
+  - [ ] 联调后端返回的风险项 JSON，实现点击前端卡片，文档自动滚动高亮到对应切片。
+- [ ] **审批流面板**
+  - [ ] 开发独立的审批卡点模态框，供用户确认或驳回 AI 生成的响应内容。
 
 ---
 
 ## ✅ 已完成 (Done)
 
-- [x] **架构设计探讨与落地方案确认**：完成了基于 Multi-Agent、LangGraph 的混合路由架构设计，确认了无星号排雷逻辑、视觉模型增强方案及数据库选型 (2026-07-10)。
-- [x] **数据库层连通与基础设施搭建 (Database Integration)**：摒弃了开发环境的 SQLite 妥协方案。通过 `docker-compose` 搭建了原生的 PostgreSQL 与 Redis 容器，配置了严格拒绝退化的 `.env` 鉴权机制，并使用 Alembic `upgrade head` 成功初始化了所有的 DDD 多租户表结构。
-- [x] **架构设计与技术栈选型**：确立 FastAPI + React + Vite 骨架，并完成了 DDD 变体分层架构设计。
-- [x] **多智能体工作流重构**：引入 LangGraph 将散乱逻辑重构为 `BiddingState` 状态图，并使用 `@tool` 简化技能库。
-- [x] **异步处理与 SSE 流式推送**：集成 Celery 处理长耗时任务，并在前端实现原生 `EventSource` 的各阶段流式进度订阅。
-- [x] **Epic Design 旗舰视觉交互**：全面重构前端，加入毛玻璃 (Glassmorphism)、动态光晕背景 (Mesh Gradients)、渐变组件与细致入微的微动画 (Micro-animations)。
-- [x] **测试隔离层重构与验证**：规范化 `backend/tests/` 目录，抽离假数据至 `fixtures/`，通过 `httpx.AsyncClient` 实现异步接口测试，核心链路测试 **100% Pass**。
-- [x] **LLM 配置与容错降级**：通过 `tenacity` 实现了大模型调用的指数退避与自动重试机制。
+### 架构与基础设施 (Architecture & Infra)
+- [x] **V2.0 架构设计落地**：确立了“DB First”、“人工负责决策”、“万物皆可溯源”的底线原则 (2026-07-13)。
+- [x] **多智能体工作流重构**：引入 LangGraph 将散乱逻辑重构为 `BiddingState` 状态图，并组装了基础的顺序流转 Pipeline (`builder.py`)。
+- [x] **数据库与异步基建**：原生 PostgreSQL + Redis 容器化，Alembic DDD 模型初始化，Celery 异步长耗时推理，FastAPI SSE 流式进度订阅。
+
+### 数据基石与解析引擎 (Data & Parsing)
+- [x] **智能文档解析 (Docling)**：完成基于语义和版面的复杂 PDF/Word 剥离提取。
+- [x] **章节级巨型分块 (Chapter-based Chunking)**：废弃碎片化切分，通过 Aggregator 将文本完美按章切块，单块容量可达 3000 字。
+- [x] **防误伤状态机与时间戳测序**：通过强力正则兜底修正 Docling 漏认标题 Bug，过滤误切分目录，并通过时序叠加完美解决数据库可视化排序混乱。
+- [x] **提取全局目录大纲 (TOC)**：自动提炼文档骨架入库，赋予大模型无与伦比的全局导航视角。
+
+### 高级检索与总控大脑 (Retrieval & Master Agent)
+- [x] **高级 RAG 混合检索引擎**：实现 Query Expansion (多路查询重写) + 向量余弦检索 + ILIKE 关键字精准模糊匹配。
+- [x] **基于章节的全量上下文召回 (Section-Based Context)**：打破物理滑窗限制，命中切片后自动拉取同章节的所有切片拼接，实现近 6 万字的“按章召回”，彻底消灭上下文碎片化。
+- [x] **Master Agent (总控智能体) 落地**：独立节点读取大纲与前 25000 字，利用 Tool-Calling 深挖全篇痛点，精准提炼出项目编号、预算限价、硬性资质等四大元数据并落库 `parsed_metadata`。

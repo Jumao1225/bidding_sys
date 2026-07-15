@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     OPENAI_API_BASE: str = os.getenv("OPENAI_API_BASE", "")
     LLM_MODEL_NAME: str = os.getenv("LLM_MODEL_NAME", "gpt-4o")
 
+    # MinerU 在线 API 配置 (参考 https://mineru.net/apiManage/docs)
+    MINERU_API_TOKEN: str = os.getenv("MINERU_API_TOKEN", "")
+    MINERU_API_BASE_URL: str = os.getenv("MINERU_API_BASE_URL", "https://mineru.net/api/v4")
+
     class Config:
         env_file = ("../.env", ".env")
         case_sensitive = True
