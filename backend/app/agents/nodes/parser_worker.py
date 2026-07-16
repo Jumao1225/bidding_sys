@@ -15,7 +15,9 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
     负责从数据库加载文件记录，进行解析、切片，获取 Embedding 和溯源结构 (trace_info)，并存入 PostgreSQL。
     这是所有流程的第 0 步。
     """
+    from app.worker.tasks import emit_agent_log
     logger.info("--- 启动 Parser Worker ---")
+    emit_agent_log("info", "文档解析引擎已启动，准备执行物理层提取流程...")
     
     document_id = state.get("document_id")
     if not document_id:
@@ -34,14 +36,17 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
 
         # 如果文件状态已完成（通过文件哈希匹配复用），则直接跳过冗长的解析流程
         if document.parse_status == "completed":
-            from app.worker.tasks import emit_agent_log
             logger.info("文档已处于解析完成状态，直接复用切片与向量数据。")
             emit_agent_log("info", "检测到同名且同内容的文件缓存，已跳过 MinerU 解析，极速启动 Agent 智能体网络...")
             return {"status": "parser_completed"}
 
         # 2. 解析和切片（先解析，成功后再清理旧数据，避免解析失败导致数据全丢）
+        import os
+        filename = os.path.basename(file_path)
+        emit_agent_log("info", f"正在调用底层智能解析引擎对 {filename} 进行物理层深度提取与多模态切割，过程可能需要 1-3 分钟，请耐心等待...")
         chunks = extractor_service.parse_and_chunk(file_path)
         logger.info(f"文档解析完成，共获得 {len(chunks)} 个切片。")
+        emit_agent_log("success", f"文件解析完成！共切割出 {len(chunks)} 个高质量标准文本块。")
 
         if not chunks:
             return {"status": "parser_failed", "error": "文档解析未获得任何切片"}
@@ -60,6 +65,7 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
         
         toc_str = "\n".join([f"- {t}" for t in toc_set])
         logger.info(f"生成目录树 (TOC)，共 {len(toc_set)} 个顶级章节。")
+        emit_agent_log("info", f"文档拓扑分析：目录树 (TOC) 提取成功，侦测到 {len(toc_set)} 个顶级章节导航。")
         
         if document.parsed_metadata is None:
             document.parsed_metadata = {}
@@ -80,8 +86,10 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
         # 4. 获取 Embedding
         texts_to_embed = [chunk.page_content for chunk in chunks]
         logger.info("开始生成 Embedding 向量...")
+        emit_agent_log("info", "正在调用 BGE-M3 混合检索大模型，开始为全部文本块生成多维稠密向量 (Embedding)...")
         embeddings = llm_service.generate_embeddings(texts_to_embed)
         logger.info("Embedding 生成完成。")
+        emit_agent_log("success", "BGE-M3 向量化矩阵计算完成！准备执行 PostgreSQL (pgvector) 高维落盘写入...")
 
         # 4. 组装数据入库
         db_chunks = []
@@ -107,6 +115,7 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
         
         db.commit()
         logger.info(f"成功将 {len(db_chunks)} 个带向量的切片存入 PostgreSQL。")
+        emit_agent_log("success", f"结构化存储完毕！{len(db_chunks)} 个带向量切片已入库。即将唤醒 Master Agent 主控智能体...")
         
         # 贯彻 DB First 原则：仅返回状态，不向 State 塞入庞大的文本数据
         return {

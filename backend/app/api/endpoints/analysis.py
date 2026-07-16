@@ -1,5 +1,6 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
 from loguru import logger
 import os
 import uuid
@@ -62,13 +63,31 @@ async def upload_and_analyze(
         logger.exception(f"提交分析任务失败: {str(e)}")
         raise e
 
+def get_db():
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 @router.api_route("/download/{task_id}", methods=["GET", "HEAD"])
-async def download_original_file(task_id: str):
+async def download_original_file(task_id: str, db: Session = Depends(get_db)):
     """
-    根据 task_id 下载原文件
+    根据 task_id 或 document_id 下载原文件
     """
     base_dir = Path(__file__).resolve().parent.parent.parent.parent
     upload_dir = os.path.join(base_dir, "uploads")
+    
+    # 1. 首先尝试按照 document_id 查找 (用于历史记录)
+    from app.db.crud.document import document_crud
+    doc = document_crud.get_document_by_id(db, task_id)
+    if doc and doc.file_path and os.path.exists(doc.file_path):
+        return FileResponse(
+            path=doc.file_path, 
+            filename=doc.filename,
+            content_disposition_type="inline"
+        )
     
     # 查找匹配 task_id 的文件
     pattern = os.path.join(upload_dir, f"{task_id}_*")

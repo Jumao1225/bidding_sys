@@ -1,15 +1,18 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
-import DocViewer, { DocViewerRenderers } from "@cyntler/react-doc-viewer";
-import "@cyntler/react-doc-viewer/dist/index.css";
-import { LocalDocxRenderer } from './LocalDocxRenderer';
+import { SmartDocViewer } from './SmartDocViewer';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Group, Panel, Separator } from 'react-resizable-panels';
+import { Virtuoso } from 'react-virtuoso';
 
 export interface UploadBoxProps {
   onTerminalMessage?: (msg: { id: string, type: 'info' | 'tool_call' | 'success' | 'error', content: string }) => void;
   onAnalysisSuccess?: (result: any) => void;
   onAnalyzingChange?: (isAnalyzing: boolean) => void;
+  initialResult?: any;
+  initialTaskId?: string | null;
 }
 
-export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingChange }: UploadBoxProps = {}) {
+export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingChange, initialResult = null, initialTaskId = null }: UploadBoxProps = {}) {
   const [isDragging, setIsDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [isAnalyzing, setIsAnalyzingInternal] = useState(false);
@@ -21,15 +24,9 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
   const [progress, setProgress] = useState(0);
   const [statusText, setStatusText] = useState("");
   
-  // 核心结果与文件信息 (从 localStorage 初始化)
-  const [result, setResult] = useState<any>(() => {
-    try {
-      const saved = localStorage.getItem('bidding_analysis_result');
-      return saved ? JSON.parse(saved) : null;
-    } catch { return null; }
-  });
-  const [taskId, setTaskId] = useState<string | null>(() => localStorage.getItem('bidding_task_id'));
-  const [fileName, setFileName] = useState<string | null>(() => localStorage.getItem('bidding_file_name'));
+  const [result, setResult] = useState<any>(null);
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
   
   // 视图与布局状态 (从 localStorage 初始化)
   const [viewMode, setViewMode] = useState<'text' | 'original'>(() => 
@@ -42,17 +39,18 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     Number(localStorage.getItem('bidding_split_ratio')) || 60
   ); 
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const splitContainerRef = useRef<HTMLDivElement>(null);
-  const draggingSplitRef = useRef(false);
 
-  // 状态自动持久化 (LocalStorage)
+  // 不再将 result, taskId, fileName 写入 localStorage，一切依赖历史记录或单次会话
+  
+  // 同步外部传入的历史数据
   useEffect(() => {
-    if (result) {
-      localStorage.setItem('bidding_analysis_result', JSON.stringify(result));
-      localStorage.setItem('bidding_task_id', taskId || '');
-      localStorage.setItem('bidding_file_name', fileName || '');
+    if (initialResult) {
+      setResult(initialResult);
     }
-  }, [result, taskId, fileName]);
+    if (initialTaskId) {
+      setTaskId(initialTaskId);
+    }
+  }, [initialResult, initialTaskId]);
 
   useEffect(() => {
     localStorage.setItem('bidding_view_mode', viewMode);
@@ -60,30 +58,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     localStorage.setItem('bidding_split_ratio', splitRatio.toString());
   }, [viewMode, activeTab, splitRatio]);
 
-  useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!draggingSplitRef.current || !splitContainerRef.current) return;
-      
-      const rect = splitContainerRef.current.getBoundingClientRect();
-      const newRatio = ((e.clientX - rect.left) / rect.width) * 100;
-      setSplitRatio(Math.max(30, Math.min(newRatio, 80)));
-    };
-    const handleMouseUp = () => {
-      draggingSplitRef.current = false;
-      document.body.style.cursor = '';
-    };
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, []);
-
-  const handleSplitMouseDown = () => {
-    draggingSplitRef.current = true;
-    document.body.style.cursor = 'col-resize';
-  };
+  // manual split resizing logic replaced by react-resizable-panels
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -193,7 +168,9 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
 
   // 高亮组件
   const HighlightText = ({ text, resultData }: { text: string, resultData: any }) => {
-    const highlights = useMemo(() => {
+    const paragraphs = useMemo(() => text.split('\n'), [text]);
+
+    const highlightList = useMemo(() => {
       const list: any[] = [];
       if (resultData?.qualifications_analysis?.items) {
         resultData.qualifications_analysis.items.forEach((item: any) => {
@@ -205,44 +182,57 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
           if (risk.exact_quote) list.push({ quote: risk.exact_quote, type: risk.severity, obj: risk });
         });
       }
+      return list;
+    }, [resultData]);
 
+    const renderParagraph = (index: number, pText: string) => {
+      if (!pText.trim()) return <div className="h-4" />;
+      
       const indices: any[] = [];
-      list.forEach(h => {
+      highlightList.forEach(h => {
         if (!h.quote) return;
-        const idx = text.indexOf(h.quote);
-        if (idx !== -1) {
+        let idx = pText.indexOf(h.quote);
+        while (idx !== -1) {
           indices.push({ start: idx, end: idx + h.quote.length, ...h });
+          idx = pText.indexOf(h.quote, idx + h.quote.length);
         }
       });
-      // Sort by start index
       indices.sort((a, b) => a.start - b.start);
-      return indices;
-    }, [text, resultData]);
 
-    const nodes = [];
-    let lastIndex = 0;
+      const nodes = [];
+      let lastIndex = 0;
 
-    highlights.forEach((h, i) => {
-      if (h.start < lastIndex) return; // skip overlaps
+      indices.forEach((h, i) => {
+        if (h.start < lastIndex) return; // skip overlaps
 
-      nodes.push(<span key={`text-${i}`} className="transition-colors duration-300">{text.substring(lastIndex, h.start)}</span>);
+        nodes.push(<span key={`text-${i}`} className="transition-colors duration-300">{pText.substring(lastIndex, h.start)}</span>);
 
-      let colorClass = 'bg-gray-200';
-      if (h.type === '做不到' || h.type === '高') colorClass = 'bg-red-200 text-red-900 border-b-2 border-red-500 shadow-sm';
-      else if (h.type === '努力可做到' || h.type === '中') colorClass = 'bg-orange-200 text-orange-900 border-b-2 border-orange-500 shadow-sm';
-      else if (h.type === '可以做到' || h.type === '低') colorClass = 'bg-green-200 text-green-900 border-b-2 border-green-500 shadow-sm';
+        let colorClass = 'bg-gray-200';
+        if (h.type === '做不到' || h.type === '高') colorClass = 'bg-red-200 text-red-900 border-b-2 border-red-500 shadow-sm';
+        else if (h.type === '努力可做到' || h.type === '中') colorClass = 'bg-orange-200 text-orange-900 border-b-2 border-orange-500 shadow-sm';
+        else if (h.type === '可以做到' || h.type === '低') colorClass = 'bg-green-200 text-green-900 border-b-2 border-green-500 shadow-sm';
 
-      nodes.push(
-        <mark key={`mark-${i}`} className={`${colorClass} px-1 rounded cursor-help hover:ring-2 hover:ring-offset-1 transition-all duration-200`} title={h.obj.reason || h.obj.description}>
-          {text.substring(h.start, h.end)}
-        </mark>
-      );
-      lastIndex = h.end;
-    });
+        nodes.push(
+          <mark key={`mark-${i}`} className={`${colorClass} px-1 rounded cursor-help hover:ring-2 hover:ring-offset-1 transition-all duration-200`} title={h.obj.reason || h.obj.description}>
+            {pText.substring(h.start, h.end)}
+          </mark>
+        );
+        lastIndex = h.end;
+      });
 
-    nodes.push(<span key="text-end" className="transition-colors duration-300">{text.substring(lastIndex)}</span>);
+      nodes.push(<span key="text-end" className="transition-colors duration-300">{pText.substring(lastIndex)}</span>);
 
-    return <div className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-slate-700">{nodes}</div>;
+      return <div className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-slate-700 mb-2">{nodes}</div>;
+    };
+
+    return (
+      <Virtuoso 
+        style={{ height: '100%', width: '100%' }}
+        data={paragraphs}
+        itemContent={renderParagraph}
+        className="custom-scrollbar"
+      />
+    );
   };
 
   const handleClear = () => {
@@ -258,15 +248,26 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
 
   const viewerDocuments = useMemo(() => {
     if (!taskId) return [];
+    
+    // 如果是上传成功后的单次会话，fileName 有值
+    // 如果是恢复的历史记录，result 中会带回 filename
+    const actualFileName = fileName || (result && result.filename) || "document.docx";
+    const fileType = actualFileName.split('.').pop() || "docx";
+
     return [{ 
       uri: `${import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"}/api/v1/analysis/download/${taskId}`,
-      fileName: fileName || "document",
-      fileType: fileName?.split('.').pop() || "docx"
+      fileName: actualFileName,
+      fileType: fileType
     }];
-  }, [taskId, fileName]);
+  }, [taskId, fileName, result]);
 
   return (
-    <div className="bg-white/80 backdrop-blur-sm p-8 rounded-3xl shadow-sm border border-emerald-100 relative overflow-hidden group hover:shadow-md transition-all h-full flex flex-col">
+    <motion.div 
+      initial={{ opacity: 0, scale: 0.98 }}
+      animate={{ opacity: 1, scale: 1 }}
+      transition={{ duration: 0.4, ease: "easeOut" }}
+      className="bg-white/80 backdrop-blur-sm p-8 rounded-3xl shadow-sm border border-emerald-100 relative overflow-hidden group hover:shadow-md transition-all h-full flex flex-col"
+    >
       <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/10 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-110 transition-transform duration-500"></div>
       
       {/* Header section with optional Clear button */}
@@ -358,13 +359,10 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
 
       {/* 结果分屏区域 */}
       {result && !isAnalyzing && (
-        <div ref={splitContainerRef} className="mt-8 flex h-[calc(100vh-200px)] min-h-[800px] animate-fade-in-up relative">
-          
-          {/* 左侧原文对照区 */}
-          <div 
-            style={{ width: isFullscreen ? '100%' : `${splitRatio}%` }} 
-            className="flex flex-col border border-slate-200 rounded-2xl overflow-hidden bg-slate-50 shadow-sm transition-all duration-300 hover:shadow-md"
-          >
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 } as any} transition={{ duration: 0.5 } as any} className="mt-8 h-[calc(100vh-200px)] min-h-[800px] relative">
+          {(() => {
+            const leftPanelContent = (
+              <div className="flex flex-col h-full border border-slate-200 rounded-2xl overflow-hidden bg-slate-50 shadow-sm transition-all duration-300 hover:shadow-md">
             <div className="bg-white px-5 py-4 border-b border-slate-200 font-bold text-slate-800 flex justify-between items-center">
               <div className="flex items-center gap-4">
                 <span className="text-blue-500">🔍</span>
@@ -392,47 +390,43 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                 </button>
               </div>
             </div>
-            <div className={`flex-1 flex flex-col overflow-y-auto custom-scrollbar gpu-layer ${viewMode === 'text' ? 'p-6' : ''}`}>
+            <div className={`flex-1 flex flex-col gpu-layer ${viewMode === 'text' ? 'overflow-y-auto custom-scrollbar p-6' : 'overflow-hidden'}`}>
               {viewMode === 'text' ? (
                 <HighlightText text={result.extracted_text || ""} resultData={result} />
               ) : (
                 taskId ? (
-                  <div className="flex-1 w-full bg-[#f3f4f6]">
-                    <DocViewer 
-                      documents={viewerDocuments}
-                      pluginRenderers={[LocalDocxRenderer, ...DocViewerRenderers]}
-                      style={{ height: "100%", width: "100%" }}
-                      config={{
-                        header: {
-                          disableHeader: true,
-                          disableFileName: true,
-                          retainURLParams: false
-                        }
-                      }}
-                    />
+                  <div className="flex-1 w-full bg-[#f3f4f6] h-full">
+                    <SmartDocViewer documents={viewerDocuments} />
                   </div>
                 ) : (
                   <div className="flex items-center justify-center h-full text-slate-400">正在加载原文件...</div>
                 )
               )}
+              </div>
             </div>
-          </div>
+            );
 
-          {/* 可拖拽分割线 */}
-          {!isFullscreen && (
-            <div 
-              onMouseDown={handleSplitMouseDown}
-              className="w-6 -mx-3 flex items-center justify-center cursor-col-resize group z-10"
-            >
-              <div className="w-1 h-12 bg-slate-200 rounded-full group-hover:bg-blue-400 group-hover:shadow-[0_0_8px_rgba(96,165,250,0.5)] transition-all duration-300"></div>
-            </div>
-          )}
+            if (isFullscreen) {
+              return (
+                <div className="w-full h-full">
+                  {leftPanelContent}
+                </div>
+              );
+            }
 
-          {/* 右侧分析结论区 */}
-          <div 
-            style={{ width: isFullscreen ? '0%' : `${100 - splitRatio}%`, opacity: isFullscreen ? 0 : 1, pointerEvents: isFullscreen ? 'none' : 'auto' }}
-            className="flex flex-col border border-slate-200 rounded-2xl overflow-hidden bg-white shadow-sm transition-all hover:shadow-md"
-          >
+            return (
+              <Group orientation="horizontal" onLayoutChange={(layout) => setSplitRatio(layout['left-panel'] || 50)}>
+                <Panel id="left-panel" defaultSize={splitRatio} minSize={30}>
+                  {leftPanelContent}
+                </Panel>
+                
+                <Separator className="w-4 flex flex-shrink-0 items-center justify-center cursor-col-resize group z-10 mx-1 outline-none">
+                  <div className="w-1 h-12 bg-slate-200 rounded-full group-hover:bg-blue-400 group-hover:shadow-[0_0_8px_rgba(96,165,250,0.5)] transition-all duration-300"></div>
+                </Separator>
+
+                {/* 右侧分析结论区 */}
+                <Panel defaultSize={100 - splitRatio} minSize={20}>
+                  <div className="flex flex-col h-full border border-slate-200 rounded-2xl overflow-hidden bg-white shadow-sm transition-all hover:shadow-md">
             <div className="bg-slate-50 flex border-b border-slate-200 p-1 gap-1">
               <button 
                 className={`flex-1 py-3 px-4 font-bold text-sm transition-all rounded-xl ${activeTab === 'qual' ? 'text-blue-700 bg-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'}`}
@@ -512,9 +506,13 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                 </div>
               )}
             </div>
-          </div>
-        </div>
+            </div>
+              </Panel>
+            </Group>
+            );
+          })()}
+        </motion.div>
       )}
-    </div>
+    </motion.div>
   );
 }

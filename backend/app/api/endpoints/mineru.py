@@ -7,10 +7,10 @@ from loguru import logger
 
 from app.schemas.response.common import ResponseModel, success_response
 from app.schemas.response.mineru import MinerUParseResponse, MinerUHealthResponse
-from app.services.mineru_service import MinerUService
+from app.services.parsers.mineru_parser import mineru_parser
 
 router = APIRouter()
-mineru_service = MinerUService()
+mineru_service = mineru_parser
 
 
 @router.get("/status", response_model=ResponseModel[MinerUHealthResponse])
@@ -60,7 +60,7 @@ async def parse_document(
         logger.info(f"上传文件已暂存: {file_path}，开始提交 MinerUService 解析...")
 
         # 3. 调用 Service 执行解析
-        result = mineru_service.parse_file(
+        result = mineru_service.parse(
             file_path=str(file_path),
             task_id=task_id,
             parse_mode=parse_mode

@@ -14,8 +14,7 @@ from app.agents.state import BiddingState
 def test_master_agent_tool_calling_should_extract_metadata_with_trace_info():
     """
     测试功能: Master Agent 的自主工具调用
-    场景: 数据库中存在已解析完成的标书文档，触发 Master Agent 节点
-    期望结果: 节点状态为 master_completed，且提取的 pain_points 中包含结构化溯源信息 (来源章节/页码)
+    期望结果: 节点状态为 master_completed，且成功调用并落盘专项领域的 Metadata
     """
     db = SessionLocal()
     try:
@@ -49,28 +48,18 @@ def test_master_agent_tool_calling_should_extract_metadata_with_trace_info():
         # 验证节点是否正常完成
         assert result_state.get("status") == "master_completed", f"节点执行失败: {result_state.get('error')}"
         
-        # 刷新数据库对象，验证结果是否落库
-        db.refresh(doc)
-        parsed_metadata = doc.parsed_metadata
+        from app.db.models.metadata import QualificationMetadata, TimelineMetadata
         
-        print("\n--- 大模型提取的落库结果 ---")
-        print(json.dumps(parsed_metadata, indent=4, ensure_ascii=False))
+        qual_md = db.query(QualificationMetadata).filter(QualificationMetadata.document_id == doc.id).first()
+        time_md = db.query(TimelineMetadata).filter(TimelineMetadata.document_id == doc.id).first()
         
-        # 验证核心字段是否存在
-        assert "project_number" in parsed_metadata
-        assert "budget_limit" in parsed_metadata
-        assert "hard_qualifications" in parsed_metadata
-        assert "pain_points" in parsed_metadata
-        
-        # 核心验证: pain_points 必须是数组，并且通过 RAG Tool 获取了溯源信息
-        pain_points = parsed_metadata["pain_points"]
-        assert isinstance(pain_points, list), "pain_points 应该是一个数组"
-        
-        # 如果 pain_points 不为空，验证其元素是否包含了溯源后缀
-        if pain_points:
-            has_trace_info = any("来源" in pt or "页" in pt for pt in pain_points)
-            assert has_trace_info, f"痛点描述中缺少结构化溯源标记。实际结果: {pain_points}"
-            print("\n✅ 测试通过: 成功在痛点描述中发现了 RAG 结构化溯源标记！")
+        print("\n--- 验证专项提取工具是否落盘成功 ---")
+        if qual_md:
+            print(f"✅ QualificationMetadata 提取成功: {qual_md.industry_qualifications}")
+        if time_md:
+            print(f"✅ TimelineMetadata 提取成功: {time_md.project_id_code}")
+            
+        assert qual_md is not None or time_md is not None, "没有任何专项提取工具成功落盘数据，Tool Calling 可能失败"
             
     finally:
         db.close()

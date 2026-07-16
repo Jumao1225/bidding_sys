@@ -195,4 +195,47 @@ class RAGService:
             logger.exception("RAG 检索异常")
             return f"检索发生异常: {str(e)}"
 
+    def get_rag_sources_for_citations(self, document_id: str, query: str, top_k: int = 5) -> list[dict]:
+        """
+        从数据库检索 RAG 结果，返回前端可展示的引文来源列表。
+        每条包含 section_title 和 text_preview（前200字）。
+        不同于 search_bidding_document 返回的拼接文本，此处保留各切片的元数据结构。
+        """
+        try:
+            from app.db.session import SessionLocal
+            from app.db.models.project import DocChunk
+            
+            # 生成查询向量
+            query_embeddings = llm_service.generate_embeddings([query])
+            if not query_embeddings:
+                return []
+
+            db: Session = SessionLocal()
+            try:
+                # 向量相似度检索，返回最相近的 top_k 条
+                results = (
+                    db.query(DocChunk)
+                    .filter(DocChunk.document_id == document_id)
+                    .order_by(DocChunk.embedding.cosine_distance(query_embeddings[0]))
+                    .limit(top_k)
+                    .all()
+                )
+                sources = []
+                seen_sections: set[str] = set()
+                for chunk in results:
+                    sec = chunk.section_title or "未知章节"
+                    # 同一章节只保留一条预览，避免重复展示
+                    if sec not in seen_sections:
+                        sources.append({
+                            "section_title": sec,
+                            "text_preview": chunk.content[:200] if chunk.content else ""
+                        })
+                        seen_sections.add(sec)
+                return sources
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"获取 RAG 来源切片失败，降级返回空列表: {str(e)}")
+            return []
+
 rag_service = RAGService()

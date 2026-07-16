@@ -5,7 +5,6 @@ from datetime import datetime, date
 from loguru import logger
 from app.core.celery_app import celery_app
 from app.core.config import settings
-from app.utils.doc_parser import DocumentParser
 from app.graph.builder import bidding_graph
 from app.core.context import current_task_id
 
@@ -84,18 +83,27 @@ def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, compa
             file_hash = hashlib.md5(f.read()).hexdigest()
             
         # 查找是否已经有同名且内容哈希一致的文件
-        existing_doc = db.query(Document).filter(
+        docs_with_same_name = db.query(Document).filter(
             Document.project_id == project.id,
             Document.filename == filename
-        ).first()
+        ).all()
+        
+        exact_match_doc = None
+        for d in docs_with_same_name:
+            if d.parsed_metadata and d.parsed_metadata.get("file_hash") == file_hash:
+                exact_match_doc = d
+                break
 
-        if existing_doc and existing_doc.parsed_metadata and existing_doc.parsed_metadata.get("file_hash") == file_hash and existing_doc.parse_status == "completed":
-            doc_id = existing_doc.id
-            publish_progress(task_id, "检测到文件缓存，跳过解析...", 20)
+        if exact_match_doc and exact_match_doc.parse_status == "completed":
+            doc_id = exact_match_doc.id
+            publish_progress(task_id, "检测到完全相同的文件缓存，跳过解析...", 20)
         else:
-            if existing_doc:
-                db.delete(existing_doc) # 如果哈希不同或者未完成，删掉旧记录重新建
+            if exact_match_doc:
+                # 只有当哈希完全一样但状态是 pending/failed 时，才删掉这条半成品记录重试
+                db.delete(exact_match_doc) 
                 db.commit()
+
+            # 只要哈希不同，哪怕文件名一模一样，也会当做一份全新的记录建档（不删除旧的）
 
             doc = Document(
                 tenant_id="default-tenant",
@@ -179,6 +187,14 @@ def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, compa
             metadata_dict["engineering"] = {k: v for k, v in eng_md.__dict__.items() if not k.startswith('_')}
         if eval_md:
             metadata_dict["evaluation"] = {k: v for k, v in eval_md.__dict__.items() if not k.startswith('_')}
+
+        # 将 strategy agent 产出的策略分析数据统一写回数据库持久化，与其他数据共存
+        if doc_obj:
+            current_meta = dict(doc_obj.parsed_metadata) if doc_obj.parsed_metadata else {}
+            current_meta["qualifications_analysis"] = final_state.get("qualifications_analysis", {})
+            current_meta["risks_analysis"] = final_state.get("risks_analysis", [])
+            doc_obj.parsed_metadata = current_meta
+            db.commit()
 
         # 提取结果用于前端展示
         # document_id 需随 result 一并下发，供 ChatPanel 聊天接口使用

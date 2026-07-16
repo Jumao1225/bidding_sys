@@ -6,6 +6,19 @@ interface MainLayoutProps {
 }
 
 export default function MainLayout({ children }: MainLayoutProps) {
+  const location = useLocation();
+  
+  const isActive = (path: string) => {
+    if (path === '/') return location.pathname === '/';
+    if (path === '/analysis') return location.pathname.startsWith('/analysis');
+    return false;
+  };
+
+  const getLinkClass = (path: string) => 
+    isActive(path) 
+      ? "flex items-center px-4 py-3 bg-gradient-to-r from-blue-600/20 to-indigo-600/10 text-blue-400 rounded-xl font-bold border border-blue-500/20 transition-all shadow-[inset_2px_0_0_#3b82f6] group relative overflow-hidden"
+      : "flex items-center px-4 py-3 text-slate-400 hover:bg-white/5 hover:text-slate-200 rounded-xl font-medium transition-all group";
+
   return (
     <div className="min-h-screen w-full flex text-slate-900 bg-transparent selection:bg-blue-200">
       {/* Sidebar - Premium Glass Dark */}
@@ -28,22 +41,23 @@ export default function MainLayout({ children }: MainLayoutProps) {
         <nav className="flex-1 p-5 space-y-2 relative z-10 overflow-y-auto custom-scrollbar">
           <p className="px-4 text-[10px] font-bold tracking-widest text-slate-500 mb-3 mt-2 uppercase">Core Engine</p>
           
-          <Link to="/analysis/new" className="flex items-center px-4 py-3 bg-gradient-to-r from-blue-600/20 to-indigo-600/10 text-blue-400 rounded-xl font-bold border border-blue-500/20 transition-all shadow-[inset_2px_0_0_#3b82f6] group relative overflow-hidden">
-            <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>
-            <svg className="w-5 h-5 mr-3 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
-            </svg>
-            <span className="relative z-10">智能解析</span>
-          </Link>
-          
-          <Link to="/" className="flex items-center px-4 py-3 text-slate-400 hover:bg-white/5 hover:text-slate-200 rounded-xl font-medium transition-all group">
-            <svg className="w-5 h-5 mr-3 opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <Link to="/" className={getLinkClass('/')}>
+            {isActive('/') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+            <svg className={`w-5 h-5 mr-3 ${isActive('/') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
-            <span className="group-hover:translate-x-1 transition-transform duration-300">系统总览</span>
+            <span className={isActive('/') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>系统总览</span>
           </Link>
           
-          <a href="#" className="flex items-center px-4 py-3 text-slate-400 hover:bg-white/5 hover:text-slate-200 rounded-xl font-medium transition-all group">
+          <Link to="/analysis/new" className={getLinkClass('/analysis')}>
+            {isActive('/analysis') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+            <svg className={`w-5 h-5 mr-3 ${isActive('/analysis') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
+            </svg>
+            <span className={isActive('/analysis') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>智能解析</span>
+          </Link>
+          
+          <a href="#" onClick={(e) => { e.preventDefault(); alert('成本测算功能开发中，敬请期待！'); }} className="flex items-center px-4 py-3 text-slate-400 hover:bg-white/5 hover:text-slate-200 rounded-xl font-medium transition-all group">
             <svg className="w-5 h-5 mr-3 opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>

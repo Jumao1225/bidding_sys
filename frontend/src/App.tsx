@@ -7,91 +7,169 @@ import { AnalysisDashboard } from './pages/AnalysisDashboard';
 
 function App() {
   const [isChatOpen, setIsChatOpen] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const chatRef = useRef<HTMLDivElement>(null);
+  const fabRef = useRef<HTMLDivElement>(null);
   // 从 localStorage 读取 document_id，供 ChatPanel RAG 接口使用
   // 每次打开对话框时重新读取，确保拿到最新分析结果的 ID
   const [documentId, setDocumentId] = useState<string | null>(
     () => localStorage.getItem('bidding_document_id')
   );
-  
+
   // 对话框拖拽逻辑
+  useEffect(() => {
+    // 监听历史记录加载或新分析成功导致的文档 ID 变更
+    const handleDocChange = () => {
+      setDocumentId(localStorage.getItem('bidding_document_id'));
+    };
+
+    window.addEventListener('bidding_document_changed', handleDocChange);
+    return () => {
+      window.removeEventListener('bidding_document_changed', handleDocChange);
+    };
+  }, []);
+
   const [position, setPosition] = useState({ x: 0, y: 0 });
-  const draggingChatRef = useRef(false);
-  const dragChatStartRef = useRef({ x: 0, y: 0 });
 
   // 悬浮球拖拽逻辑
   const [fabPosition, setFabPosition] = useState({ x: -40, y: -40 }); // 默认在右下角 (right-10, bottom-10)
-  const [isFabSnapped, setIsFabSnapped] = useState(false);
-  const draggingFabRef = useRef(false);
-  const dragFabStartRef = useRef({ x: 0, y: 0 });
   const hasDraggedFab = useRef(false); // 用于区分点击和拖动
+  const fabSnapTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     // 初始设置FAB的绝对坐标（相对于页面左上角）
-    // 为了更灵活的拖动，我们将原来 fixed bottom-10 right-10 的逻辑改为完全通过坐标控制
     setFabPosition({
       x: window.innerWidth - 100,
       y: window.innerHeight - 100
     });
-
-    const handleMouseMove = (e: MouseEvent) => {
-      if (draggingChatRef.current) {
-        setPosition({
-          x: e.clientX - dragChatStartRef.current.x,
-          y: e.clientY - dragChatStartRef.current.y
-        });
-      } else if (draggingFabRef.current) {
-        hasDraggedFab.current = true;
-        setIsFabSnapped(false);
-        setFabPosition({
-          x: Math.max(-30, Math.min(e.clientX - dragFabStartRef.current.x, window.innerWidth - 34)),
-          y: Math.max(0, Math.min(e.clientY - dragFabStartRef.current.y, window.innerHeight - 64))
-        });
-      }
-    };
-
-    const handleMouseUp = () => {
-      draggingChatRef.current = false;
-      
-      if (draggingFabRef.current) {
-        draggingFabRef.current = false;
-        // 边缘吸附逻辑
-        setFabPosition(prev => {
-          const screenWidth = window.innerWidth;
-          const isLeft = prev.x < screenWidth / 2;
-          // 吸附并稍微隐藏（表现为缩进边栏），FAB宽64px
-          const snappedX = isLeft ? -20 : screenWidth - 44; 
-          setIsFabSnapped(true);
-          return { ...prev, x: snappedX };
-        });
-      }
-    };
-
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-    };
   }, []);
 
   const handleChatMouseDown = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest('.chat-header')) {
-      draggingChatRef.current = true;
-      dragChatStartRef.current = {
-        x: e.clientX - position.x,
-        y: e.clientY - position.y
+      const startX = e.clientX - position.x;
+      const startY = e.clientY - position.y;
+      let newX = position.x;
+      let newY = position.y;
+
+      if (chatRef.current) {
+        chatRef.current.style.transition = 'none';
+      }
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = 'move';
+
+      const handleMouseMove = (moveEvent: MouseEvent) => {
+        newX = moveEvent.clientX - startX;
+        newY = moveEvent.clientY - startY;
+
+        if (chatRef.current) {
+          chatRef.current.style.transform = `translate(${newX}px, ${newY}px)`;
+        }
       };
+
+      const handleMouseUp = () => {
+        setPosition({ x: newX, y: newY });
+        if (chatRef.current) {
+          chatRef.current.style.transition = '';
+        }
+        document.body.style.userSelect = '';
+        document.body.style.cursor = '';
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.removeEventListener('mouseup', handleMouseUp);
+      };
+
+      document.addEventListener('mousemove', handleMouseMove, { passive: true });
+      document.addEventListener('mouseup', handleMouseUp);
     }
   };
 
   const handleFabMouseDown = (e: React.MouseEvent) => {
-    draggingFabRef.current = true;
     hasDraggedFab.current = false;
-    dragFabStartRef.current = {
-      x: e.clientX - fabPosition.x,
-      y: e.clientY - fabPosition.y
+
+    // 如果在回弹动画过程中又抓起了它，立刻打断动画并清空定时器
+    if (fabSnapTimeout.current) {
+      clearTimeout(fabSnapTimeout.current);
+      fabSnapTimeout.current = null;
+    }
+    if (fabRef.current) {
+      fabRef.current.style.transition = 'none';
+      // 获取子 button 并锁定它的样式，防止拖拽期间鼠标脱离导致 hover 动画高频闪烁（这在视觉上会造成严重的“卡顿感”）
+      const button = fabRef.current.querySelector('button');
+      if (button) {
+        button.style.transition = 'none';
+        button.style.transform = 'scale(1.1)';
+      }
+    }
+    
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'move';
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let newX = fabPosition.x;
+    let newY = fabPosition.y;
+    let deltaX = 0;
+    let deltaY = 0;
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      hasDraggedFab.current = true;
+      newX = Math.max(-10, Math.min(fabPosition.x + (moveEvent.clientX - startX), window.innerWidth - 54));
+      newY = Math.max(0, Math.min(fabPosition.y + (moveEvent.clientY - startY), window.innerHeight - 64));
+
+      deltaX = newX - fabPosition.x;
+      deltaY = newY - fabPosition.y;
+
+      if (fabRef.current) {
+        fabRef.current.style.transform = `translate(${deltaX}px, ${deltaY}px)`;
+      }
     };
+
+    const handleMouseUp = () => {
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      
+      if (fabRef.current) {
+        const button = fabRef.current.querySelector('button');
+        if (button) {
+          button.style.transition = '';
+          button.style.transform = '';
+        }
+      }
+
+      if (hasDraggedFab.current) {
+        // 智能吸附到屏幕边缘
+        const snapToLeft = newX + 28 < window.innerWidth / 2;
+        const snappedX = snapToLeft ? 20 : window.innerWidth - 76; // 76 = 56(宽) + 20(边距)
+        const snappedY = newY;
+
+        // 计算动画滑行的目标终点
+        const finalDeltaX = snappedX - fabPosition.x;
+        const finalDeltaY = snappedY - fabPosition.y;
+
+        if (fabRef.current) {
+          // 添加回弹过渡动画
+          fabRef.current.style.transition = 'transform 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.1)';
+          fabRef.current.style.transform = `translate(${finalDeltaX}px, ${finalDeltaY}px)`;
+
+          fabSnapTimeout.current = setTimeout(() => {
+            if (fabRef.current) {
+              fabRef.current.style.transition = '';
+              fabRef.current.style.transform = 'none';
+            }
+            setFabPosition({ x: snappedX, y: snappedY });
+            setPosition({ x: 0, y: 0 }); // 重置面板拖拽偏移
+            fabSnapTimeout.current = null;
+          }, 350);
+        } else {
+          setFabPosition({ x: snappedX, y: snappedY });
+          setPosition({ x: 0, y: 0 });
+        }
+      }
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove, { passive: true });
+    document.addEventListener('mouseup', handleMouseUp);
   };
 
   const handleFabClick = () => {
@@ -102,67 +180,88 @@ function App() {
     }
   };
 
+  const hasDraggedChat = position.x !== 0 || position.y !== 0;
+
   // 计算弹窗展开方向和最佳坐标
   const isTop = fabPosition.y < window.innerHeight / 2;
   const isLeft = fabPosition.x < window.innerWidth / 2;
-  
-  let originClass = 'origin-bottom-right';
-  if (isTop && isLeft) originClass = 'origin-top-left';
-  else if (isTop && !isLeft) originClass = 'origin-top-right';
-  else if (!isTop && isLeft) originClass = 'origin-bottom-left';
-  else originClass = 'origin-bottom-right';
+  // 动态计算实际面板尺寸，匹配 CSS 的 max-w 和 max-h 限制
+  const dialogWidth = Math.min(420, window.innerWidth * 0.8);
+  const dialogHeight = Math.min(650, window.innerHeight * 0.85);
+  const fabWidth = 56;
 
-  // 计算并限制对话框的绝对位置，确保永远不会超出屏幕外
-  const dialogWidth = 420;
-  const dialogHeight = 650;
-  const fabWidth = 64;
-  
-  let idealLeft = isLeft ? fabPosition.x : fabPosition.x - dialogWidth + fabWidth;
-  let idealTop = isTop ? fabPosition.y + fabWidth + 10 : fabPosition.y - dialogHeight - 10;
+  // 采用“侧边停靠”策略，彻底解决上下空间不足导致的重叠问题
+  // 如果悬浮球在左侧，面板向右展开；如果在右侧，面板向左展开
+  let idealLeft = isLeft ? fabPosition.x + fabWidth + 10 : fabPosition.x - dialogWidth - 10;
+  // 垂直方向尽量与悬浮球居中对齐
+  let idealTop = fabPosition.y + (fabWidth / 2) - (dialogHeight / 2);
 
+  // 完美边缘滑动：确保任何情况下面板都在屏幕内
   const clampedLeft = Math.max(20, Math.min(idealLeft, window.innerWidth - dialogWidth - 20));
   const clampedTop = Math.max(20, Math.min(idealTop, window.innerHeight - dialogHeight - 20));
 
+  let chatStyle: React.CSSProperties = {};
+  if (isFullscreen) {
+    chatStyle = { top: '16px', bottom: '16px', right: '16px', left: '316px' };
+  } else {
+    chatStyle = { left: clampedLeft, top: clampedTop };
+  }
+
   return (
-    <MainLayout>
-      <Routes>
-        <Route path="/" element={<Home />} />
-        <Route path="/analysis/:id" element={<AnalysisDashboard />} />
-      </Routes>
+    <>
+      <MainLayout>
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/analysis/:id" element={<AnalysisDashboard />} />
+        </Routes>
+      </MainLayout>
 
       {/* 展开的聊天窗口 (Fixed 独立层，确保不会超出屏幕) */}
-      <div 
-        className={`fixed z-[60] pointer-events-none ${originClass} transition-all duration-300 ${isChatOpen ? 'scale-100 opacity-100' : 'scale-0 opacity-0 h-0 w-0'}`}
-        style={{ left: clampedLeft, top: clampedTop }}
+      <div
+        className={`fixed z-[60] pointer-events-none origin-center transition-all duration-100 ease-out ${isChatOpen ? 'scale-100 opacity-100' : 'scale-[0.85] opacity-0'}`}
+        style={chatStyle}
       >
-        <div 
-          ref={chatRef} 
-          onMouseDown={handleChatMouseDown}
-          style={{ transform: `translate(${position.x}px, ${position.y}px)` }}
-          className="pointer-events-auto w-[420px] h-[650px] min-w-[320px] min-h-[400px] max-w-[80vw] max-h-[85vh] shadow-2xl rounded-3xl overflow-hidden flex flex-col bg-white resize overflow-auto"
+        <div
+          ref={chatRef}
+          onMouseDown={!isFullscreen ? handleChatMouseDown : undefined}
+          onDragStart={(e) => e.preventDefault()}
+          style={!isFullscreen
+            ? { transform: `translate(${position.x}px, ${position.y}px)`, willChange: 'transform' }
+            : { transform: 'none', width: '100%', height: '100%' }}
+          className={`${isChatOpen ? 'pointer-events-auto' : 'pointer-events-none'} shadow-2xl rounded-3xl overflow-hidden flex flex-col bg-white ${isFullscreen
+            ? 'w-full h-full transition-[width,height]'
+            : 'w-[420px] h-[650px] min-w-[320px] min-h-[400px] max-w-[80vw] max-h-[85vh] resize transition-[width,height]'
+            }`}
         >
-          <ChatPanel documentId={documentId} />
+          <ChatPanel
+            documentId={documentId}
+            isFullscreen={isFullscreen}
+            onToggleFullscreen={() => setIsFullscreen(!isFullscreen)}
+            onClose={() => setIsChatOpen(false)}
+          />
         </div>
       </div>
 
       {/* 悬浮助手开关按钮 */}
-      <div 
-        className={`fixed z-50 pointer-events-none ${isFabSnapped ? 'transition-all duration-300' : ''}`}
-        style={{ left: fabPosition.x, top: fabPosition.y }}
+      <div
+        ref={fabRef}
+        className="fixed z-50 pointer-events-none"
+        style={{ left: fabPosition.x, top: fabPosition.y, willChange: 'transform, left, top' }}
       >
-        <button 
+        <button
           onMouseDown={handleFabMouseDown}
           onClick={handleFabClick}
-          className={`pointer-events-auto w-16 h-16 bg-gradient-to-tr from-blue-600 to-indigo-600 rounded-full flex items-center justify-center text-white shadow-2xl hover:scale-110 hover:shadow-indigo-500/50 transition-all duration-300 group ring-4 ring-white/50 cursor-move ${isFabSnapped ? 'opacity-60 hover:opacity-100' : ''}`}
+          onDragStart={(e) => e.preventDefault()}
+          className="pointer-events-auto w-14 h-14 bg-gradient-to-tr from-blue-600 to-indigo-600 rounded-full flex items-center justify-center text-white shadow-2xl hover:scale-110 hover:shadow-indigo-500/50 transition-all duration-300 group ring-4 ring-white/50 cursor-move"
         >
           {isChatOpen ? (
-            <svg className="w-8 h-8 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            <svg className="w-6 h-6 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
           ) : (
-            <span className="text-3xl pointer-events-none group-hover:animate-bounce">🤖</span>
+            <span className="text-2xl pointer-events-none group-hover:animate-bounce">🤖</span>
           )}
         </button>
       </div>
-    </MainLayout>
+    </>
   );
 }
 

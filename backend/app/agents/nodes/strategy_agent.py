@@ -19,12 +19,24 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
     document_id = state.get("document_id")
     
     db: Session = SessionLocal()
-    hard_quals = []
+    hard_quals_str = "无明确提取的硬性资质"
     try:
-        # [DB First] 直接获取 Master Agent 提炼的硬性资质
-        document = db.query(Document).filter(Document.id == document_id).first()
-        if document and document.parsed_metadata:
-            hard_quals = document.parsed_metadata.get("hard_qualifications", [])
+        from app.db.models.metadata import QualificationMetadata
+        qual_md = db.query(QualificationMetadata).filter(QualificationMetadata.document_id == document_id).first()
+        
+        if qual_md:
+            quals = []
+            if qual_md.industry_qualifications:
+                quals.append(f"- 行业资质: {qual_md.industry_qualifications}")
+            if qual_md.special_licenses:
+                quals.append(f"- 特种许可证: {qual_md.special_licenses}")
+            if qual_md.core_personnel_certs:
+                quals.append(f"- 核心人员证书: {qual_md.core_personnel_certs}")
+            if qual_md.historical_performance_reqs:
+                quals.append(f"- 历史业绩门槛: {qual_md.historical_performance_reqs}")
+            
+            if quals:
+                hard_quals_str = "\n".join(quals)
     finally:
         db.close()
         
@@ -32,8 +44,6 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
     rag_text = rag_service.search_bidding_document(
         document_id, "投标人资格要求 资质 业绩 人员", top_k=3, disable_expansion=True
     )
-    
-    hard_quals_str = "\n".join([f"- {q}" for q in hard_quals]) if hard_quals else "无明确提取的硬性资质"
     
     logger.info(f"--- Strategy Agent [履约盘点] ---")
     logger.info(f"Master Agent 提取的硬性门槛: \n{hard_quals_str}")
@@ -71,17 +81,23 @@ def identify_risks_node(state: BiddingState) -> dict:
     """
     document_id = state.get("document_id")
     
-    # [靶向探雷] 预设高危关键字列表
-    risk_keywords = [
-        "违约金 罚款 赔偿金",
-        "付款方式 结算 账期 预付款",
-        "单方面免责 解除合同",
-        "废标条件 否决投标 无效投标"
-    ]
+    db: Session = SessionLocal()
+    try:
+        from app.db.models.metadata import EvaluationMetadata, FinancialMetadata, EngineeringMetadata
+        eval_md = db.query(EvaluationMetadata).filter(EvaluationMetadata.document_id == document_id).first()
+        fin_md = db.query(FinancialMetadata).filter(FinancialMetadata.document_id == document_id).first()
+        eng_md = db.query(EngineeringMetadata).filter(EngineeringMetadata.document_id == document_id).first()
+        
+        penalties = eval_md.penalty_clauses if eval_md else {}
+        payment_terms = fin_md.payment_milestones if fin_md else {}
+        special_conditions = eng_md.special_working_conditions if eng_md else {}
+    finally:
+        db.close()
     
+    # [靶向探雷] 针对“单方面免责”或“废标条件”这种元数据模型没覆盖到的死角，再用一次 RAG 兜底
+    risk_keywords = ["单方面免责 解除合同", "废标条件 否决投标 无效投标"]
     rag_texts = []
     for kw in risk_keywords:
-        # top_k=2 因为我们启用了整章召回，拉出的文本会非常大 (开启严格模式，关闭重写发散)
         res = rag_service.search_bidding_document(document_id, kw, top_k=2, disable_expansion=True)
         if res and res != "未检索到相关内容。":
             rag_texts.append(f"--- 关于【{kw}】的检索结果 ---\n{res}")
@@ -89,8 +105,7 @@ def identify_risks_node(state: BiddingState) -> dict:
     aggregated_risk_context = "\n\n".join(rag_texts)
     
     logger.info(f"--- Strategy Agent [风险提示] ---")
-    logger.info(f"靶向探雷共聚合了 {len(rag_texts)} 个维度的风险片段，总长度: {len(aggregated_risk_context)} 字符")
-    logger.debug(f"聚合的风险上下文内容预览:\n{aggregated_risk_context[:500]}...")
+    logger.info(f"复用主控节点提取的结构化元数据 (罚则、付款方式、高危工况) 进行风险评估。")
     
     prompt = f"""
     请分析以下招标文件内容，提取所有可能对投标方不利的风险条款（如违约金过高、账期过长、单方面免责等）。
@@ -100,7 +115,12 @@ def identify_risks_node(state: BiddingState) -> dict:
     - exact_quote: 原文对应的条款原句（必须**一字不差**，以便前端精准高亮）
     - severity: 风险级别（"高", "中", "低"）
     
-    【定向排雷检索到的高危上下文】: 
+    【结构化元数据 (已由主控提取)】: 
+    - 违约罚则条款: {penalties}
+    - 资金支付与结算节点: {payment_terms}
+    - 特殊/高危施工工况: {special_conditions}
+
+    【定向排雷检索到的高危上下文 (RAG兜底)】: 
     {aggregated_risk_context}
     """
     

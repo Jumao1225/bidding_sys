@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 // ==================== 类型定义 ====================
 
@@ -17,22 +18,40 @@ interface Message {
   sources?: Source[];
   /** 是否正在流式输出中 */
   isStreaming?: boolean;
+  /** Agent 调用的工具思考日志 */
+  toolCalls?: string[];
 }
 
 interface ChatPanelProps {
   /** 当前招标文件的数据库 ID，来自 AnalysisDashboard */
   documentId: string | null;
+  /** 是否全屏模式 */
+  isFullscreen?: boolean;
+  /** 全屏切换回调 */
+  onToggleFullscreen?: () => void;
+  /** 关闭回调 */
+  onClose?: () => void;
 }
 
 // ==================== 主组件 ====================
 
-export function ChatPanel({ documentId }: ChatPanelProps) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: 'ai',
-      content: '您好！我是您的专属标书解析助手。我已深度阅读了当前的招标文件，您可以向我提问关于**资质要求、交货期、付款方式、评分标准**等任何深层细节。',
-    },
-  ]);
+export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClose }: ChatPanelProps) {
+  const defaultGreeting: Message = {
+    role: 'ai',
+    content: '您好！我是您的专属标书解析助手。我已深度阅读了当前的招标文件，您可以向我提问关于**资质要求、交货期、付款方式、评分标准**等任何深层细节。',
+  };
+
+  const [messages, setMessages] = useState<Message[]>(() => {
+    if (documentId) {
+      const saved = localStorage.getItem(`chat_history_${documentId}`);
+      if (saved) {
+        try {
+          return JSON.parse(saved);
+        } catch (e) {}
+      }
+    }
+    return [defaultGreeting];
+  });
   const [input, setInput] = useState('');
   /** true: 正在流式接收 AI 回复，此时禁止再次发送 */
   const [isStreaming, setIsStreaming] = useState(false);
@@ -51,6 +70,31 @@ export function ChatPanel({ documentId }: ChatPanelProps) {
       });
     }
   }, []);
+
+  // 当 documentId 变化时，重新加载对应的历史记录
+  useEffect(() => {
+    if (documentId) {
+      const saved = localStorage.getItem(`chat_history_${documentId}`);
+      if (saved) {
+        try {
+          setMessages(JSON.parse(saved));
+          return;
+        } catch (e) {}
+      }
+    }
+    setMessages([defaultGreeting]);
+  }, [documentId]);
+
+  // 同步 messages 到 localStorage（过滤掉 isStreaming 状态）
+  useEffect(() => {
+    if (documentId) {
+      // 只有在非流式传输中，且有实际对话（超过1条）时才保存
+      if (!isStreaming && messages.length > 0) {
+        const toSave = messages.map(m => ({ ...m, isStreaming: false }));
+        localStorage.setItem(`chat_history_${documentId}`, JSON.stringify(toSave));
+      }
+    }
+  }, [messages, documentId, isStreaming]);
 
   useEffect(() => {
     scrollToBottom();
@@ -143,6 +187,20 @@ export function ChatPanel({ documentId }: ChatPanelProps) {
                     ...updated[lastIdx],
                     content: aiContent,
                     isStreaming: true,
+                  };
+                }
+                return updated;
+              });
+            } else if (event.type === 'tool_call') {
+              // 收集 Agent 工具调用日志
+              setMessages(prev => {
+                const updated = [...prev];
+                const lastIdx = updated.length - 1;
+                if (updated[lastIdx]?.role === 'ai') {
+                  const existing = updated[lastIdx].toolCalls || [];
+                  updated[lastIdx] = {
+                    ...updated[lastIdx],
+                    toolCalls: [...existing, event.content],
                   };
                 }
                 return updated;
@@ -248,15 +306,39 @@ export function ChatPanel({ documentId }: ChatPanelProps) {
               {documentId ? '✅ 文档已加载，RAG 检索就绪' : '⚠️ 请先上传招标文件'}
             </p>
           </div>
-          {/* 快捷问题按钮 */}
-          {documentId && (
-            <button
-              onClick={() => setInput('最高投标限价是多少？')}
-              className="text-xs bg-indigo-50 text-indigo-600 px-2 py-1 rounded-lg hover:bg-indigo-100 transition-colors font-medium whitespace-nowrap"
-            >
-              试试看
-            </button>
-          )}
+          {/* 快捷按钮与操作区 */}
+          <div className="flex items-center gap-2">
+            {documentId && (
+              <button
+                onClick={() => setInput('最高投标限价是多少？')}
+                className="text-xs bg-indigo-50 text-indigo-600 px-2 py-1.5 rounded-lg hover:bg-indigo-100 transition-colors font-medium whitespace-nowrap"
+              >
+                试试看
+              </button>
+            )}
+            {onToggleFullscreen && (
+              <button
+                onClick={onToggleFullscreen}
+                className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                title={isFullscreen ? "还原" : "全屏"}
+              >
+                {isFullscreen ? (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 14h6v6M20 10h-6V4M14 10l7-7M10 14l-7 7"/></svg>
+                ) : (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"/></svg>
+                )}
+              </button>
+            )}
+            {onClose && (
+              <button
+                onClick={onClose}
+                className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                title="关闭"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"/></svg>
+              </button>
+            )}
+          </div>
         </div>
 
         {/* 消息区 */}
@@ -287,8 +369,29 @@ export function ChatPanel({ documentId }: ChatPanelProps) {
                   }`}
                 >
                   {msg.role === 'ai' ? (
-                    <div className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-strong:text-slate-800 prose-code:bg-slate-100 prose-code:px-1 prose-code:rounded">
-                      <ReactMarkdown>{msg.content || (msg.isStreaming ? '▊' : '')}</ReactMarkdown>
+                    <div className="flex flex-col gap-3">
+                      {/* Agent 工具调用思考区 */}
+                      {msg.toolCalls && msg.toolCalls.length > 0 && (
+                        <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2 mb-1 shadow-inner">
+                          <div className="flex items-center text-xs font-semibold text-slate-500 mb-2">
+                            <svg className="w-4 h-4 mr-1.5 animate-spin-slow text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                            </svg>
+                            Agent 推理过程
+                          </div>
+                          {msg.toolCalls.map((tc, tcIdx) => (
+                            <div key={tcIdx} className="text-xs text-slate-600 font-mono bg-white px-2.5 py-1.5 rounded-lg border border-slate-100 shadow-sm leading-relaxed whitespace-pre-wrap">
+                              {tc}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      
+                      {/* 最终回答区 */}
+                      <div className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-strong:text-slate-800 prose-code:bg-slate-100 prose-code:px-1 prose-code:rounded prose-table:w-full prose-table:border-collapse prose-th:border-b-2 prose-th:border-slate-200 prose-th:text-left prose-th:p-2 prose-td:border-b prose-td:border-slate-100 prose-td:p-2">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content || (msg.isStreaming ? '▊' : '')}</ReactMarkdown>
+                      </div>
                     </div>
                   ) : (
                     msg.content
