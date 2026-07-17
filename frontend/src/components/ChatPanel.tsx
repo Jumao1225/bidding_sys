@@ -33,6 +33,147 @@ interface ChatPanelProps {
   onClose?: () => void;
 }
 
+// ==================== 辅助提取逻辑 ====================
+
+const extractThoughts = (text: string) => {
+  const jsonBlocks: string[] = [];
+  const thinkBlocks: string[] = [];
+  let cleanText = text;
+
+  // 1. 提取 <think>...</think> 块（支持流式未闭合状态）
+  let thinkStart = cleanText.indexOf('<think>');
+  while (thinkStart !== -1) {
+    let thinkEnd = cleanText.indexOf('</think>', thinkStart);
+    if (thinkEnd !== -1) {
+      const content = cleanText.substring(thinkStart + 7, thinkEnd).trim();
+      if (content) thinkBlocks.push(content);
+      cleanText = cleanText.substring(0, thinkStart) + cleanText.substring(thinkEnd + 8);
+      thinkStart = cleanText.indexOf('<think>');
+    } else {
+      // 流式输出中尚未闭合
+      const content = cleanText.substring(thinkStart + 7).trim();
+      if (content) thinkBlocks.push(content);
+      cleanText = cleanText.substring(0, thinkStart);
+      break;
+    }
+  }
+  
+  // 2. 提取并丢弃大模型复读的底层 JSON 数据（包含 reasoning, project_id_code 等）
+  const keywords = ['"reasoning"', '"project_id_code"', '"project_name"'];
+  
+  let startIndex = cleanText.indexOf('{');
+  while (startIndex !== -1) {
+    let braceCount = 0;
+    let endIndex = -1;
+    let inString = false;
+    let escapeNext = false;
+    
+    for (let i = startIndex; i < cleanText.length; i++) {
+      const char = cleanText[i];
+      if (escapeNext) {
+        escapeNext = false;
+        continue;
+      }
+      if (char === '\\') {
+        escapeNext = true;
+        continue;
+      }
+      if (char === '"') {
+        inString = !inString;
+        continue;
+      }
+      
+      if (!inString) {
+        if (char === '{') braceCount++;
+        if (char === '}') braceCount--;
+        
+        if (braceCount === 0) {
+          endIndex = i;
+          break;
+        }
+      }
+    }
+    
+    if (endIndex !== -1) {
+      const potentialJson = cleanText.substring(startIndex, endIndex + 1);
+      if (keywords.some(k => potentialJson.includes(k))) {
+        // 直接从 cleanText 中剥离，但不加入显示列表
+        cleanText = cleanText.substring(0, startIndex) + cleanText.substring(endIndex + 1);
+        startIndex = cleanText.indexOf('{');
+      } else {
+        startIndex = cleanText.indexOf('{', startIndex + 1);
+      }
+    } else {
+      // 未闭合的 JSON（可能正在流式输出）
+      const remaining = cleanText.substring(startIndex);
+      if (keywords.some(k => remaining.includes(k))) {
+        // 直接剥离
+        cleanText = cleanText.substring(0, startIndex);
+      }
+      break;
+    }
+  }
+  
+  return { cleanText, inlineJson: [], thinkBlocks };
+};
+
+// ==================== 折叠面板组件 ====================
+
+function ThoughtProcessBlock({ toolCalls, inlineJson, thinkBlocks, isStreaming }: { toolCalls?: string[], inlineJson?: string[], thinkBlocks?: string[], isStreaming?: boolean }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const hasContent = (toolCalls && toolCalls.length > 0) || (inlineJson && inlineJson.length > 0) || (thinkBlocks && thinkBlocks.length > 0);
+  
+  if (!hasContent) return null;
+  
+  return (
+    <div className="bg-slate-50 border border-slate-200 rounded-xl mb-3 shadow-sm overflow-hidden transition-all duration-300">
+      <button 
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full flex items-center justify-between p-3 bg-white/50 hover:bg-slate-100 transition-colors"
+      >
+        <div className="flex items-center text-xs font-semibold text-slate-600">
+          <svg className={`w-4 h-4 mr-2 ${isStreaming ? 'animate-spin-slow text-amber-500' : 'text-indigo-500'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+          </svg>
+          Agent 思考与分析过程
+        </div>
+        <svg className={`w-4 h-4 text-slate-400 transform transition-transform ${isOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"/></svg>
+      </button>
+      
+      {isOpen && (
+        <div className="p-3 pt-0 space-y-2 border-t border-slate-100 bg-slate-50/50">
+          {thinkBlocks?.map((tb, idx) => (
+            <div key={`tb-${idx}`} className="text-xs text-slate-500 bg-white px-3 py-2 rounded-lg border border-slate-200 shadow-sm leading-relaxed whitespace-pre-wrap break-all italic font-serif">
+              {tb}
+            </div>
+          ))}
+          {toolCalls?.map((tc, idx) => (
+            <div key={`tc-${idx}`} className="text-xs text-slate-600 font-mono bg-white px-3 py-2 rounded-lg border border-slate-200 shadow-sm leading-relaxed whitespace-pre-wrap break-all">
+              {tc}
+            </div>
+          ))}
+          {inlineJson?.map((jsonStr, idx) => {
+            let parsed;
+            try {
+              parsed = JSON.parse(jsonStr);
+            } catch(e) {}
+            return (
+              <div key={`ij-${idx}`} className="text-[11px] text-slate-600 font-mono bg-white px-3 py-2 rounded-lg border border-slate-200 shadow-sm leading-relaxed overflow-x-auto">
+                {parsed ? (
+                   <pre className="m-0 font-mono text-indigo-700">{JSON.stringify(parsed, null, 2)}</pre>
+                ) : (
+                   <div className="whitespace-pre-wrap break-all text-indigo-700">{jsonStr}</div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ==================== 主组件 ====================
 
 export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClose }: ChatPanelProps) {
@@ -207,12 +348,13 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
               });
             } else if (event.type === 'done') {
               aiSources = event.sources || [];
-              // 流结束，更新最终消息（去掉 isStreaming 标志，附上引文来源）
+              // 流结束，更新最终消息（去掉 isStreaming 标志，附上引文来源，保留 toolCalls）
               setMessages(prev => {
                 const updated = [...prev];
                 const lastIdx = updated.length - 1;
                 if (updated[lastIdx]?.role === 'ai') {
                   updated[lastIdx] = {
+                    ...updated[lastIdx],
                     role: 'ai',
                     content: aiContent,
                     sources: aiSources,
@@ -228,6 +370,7 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
                 const lastIdx = updated.length - 1;
                 if (updated[lastIdx]?.role === 'ai') {
                   updated[lastIdx] = {
+                    ...updated[lastIdx],
                     role: 'ai',
                     content: aiContent,
                     isStreaming: false,
@@ -371,27 +514,24 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
                   {msg.role === 'ai' ? (
                     <div className="flex flex-col gap-3">
                       {/* Agent 工具调用思考区 */}
-                      {msg.toolCalls && msg.toolCalls.length > 0 && (
-                        <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2 mb-1 shadow-inner">
-                          <div className="flex items-center text-xs font-semibold text-slate-500 mb-2">
-                            <svg className="w-4 h-4 mr-1.5 animate-spin-slow text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                            </svg>
-                            Agent 推理过程
-                          </div>
-                          {msg.toolCalls.map((tc, tcIdx) => (
-                            <div key={tcIdx} className="text-xs text-slate-600 font-mono bg-white px-2.5 py-1.5 rounded-lg border border-slate-100 shadow-sm leading-relaxed whitespace-pre-wrap">
-                              {tc}
+                      {(() => {
+                        const { cleanText, inlineJson, thinkBlocks } = extractThoughts(msg.content || '');
+                        return (
+                          <>
+                            <ThoughtProcessBlock 
+                              toolCalls={msg.toolCalls} 
+                              inlineJson={inlineJson}
+                              thinkBlocks={thinkBlocks}
+                              isStreaming={msg.isStreaming} 
+                            />
+                            
+                            {/* 最终回答区 */}
+                            <div className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-strong:text-slate-800 [&_:not(pre)>code]:bg-slate-100 [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:rounded [&_:not(pre)>code]:text-blue-700 [&_:not(pre)>code]:font-medium prose-pre:bg-slate-800 prose-pre:text-slate-50 prose-table:w-full prose-table:border-collapse prose-th:border-b-2 prose-th:border-slate-200 prose-th:text-left prose-th:p-2 prose-td:border-b prose-td:border-slate-100 prose-td:p-2">
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanText || (msg.isStreaming ? '▊' : '')}</ReactMarkdown>
                             </div>
-                          ))}
-                        </div>
-                      )}
-                      
-                      {/* 最终回答区 */}
-                      <div className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-strong:text-slate-800 prose-code:bg-slate-100 prose-code:px-1 prose-code:rounded prose-table:w-full prose-table:border-collapse prose-th:border-b-2 prose-th:border-slate-200 prose-th:text-left prose-th:p-2 prose-td:border-b prose-td:border-slate-100 prose-td:p-2">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content || (msg.isStreaming ? '▊' : '')}</ReactMarkdown>
-                      </div>
+                          </>
+                        );
+                      })()}
                     </div>
                   ) : (
                     msg.content

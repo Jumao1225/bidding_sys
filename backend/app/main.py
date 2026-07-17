@@ -11,11 +11,22 @@ from app.core.logger import setup_app_logging
 from app.middleware.logging_middleware import LoggingMiddleware
 from loguru import logger
 
+from app.services.llm_service import llm_service
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     setup_app_logging()
     logger.info("🚀 智能投标系统后端启动成功")
+    
+    # 预加载 Embedding 模型，使其一直常驻后台内存/显存
+    try:
+        logger.info("⏳ 正在后台预加载 Embedding 模型，请稍候...")
+        llm_service._get_embeddings_model()
+        logger.info("✅ Embedding 模型预加载完成，已常驻后台！")
+    except Exception as e:
+        logger.error(f"❌ Embedding 模型预加载失败: {e}")
+        
     yield
     # Shutdown
     logger.info("🛑 系统安全关闭")

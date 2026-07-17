@@ -6,6 +6,8 @@ import { TimelineCard } from '../components/dashboard/TimelineCard';
 import { EngineeringCard } from '../components/dashboard/EngineeringCard';
 import { AgentTerminal } from '../components/dashboard/AgentTerminal';
 import { EvaluationCard } from '../components/dashboard/EvaluationCard';
+import { QualificationCard } from '../components/dashboard/QualificationCard';
+import { FinancialCard } from '../components/dashboard/FinancialCard';
 
 export function AnalysisDashboard() {
   const { id } = useParams<{ id: string }>();
@@ -15,12 +17,9 @@ export function AnalysisDashboard() {
   
   const [result, setResult] = useState<any>(null);
 
-  // 处理历史记录加载
   useEffect(() => {
     if (id && id !== 'new') {
-      // 告诉全局 ChatPanel 当前活动的文档 ID
       localStorage.setItem('bidding_document_id', id);
-      // 分发事件让 App.tsx 或 ChatPanel 能够立刻响应
       window.dispatchEvent(new Event('bidding_document_changed'));
       
       const loadHistory = async () => {
@@ -74,13 +73,12 @@ export function AnalysisDashboard() {
     }
   };
 
-  // Safe fallback extractors
   const tl = result?.metadata?.timeline || {};
   const eng = result?.metadata?.engineering || {};
   const ev = result?.metadata?.evaluation || {};
   const qual = result?.metadata?.qualification || {};
+  const fin = result?.metadata?.financial || {};
 
-  // Calculate dynamic metrics for KPI Cards based on dedicated LangGraph nodes output
   const risks = result?.risks_analysis || [];
   const highRiskCount = risks.filter((r: any) => r.severity === '高').length;
   
@@ -90,7 +88,7 @@ export function AnalysisDashboard() {
     const totalScore = qualItems.reduce((acc: number, curr: any) => {
       if (curr.status === '可以做到') return acc + 100;
       if (curr.status === '努力可做到' || curr.status === '中') return acc + 50;
-      return acc + 0; // '做不到' or others
+      return acc + 0;
     }, 0);
     matchScore = Math.round(totalScore / qualItems.length);
   } else if (!result) {
@@ -98,7 +96,7 @@ export function AnalysisDashboard() {
   }
 
   return (
-    <div className="w-full space-y-10 animate-fade-in-up delay-100">
+    <div className="w-full space-y-10 animate-fade-in-up delay-100 pb-20">
       
       {/* 文本阅读与履约盘点/风险提示区域 */}
       <UploadBox 
@@ -116,7 +114,6 @@ export function AnalysisDashboard() {
         </div>
       )}
       
-      {/* 实时智能体思考终端 */}
       <AgentTerminal isAnalyzing={isAnalyzing} messages={terminalMessages} />
         
       {/* KPI Cards */}
@@ -144,29 +141,23 @@ export function AnalysisDashboard() {
         </div>
       </div>
       
-      {/* 专项提取维度面板矩阵 */}
-      <div className="grid grid-cols-2 gap-8">
-        <TimelineCard 
-          biddingDeadline={tl.bid_deadline}
-          qaDeadline={tl.qa_deadline}
-          projectDuration={tl.construction_period_days}
-        />
-        <EngineeringCard 
-          painPoints={eng.special_working_conditions ? Object.values(eng.special_working_conditions).map(String) : []}
-          equipment={eng.main_equipment_quantities ? Object.keys(eng.main_equipment_quantities) : []}
-        />
+      {/* 专项提取维度面板矩阵 - 5 大维度 Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        {/* 新增的财务防线卡片 */}
+        <FinancialCard financial={fin} />
+        
+        {/* 资质综合门槛卡片 */}
+        <QualificationCard qualification={qual} />
+        
+        <TimelineCard timeline={tl} />
+        
+        <EngineeringCard engineering={eng} />
+        
+        <EvaluationCard evaluation={ev} />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-        <EvaluationCard 
-          weights={{ 
-            price: Number(ev.price_weight?.replace('%', '')) || 50, 
-            tech: Number(ev.tech_weight?.replace('%', '')) || 30, 
-            business: 100 - (Number(ev.price_weight?.replace('%', '')) || 50) - (Number(ev.tech_weight?.replace('%', '')) || 30) 
-          }}
-          penalties={ev.penalty_clauses ? Object.values(ev.penalty_clauses).map(String) : []}
-        />
-        <CostTable equipment={eng.main_equipment_quantities || {}} />
+        <CostTable equipmentList={eng.main_equipment_list || []} />
       </div>
     </div>
   );

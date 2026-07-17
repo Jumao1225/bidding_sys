@@ -12,6 +12,75 @@ export interface UploadBoxProps {
   initialTaskId?: string | null;
 }
 
+// 高亮组件
+const HighlightText = React.memo(({ text, resultData }: { text: string, resultData: any }) => {
+  const paragraphs = useMemo(() => text.split('\n'), [text]);
+
+  const highlightList = useMemo(() => {
+    const list: any[] = [];
+    if (resultData?.qualifications_analysis?.items) {
+      resultData.qualifications_analysis.items.forEach((item: any) => {
+        if (item.exact_quote) list.push({ quote: item.exact_quote, type: item.status, obj: item });
+      });
+    }
+    if (resultData?.risks_analysis) {
+      resultData.risks_analysis.forEach((risk: any) => {
+        if (risk.exact_quote) list.push({ quote: risk.exact_quote, type: risk.severity, obj: risk });
+      });
+    }
+    return list;
+  }, [resultData]);
+
+  const renderParagraph = (index: number, pText: string) => {
+    if (!pText.trim()) return <div className="h-4" />;
+    
+    const indices: any[] = [];
+    highlightList.forEach(h => {
+      if (!h.quote) return;
+      let idx = pText.indexOf(h.quote);
+      while (idx !== -1) {
+        indices.push({ start: idx, end: idx + h.quote.length, ...h });
+        idx = pText.indexOf(h.quote, idx + h.quote.length);
+      }
+    });
+    indices.sort((a, b) => a.start - b.start);
+
+    const nodes = [];
+    let lastIndex = 0;
+
+    indices.forEach((h, i) => {
+      if (h.start < lastIndex) return; // skip overlaps
+
+      nodes.push(<span key={`text-${i}`} className="transition-colors duration-300">{pText.substring(lastIndex, h.start)}</span>);
+
+      let colorClass = 'bg-gray-200';
+      if (h.type === '做不到' || h.type === '高') colorClass = 'bg-red-200 text-red-900 border-b-2 border-red-500 shadow-sm';
+      else if (h.type === '努力可做到' || h.type === '中') colorClass = 'bg-orange-200 text-orange-900 border-b-2 border-orange-500 shadow-sm';
+      else if (h.type === '可以做到' || h.type === '低') colorClass = 'bg-green-200 text-green-900 border-b-2 border-green-500 shadow-sm';
+
+      nodes.push(
+        <mark key={`mark-${i}`} className={`${colorClass} px-1 rounded cursor-help hover:ring-2 hover:ring-offset-1 transition-all duration-200`} title={h.obj.reason || h.obj.description}>
+          {pText.substring(h.start, h.end)}
+        </mark>
+      );
+      lastIndex = h.end;
+    });
+
+    nodes.push(<span key="text-end" className="transition-colors duration-300">{pText.substring(lastIndex)}</span>);
+
+    return <div className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-slate-700 mb-2">{nodes}</div>;
+  };
+
+  return (
+    <Virtuoso 
+      style={{ height: '100%', width: '100%' }}
+      data={paragraphs}
+      itemContent={renderParagraph}
+      className="custom-scrollbar"
+    />
+  );
+});
+
 export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingChange, initialResult = null, initialTaskId = null }: UploadBoxProps = {}) {
   const [isDragging, setIsDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
@@ -166,74 +235,6 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     }
   };
 
-  // 高亮组件
-  const HighlightText = ({ text, resultData }: { text: string, resultData: any }) => {
-    const paragraphs = useMemo(() => text.split('\n'), [text]);
-
-    const highlightList = useMemo(() => {
-      const list: any[] = [];
-      if (resultData?.qualifications_analysis?.items) {
-        resultData.qualifications_analysis.items.forEach((item: any) => {
-          if (item.exact_quote) list.push({ quote: item.exact_quote, type: item.status, obj: item });
-        });
-      }
-      if (resultData?.risks_analysis) {
-        resultData.risks_analysis.forEach((risk: any) => {
-          if (risk.exact_quote) list.push({ quote: risk.exact_quote, type: risk.severity, obj: risk });
-        });
-      }
-      return list;
-    }, [resultData]);
-
-    const renderParagraph = (index: number, pText: string) => {
-      if (!pText.trim()) return <div className="h-4" />;
-      
-      const indices: any[] = [];
-      highlightList.forEach(h => {
-        if (!h.quote) return;
-        let idx = pText.indexOf(h.quote);
-        while (idx !== -1) {
-          indices.push({ start: idx, end: idx + h.quote.length, ...h });
-          idx = pText.indexOf(h.quote, idx + h.quote.length);
-        }
-      });
-      indices.sort((a, b) => a.start - b.start);
-
-      const nodes = [];
-      let lastIndex = 0;
-
-      indices.forEach((h, i) => {
-        if (h.start < lastIndex) return; // skip overlaps
-
-        nodes.push(<span key={`text-${i}`} className="transition-colors duration-300">{pText.substring(lastIndex, h.start)}</span>);
-
-        let colorClass = 'bg-gray-200';
-        if (h.type === '做不到' || h.type === '高') colorClass = 'bg-red-200 text-red-900 border-b-2 border-red-500 shadow-sm';
-        else if (h.type === '努力可做到' || h.type === '中') colorClass = 'bg-orange-200 text-orange-900 border-b-2 border-orange-500 shadow-sm';
-        else if (h.type === '可以做到' || h.type === '低') colorClass = 'bg-green-200 text-green-900 border-b-2 border-green-500 shadow-sm';
-
-        nodes.push(
-          <mark key={`mark-${i}`} className={`${colorClass} px-1 rounded cursor-help hover:ring-2 hover:ring-offset-1 transition-all duration-200`} title={h.obj.reason || h.obj.description}>
-            {pText.substring(h.start, h.end)}
-          </mark>
-        );
-        lastIndex = h.end;
-      });
-
-      nodes.push(<span key="text-end" className="transition-colors duration-300">{pText.substring(lastIndex)}</span>);
-
-      return <div className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-slate-700 mb-2">{nodes}</div>;
-    };
-
-    return (
-      <Virtuoso 
-        style={{ height: '100%', width: '100%' }}
-        data={paragraphs}
-        itemContent={renderParagraph}
-        className="custom-scrollbar"
-      />
-    );
-  };
 
   const handleClear = () => {
     setResult(null);
@@ -260,6 +261,53 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
       fileType: fileType
     }];
   }, [taskId, fileName, result]);
+
+  const leftPanelContent = useMemo(() => {
+    return (
+      <div className="flex flex-col h-full border border-slate-200 rounded-2xl overflow-hidden bg-slate-50 shadow-sm transition-all duration-300 hover:shadow-md">
+        <div className="bg-white px-5 py-4 border-b border-slate-200 font-bold text-slate-800 flex justify-between items-center">
+          <div className="flex items-center gap-4">
+            <span className="text-blue-500">🔍</span>
+            <span>原文对照区</span>
+            {/* 切换按钮 */}
+            <div className="flex bg-slate-100 p-1 rounded-lg">
+              <button onClick={() => setViewMode('text')} className={viewMode === 'text' ? 'bg-white shadow-sm px-3 py-1 rounded text-blue-600 text-sm transition-all' : 'px-3 py-1 text-slate-500 text-sm hover:text-slate-700 transition-all'}>提取文本</button>
+              <button onClick={() => setViewMode('original')} className={viewMode === 'original' ? 'bg-white shadow-sm px-3 py-1 rounded text-blue-600 text-sm transition-all' : 'px-3 py-1 text-slate-500 text-sm hover:text-slate-700 transition-all'}>原文件预览</button>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-slate-400 font-medium bg-slate-100 px-2 py-1 rounded-md">悬浮高亮查看说明</span>
+            
+            {/* 全屏切换按钮 */}
+            <button 
+              onClick={() => setIsFullscreen(!isFullscreen)}
+              className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+              title={isFullscreen ? "退出沉浸模式" : "沉浸阅读模式"}
+            >
+              {isFullscreen ? (
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+              ) : (
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"></path></svg>
+              )}
+            </button>
+          </div>
+        </div>
+        <div className={`flex-1 flex flex-col gpu-layer ${viewMode === 'text' ? 'overflow-y-auto custom-scrollbar p-6' : 'overflow-hidden'}`}>
+          {viewMode === 'text' ? (
+            <HighlightText text={result?.extracted_text || ""} resultData={result} />
+          ) : (
+            taskId ? (
+              <div className="flex-1 w-full bg-[#f3f4f6] h-full">
+                <SmartDocViewer documents={viewerDocuments} />
+              </div>
+            ) : (
+              <div className="flex items-center justify-center h-full text-slate-400">正在加载原文件...</div>
+            )
+          )}
+        </div>
+      </div>
+    );
+  }, [viewMode, taskId, viewerDocuments, result, isFullscreen]);
 
   return (
     <motion.div 
@@ -361,51 +409,6 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
       {result && !isAnalyzing && (
         <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 } as any} transition={{ duration: 0.5 } as any} className="mt-8 h-[calc(100vh-200px)] min-h-[800px] relative">
           {(() => {
-            const leftPanelContent = (
-              <div className="flex flex-col h-full border border-slate-200 rounded-2xl overflow-hidden bg-slate-50 shadow-sm transition-all duration-300 hover:shadow-md">
-            <div className="bg-white px-5 py-4 border-b border-slate-200 font-bold text-slate-800 flex justify-between items-center">
-              <div className="flex items-center gap-4">
-                <span className="text-blue-500">🔍</span>
-                <span>原文对照区</span>
-                {/* 切换按钮 */}
-                <div className="flex bg-slate-100 p-1 rounded-lg">
-                  <button onClick={() => setViewMode('text')} className={viewMode === 'text' ? 'bg-white shadow-sm px-3 py-1 rounded text-blue-600 text-sm transition-all' : 'px-3 py-1 text-slate-500 text-sm hover:text-slate-700 transition-all'}>提取文本</button>
-                  <button onClick={() => setViewMode('original')} className={viewMode === 'original' ? 'bg-white shadow-sm px-3 py-1 rounded text-blue-600 text-sm transition-all' : 'px-3 py-1 text-slate-500 text-sm hover:text-slate-700 transition-all'}>原文件预览</button>
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-slate-400 font-medium bg-slate-100 px-2 py-1 rounded-md">悬浮高亮查看说明</span>
-                
-                {/* 全屏切换按钮 */}
-                <button 
-                  onClick={() => setIsFullscreen(!isFullscreen)}
-                  className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                  title={isFullscreen ? "退出沉浸模式" : "沉浸阅读模式"}
-                >
-                  {isFullscreen ? (
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                  ) : (
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"></path></svg>
-                  )}
-                </button>
-              </div>
-            </div>
-            <div className={`flex-1 flex flex-col gpu-layer ${viewMode === 'text' ? 'overflow-y-auto custom-scrollbar p-6' : 'overflow-hidden'}`}>
-              {viewMode === 'text' ? (
-                <HighlightText text={result.extracted_text || ""} resultData={result} />
-              ) : (
-                taskId ? (
-                  <div className="flex-1 w-full bg-[#f3f4f6] h-full">
-                    <SmartDocViewer documents={viewerDocuments} />
-                  </div>
-                ) : (
-                  <div className="flex items-center justify-center h-full text-slate-400">正在加载原文件...</div>
-                )
-              )}
-              </div>
-            </div>
-            );
-
             if (isFullscreen) {
               return (
                 <div className="w-full h-full">

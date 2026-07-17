@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, memo } from 'react';
 import DocViewer, { DocViewerRenderers } from "@cyntler/react-doc-viewer";
 import "@cyntler/react-doc-viewer/dist/index.css";
 import { LocalDocxRenderer } from './LocalDocxRenderer';
@@ -17,7 +17,9 @@ export interface SmartDocViewerProps {
   documents: { uri: string; fileName: string; fileType: string }[];
 }
 
-export function SmartDocViewer({ documents }: SmartDocViewerProps) {
+const RENDERERS = [LocalDocxRenderer, ...DocViewerRenderers];
+
+export const SmartDocViewer = memo(function SmartDocViewer({ documents }: SmartDocViewerProps) {
   const doc = documents[0];
   const [numPages, setNumPages] = useState<number>(0);
   const [pdfError, setPdfError] = useState<string>('');
@@ -81,7 +83,7 @@ export function SmartDocViewer({ documents }: SmartDocViewerProps) {
       `}</style>
       <DocViewer 
         documents={documents}
-        pluginRenderers={[LocalDocxRenderer, ...DocViewerRenderers]}
+        pluginRenderers={RENDERERS}
         style={{ height: "100%", width: "100%" }}
         config={{
           header: {
@@ -93,4 +95,4 @@ export function SmartDocViewer({ documents }: SmartDocViewerProps) {
       />
     </div>
   );
-}
+});
