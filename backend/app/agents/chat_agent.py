@@ -39,7 +39,9 @@ class ChatAgent:
         self,
         document_id: str,
         question: str,
-        history: list
+        history: list,
+        user_id: str = None,
+        tenant_id: str = None
     ) -> AsyncGenerator[str, None]:
         """
         流式聊天生成器 (ReAct Agent 架构)：
@@ -51,6 +53,12 @@ class ChatAgent:
         chat_task_id = f"chat-{uuid.uuid4().hex[:8]}"
         current_task_id.set(chat_task_id)
         current_node_name.set("ChatAgent")
+        
+        from app.core.context import current_user_id, current_tenant_id
+        if user_id:
+            current_user_id.set(user_id)
+        if tenant_id:
+            current_tenant_id.set(tenant_id)
 
         logger.info(
             f"ChatAgent 会话启动，任务ID: {chat_task_id}，文档ID: {document_id}，问题: {question[:50]}..."

@@ -7,6 +7,8 @@ class BiddingState(TypedDict):
     # 基础信息
     task_id: str
     document_id: str
+    user_id: str
+    tenant_id: str
     doc_text: str
     company_quals: str
     

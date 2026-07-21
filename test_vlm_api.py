@@ -3,20 +3,25 @@ import base64
 import json
 import httpx
 from openai import OpenAI
+from dotenv import load_dotenv
+
+# 加载 .env 文件中的环境变量
+load_dotenv()
 
 # ======= 模型配置 =======
 # 1. 阿里通义千问多模态 (推荐 qwen-vl-plus，成本较低且效果极佳)
-ALI_API_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-ALI_API_KEY = "sk-ws-H.REEXEYD.ph32.MEYCIQCCdCWV0BeyM1Ll-hvdFsOV_7BtOWoTzNn73_MWjTTNmgIhAPnEjXku_Vz1i5Wgolg2sXmsSc0eleCBisZWq1FbU7ot" # TODO: 请在此处填入您的阿里云 DashScope API Key
-ALI_MODEL_NAME = "qwen-vl-plus"
+ALI_API_BASE = os.getenv("ALI_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+ALI_API_KEY = os.getenv("ALI_API_KEY", "")
+ALI_MODEL_NAME = os.getenv("ALI_MODEL_NAME", "qwen-vl-plus")
 
 # 2. 原本地部署模型
-LOCAL_API_BASE = "http://221.224.69.13:8083/v1"
-LOCAL_API_KEY = "xq-prod-x62q6N62y02rGzn2101sjdkf2jb3t4b838sd"
-LOCAL_MODEL_NAME = "minimax-m3-mxfp8"
+LOCAL_API_BASE = os.getenv("LOCAL_API_BASE")
+LOCAL_API_KEY = os.getenv("LOCAL_API_KEY", "")
+LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "minimax-m3-mxfp8")
 
 # --- 切换使用哪个模型 ---
-USE_ALI = True
+# 默认使用阿里模型，如果 .env 中 USE_ALI="False" 则使用本地模型
+USE_ALI = os.getenv("USE_ALI", "True").lower() == "true"
 
 if USE_ALI:
     API_BASE = ALI_API_BASE

@@ -15,9 +15,10 @@ class CRUDQualification:
             CompanyQualification.tenant_id == tenant_id
         ).first()
 
-    def create_qualification(self, db: Session, obj_in: QualificationCreate, tenant_id: str) -> CompanyQualification:
+    def create_qualification(self, db: Session, obj_in: QualificationCreate, tenant_id: str, user_id: str) -> CompanyQualification:
         db_obj = CompanyQualification(
             tenant_id=tenant_id,
+            user_id=user_id,
             name=obj_in.name,
             company_name=obj_in.company_name,
             level=obj_in.level,

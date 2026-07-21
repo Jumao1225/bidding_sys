@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
+import { apiFetch } from '../utils/api';
 
 interface DocumentRecord {
   id: string;
@@ -18,7 +19,7 @@ export function Home() {
     const fetchDocuments = async () => {
       try {
         const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-        const res = await fetch(`${baseUrl}/api/v1/documents/`);
+        const res = await apiFetch(`${baseUrl}/api/v1/documents/`);
         if (res.ok) {
           const json = await res.json();
           if (json.code === 200 && json.data) {
@@ -42,7 +43,7 @@ export function Home() {
 
     try {
       const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-      const res = await fetch(`${baseUrl}/api/v1/documents/${docId}`, {
+      const res = await apiFetch(`${baseUrl}/api/v1/documents/${docId}`, {
         method: 'DELETE'
       });
       if (res.ok) {

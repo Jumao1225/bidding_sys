@@ -5,9 +5,9 @@ from fastapi import HTTPException
 from app.db.crud.document import document_crud
 
 class DocumentService:
-    def get_documents_list(self, db: Session):
+    def get_documents_list(self, db: Session, user_id: str, tenant_id: str):
         """处理获取所有历史记录的业务逻辑"""
-        docs = document_crud.get_all_documents(db)
+        docs = document_crud.get_all_documents(db, user_id, tenant_id)
         docs_list = []
         for d in docs:
             docs_list.append({
@@ -20,9 +20,9 @@ class DocumentService:
         docs_list.sort(key=lambda x: x["created_at"] or "", reverse=True)
         return docs_list
 
-    def get_document_result(self, db: Session, doc_id: str):
+    def get_document_result(self, db: Session, doc_id: str, user_id: str, tenant_id: str):
         """处理获取文档详情结果的业务逻辑（降级读取 Markdown 或 Chunk，拼装超大结果字典）"""
-        doc_obj = document_crud.get_document_by_id(db, doc_id)
+        doc_obj = document_crud.get_document_by_id(db, doc_id, user_id, tenant_id)
         if not doc_obj:
             raise HTTPException(status_code=404, detail="文档记录未找到")
             
@@ -59,9 +59,9 @@ class DocumentService:
         
         return result
 
-    def delete_document(self, db: Session, doc_id: str):
+    def delete_document(self, db: Session, doc_id: str, user_id: str, tenant_id: str):
         """处理文档删除的业务逻辑（含数据库记录级联删除与本地文件物理清理）"""
-        doc_obj = document_crud.get_document_by_id(db, doc_id)
+        doc_obj = document_crud.get_document_by_id(db, doc_id, user_id, tenant_id)
         if not doc_obj:
             raise HTTPException(status_code=404, detail="文档记录未找到")
         

@@ -1,4 +1,5 @@
 from .base import Base, TenantBase
+from .user import Tenant, User
 from .business import CompanyQualification, MarketPriceReference
 from .project import Project, Document, DocChunk
 from .ai_analysis import QualificationMatch, RiskItem, CostEstimate
@@ -13,6 +14,8 @@ from .metadata import (
 __all__ = [
     "Base",
     "TenantBase",
+    "Tenant",
+    "User",
     "CompanyQualification",
     "MarketPriceReference",
     "Project",

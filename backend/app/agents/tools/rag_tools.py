@@ -16,7 +16,11 @@ def search_bidding_document(document_id: str, query: str) -> str:
     """
     try:
         from app.worker.tasks import emit_agent_log
+        from app.agents.tools.security import validate_document_access
         
+        if not validate_document_access(document_id):
+            return f"拒绝访问：您无权检索文档 {document_id} 的原文内容。"
+            
         # 动态意图路由拦截
         emit_agent_log("info", f"ChatAgent 发起通用检索: '{query}'，正在启动 Routing 意图识别引擎进行导航...")
         section_titles = routing_service.analyze_intent_and_route(document_id, query)

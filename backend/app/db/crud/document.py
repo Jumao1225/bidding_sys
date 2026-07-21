@@ -6,12 +6,23 @@ from app.db.models.metadata import (
 )
 
 class CRUDDocument:
-    def get_all_documents(self, db: Session):
-        """获取所有文档记录并按ID倒序（ID基于UUID创建顺序或时间顺序）"""
-        return db.query(Document).order_by(Document.id.desc()).all()
+    def get_all_documents(self, db: Session, user_id: str, tenant_id: str):
+        """获取当前用户本租户下的所有文档记录并按ID倒序"""
+        return db.query(Document).filter(
+            Document.user_id == user_id, 
+            Document.tenant_id == tenant_id
+        ).order_by(Document.id.desc()).all()
 
-    def get_document_by_id(self, db: Session, doc_id: str):
-        """根据文档 ID 获取单条记录"""
+    def get_document_by_id(self, db: Session, doc_id: str, user_id: str, tenant_id: str):
+        """根据文档 ID 及权限获取单条记录"""
+        return db.query(Document).filter(
+            Document.id == doc_id,
+            Document.user_id == user_id,
+            Document.tenant_id == tenant_id
+        ).first()
+
+    def get_document_by_id_system(self, db: Session, doc_id: str):
+        """系统内部使用，无视权限根据文档 ID 获取记录"""
         return db.query(Document).filter(Document.id == doc_id).first()
 
     def get_document_chunks(self, db: Session, doc_id: str):

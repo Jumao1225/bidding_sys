@@ -1,4 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { apiFetch } from '../utils/api';
+import { Upload, X, FileText, CheckCircle2, ChevronRight, Loader2 } from 'lucide-react';
 import { SmartDocViewer } from './SmartDocViewer';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Group, Panel, Separator } from 'react-resizable-panels';
@@ -167,7 +169,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     // 获取真实公司资质数据
     let realCompanyQuals = "本公司具有建筑工程施工总承包一级资质，注册资金5000万元，拥有 ISO9001 质量认证体系。"; // 默认 fallback
     try {
-      const qualRes = await fetch(`${baseUrl}/api/v1/qualifications/`, {
+      const qualRes = await apiFetch(`${baseUrl}/api/v1/qualifications/`, {
         headers: { 'X-Tenant-ID': 'default-tenant' }
       });
       if (qualRes.ok) {
@@ -195,7 +197,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     formData.append("company_quals", realCompanyQuals);
 
     try {
-      const response = await fetch(`${baseUrl}/api/v1/analysis/upload-and-analyze`, {
+      const response = await apiFetch(`${baseUrl}/api/v1/analysis/upload-and-analyze`, {
         method: "POST",
         body: formData,
       });
@@ -268,6 +270,9 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     localStorage.removeItem('bidding_analysis_result');
     localStorage.removeItem('bidding_task_id');
     localStorage.removeItem('bidding_file_name');
+    localStorage.removeItem('bidding_document_id');
+    // 触发全局事件通知 ChatPanel 刷新状态
+    window.dispatchEvent(new Event('bidding_document_changed'));
     if (onAnalysisSuccess) onAnalysisSuccess(null);
   };
 

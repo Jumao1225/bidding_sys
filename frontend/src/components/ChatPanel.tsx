@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Send, User, Bot, Trash2, FileText, Download, Check, ExternalLink } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { apiFetch } from '../utils/api';
 
 // ==================== 类型定义 ====================
 
@@ -177,10 +179,12 @@ function ThoughtProcessBlock({ toolCalls, inlineJson, thinkBlocks, isStreaming }
 // ==================== 主组件 ====================
 
 export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClose }: ChatPanelProps) {
-  const defaultGreeting: Message = {
+  const getDefaultGreeting = (hasDoc: boolean): Message => ({
     role: 'ai',
-    content: '您好！我是您的专属标书解析助手。我已深度阅读了当前的招标文件，您可以向我提问关于**资质要求、交货期、付款方式、评分标准**等任何深层细节。',
-  };
+    content: hasDoc
+      ? '您好！我是您的专属标书解析助手。我已深度阅读了当前的招标文件，您可以向我提问关于**资质要求、交货期、付款方式、评分标准**等任何深层细节。'
+      : '您好！我是您的专属标书解析助手。**目前您还没有上传或选择任何标书文件**。\n\n请先前往工作台上传标书，解析完成后我就可以基于文档内容回答您的任何问题了。',
+  });
 
   const [messages, setMessages] = useState<Message[]>(() => {
     if (documentId) {
@@ -191,7 +195,7 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
         } catch (e) {}
       }
     }
-    return [defaultGreeting];
+    return [getDefaultGreeting(!!documentId)];
   });
   const [input, setInput] = useState('');
   /** true: 正在流式接收 AI 回复，此时禁止再次发送 */
@@ -223,7 +227,7 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
         } catch (e) {}
       }
     }
-    setMessages([defaultGreeting]);
+    setMessages([getDefaultGreeting(!!documentId)]);
   }, [documentId]);
 
   // 同步 messages 到 localStorage（过滤掉 isStreaming 状态）
@@ -282,7 +286,7 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
     abortControllerRef.current = new AbortController();
 
     try {
-      const response = await fetch(`${baseUrl}/api/v1/chat/`, {
+      const response = await apiFetch(`${baseUrl}/api/v1/chat/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -294,7 +298,19 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
       });
 
       if (!response.ok || !response.body) {
-        throw new Error(`请求失败: ${response.status}`);
+        // 尝试解析后端的详细报错信息 (如 403 越权提示)
+        let errorDetail = `请求失败: HTTP ${response.status}`;
+        try {
+          const errorData = await response.json();
+          if (errorData.detail) {
+            errorDetail = typeof errorData.detail === 'string' ? errorData.detail : JSON.stringify(errorData.detail);
+          } else if (errorData.message) {
+            errorDetail = errorData.message;
+          }
+        } catch (e) {
+          // 如果后端没返回 JSON，就使用默认状态码提示
+        }
+        throw new Error(errorDetail);
       }
 
       const reader = response.body.getReader();
@@ -386,13 +402,16 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
       }
     } catch (err: any) {
       if (err.name === 'AbortError') return; // 用户主动中断
+      
+      const errorMsg = err.message || '网络请求失败，请检查后端服务是否正常运行。';
+      
       setMessages(prev => {
         const updated = [...prev];
         const lastIdx = updated.length - 1;
         if (updated[lastIdx]?.role === 'ai') {
           updated[lastIdx] = {
             role: 'ai',
-            content: '❌ 网络请求失败，请检查后端服务是否正常运行。',
+            content: `❌ ${errorMsg}`,
             isStreaming: false,
           };
         }

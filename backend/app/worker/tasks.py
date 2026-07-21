@@ -3,7 +3,6 @@ import json
 import os
 from datetime import datetime, date
 from loguru import logger
-from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.graph.builder import bidding_graph
 from app.core.context import current_task_id
@@ -54,8 +53,7 @@ def emit_agent_log(log_type: str, content: str):
         # ensure_ascii=False：保证 agent_log 里的中文字符不被转义为 \uXXXX
         redis_client.publish(f"channel:{task_id}", json.dumps(message, ensure_ascii=False, default=json_serial))
 
-@celery_app.task(bind=True, name="analyze_bidding_doc")
-def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, company_quals: str):
+def analyze_bidding_doc(task_id: str, file_path: str, filename: str, company_quals: str, user_id: str = None, tenant_id: str = "default-tenant"):
     """
     后台处理招标文件解析和 AI 分析
     """
@@ -106,7 +104,8 @@ def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, compa
             # 只要哈希不同，哪怕文件名一模一样，也会当做一份全新的记录建档（不删除旧的）
 
             doc = Document(
-                tenant_id="default-tenant",
+                tenant_id=tenant_id,
+                user_id=user_id,
                 project_id=project.id,
                 filename=filename,
                 file_path=file_path,
@@ -123,6 +122,8 @@ def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, compa
         initial_state = {
             "task_id": task_id,
             "document_id": doc_id,
+            "user_id": user_id,
+            "tenant_id": tenant_id,
             "doc_text": "",
             "company_quals": company_quals,
             "status": "RUNNING",
@@ -225,7 +226,6 @@ def analyze_bidding_doc(self, task_id: str, file_path: str, filename: str, compa
         #     os.remove(file_path)
         pass
 
-@celery_app.task(name="async_write_audit_log")
 def async_write_audit_log(
     task_id: str,
     node_name: str,

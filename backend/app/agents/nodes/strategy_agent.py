@@ -2,7 +2,7 @@ from app.services.llm_service import llm_service
 from app.agents.state import BiddingState
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
-from app.db.models.project import DocChunk, Document
+from app.db.crud.document import document_crud
 from app.services.rag_service import rag_service
 from app.core.audit_decorator import audit_node
 import logging
@@ -21,8 +21,8 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
     db: Session = SessionLocal()
     hard_quals_str = "无明确提取的硬性资质"
     try:
-        from app.db.models.metadata import QualificationMetadata
-        qual_md = db.query(QualificationMetadata).filter(QualificationMetadata.document_id == document_id).first()
+        all_meta = document_crud.get_all_metadata(db, document_id)
+        qual_md = all_meta.get("qualification")
         
         if qual_md:
             quals = []
@@ -46,31 +46,31 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
     )
     
     logger.info(f"--- Strategy Agent [履约盘点] ---")
-    logger.info(f"Master Agent 提取的硬性门槛: \n{hard_quals_str}")
+    logger.info(f"Master Agent 提取的结构化资格要求: \n{hard_quals_str}")
     logger.info(f"RAG 补充检索召回的原文章节长度: {len(rag_text)} 字符")
     
     prompt = f"""
-    你是一位资深的投标经理，需要从**投标方视角**盘点招标文件中的资格与业绩要求。
-    请结合总控智能体提取的“核心硬性门槛”，以及检索到的原文片段，基于“我公司客观条件”进行客观的能力评估。
+    你是一位资深的投标经理，需要从**投标方视角**全面盘点招标文件中的所有资格、资质、业绩和人员要求。
+    请结合总控智能体已经提取的结构化要求，以及检索到的原文片段，基于“我公司客观条件”进行全面、客观的能力评估。
     
-    【核心硬性门槛 (Master Agent 提取)】:
+    【已提取的结构化资格要求】:
     {hard_quals_str}
     
-    【补充检索的原文章节】:
+    【补充检索的原文章节 (可能包含遗漏的资格要求)】:
     {rag_text}
     
     【我公司客观条件】:
     {company_quals}
     
     【任务要求】:
-    1. **严格对齐门槛**：请**优先且严格**按照【核心硬性门槛】中列出的每一项资质、业绩、人员要求进行逐一盘点。不要遗漏，也不要随意合并。
-    2. 只有当核心硬性门槛中"无明确提取"或有重大遗漏时，才从【补充检索的原文章节】中发掘其他隐性门槛。
-    3. 必须基于【我公司客观条件】进行比对，不要凭空捏造我公司的能力。如果我公司条件中完全没有提到某项要求，请将其判定为"做不到"或"努力可做到"，并在理由中明确指出我方资料缺失。
+    1. **全面盘点**：请结合【已提取的结构化资格要求】和【补充检索的原文章节】，提取并盘点**所有的**投标人资格要求（包括但不限于：企业基本资质、体系认证、特定行业资质证书、财务要求、历史同类业绩要求、核心人员（项目经理等）资格要求等）。
+    2. **绝不遗漏**：绝对不能仅仅局限于已提取的结构化要求！如果【补充检索的原文章节】中存在任何其他的资格、资质或人员门槛，必须一并独立提取并纳入盘点。
+    3. 必须基于【我公司客观条件】进行比对，不要凭空捏造我公司的能力。如果我方资料中完全没有提到某项要求，请将其判定为"做不到"或"努力可做到"，并在理由中明确指出我方资料缺失。
     
     请输出 JSON 格式，包含:
     - match_score: 整体匹配度评估分 (0-100)
     - items: 数组，包含每个要求的评估：
-      - requirement: 招标要求简述（直接对应核心门槛中的某一项）
+      - requirement: 招标要求简述（如“必须具备有效的营业执照”、“项目经理需具备一级建造师证书”、“具有类似项目业绩”等）
       - exact_quote: 从原文中提取的**一字不差**的原句（必须完全匹配原文的子串，用于前端锚点高亮展示）
       - status: 必须是以下三种之一："可以做到", "努力可做到", "做不到"
       - reason: 评估原因或行动建议
@@ -88,10 +88,10 @@ def identify_risks_node(state: BiddingState) -> dict:
     
     db: Session = SessionLocal()
     try:
-        from app.db.models.metadata import EvaluationMetadata, FinancialMetadata, EngineeringMetadata
-        eval_md = db.query(EvaluationMetadata).filter(EvaluationMetadata.document_id == document_id).first()
-        fin_md = db.query(FinancialMetadata).filter(FinancialMetadata.document_id == document_id).first()
-        eng_md = db.query(EngineeringMetadata).filter(EngineeringMetadata.document_id == document_id).first()
+        all_meta = document_crud.get_all_metadata(db, document_id)
+        eval_md = all_meta.get("evaluation")
+        fin_md = all_meta.get("financial")
+        eng_md = all_meta.get("engineering")
         
         penalties = fin_md.delayed_payment_penalty if fin_md else ""
         payment_terms = fin_md.payment_milestones if fin_md else []

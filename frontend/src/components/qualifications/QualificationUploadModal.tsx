@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { apiFetch } from '../../utils/api';
 import type { Qualification } from './QualificationCard';
 
 interface Props {
@@ -61,7 +62,7 @@ export function QualificationUploadModal({ isOpen, onClose, onSuccess, editData 
     const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
     
     try {
-      const res = await fetch(`${baseUrl}/api/v1/qualifications/upload`, {
+      const res = await apiFetch(`${baseUrl}/api/v1/qualifications/upload`, {
         method: 'POST',
         body: formData,
         headers: {
@@ -101,7 +102,7 @@ export function QualificationUploadModal({ isOpen, onClose, onSuccess, editData 
       const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
       try {
         if (qualId) {
-          await fetch(`${baseUrl}/api/v1/qualifications/${qualId}`, {
+          await apiFetch(`${baseUrl}/api/v1/qualifications/${qualId}`, {
             method: 'DELETE',
             headers: { 'X-Tenant-ID': 'default-tenant' }
           });
@@ -132,7 +133,7 @@ export function QualificationUploadModal({ isOpen, onClose, onSuccess, editData 
       if (editData) {
         // 单个编辑模式，调用 PUT
         const qual = parsedDataList[0];
-        await fetch(`${baseUrl}/api/v1/qualifications/${qual.id}`, {
+        await apiFetch(`${baseUrl}/api/v1/qualifications/${qual.id}`, {
           method: 'PUT',
           headers: {
             'Content-Type': 'application/json',
@@ -148,7 +149,7 @@ export function QualificationUploadModal({ isOpen, onClose, onSuccess, editData 
       } else {
         // 新上传模式，批量调用 POST
         await Promise.all(parsedDataList.map(qual => {
-          return fetch(`${baseUrl}/api/v1/qualifications/`, {
+          return apiFetch(`${baseUrl}/api/v1/qualifications/`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',

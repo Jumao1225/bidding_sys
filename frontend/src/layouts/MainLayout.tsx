@@ -1,5 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
 
 interface MainLayoutProps {
   children: React.ReactNode;
@@ -7,11 +8,13 @@ interface MainLayoutProps {
 
 export default function MainLayout({ children }: MainLayoutProps) {
   const location = useLocation();
+  const { user, logout } = useAuth();
   
   const isActive = (path: string) => {
     if (path === '/') return location.pathname === '/';
     if (path === '/analysis') return location.pathname.startsWith('/analysis');
     if (path === '/qualifications') return location.pathname.startsWith('/qualifications');
+    if (path === '/admin') return location.pathname.startsWith('/admin');
     return false;
   };
 
@@ -74,6 +77,16 @@ export default function MainLayout({ children }: MainLayoutProps) {
             </svg>
             <span className={isActive('/qualifications') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>资质中心</span>
           </Link>
+
+          {user?.role === 'admin' && (
+            <Link to="/admin" className={getLinkClass('/admin')}>
+              {isActive('/admin') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+              <svg className={`w-5 h-5 mr-3 ${isActive('/admin') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              </svg>
+              <span className={isActive('/admin') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>系统管理</span>
+            </Link>
+          )}
         </nav>
 
         <div className="p-5 border-t border-white/5 mt-auto bg-black/10 relative z-10">
@@ -83,14 +96,15 @@ export default function MainLayout({ children }: MainLayoutProps) {
                 OP
               </div>
               <div>
-                <p className="text-sm font-bold text-slate-200 group-hover:text-white transition-colors">Operator</p>
-                <p className="text-[11px] text-slate-500">admin@bidding.ai</p>
+                <p className="text-sm font-bold text-slate-200 group-hover:text-white transition-colors">{user?.name || 'Operator'}</p>
+                <p className="text-[11px] text-slate-500">{user?.email || 'admin@bidding.ai'}</p>
               </div>
             </div>
-            <svg className="w-5 h-5 text-slate-500 group-hover:text-white transition-colors opacity-0 group-hover:opacity-100" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
+            <button onClick={logout} className="w-5 h-5 text-slate-500 hover:text-red-400 transition-colors">
+              <svg fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+              </svg>
+            </button>
           </div>
         </div>
       </aside>

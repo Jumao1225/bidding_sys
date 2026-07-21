@@ -1,7 +1,7 @@
 import os
 import uuid
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import PlainTextResponse
 from loguru import logger
 
@@ -12,9 +12,11 @@ from app.services.parsers.mineru_parser import mineru_parser
 router = APIRouter()
 mineru_service = mineru_parser
 
+from app.db.models.user import User
+from app.api import deps
 
 @router.get("/status", response_model=ResponseModel[MinerUHealthResponse])
-async def get_mineru_status():
+async def get_mineru_status(current_user: User = Depends(deps.get_current_active_user)):
     """
     查询服务器上 MinerU (magic-pdf) 环境可用性与配置诊断状态
     """
@@ -30,7 +32,8 @@ async def get_mineru_status():
 @router.post("/parse", response_model=ResponseModel[MinerUParseResponse])
 async def parse_document(
     file: UploadFile = File(..., description="要测试解析的文档 (PDF/Word 等)"),
-    parse_mode: str = Form("auto", description="解析模式: auto (自动识别), txt (纯文本), ocr (强制OCR)")
+    parse_mode: str = Form("auto", description="解析模式: auto (自动识别), txt (纯文本), ocr (强制OCR)"),
+    current_user: User = Depends(deps.get_current_active_user)
 ):
     """
     测试文件解析接口：
@@ -84,7 +87,10 @@ async def parse_document(
 
 
 @router.get("/preview-md/{task_id}", response_class=PlainTextResponse)
-async def preview_markdown_file(task_id: str):
+async def preview_markdown_file(
+    task_id: str,
+    current_user: User = Depends(deps.get_current_active_user)
+):
     """
     直接查看/阅读特定任务解析导出的原始 Markdown 文本文件
     """

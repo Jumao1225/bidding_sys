@@ -31,10 +31,15 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents }: SmartD
   const isPdf = doc.fileType?.toLowerCase() === 'pdf' || doc.fileName?.toLowerCase().endsWith('.pdf');
 
   if (isPdf) {
+    const token = localStorage.getItem('bidding_token');
+    const pdfFile = token 
+      ? { url: doc.uri, httpHeaders: { Authorization: `Bearer ${token}` } } 
+      : doc.uri;
+
     return (
       <div className="flex-1 w-full h-full bg-[#f3f4f6]">
         <Document
-          file={doc.uri}
+          file={pdfFile}
           onLoadSuccess={({ numPages }) => setNumPages(numPages)}
           onLoadError={(error) => setPdfError(error.message)}
           className="h-full w-full flex flex-col"
@@ -71,6 +76,9 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents }: SmartD
   }
 
   // Word 文档 (Docx) 退回原渲染器，但加上 content-visibility 优化
+  const token = localStorage.getItem('bidding_token');
+  const requestHeaders = token ? { Authorization: `Bearer ${token}` } : {};
+
   return (
     <div className="flex-1 w-full bg-[#f3f4f6] h-full overflow-y-auto custom-scrollbar smart-doc-container">
       <style>{`
@@ -84,6 +92,7 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents }: SmartD
       <DocViewer 
         documents={documents}
         pluginRenderers={RENDERERS}
+        requestHeaders={requestHeaders}
         style={{ height: "100%", width: "100%" }}
         config={{
           header: {

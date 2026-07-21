@@ -11,21 +11,13 @@ from loguru import logger
 
 router = APIRouter()
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def get_tenant_id(x_tenant_id: Optional[str] = Header(None, alias="X-Tenant-ID")) -> str:
-    # MVP fallback to 'default-tenant' if header is not present
-    return x_tenant_id if x_tenant_id else "default-tenant"
+from app.api import deps
+from app.db.models.user import User
 
 @router.get("/", response_model=ResponseModel[List[QualificationResponse]])
 def list_qualifications(
-    db: Session = Depends(get_db),
-    tenant_id: str = Depends(get_tenant_id)
+    db: Session = Depends(deps.get_db),
+    tenant_id: str = Depends(deps.get_current_tenant)
 ):
     """获取租户的所有资质"""
     try:
@@ -38,12 +30,13 @@ def list_qualifications(
 @router.post("/", response_model=ResponseModel[QualificationResponse])
 def create_qualification(
     obj_in: QualificationCreate,
-    db: Session = Depends(get_db),
-    tenant_id: str = Depends(get_tenant_id)
+    db: Session = Depends(deps.get_db),
+    tenant_id: str = Depends(deps.get_current_tenant),
+    current_user: User = Depends(deps.get_current_active_user)
 ):
     """创建新的资质记录（保存前端确认的AI解析数据）"""
     try:
-        db_obj = qualification_crud.create_qualification(db=db, obj_in=obj_in, tenant_id=tenant_id)
+        db_obj = qualification_crud.create_qualification(db=db, obj_in=obj_in, tenant_id=tenant_id, user_id=current_user.id)
         return success_response(data=db_obj)
     except Exception as e:
         logger.error(f"Create qualification failed: {e}")
@@ -52,8 +45,8 @@ def create_qualification(
 @router.post("/upload", response_model=ResponseModel[List[QualificationResponse]])
 def upload_and_parse_qualification(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    tenant_id: str = Depends(get_tenant_id)
+    db: Session = Depends(deps.get_db),
+    tenant_id: str = Depends(deps.get_current_tenant)
 ):
     """上传文件并进行AI解析提取，自动创建资质记录（支持单文件多资质）"""
     try:
@@ -69,8 +62,8 @@ def upload_and_parse_qualification(
 def update_qualification(
     qual_id: str,
     obj_in: QualificationUpdate,
-    db: Session = Depends(get_db),
-    tenant_id: str = Depends(get_tenant_id)
+    db: Session = Depends(deps.get_db),
+    tenant_id: str = Depends(deps.get_current_tenant)
 ):
     """更新资质信息（主要用于用户手动修正AI解析结果）"""
     db_obj = qualification_crud.get_qualification_by_id(db=db, qual_id=qual_id, tenant_id=tenant_id)
@@ -87,8 +80,8 @@ def update_qualification(
 @router.delete("/{qual_id}", response_model=ResponseModel[dict])
 def delete_qualification(
     qual_id: str,
-    db: Session = Depends(get_db),
-    tenant_id: str = Depends(get_tenant_id)
+    db: Session = Depends(deps.get_db),
+    tenant_id: str = Depends(deps.get_current_tenant)
 ):
     """删除资质"""
     db_obj = qualification_crud.get_qualification_by_id(db=db, qual_id=qual_id, tenant_id=tenant_id)

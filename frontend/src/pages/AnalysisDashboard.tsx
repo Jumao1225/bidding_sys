@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
+import { apiFetch } from '../utils/api';
 import { UploadBox } from '../components/UploadBox';
 import { CostTable } from '../components/CostTable';
 import { TimelineCard } from '../components/dashboard/TimelineCard';
@@ -27,7 +28,7 @@ export function AnalysisDashboard() {
         setIsLoadingHistory(true);
         try {
           const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-          const res = await fetch(`${baseUrl}/api/v1/documents/${id}/result`);
+          const res = await apiFetch(`${baseUrl}/api/v1/documents/${id}/result`);
           if (res.ok) {
             const json = await res.json();
             if (json.code === 200 && json.data) {
@@ -80,7 +81,7 @@ export function AnalysisDashboard() {
     setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'info', content: `正在重新提取专项领域: ${domain} ...` }]);
     try {
       const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-      const res = await fetch(`${baseUrl}/api/v1/analysis/${id}/reextract/${domain}`, {
+      const res = await apiFetch(`${baseUrl}/api/v1/analysis/${id}/reextract/${domain}`, {
         method: 'POST'
       });
       if (res.ok) {

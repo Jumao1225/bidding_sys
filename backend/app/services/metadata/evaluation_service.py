@@ -10,7 +10,7 @@ class ScoreDetail(BaseModel):
     category: str = Field(..., description="一级评分分类，如：商务分/技术分/价格分/资信分/服务分")
     sub_category: Optional[str] = Field(None, description="二级子项，如：团队人员配置、项目实施方案、同类业绩")
     title: str = Field(..., description="评分项名称")
-    max_score: float = Field(..., description="本项最高分值")
+    max_score: Optional[float] = Field(None, description="本项最高分值")
     
     scoring_criteria: str = Field(..., description="完整评分标准原文")
     scoring_type: Optional[str] = Field(None, description="评分类型：加分项(bonus) / 扣分项(deduction) / 阶梯打分(ladder) / 专家打分(subjective)")
@@ -22,11 +22,11 @@ class ScoreDetail(BaseModel):
 
 class EvaluationSchema(BaseModel):
     evaluation_method: str = Field("综合评分法", description="评标方法（如：综合评分法、最低投标价法、双信封法）")
-    total_score: float = Field(100.0, description="总分，通常为 100")
+    total_score: float = Field(100.0, description="总分，通常为 100 (必须是纯数字)")
     
     weight_distribution: dict[str, float] = Field(
         default_factory=dict, 
-        description="各评分维度及其对应的权重分值"
+        description="各评分维度及其对应的权重分值 (值必须是纯数字，不要带'分'或'%'等单位)"
     )
 
     score_tree: list[ScoreDetail] = Field(

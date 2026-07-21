@@ -4,8 +4,12 @@ from app.services.llm_service import llm_service
 from app.agents.state import BiddingState
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
-from app.db.models.project import Document, DocChunk
+from app.db.crud.document import document_crud
+from app.db.crud.business import business_crud
+from app.core.audit_decorator import audit_node
+from app.services.rag_service import rag_service
 
+@audit_node(name="CostAgent-CalculateCost")
 def cost_node(state: BiddingState) -> dict:
     """
     智能成本测算节点。
@@ -14,33 +18,42 @@ def cost_node(state: BiddingState) -> dict:
     为了简化，直接利用大模型做一次性评估。
     """
     document_id = state.get("document_id")
+    user_id = state.get("user_id")
+    tenant_id = state.get("tenant_id")
     
     db: Session = SessionLocal()
     try:
-        document = db.query(Document).filter(Document.id == document_id).first()
+        document = document_crud.get_document_by_id(db, document_id, user_id, tenant_id)
         budget_limit = None
         if document and document.parsed_metadata:
             budget_limit = document.parsed_metadata.get("budget_limit")
             
-        chunks = db.query(DocChunk).filter(DocChunk.document_id == document_id).order_by(DocChunk.chunk_index).all()
-        doc_text = "\n\n".join([chunk.content for chunk in chunks]) if chunks else ""
+        # 不再提取和拼接所有全文，改用 RAG 按需搜索
+        
+        # 动态获取当前租户的价格参考库
+        price_refs = business_crud.get_all_price_references(db, tenant_id)
+        price_book = {ref.item_name: ref.unit_price for ref in price_refs}
     finally:
         db.close()
 
-    # 这里为了演示，硬编码一个简单的价格库。实际应从数据库查询或通过 Skill 查询。
-    price_book = {
-        "高性能服务器": 45000, 
-        "千兆交换机": 3000
-    }
+    # 使用 RAG 靶向检索相关清单和报价信息
+    rag_text = rag_service.search_bidding_document(
+        document_id, 
+        "采购清单 货物需求一览表 设备清单 BOM 报价", 
+        top_k=5, 
+        disable_expansion=True
+    )
     
-    logger.info(f"开始成本核算节点，文本长度: {len(doc_text)}。")
+    # 如果没有配置价格库，给模型一个空库，让它自己评估或标为 0
+    
+    logger.info(f"开始成本核算节点，靶向检索文本长度: {len(rag_text)}。")
 
     prompt = f"""
     你是一位专业的成本核算专家。请从下面的招标文件中提取包含物品名称、数量的“采购清单(BOM)”，
     并将其与提供的“价格参考库(Price Book)”进行智能语义匹配。
     
-    【招标文件部分文本】:
-    {doc_text[:20000]}
+    【检索到的可能包含清单的原文片段】:
+    {rag_text}
     
     【价格参考库】:
     {json.dumps(price_book, ensure_ascii=False)}

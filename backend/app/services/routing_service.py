@@ -31,10 +31,20 @@ class RoutingService:
         """
         db: Session = SessionLocal()
         try:
-            document = document_crud.get_document_by_id(db, document_id)
+            from app.core.context import current_user_id, current_tenant_id
+            user_id = current_user_id.get()
+            tenant_id = current_tenant_id.get()
+            
+            # 如果 Context 中有用户身份，则使用严格的租户鉴权
+            if user_id and tenant_id:
+                document = document_crud.get_document_by_id(db, document_id, user_id, tenant_id)
+            else:
+                # 兼容不需要权限校验的后台系统级调用
+                document = document_crud.get_document_by_id_system(db, document_id)
+                
             if not document:
-                logger.warning(f"RoutingService: 未找到文档 {document_id}")
-                return []
+                logger.warning(f"RoutingService: 未找到文档或无权访问 {document_id}")
+                return RoutingDecision(is_global_search=True, target_chapters=[])
                 
             parsed_metadata = document.parsed_metadata or {}
             toc_str = parsed_metadata.get("table_of_contents", "")

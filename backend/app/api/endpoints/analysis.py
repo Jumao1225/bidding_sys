@@ -19,11 +19,15 @@ from app.agents.tools.metadata_tools import (
 
 router = APIRouter()
 
+from app.db.models.user import User
+from app.api import deps
+
 @router.post("/upload-and-analyze", response_model=ResponseModel[dict])
 async def upload_and_analyze(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="上传的招标文件 (Word/PDF 等)"),
-    company_quals: str = Form(..., description="我方公司的资质信息文本")
+    company_quals: str = Form(..., description="我方公司的资质信息文本"),
+    current_user: User = Depends(deps.get_current_active_user)
 ):
     """
     上传招标文件，触发后台 AI 提取和对比流程。
@@ -52,13 +56,15 @@ async def upload_and_analyze(
             
         logger.info(f"文件已保存: {file_path}，即将触发 Celery 任务: {task_id}")
         
-        # 异步调用 BackgroundTask
+        # 触发后台异步任务
         background_tasks.add_task(
             analyze_bidding_doc,
             task_id, 
             file_path, 
             file.filename, 
-            company_quals
+            company_quals,
+            current_user.id,
+            current_user.tenant_id
         )
         
         # 返回 task_id，前端根据这个 task_id 建立 SSE 连接
@@ -79,7 +85,12 @@ def get_db():
         db.close()
 
 @router.post("/{document_id}/reextract/{domain}", response_model=ResponseModel[dict])
-async def reextract_domain(document_id: str, domain: str, db: Session = Depends(get_db)):
+async def reextract_domain(
+    document_id: str, 
+    domain: str, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
     """
     针对特定的元数据领域（domain）进行重新提取，并返回最新结果。
     """
@@ -95,6 +106,12 @@ async def reextract_domain(document_id: str, domain: str, db: Session = Depends(
         raise HTTPException(status_code=400, detail=f"未知的提取领域: {domain}")
         
     try:
+        from app.db.crud.document import document_crud
+        # 鉴权验证：确保文档属于当前用户
+        doc = document_crud.get_document_by_id(db, document_id, current_user.id, current_user.tenant_id)
+        if not doc:
+            raise HTTPException(status_code=403, detail="无权访问该文档或文档不存在")
+            
         from app.worker.tasks import emit_agent_log
         from app.core.context import current_task_id
         
@@ -117,16 +134,20 @@ async def reextract_domain(document_id: str, domain: str, db: Session = Depends(
         raise HTTPException(status_code=500, detail=f"重新提取失败: {str(e)}")
 
 @router.api_route("/download/{task_id}", methods=["GET", "HEAD"])
-async def download_original_file(task_id: str, db: Session = Depends(get_db)):
+async def download_original_file(
+    task_id: str, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
     """
     根据 task_id 或 document_id 下载原文件
     """
     base_dir = Path(__file__).resolve().parent.parent.parent.parent
     upload_dir = os.path.join(base_dir, "uploads")
     
-    # 1. 首先尝试按照 document_id 查找 (用于历史记录)
+    # 1. 首先尝试按照 document_id 查找 (用于历史记录)并验证权限
     from app.db.crud.document import document_crud
-    doc = document_crud.get_document_by_id(db, task_id)
+    doc = document_crud.get_document_by_id(db, task_id, current_user.id, current_user.tenant_id)
     if doc and doc.file_path and os.path.exists(doc.file_path):
         return FileResponse(
             path=doc.file_path, 

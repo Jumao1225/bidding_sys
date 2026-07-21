@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { apiFetch } from '../utils/api';
 import { motion } from 'framer-motion';
 import { QualificationCard, type Qualification } from '../components/qualifications/QualificationCard';
 import { QualificationUploadModal } from '../components/qualifications/QualificationUploadModal';
@@ -18,7 +19,7 @@ export function QualificationCenter() {
     setIsLoading(true);
     try {
       const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-      const res = await fetch(`${baseUrl}/api/v1/qualifications/`, {
+      const res = await apiFetch(`${baseUrl}/api/v1/qualifications/`, {
         headers: { 'X-Tenant-ID': 'default-tenant' }
       });
       if (res.ok) {
@@ -42,7 +43,7 @@ export function QualificationCenter() {
     if (!window.confirm('确认删除此资质文件？')) return;
     try {
       const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-      const res = await fetch(`${baseUrl}/api/v1/qualifications/${id}`, {
+      const res = await apiFetch(`${baseUrl}/api/v1/qualifications/${id}`, {
         method: 'DELETE',
         headers: { 'X-Tenant-ID': 'default-tenant' }
       });
@@ -68,7 +69,7 @@ export function QualificationCenter() {
       // Implement batch deletion by calling individual DELETEs concurrently or a new batch endpoint
       // We'll use concurrent individual DELETEs for simplicity and avoiding new backend routes unless necessary
       const promises = Array.from(selectedIds).map(id => 
-        fetch(`${baseUrl}/api/v1/qualifications/${id}`, {
+        apiFetch(`${baseUrl}/api/v1/qualifications/${id}`, {
           method: 'DELETE',
           headers: { 'X-Tenant-ID': 'default-tenant' }
         })

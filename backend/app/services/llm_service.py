@@ -86,6 +86,9 @@ class LLMService:
         """懒加载 Embedding 模型，仅在首次使用时加载以缩短应用启动时间"""
         if self.embeddings is None:
             import os
+            # 解决 Windows 环境下 Celery / PyTorch 加载时的 OpenMP 冲突崩溃问题
+            os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
             import torch  # 引入 torch 用以精确控制精度
             from langchain_huggingface import HuggingFaceEmbeddings
             
@@ -98,10 +101,10 @@ class LLMService:
                     'model_kwargs': {'torch_dtype': torch.float32}  # 正确将 torch_dtype 传递给底层 Transformer 模型
                 }
                 
-                # 2. 优化推理：控制 batch_size 和 归一化
+                # 2. 优化推理：控制 batch_size 和 归一化 (减小 batch_size 防止 CPU 内存溢出)
                 encode_kwargs = {
                     'normalize_embeddings': True,  # BGE 模型推荐开启归一化（使检索时余弦相似度计算更准确）
-                    'batch_size': 32
+                    'batch_size': 4
                 }
                 
                 # 3. 实例化模型并限制最大序列长度 (8192)

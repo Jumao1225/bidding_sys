@@ -1,14 +1,11 @@
-import logging
-import json
+from loguru import logger
 from typing import Dict, Any
 from sqlalchemy.orm import Session
 from app.agents.state import BiddingState
 from app.services.llm_service import llm_service
 from app.db.session import SessionLocal
-from app.db.models.project import Document, DocChunk
+from app.db.crud.document import document_crud
 from app.core.audit_decorator import audit_node
-
-logger = logging.getLogger(__name__)
 
 @audit_node(name="MasterAgent")
 def master_agent_node(state: BiddingState) -> Dict[str, Any]:
@@ -27,13 +24,20 @@ def master_agent_node(state: BiddingState) -> Dict[str, Any]:
     db: Session = SessionLocal()
     try:
         # 1. 查找对应的 Document 记录
-        document = db.query(Document).filter(Document.id == document_id).first()
+        user_id = state.get("user_id")
+        tenant_id = state.get("tenant_id")
+        
+        from app.core.context import current_user_id, current_tenant_id
+        if user_id: current_user_id.set(user_id)
+        if tenant_id: current_tenant_id.set(tenant_id)
+
+        document = document_crud.get_document_by_id(db, document_id, user_id, tenant_id)
         if not document:
             return {"status": "master_failed", "error": f"未找到文档记录: {document_id}"}
             
         # 2. [DB First] 从数据库拉取属于该文档的所有解析块
         logger.info("Master Agent: 正在从数据库提取解析文本块...")
-        chunks = db.query(DocChunk).filter(DocChunk.document_id == document_id).order_by(DocChunk.chunk_index).all()
+        chunks = document_crud.get_document_chunks(db, document_id)
         
         if not chunks:
             logger.warning("该文档没有可用的解析文本块！")

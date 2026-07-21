@@ -5,6 +5,10 @@ import { ChatPanel } from './components/ChatPanel';
 import { Home } from './pages/Home';
 import { AnalysisDashboard } from './pages/AnalysisDashboard';
 import { QualificationCenter } from './pages/QualificationCenter';
+import { Login } from './pages/Login';
+import { SystemAdmin } from './pages/admin/SystemAdmin';
+import { ProtectedRoute } from './components/ProtectedRoute';
+import { AdminRoute } from './components/AdminRoute';
 
 function App() {
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -209,61 +213,73 @@ function App() {
   }
 
   return (
-    <>
-      <MainLayout>
-        <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/analysis/:id" element={<AnalysisDashboard />} />
-          <Route path="/qualifications" element={<QualificationCenter />} />
-        </Routes>
-      </MainLayout>
+    <Routes>
+      <Route path="/login" element={<Login />} />
+      <Route path="*" element={
+        <ProtectedRoute>
+          <>
+            <MainLayout>
+              <Routes>
+                <Route path="/" element={<Home />} />
+                <Route path="/analysis/:id" element={<AnalysisDashboard />} />
+                <Route path="/qualifications" element={<QualificationCenter />} />
+                <Route path="/admin/*" element={
+                  <AdminRoute>
+                    <SystemAdmin />
+                  </AdminRoute>
+                } />
+              </Routes>
+            </MainLayout>
 
-      {/* 展开的聊天窗口 (Fixed 独立层，确保不会超出屏幕) */}
-      <div
-        className={`fixed z-[60] pointer-events-none origin-center transition-all duration-100 ease-out ${isChatOpen ? 'scale-100 opacity-100' : 'scale-[0.85] opacity-0'}`}
-        style={chatStyle}
-      >
-        <div
-          ref={chatRef}
-          onMouseDown={!isFullscreen ? handleChatMouseDown : undefined}
-          onDragStart={(e) => e.preventDefault()}
-          style={!isFullscreen
-            ? { transform: `translate(${position.x}px, ${position.y}px)`, willChange: 'transform' }
-            : { transform: 'none', width: '100%', height: '100%' }}
-          className={`${isChatOpen ? 'pointer-events-auto' : 'pointer-events-none'} shadow-2xl rounded-3xl overflow-hidden flex flex-col bg-white ${isFullscreen
-            ? 'w-full h-full transition-[width,height]'
-            : 'w-[420px] h-[650px] min-w-[320px] min-h-[400px] max-w-[80vw] max-h-[85vh] resize transition-[width,height]'
-            }`}
-        >
-          <ChatPanel
-            documentId={documentId}
-            isFullscreen={isFullscreen}
-            onToggleFullscreen={() => setIsFullscreen(!isFullscreen)}
-            onClose={() => setIsChatOpen(false)}
-          />
-        </div>
-      </div>
+            {/* 展开的聊天窗口 (Fixed 独立层，确保不会超出屏幕) */}
+            <div
+              className={`fixed z-[60] pointer-events-none origin-center transition-all duration-100 ease-out ${isChatOpen ? 'scale-100 opacity-100' : 'scale-[0.85] opacity-0'}`}
+              style={chatStyle}
+            >
+              <div
+                ref={chatRef}
+                onMouseDown={!isFullscreen ? handleChatMouseDown : undefined}
+                onDragStart={(e) => e.preventDefault()}
+                style={!isFullscreen
+                  ? { transform: `translate(${position.x}px, ${position.y}px)`, willChange: 'transform' }
+                  : { transform: 'none', width: '100%', height: '100%' }}
+                className={`${isChatOpen ? 'pointer-events-auto' : 'pointer-events-none'} shadow-2xl rounded-3xl overflow-hidden flex flex-col bg-white ${isFullscreen
+                  ? 'w-full h-full transition-[width,height]'
+                  : 'w-[420px] h-[650px] min-w-[320px] min-h-[400px] max-w-[80vw] max-h-[85vh] resize transition-[width,height]'
+                  }`}
+              >
+                <ChatPanel
+                  documentId={documentId}
+                  isFullscreen={isFullscreen}
+                  onToggleFullscreen={() => setIsFullscreen(!isFullscreen)}
+                  onClose={() => setIsChatOpen(false)}
+                />
+              </div>
+            </div>
 
-      {/* 悬浮助手开关按钮 */}
-      <div
-        ref={fabRef}
-        className="fixed z-50 pointer-events-none"
-        style={{ left: fabPosition.x, top: fabPosition.y, willChange: 'transform, left, top' }}
-      >
-        <button
-          onMouseDown={handleFabMouseDown}
-          onClick={handleFabClick}
-          onDragStart={(e) => e.preventDefault()}
-          className="pointer-events-auto w-14 h-14 bg-gradient-to-tr from-blue-600 to-indigo-600 rounded-full flex items-center justify-center text-white shadow-2xl hover:scale-110 hover:shadow-indigo-500/50 transition-all duration-300 group ring-4 ring-white/50 cursor-move"
-        >
-          {isChatOpen ? (
-            <svg className="w-6 h-6 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-          ) : (
-            <span className="text-2xl pointer-events-none group-hover:animate-bounce">🤖</span>
-          )}
-        </button>
-      </div>
-    </>
+            {/* 悬浮助手开关按钮 */}
+            <div
+              ref={fabRef}
+              className="fixed z-50 pointer-events-none"
+              style={{ left: fabPosition.x, top: fabPosition.y, willChange: 'transform, left, top' }}
+            >
+              <button
+                onMouseDown={handleFabMouseDown}
+                onClick={handleFabClick}
+                onDragStart={(e) => e.preventDefault()}
+                className="pointer-events-auto w-14 h-14 bg-gradient-to-tr from-blue-600 to-indigo-600 rounded-full flex items-center justify-center text-white shadow-2xl hover:scale-110 hover:shadow-indigo-500/50 transition-all duration-300 group ring-4 ring-white/50 cursor-move"
+              >
+                {isChatOpen ? (
+                  <svg className="w-6 h-6 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                ) : (
+                  <span className="text-2xl pointer-events-none group-hover:animate-bounce">🤖</span>
+                )}
+              </button>
+            </div>
+          </>
+        </ProtectedRoute>
+      } />
+    </Routes>
   );
 }
 
