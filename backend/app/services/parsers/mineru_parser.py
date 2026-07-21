@@ -72,7 +72,7 @@ class MinerUParser(BaseParser):
                 "model_version": model_version
             }
             logger.info(f"正在向 MinerU 云端 API 申请上传凭证 ({sanitized_name})")
-            res = requests.post(apply_url, headers=headers, json=apply_payload, timeout=30)
+            res = requests.post(apply_url, headers=headers, json=apply_payload, timeout=30, proxies={"http": None, "https": None})
             res.raise_for_status()
             res_data = res.json()
 
@@ -89,7 +89,7 @@ class MinerUParser(BaseParser):
 
             logger.info(f"开始直传文件流...")
             with open(file_path, "rb") as f:
-                upload_res = requests.put(upload_url, data=f, headers=upload_headers, timeout=120)
+                upload_res = requests.put(upload_url, data=f, headers=upload_headers, timeout=120, proxies={"http": None, "https": None})
                 upload_res.raise_for_status()
 
             logger.info(f"文件流直传成功，正在向 MinerU 轮询解析任务状态 (batch_id: {batch_id})...")
@@ -99,7 +99,7 @@ class MinerUParser(BaseParser):
             full_zip_url: Optional[str] = None
 
             while time.time() - start_time < max_poll_seconds:
-                poll_res = requests.get(query_url, headers={"Authorization": f"Bearer {self.api_token}"}, timeout=20)
+                poll_res = requests.get(query_url, headers={"Authorization": f"Bearer {self.api_token}"}, timeout=20, proxies={"http": None, "https": None})
                 if poll_res.status_code == 200:
                     poll_data = poll_res.json()
                     if poll_data.get("code") == 0 and poll_data.get("data"):

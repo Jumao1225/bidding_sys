@@ -29,6 +29,7 @@ class Settings(BaseSettings):
         "http://localhost:5173", 
         "http://localhost:3000", 
         "http://localhost:5174",
+        "http://127.0.0.1:5173",
         "http://127.0.0.1:5174"
     ]
     
@@ -36,6 +37,20 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     OPENAI_API_BASE: str = os.getenv("OPENAI_API_BASE", "")
     LLM_MODEL_NAME: str = os.getenv("LLM_MODEL_NAME", "gpt-4o")
+
+    # ======= VLM 双引擎配置 =======
+    VLM_PROVIDER: str = os.getenv("VLM_PROVIDER", "ali")
+    
+    # 1. 阿里通义千问配置
+    ALI_VLM_API_BASE: str = os.getenv("ALI_VLM_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    ALI_VLM_API_KEY: str = os.getenv("ALI_VLM_API_KEY", "")
+    ALI_VLM_MODEL_NAME: str = os.getenv("ALI_VLM_MODEL_NAME", "qwen-vl-plus")
+    
+    # 2. 本地部署配置
+    LOCAL_VLM_API_BASE: str = os.getenv("LOCAL_VLM_API_BASE", "http://221.224.69.13:8083/v1")
+    LOCAL_VLM_API_KEY: str = os.getenv("LOCAL_VLM_API_KEY", "")
+    LOCAL_VLM_MODEL_NAME: str = os.getenv("LOCAL_VLM_MODEL_NAME", "minimax-m3-mxfp8")
+    # ===============================
 
     # MinerU 在线 API 配置 (参考 https://mineru.net/apiManage/docs)
     MINERU_API_TOKEN: str = os.getenv("MINERU_API_TOKEN", "")

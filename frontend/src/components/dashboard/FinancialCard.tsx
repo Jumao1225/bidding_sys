@@ -15,9 +15,11 @@ interface FinancialProps {
     advance_payment_ratio?: number | null;
     payment_milestones?: any[];
   };
+  onReextract?: () => void;
+  isRetrying?: boolean;
 }
 
-export function FinancialCard({ financial = {} }: FinancialProps) {
+export function FinancialCard({ financial = {}, onReextract, isRetrying = false }: FinancialProps) {
   const budget = financial.budget;
   const max_price_limit = financial.max_price_limit;
   const unit_price_limits = financial.unit_price_limits || {};
@@ -39,10 +41,24 @@ export function FinancialCard({ financial = {} }: FinancialProps) {
   const hasBonds = bid_bond || performance_bond || warranty_bond;
 
   return (
-    <div className="bg-white/80 backdrop-blur-sm p-6 rounded-3xl shadow-sm border border-amber-100 flex flex-col group hover:shadow-md transition-all h-[400px] overflow-hidden">
+    <div className={`bg-white/80 backdrop-blur-sm p-6 rounded-3xl shadow-sm border border-amber-100 flex flex-col group hover:shadow-md transition-all h-[400px] overflow-hidden relative ${isRetrying ? 'opacity-70 pointer-events-none' : ''}`}>
+      {isRetrying && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-white/40 backdrop-blur-[1px] rounded-3xl">
+          <svg className="animate-spin h-8 w-8 text-amber-500" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+        </div>
+      )}
       <div className="flex items-center gap-3 mb-6 shrink-0">
         <span className="p-2 bg-amber-100 text-amber-600 rounded-lg">💰</span>
         <h3 className="text-slate-700 font-bold tracking-wide flex-1">核心财务防线与资金流</h3>
+        {onReextract && (
+          <button 
+            onClick={(e) => { e.stopPropagation(); onReextract(); }}
+            className="p-1.5 ml-1 text-slate-400 hover:text-amber-500 hover:bg-amber-50 rounded-md transition-colors"
+            title="重新提取该部分"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+          </button>
+        )}
       </div>
 
       <div className="overflow-y-auto custom-scrollbar pr-2 space-y-6 flex-1 pb-4">

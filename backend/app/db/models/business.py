@@ -7,7 +7,8 @@ class CompanyQualification(TenantBase):
     __tablename__ = "company_qualifications"
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    level: Mapped[str | None] = mapped_column(String(50))
+    company_name: Mapped[str | None] = mapped_column(String(255))
+    level: Mapped[str | None] = mapped_column(String(500))
     expiry_date: Mapped[date | None] = mapped_column(Date)
     file_url: Mapped[str | None] = mapped_column(String(500))
 

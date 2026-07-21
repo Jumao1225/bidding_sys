@@ -159,8 +159,18 @@ class LLMService:
                 execution_time_ms=int((end_time - start_time) * 1000)
             )
             
+            # 清理可能的 Markdown JSON 代码块包装
+            clean_content = content.strip()
+            if clean_content.startswith("```json"):
+                clean_content = clean_content[7:]
+            elif clean_content.startswith("```"):
+                clean_content = clean_content[3:]
+            if clean_content.endswith("```"):
+                clean_content = clean_content[:-3]
+            clean_content = clean_content.strip()
+            
             # 解析 JSON
-            return json.loads(content)
+            return json.loads(clean_content)
         except json.JSONDecodeError as e:
             audit_service.log_event(action_type="llm_call", status="error", error_message=f"JSONDecodeError: {str(e)}")
             logger.error(f"大模型返回的不是合法 JSON: {str(e)}")
@@ -209,7 +219,7 @@ class LLMService:
         schema_dict = schema_cls.model_json_schema() if hasattr(schema_cls, "model_json_schema") else schema_cls.schema()
         schema_json = json.dumps(schema_dict, indent=2, ensure_ascii=False)
             
-        fallback_prompt = f"{prompt}\n\n【强制格式约束】\n必须返回严格符合以下 JSON Schema 的纯 JSON 格式：\n{schema_json}"
+        fallback_prompt = f"{prompt}\n\n【强制格式约束】\n必须返回严格符合以下 JSON Schema 的纯 JSON 格式：\n{schema_json}\n\n[极其重要]\n1. 只能输出纯 JSON 数据，绝对不要用 ```json 标签包裹！\n2. 确保所有的双引号、括号、逗号等符号完美匹配，不允许出现任何语法错误。"
         
         extracted_dict = self.generate_structured_json(fallback_prompt, temperature=temperature)
         if hasattr(schema_cls, "model_validate"):

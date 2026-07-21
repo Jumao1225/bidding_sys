@@ -56,6 +56,16 @@ class QualificationSchema(BaseModel):
         description="资质/业绩/人员方面的评分加分项（如：多提供1份业绩加2分）"
     )
 
+    # --- 6. 废标与无效投标条款 (Checklist) ---
+    invalid_bid_clauses: list[str] = Field(
+        default_factory=list,
+        description="针对单家公司的【无效投标/否决投标】情形（如：未按规定签字盖章、报价超限价、资质造假等程序性/实质性错误）"
+    )
+    project_annulment_clauses: list[str] = Field(
+        default_factory=list,
+        description="针对整个招标项目的【废标】情形（如：有效响应不足3家、采购任务取消等）"
+    )
+
     # --- CoT 推导过程 ---
     reasoning: Optional[str] = Field(None, description="CoT 推导过程（不落库）")
 
@@ -75,6 +85,9 @@ class QualificationService(BaseMetadataService):
 3. **结构化业绩要求**：针对历史业绩，提取核心数字。如“近3年”，则 `time_frame_years=3`；如“不少于500万”，则 `min_amount_wuyuan=500.0`。如果业绩要求中还写明了特定领域，填入 `keyword_or_domain`。必须保留 `description` 原文。
 4. **信用与准入**：提取任何关于“信用中国”、“失信被执行人”、“重大违法记录”、“注册资本金”相关的硬性门槛。
 5. **系统认证**：把 ISO、CMMI、特种安全许可证等放入 `system_certifications`。
+6. **废标与无效投标条款（程序性死刑）**：严格拆分并穷尽式提取：
+   - 寻找标书中关于“无效投标”、“否决投标”的条款（如未盖章、无授权书等针对单个投标人的致命错误），放入 `invalid_bid_clauses`。
+   - 寻找标书中关于“废标”或“重新招标”的条款（如不足3家等导致整个项目流产的情形），放入 `project_annulment_clauses`。
 
 请先在 `reasoning` 字段中简述你的推断过程，梳理各条件是属于“基本门槛”还是“加分项”，然后再严格按照 Schema 填充。
 如果上下文中没有任何关于某项的具体要求，对应字段置空或返回空列表。绝不可凭空捏造。

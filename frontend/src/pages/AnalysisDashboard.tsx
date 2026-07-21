@@ -14,6 +14,7 @@ export function AnalysisDashboard() {
   const [terminalMessages, setTerminalMessages] = useState<any[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [retryingDomain, setRetryingDomain] = useState<string | null>(null);
   
   const [result, setResult] = useState<any>(null);
 
@@ -70,6 +71,39 @@ export function AnalysisDashboard() {
     setIsAnalyzing(analyzing);
     if (analyzing) {
       setTerminalMessages([{ id: Date.now().toString(), type: 'info', content: '等待主控 Agent 调度...' }]);
+    }
+  };
+
+  const handleReextract = async (domain: string) => {
+    if (!id || id === 'new') return;
+    setRetryingDomain(domain);
+    setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'info', content: `正在重新提取专项领域: ${domain} ...` }]);
+    try {
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+      const res = await fetch(`${baseUrl}/api/v1/analysis/${id}/reextract/${domain}`, {
+        method: 'POST'
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (json.code === 200 && json.data) {
+          setResult((prev: any) => ({
+            ...prev,
+            metadata: {
+              ...(prev?.metadata || {}),
+              [domain]: json.data
+            }
+          }));
+          setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'success', content: `✅ ${domain} 领域重新提取成功！` }]);
+        } else {
+          setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: ${json.message}` }]);
+        }
+      } else {
+        setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: 网络错误` }]);
+      }
+    } catch (err) {
+      setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取发生异常` }]);
+    } finally {
+      setRetryingDomain(null);
     }
   };
 
@@ -144,16 +178,16 @@ export function AnalysisDashboard() {
       {/* 专项提取维度面板矩阵 - 5 大维度 Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
         {/* 新增的财务防线卡片 */}
-        <FinancialCard financial={fin} />
+        <FinancialCard financial={fin} onReextract={() => handleReextract('financial')} isRetrying={retryingDomain === 'financial'} />
         
         {/* 资质综合门槛卡片 */}
-        <QualificationCard qualification={qual} />
+        <QualificationCard qualification={qual} onReextract={() => handleReextract('qualification')} isRetrying={retryingDomain === 'qualification'} />
         
-        <TimelineCard timeline={tl} />
+        <TimelineCard timeline={tl} onReextract={() => handleReextract('timeline')} isRetrying={retryingDomain === 'timeline'} />
         
-        <EngineeringCard engineering={eng} />
+        <EngineeringCard engineering={eng} onReextract={() => handleReextract('engineering')} isRetrying={retryingDomain === 'engineering'} />
         
-        <EvaluationCard evaluation={ev} />
+        <EvaluationCard evaluation={ev} onReextract={() => handleReextract('evaluation')} isRetrying={retryingDomain === 'evaluation'} />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">

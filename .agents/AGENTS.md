@@ -26,7 +26,7 @@
 - **统一接口响应**：所有对外 API 的返回数据格式必须保持统一（例如标准化包含 `code`, `message`, `data` 等字段），并利用 FastAPI 提供完善的 OpenAPI 文档描述。
 - **异常处理**：禁止使用裸露的 `except:` 或 `except Exception:` 而不记录原始错误信息。需精确捕获异常，并统一交给全局异常处理器转换为标准的 HTTP 响应。
 - **代码结构与模块化**：保持低耦合与高内聚，路由层（Routers）、业务逻辑层（Services）和数据访问层（CRUD/Repositories）必须严格分离。
-- **改动记录 (Changelog)**：记录每次完成的代码改动，并按照当天的日期输出成一个 Markdown 文档（例如 `docs/changelog/YYYY-MM-DD.md`），以追踪项目修改历史。
+- **改动记录 (Changelog)**：记录每次完成的代码改动，并按照当天的日期输出成一个 Markdown 文档（例如根目录下的 `docs/changelog/YYYY-MM-DD.md`），以追踪项目修改历史。
 
 # 测试规范 (Testing Rules)
 - **测试目标与原则**：新增功能必写测试，测试代码必须与业务代码同步提交。严禁只交业务代码、删除旧用例或提交无法运行的死代码。

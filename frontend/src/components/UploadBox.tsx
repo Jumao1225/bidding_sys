@@ -162,15 +162,39 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     setStatusText("准备上传...");
     setResult(null);
 
-    // 模拟公司资质数据
-    const mockCompanyQuals = "本公司具有建筑工程施工总承包一级资质，注册资金5000万元，拥有 ISO9001 质量认证体系。";
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+
+    // 获取真实公司资质数据
+    let realCompanyQuals = "本公司具有建筑工程施工总承包一级资质，注册资金5000万元，拥有 ISO9001 质量认证体系。"; // 默认 fallback
+    try {
+      const qualRes = await fetch(`${baseUrl}/api/v1/qualifications/`, {
+        headers: { 'X-Tenant-ID': 'default-tenant' }
+      });
+      if (qualRes.ok) {
+        const qualJson = await qualRes.json();
+        if (qualJson.code === 200 && qualJson.data && qualJson.data.length > 0) {
+          const qualsStr = qualJson.data.map((q: any) => {
+            let s = q.name;
+            if (q.level && q.level !== '无') s += `(${q.level})`;
+            if (q.expiry_date) s += `[有效期至:${q.expiry_date}]`;
+            return s;
+          }).join("、");
+          realCompanyQuals = `本公司已具备以下资质证书：${qualsStr}。`;
+          const companyName = qualJson.data.find((q:any) => q.company_name)?.company_name;
+          if (companyName) {
+             realCompanyQuals = `公司名称：${companyName}。` + realCompanyQuals;
+          }
+        }
+      }
+    } catch (err) {
+      console.error("Failed to fetch qualifications", err);
+    }
 
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("company_quals", mockCompanyQuals);
+    formData.append("company_quals", realCompanyQuals);
 
     try {
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
       const response = await fetch(`${baseUrl}/api/v1/analysis/upload-and-analyze`, {
         method: "POST",
         body: formData,

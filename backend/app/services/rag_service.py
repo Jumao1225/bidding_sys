@@ -1,4 +1,5 @@
 import logging
+import typing
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.db.models.project import DocChunk
@@ -23,7 +24,7 @@ class RAGService:
         self,
         document_id: str,
         query: str,
-        section_title: str = None,
+        section_title: typing.Union[str, list] = None,
         top_k: int = 5,
         disable_expansion: bool = False,
         context_mode: str = "chapter",
@@ -69,9 +70,15 @@ class RAGService:
                 
                 # 构建基准数据库 Query Filter，支持按 section_title 条件限定
                 base_query = db.query(DocChunk).filter(DocChunk.document_id == document_id)
-                if section_title and isinstance(section_title, str) and section_title.strip():
-                    clean_sec = section_title.strip()
-                    base_query = base_query.filter(DocChunk.section_title.ilike(f"%{clean_sec}%"))
+                if section_title:
+                    if isinstance(section_title, str) and section_title.strip():
+                        clean_sec = section_title.strip()
+                        base_query = base_query.filter(DocChunk.section_title.ilike(f"%{clean_sec}%"))
+                    elif isinstance(section_title, list) and section_title:
+                        from sqlalchemy import or_
+                        conditions = [DocChunk.section_title.ilike(f"%{sec.strip()}%") for sec in section_title if sec.strip()]
+                        if conditions:
+                            base_query = base_query.filter(or_(*conditions))
 
                 # 3. 向量检索 (Vector Search)
                 import math

@@ -9,6 +9,13 @@ import glob
 
 from app.schemas.response.common import ResponseModel, success_response
 from app.worker.tasks import analyze_bidding_doc
+from app.agents.tools.metadata_tools import (
+    extract_qualification_info,
+    extract_financial_info,
+    extract_timeline_info,
+    extract_engineering_info,
+    extract_evaluation_info
+)
 
 router = APIRouter()
 
@@ -70,6 +77,44 @@ def get_db():
         yield db
     finally:
         db.close()
+
+@router.post("/{document_id}/reextract/{domain}", response_model=ResponseModel[dict])
+async def reextract_domain(document_id: str, domain: str, db: Session = Depends(get_db)):
+    """
+    针对特定的元数据领域（domain）进行重新提取，并返回最新结果。
+    """
+    domain_map = {
+        "qualification": extract_qualification_info,
+        "financial": extract_financial_info,
+        "timeline": extract_timeline_info,
+        "engineering": extract_engineering_info,
+        "evaluation": extract_evaluation_info
+    }
+    
+    if domain not in domain_map:
+        raise HTTPException(status_code=400, detail=f"未知的提取领域: {domain}")
+        
+    try:
+        from app.worker.tasks import emit_agent_log
+        from app.core.context import current_task_id
+        
+        # 为了让 emit_agent_log 生效（如果有建立SSE连接），借用 document_id 作为临时 task_id
+        token = current_task_id.set(document_id)
+        try:
+            tool_func = domain_map[domain]
+            # 调用工具提取（其内部已包含落盘逻辑）
+            res_str = tool_func.invoke({"document_id": document_id})
+            
+            import json
+            res_data = json.loads(res_str) if res_str and res_str.startswith("{") else {"error": res_str}
+            
+            return success_response(data=res_data, message=f"{domain} 领域重新提取成功")
+        finally:
+            current_task_id.reset(token)
+            
+    except Exception as e:
+        logger.exception(f"重新提取 {domain} 失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"重新提取失败: {str(e)}")
 
 @router.api_route("/download/{task_id}", methods=["GET", "HEAD"])
 async def download_original_file(task_id: str, db: Session = Depends(get_db)):

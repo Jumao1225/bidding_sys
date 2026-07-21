@@ -11,6 +11,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
   const isActive = (path: string) => {
     if (path === '/') return location.pathname === '/';
     if (path === '/analysis') return location.pathname.startsWith('/analysis');
+    if (path === '/qualifications') return location.pathname.startsWith('/qualifications');
     return false;
   };
 
@@ -66,12 +67,13 @@ export default function MainLayout({ children }: MainLayoutProps) {
 
           <p className="px-4 text-[10px] font-bold tracking-widest text-slate-500 mb-3 mt-6 uppercase">Resources</p>
 
-          <a href="#" className="flex items-center px-4 py-3 text-slate-400 hover:bg-white/5 hover:text-slate-200 rounded-xl font-medium transition-all group">
-            <svg className="w-5 h-5 mr-3 opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <Link to="/qualifications" className={getLinkClass('/qualifications')}>
+            {isActive('/qualifications') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+            <svg className={`w-5 h-5 mr-3 ${isActive('/qualifications') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
             </svg>
-            <span className="group-hover:translate-x-1 transition-transform duration-300">资质中心</span>
-          </a>
+            <span className={isActive('/qualifications') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>资质中心</span>
+          </Link>
         </nav>
 
         <div className="p-5 border-t border-white/5 mt-auto bg-black/10 relative z-10">

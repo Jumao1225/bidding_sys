@@ -61,6 +61,14 @@ if settings.BACKEND_CORS_ORIGINS:
 
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
+# 挂载本地上传文件目录
+import os
+from fastapi.staticfiles import StaticFiles
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # backend dir
+uploads_dir = os.path.join(base_dir, "uploads")
+os.makedirs(uploads_dir, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "version": "1.0.0"}

@@ -4,6 +4,7 @@ import MainLayout from './layouts/MainLayout';
 import { ChatPanel } from './components/ChatPanel';
 import { Home } from './pages/Home';
 import { AnalysisDashboard } from './pages/AnalysisDashboard';
+import { QualificationCenter } from './pages/QualificationCenter';
 
 function App() {
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -213,6 +214,7 @@ function App() {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/analysis/:id" element={<AnalysisDashboard />} />
+          <Route path="/qualifications" element={<QualificationCenter />} />
         </Routes>
       </MainLayout>
 

@@ -9,11 +9,13 @@ interface EvaluationProps {
     score_tree?: any[];
     hard_service_requirements?: Record<string, string>;
   };
+  onReextract?: () => void;
+  isRetrying?: boolean;
 }
 
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444', '#ec4899', '#06b6d4'];
 
-export function EvaluationCard({ evaluation = {} }: EvaluationProps) {
+export function EvaluationCard({ evaluation = {}, onReextract, isRetrying = false }: EvaluationProps) {
   const evaluation_method = evaluation.evaluation_method;
   const weight_distribution = evaluation.weight_distribution || {};
   const hard_service_requirements = evaluation.hard_service_requirements || {};
@@ -28,17 +30,33 @@ export function EvaluationCard({ evaluation = {} }: EvaluationProps) {
   const hasValidWeights = data.length > 0;
 
   return (
-    <div className="bg-white/80 backdrop-blur-sm p-6 rounded-3xl shadow-sm border border-purple-100 flex flex-col group hover:shadow-md transition-all h-[400px]">
-      <div className="flex items-center justify-between mb-4 shrink-0">
-        <div className="flex items-center gap-3">
-          <span className="p-2 bg-purple-100 text-purple-600 rounded-lg">⚖️</span>
-          <h3 className="text-slate-700 font-bold tracking-wide">评标权重与售后红线</h3>
+    <div className={`bg-white/80 backdrop-blur-sm p-6 rounded-3xl shadow-sm border border-purple-100 flex flex-col group hover:shadow-md transition-all h-[400px] relative ${isRetrying ? 'opacity-70 pointer-events-none' : ''}`}>
+      {isRetrying && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-white/40 backdrop-blur-[1px] rounded-3xl">
+          <svg className="animate-spin h-8 w-8 text-purple-500" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
         </div>
-        {evaluation_method && (
-          <span className="px-3 py-1 bg-purple-50 text-purple-700 text-xs font-bold rounded-full border border-purple-200">
-            {evaluation_method}
-          </span>
-        )}
+      )}
+      <div className="flex items-center justify-between mb-4 shrink-0">
+        <div className="flex items-center gap-3 flex-1">
+          <span className="p-2 bg-purple-100 text-purple-600 rounded-lg">⚖️</span>
+          <h3 className="text-slate-700 font-bold tracking-wide">评标权重与售后服务</h3>
+        </div>
+        <div className="flex items-center gap-2">
+          {evaluation_method && (
+            <span className="px-3 py-1 bg-purple-50 text-purple-700 text-xs font-bold rounded-full border border-purple-200">
+              {evaluation_method}
+            </span>
+          )}
+          {onReextract && (
+            <button 
+              onClick={(e) => { e.stopPropagation(); onReextract(); }}
+              className="p-1.5 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-md transition-colors"
+              title="重新提取该部分"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+            </button>
+          )}
+        </div>
       </div>
       
       <div className="flex flex-col md:flex-row gap-6 mt-2 flex-1 overflow-hidden">
@@ -100,7 +118,7 @@ export function EvaluationCard({ evaluation = {} }: EvaluationProps) {
 
         {/* 右侧：售后与硬性服务条款 */}
         <div className="w-full md:w-[45%] flex flex-col h-full overflow-hidden">
-          <h4 className="text-xs font-bold text-slate-400 mb-3 border-b border-slate-100 pb-2 uppercase tracking-wider">售后及硬性服务红线</h4>
+          <h4 className="text-xs font-bold text-slate-400 mb-3 border-b border-slate-100 pb-2 uppercase tracking-wider">售后服务</h4>
           
           <div className="overflow-y-auto custom-scrollbar pr-2 space-y-3 flex-1 pb-4">
             {Object.keys(hard_service_requirements).length > 0 ? (

@@ -1,5 +1,6 @@
 from langchain_core.tools import tool
 from app.services.rag_service import rag_service
+from app.services.routing_service import routing_service
 
 @tool
 def search_bidding_document(document_id: str, query: str) -> str:
@@ -14,8 +15,26 @@ def search_bidding_document(document_id: str, query: str) -> str:
       - query: 你想要查询的问题或关键词，请尽量描述得详细具体，以便向量检索更精准
     """
     try:
+        from app.worker.tasks import emit_agent_log
+        
+        # 动态意图路由拦截
+        emit_agent_log("info", f"ChatAgent 发起通用检索: '{query}'，正在启动 Routing 意图识别引擎进行导航...")
+        section_titles = routing_service.analyze_intent_and_route(document_id, query)
+        
+        if section_titles:
+            emit_agent_log("info", f"Routing 引擎锁定目标章节: {section_titles}")
+        else:
+            emit_agent_log("info", f"Routing 引擎判定该问题为全局性问题，降级为全量 RAG 搜索。")
+            
+        emit_agent_log("tool_call", f"调用工具: 正在执行底层 RAG 检索...")
+        
         # 直接调用 RAG 服务，返回最相关的拼接上下文给大模型阅读
-        context = rag_service.search_bidding_document(document_id=document_id, query=query, top_k=5)
+        context = rag_service.search_bidding_document(
+            document_id=document_id, 
+            query=query, 
+            section_title=section_titles, 
+            top_k=5
+        )
         
         if not context or "未检索到" in context:
             return f"未能针对关键词 '{query}' 检索到相关的原文段落，请尝试换一个说法重新搜索。"
