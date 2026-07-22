@@ -5,6 +5,7 @@ import { ChatPanel } from './components/ChatPanel';
 import { Home } from './pages/Home';
 import { AnalysisDashboard } from './pages/AnalysisDashboard';
 import { QualificationCenter } from './pages/QualificationCenter';
+import { PriceBookCenter } from './pages/PriceBookCenter';
 import { Login } from './pages/Login';
 import { SystemAdmin } from './pages/admin/SystemAdmin';
 import { ProtectedRoute } from './components/ProtectedRoute';
@@ -223,6 +224,7 @@ function App() {
                 <Route path="/" element={<Home />} />
                 <Route path="/analysis/:id" element={<AnalysisDashboard />} />
                 <Route path="/qualifications" element={<QualificationCenter />} />
+                <Route path="/price-book" element={<PriceBookCenter />} />
                 <Route path="/admin/*" element={
                   <AdminRoute>
                     <SystemAdmin />

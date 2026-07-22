@@ -14,6 +14,10 @@ from app.db.crud import user as crud_user
 reusable_oauth2 = OAuth2PasswordBearer(
     tokenUrl=f"{settings.API_V1_STR}/auth/login" if hasattr(settings, "API_V1_STR") else "/auth/login"
 )
+reusable_oauth2_optional = OAuth2PasswordBearer(
+    tokenUrl=f"{settings.API_V1_STR}/auth/login" if hasattr(settings, "API_V1_STR") else "/auth/login",
+    auto_error=False
+)
 
 def get_db() -> Generator:
     try:
@@ -21,6 +25,21 @@ def get_db() -> Generator:
         yield db
     finally:
         db.close()
+
+def get_current_user_optional(
+    db: Session = Depends(get_db), token: Optional[str] = Depends(reusable_oauth2_optional)
+) -> Optional[User]:
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+        )
+        token_data = TokenPayload(**payload)
+        return crud_user.user.get(db, id=token_data.sub)
+    except Exception:
+        return None
+
 
 def get_current_user(
     db: Session = Depends(get_db), token: str = Depends(reusable_oauth2)

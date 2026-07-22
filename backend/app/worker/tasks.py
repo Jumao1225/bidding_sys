@@ -29,20 +29,25 @@ def publish_progress(task_id: str, status: str, progress: int, result: dict = No
     # ensure_ascii=False：保证中文直接以 UTF-8 写入，禁止输出 \uXXXX 转义
     redis_client.publish(f"channel:{task_id}", json.dumps(message, ensure_ascii=False, default=json_serial))
 
-def emit_agent_log(log_type: str, content: str):
+def emit_agent_log(log_type: str, content: str, extra: dict = None):
     """
     流式推送 Agent 思考/动作日志到前端终端
     log_type: 'info' | 'tool_call' | 'success' | 'error'
     """
     task_id = current_task_id.get()
     if task_id:
+        agent_log_data = {
+            "type": log_type,
+            "content": content
+        }
+        if extra:
+            # 如果 extra 中包含了覆盖 type 的逻辑（如 supervisor_decision），优先使用 extra 中的 type
+            agent_log_data.update(extra)
+            
         message = {
             "status": "Agent 处理中...",
             "progress": 50,  # Maintain a static progress or let frontend ignore it
-            "agent_log": {
-                "type": log_type,
-                "content": content
-            }
+            "agent_log": agent_log_data
         }
         
         def json_serial(obj):
@@ -189,11 +194,12 @@ def analyze_bidding_doc(task_id: str, file_path: str, filename: str, company_qua
         if eval_md:
             metadata_dict["evaluation"] = {k: v for k, v in eval_md.__dict__.items() if not k.startswith('_')}
 
-        # 将 strategy agent 产出的策略分析数据统一写回数据库持久化，与其他数据共存
+        # 将 strategy agent 和 cost agent 产出的策略分析数据统一写回数据库持久化，与其他数据共存
         if doc_obj:
             current_meta = dict(doc_obj.parsed_metadata) if doc_obj.parsed_metadata else {}
             current_meta["qualifications_analysis"] = final_state.get("qualifications_analysis", {})
             current_meta["risks_analysis"] = final_state.get("risks_analysis", [])
+            current_meta["cost_analysis"] = final_state.get("cost_analysis", {})
             doc_obj.parsed_metadata = current_meta
             db.commit()
 

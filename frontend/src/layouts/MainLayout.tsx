@@ -14,6 +14,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (path === '/') return location.pathname === '/';
     if (path === '/analysis') return location.pathname.startsWith('/analysis');
     if (path === '/qualifications') return location.pathname.startsWith('/qualifications');
+    if (path === '/price-book') return location.pathname.startsWith('/price-book');
     if (path === '/admin') return location.pathname.startsWith('/admin');
     return false;
   };
@@ -61,12 +62,13 @@ export default function MainLayout({ children }: MainLayoutProps) {
             <span className={isActive('/analysis') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>智能解析</span>
           </Link>
           
-          <a href="#" onClick={(e) => { e.preventDefault(); alert('成本测算功能开发中，敬请期待！'); }} className="flex items-center px-4 py-3 text-slate-400 hover:bg-white/5 hover:text-slate-200 rounded-xl font-medium transition-all group">
-            <svg className="w-5 h-5 mr-3 opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <Link to="/price-book" className={getLinkClass('/price-book')}>
+            {isActive('/price-book') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+            <svg className={`w-5 h-5 mr-3 ${isActive('/price-book') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
-            <span className="group-hover:translate-x-1 transition-transform duration-300">成本测算</span>
-          </a>
+            <span className={isActive('/price-book') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>成本报价</span>
+          </Link>
 
           <p className="px-4 text-[10px] font-bold tracking-widest text-slate-500 mb-3 mt-6 uppercase">Resources</p>
 

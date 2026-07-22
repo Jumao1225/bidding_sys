@@ -6,6 +6,8 @@ import { CostTable } from '../components/CostTable';
 import { TimelineCard } from '../components/dashboard/TimelineCard';
 import { EngineeringCard } from '../components/dashboard/EngineeringCard';
 import { AgentTerminal } from '../components/dashboard/AgentTerminal';
+import { AgentOrchestrator } from '../components/dashboard/AgentOrchestrator';
+import type { WorkerStatus, SupervisorDecision } from '../components/dashboard/AgentOrchestrator';
 import { EvaluationCard } from '../components/dashboard/EvaluationCard';
 import { QualificationCard } from '../components/dashboard/QualificationCard';
 import { FinancialCard } from '../components/dashboard/FinancialCard';
@@ -19,22 +21,41 @@ export function AnalysisDashboard() {
   
   const [result, setResult] = useState<any>(null);
 
+  const initialWorkerStatuses: WorkerStatus[] = [
+    { name: 'master_agent', label: '元数据提取', status: 'waiting', retryCount: 0 },
+    { name: 'strategy_qual', label: '资质盘点', status: 'locked', retryCount: 0 },
+    { name: 'strategy_risk', label: '风险排查', status: 'locked', retryCount: 0 },
+    { name: 'cost_estimation', label: '成本核算', status: 'locked', retryCount: 0 },
+    { name: 'writer_agent', label: '标书起草', status: 'locked', retryCount: 0 },
+  ];
+  const [supervisorDecision, setSupervisorDecision] = useState<SupervisorDecision | undefined>(undefined);
+  const [workerStatuses, setWorkerStatuses] = useState<WorkerStatus[]>(initialWorkerStatuses);
+
   useEffect(() => {
-    if (id && id !== 'new') {
-      localStorage.setItem('bidding_document_id', id);
+    const targetDocId = (id && id !== 'new') ? id : localStorage.getItem('bidding_document_id');
+    if (targetDocId && targetDocId !== 'new') {
+      localStorage.setItem('bidding_document_id', targetDocId);
       window.dispatchEvent(new Event('bidding_document_changed'));
       
       const loadHistory = async () => {
         setIsLoadingHistory(true);
         try {
           const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-          const res = await apiFetch(`${baseUrl}/api/v1/documents/${id}/result`);
+          const res = await apiFetch(`${baseUrl}/api/v1/documents/${targetDocId}/result`);
           if (res.ok) {
             const json = await res.json();
             if (json.code === 200 && json.data) {
               setResult(json.data);
               setTerminalMessages([
-                { id: Date.now().toString(), type: 'success', content: '✅ 历史数据加载完毕。' }
+                { id: Date.now().toString(), type: 'success', content: '✅ 历史解析数据加载完毕。' }
+              ]);
+              // 为历史任务填充成功的 Worker 状态，以便显示调度大盘
+              setWorkerStatuses([
+                { name: 'master_agent', label: '元数据提取', status: 'success', retryCount: 0, summary: '已完成' },
+                { name: 'strategy_qual', label: '资质盘点', status: 'success', retryCount: 0, summary: '已完成' },
+                { name: 'strategy_risk', label: '风险排查', status: 'success', retryCount: 0, summary: '已完成' },
+                { name: 'cost_estimation', label: '成本核算', status: 'success', retryCount: 0, summary: '已完成' },
+                { name: 'writer_agent', label: '标书起草', status: 'success', retryCount: 0, summary: '已完成' },
               ]);
             }
           }
@@ -51,6 +72,7 @@ export function AnalysisDashboard() {
       loadHistory();
     }
   }, [id]);
+
 
   const handleTerminalMessage = (msg: any) => {
     setTerminalMessages(prev => [...prev, msg]);
@@ -71,42 +93,78 @@ export function AnalysisDashboard() {
   const handleAnalyzingChange = (analyzing: boolean) => {
     setIsAnalyzing(analyzing);
     if (analyzing) {
+      setWorkerStatuses(initialWorkerStatuses);
+      setSupervisorDecision(undefined);
       setTerminalMessages([{ id: Date.now().toString(), type: 'info', content: '等待主控 Agent 调度...' }]);
     }
   };
 
+  const handleSupervisorUpdate = (decision: any) => {
+    setSupervisorDecision(decision);
+    if (decision.nextWorker && decision.nextWorker !== 'FINISH') {
+      setWorkerStatuses(prev => prev.map(w => 
+        w.name === decision.nextWorker ? { ...w, status: 'waiting', retryCount: decision.retryCounts?.[w.name] || 0 } : w
+      ));
+    }
+  };
+
+  const handleWorkerStatusChange = (workerName: string, status: string, summary?: string) => {
+    setWorkerStatuses(prev => prev.map(w => 
+      w.name === workerName ? { ...w, status: status as any, summary: summary || w.summary } : w
+    ));
+  };
+
   const handleReextract = async (domain: string) => {
-    if (!id || id === 'new') return;
+    const targetDocId = (id && id !== 'new') ? id : (result?.document_id || localStorage.getItem('bidding_document_id'));
+    if (!targetDocId) {
+      setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: '❌ 重新提取失败: 未找到有效文档，请先上传并解析标书文件。' }]);
+      alert("未找到有效文档ID，请先上传并解析标书文件。");
+      return;
+    }
+
     setRetryingDomain(domain);
     setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'info', content: `正在重新提取专项领域: ${domain} ...` }]);
     try {
       const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-      const res = await apiFetch(`${baseUrl}/api/v1/analysis/${id}/reextract/${domain}`, {
+      const res = await apiFetch(`${baseUrl}/api/v1/analysis/${targetDocId}/reextract/${domain}`, {
         method: 'POST'
       });
       if (res.ok) {
         const json = await res.json();
-        if (json.code === 200 && json.data) {
-          setResult((prev: any) => ({
-            ...prev,
-            metadata: {
-              ...(prev?.metadata || {}),
-              [domain]: json.data
-            }
-          }));
-          setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'success', content: `✅ ${domain} 领域重新提取成功！` }]);
+        if (json.code === 200 && json.data && !json.data.error) {
+          if (domain === 'cost_estimation' || domain === 'cost') {
+            setResult((prev: any) => ({
+              ...prev,
+              cost_analysis: json.data
+            }));
+          } else {
+            setResult((prev: any) => ({
+              ...prev,
+              metadata: {
+                ...(prev?.metadata || {}),
+                [domain]: json.data
+              }
+            }));
+          }
+          const domainLabel = domain === 'cost_estimation' ? 'BOM 成本测算' : domain;
+          setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'success', content: `✅ ${domainLabel} 领域重新提取/计算成功！` }]);
         } else {
-          setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: ${json.message}` }]);
+          const errMsg = json.data?.error || json.message || '系统错误';
+          setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: ${errMsg}` }]);
         }
       } else {
-        setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: 网络错误` }]);
+        const json = await res.json().catch(() => ({ detail: `网络服务异常 (${res.status})` }));
+        const errMsg = json.detail || json.message || `网络服务异常 (${res.status})`;
+        setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: ${errMsg}` }]);
       }
-    } catch (err) {
-      setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取发生异常` }]);
+    } catch (err: any) {
+      console.error(`Re-extract ${domain} failed`, err);
+      setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取异常: ${err?.message || '服务器未响应'}` }]);
     } finally {
       setRetryingDomain(null);
     }
   };
+
 
   const tl = result?.metadata?.timeline || {};
   const eng = result?.metadata?.engineering || {};
@@ -140,6 +198,8 @@ export function AnalysisDashboard() {
         onAnalyzingChange={handleAnalyzingChange}
         initialResult={result}
         initialTaskId={id === 'new' ? null : id}
+        onSupervisorUpdate={handleSupervisorUpdate}
+        onWorkerStatusChange={handleWorkerStatusChange}
       />
       
       {isLoadingHistory && (
@@ -149,7 +209,24 @@ export function AnalysisDashboard() {
         </div>
       )}
       
-      <AgentTerminal isAnalyzing={isAnalyzing} messages={terminalMessages} />
+      <AgentOrchestrator 
+        isActive={isAnalyzing}
+        supervisorDecision={supervisorDecision}
+        workerStatuses={workerStatuses}
+      />
+      
+      <details className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-sm border border-slate-200 overflow-hidden group">
+        <summary className="px-6 py-4 font-bold text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors list-none flex justify-between items-center">
+          <div className="flex items-center gap-3">
+            <span className="text-slate-400">👨‍💻</span>
+            查看底层 Agent 详细交互日志
+          </div>
+          <span className="text-slate-400 group-open:rotate-180 transition-transform">▼</span>
+        </summary>
+        <div className="border-t border-slate-100">
+          <AgentTerminal isAnalyzing={isAnalyzing} messages={terminalMessages} />
+        </div>
+      </details>
         
       {/* KPI Cards */}
       <div className="grid grid-cols-2 gap-8">
@@ -192,7 +269,12 @@ export function AnalysisDashboard() {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-        <CostTable equipmentList={eng.main_equipment_list || []} />
+        <CostTable 
+          equipmentList={eng.main_equipment_list || []} 
+          costAnalysis={result?.cost_analysis || {}} 
+          onReextract={() => handleReextract('cost_estimation')}
+          isRetrying={retryingDomain === 'cost_estimation'}
+        />
       </div>
     </div>
   );

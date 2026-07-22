@@ -69,6 +69,7 @@ class LLMService:
                     api_key=settings.OPENAI_API_KEY,
                     base_url=settings.OPENAI_API_BASE if settings.OPENAI_API_BASE else None,
                     temperature=temperature,
+                    request_timeout=60.0,  # 显式配置 60 秒请求超时，防止网络卡死
                 )
                 if json_mode:
                     llm = llm.bind(response_format={"type": "json_object"})
@@ -138,8 +139,8 @@ class LLMService:
             raise ValueError("❌ 无法获取 LLM 实例")
             
         try:
-            # LangChain 调用
             import time
+            import re
             start_time = time.time()
             response = llm.invoke(prompt)
             end_time = time.time()
@@ -162,32 +163,35 @@ class LLMService:
                 execution_time_ms=int((end_time - start_time) * 1000)
             )
             
-            # 清理可能的 Markdown JSON 代码块包装
+            # 强化型 Markdown 代码块与前导/后置文本清洗
             clean_content = content.strip()
-            if clean_content.startswith("```json"):
-                clean_content = clean_content[7:]
-            elif clean_content.startswith("```"):
-                clean_content = clean_content[3:]
-            if clean_content.endswith("```"):
-                clean_content = clean_content[:-3]
-            clean_content = clean_content.strip()
+            # 1. 尝试使用正则匹配 ```json ... ``` 块
+            json_code_block_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", clean_content)
+            if json_code_block_match:
+                clean_content = json_code_block_match.group(1).strip()
+            else:
+                # 2. 兜底提取最外层的 { ... } 或 [ ... ]
+                json_obj_match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", clean_content)
+                if json_obj_match:
+                    clean_content = json_obj_match.group(1).strip()
             
             # 解析 JSON
             return json.loads(clean_content)
         except json.JSONDecodeError as e:
             audit_service.log_event(action_type="llm_call", status="error", error_message=f"JSONDecodeError: {str(e)}")
-            logger.error(f"大模型返回的不是合法 JSON: {str(e)}")
+            logger.error(f"❌ 大模型返回内容解析 JSON 失败: {str(e)}, 原始返回片段: {content[:300] if 'content' in locals() else 'None'}")
             raise ValueError(f"大模型返回内容解析 JSON 失败: {str(e)}")
         except Exception as e:
             audit_service.log_event(action_type="llm_call", status="error", error_message=str(e))
-            logger.error(f"LLM 调用失败: {str(e)}")
+            logger.error(f"❌ LLM 调用过程发生异常: {str(e)}")
             raise e
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
     def generate_structured_output(self, prompt: str, schema_cls: Type[BaseModel], temperature: float = 0.1) -> BaseModel:
         """
         利用大模型原生的 Structured Outputs 能力直接生成校验过的 Pydantic 对象。
-        如果当前模型(如某些兼容 API)不支持，则平滑降级到 json_mode 并手动反序列化。
+        如果当前模型(如某些兼容 API)不支持，则平滑降级到 json_mode 并手动反序列化，
+        并具备智能外层包装节点 (Root Key Unwrap) 解包能力。
         """
         if not self.is_configured:
             raise ValueError("❌ 无法进行大模型解析：尚未配置有效的 OPENAI_API_KEY")
@@ -225,10 +229,38 @@ class LLMService:
         fallback_prompt = f"{prompt}\n\n【强制格式约束】\n必须返回严格符合以下 JSON Schema 的纯 JSON 格式：\n{schema_json}\n\n[极其重要]\n1. 只能输出纯 JSON 数据，绝对不要用 ```json 标签包裹！\n2. 确保所有的双引号、括号、逗号等符号完美匹配，不允许出现任何语法错误。"
         
         extracted_dict = self.generate_structured_json(fallback_prompt, temperature=temperature)
-        if hasattr(schema_cls, "model_validate"):
-            return schema_cls.model_validate(extracted_dict)
-        else:
-            return schema_cls.parse_obj(extracted_dict)
+        
+        # 3. 智能根节点解包 (Auto-Unwrap Root Key) 机制
+        if isinstance(extracted_dict, dict):
+            expected_fields = set(schema_cls.model_fields.keys()) if hasattr(schema_cls, "model_fields") else set(schema_cls.__fields__.keys())
+            # 如果当前字典的顶层不包含 Schema 期望的字段，检查是否被大模型在最外层包装了一层 root key
+            if not any(field in extracted_dict for field in expected_fields):
+                # 检查常见的大模型包装 Key
+                candidates = [schema_cls.__name__, schema_cls.__name__.lower(), "data", "result", "output", "properties", "response"]
+                unwrapped = False
+                for cand in candidates:
+                    if cand in extracted_dict and isinstance(extracted_dict[cand], dict):
+                        logger.info(f"💡 检测到大模型外层包装 Key '{cand}'，正在自动解包...")
+                        extracted_dict = extracted_dict[cand]
+                        unwrapped = True
+                        break
+                # 如果没有匹配到常用名称，但顶层只有唯一的 1 个 Key 且值也是字典，自动解包该 Key
+                if not unwrapped and len(extracted_dict) == 1:
+                    single_val = list(extracted_dict.values())[0]
+                    if isinstance(single_val, dict):
+                        single_key = list(extracted_dict.keys())[0]
+                        logger.info(f"💡 自动解包唯一外层 Key '{single_key}'...")
+                        extracted_dict = single_val
+
+        # 4. 反序列化校验
+        try:
+            if hasattr(schema_cls, "model_validate"):
+                return schema_cls.model_validate(extracted_dict)
+            else:
+                return schema_cls.parse_obj(extracted_dict)
+        except Exception as val_err:
+            logger.error(f"❌ Pydantic Schema ({schema_cls.__name__}) 反序列化校验失败: {val_err}. 字典内容片段: {str(extracted_dict)[:300]}")
+            raise ValueError(f"大模型提取格式不匹配 Schema ({schema_cls.__name__}): {val_err}") from val_err
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
     def expand_query(self, query: str, num_variants: int = 3, temperature: float = 0.7) -> list[str]:

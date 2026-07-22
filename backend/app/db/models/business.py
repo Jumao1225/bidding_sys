@@ -17,5 +17,11 @@ class MarketPriceReference(TenantBase):
 
     item_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     category: Mapped[str | None] = mapped_column(String(100))
+    brand: Mapped[str | None] = mapped_column(String(100), comment="品牌")
+    spec: Mapped[str | None] = mapped_column(String(255), comment="规格")
+    model: Mapped[str | None] = mapped_column(String(100), comment="型号")
+    manufacturer: Mapped[str | None] = mapped_column(String(255), comment="生产厂商")
     unit_price: Mapped[float] = mapped_column(Float, nullable=False)
     unit: Mapped[str] = mapped_column(String(50), nullable=False)
+    remark: Mapped[str | None] = mapped_column(String(500), comment="备注")
+

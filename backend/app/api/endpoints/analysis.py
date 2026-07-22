@@ -102,36 +102,70 @@ async def reextract_domain(
         "evaluation": extract_evaluation_info
     }
     
-    if domain not in domain_map:
+    if domain not in domain_map and domain not in ("cost_estimation", "cost"):
         raise HTTPException(status_code=400, detail=f"未知的提取领域: {domain}")
         
     try:
         from app.db.crud.document import document_crud
+        from app.worker.tasks import emit_agent_log
+        from app.core.context import current_task_id, current_user_id, current_tenant_id
+        
         # 鉴权验证：确保文档属于当前用户
         doc = document_crud.get_document_by_id(db, document_id, current_user.id, current_user.tenant_id)
         if not doc:
             raise HTTPException(status_code=403, detail="无权访问该文档或文档不存在")
             
-        from app.worker.tasks import emit_agent_log
-        from app.core.context import current_task_id
+        # 为了让 emit_agent_log 生效，并满足安全鉴权，注入全链路上下文
+        token_task = current_task_id.set(document_id)
+        token_user = current_user_id.set(current_user.id)
+        token_tenant = current_tenant_id.set(current_user.tenant_id)
         
-        # 为了让 emit_agent_log 生效（如果有建立SSE连接），借用 document_id 作为临时 task_id
-        token = current_task_id.set(document_id)
         try:
+            if domain in ("cost_estimation", "cost"):
+                from sqlalchemy.orm.attributes import flag_modified
+                from app.agents.nodes.cost_agent import cost_node
+                
+                state = {
+                    "document_id": document_id,
+                    "user_id": current_user.id,
+                    "tenant_id": current_user.tenant_id
+                }
+                cost_result = cost_node(state)
+                cost_data = cost_result.get("cost_analysis", {})
+                
+                # 持久化更新至数据库 parsed_metadata
+                parsed_metadata = dict(doc.parsed_metadata or {})
+                parsed_metadata["cost_analysis"] = cost_data
+                doc.parsed_metadata = parsed_metadata
+                flag_modified(doc, "parsed_metadata")
+                db.commit()
+                
+                return success_response(data=cost_data, message="成本测算重新计算成功")
+            
             tool_func = domain_map[domain]
             # 调用工具提取（其内部已包含落盘逻辑）
             res_str = tool_func.invoke({"document_id": document_id})
             
             import json
-            res_data = json.loads(res_str) if res_str and res_str.startswith("{") else {"error": res_str}
-            
-            return success_response(data=res_data, message=f"{domain} 领域重新提取成功")
+            if res_str and res_str.startswith("{"):
+                res_data = json.loads(res_str)
+                if "error" in res_data:
+                    logger.error(f"重新提取 {domain} 失败: {res_data['error']}")
+                    raise HTTPException(status_code=500, detail=f"重新提取失败: {res_data['error']}")
+                return success_response(data=res_data, message=f"{domain} 领域重新提取成功")
+            else:
+                logger.error(f"重新提取 {domain} 失败或无权限: {res_str}")
+                raise HTTPException(status_code=500, detail=f"重新提取失败: {res_str}")
         finally:
-            current_task_id.reset(token)
+            current_task_id.reset(token_task)
+            current_user_id.reset(token_user)
+            current_tenant_id.reset(token_tenant)
             
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception(f"重新提取 {domain} 失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"重新提取失败: {str(e)}")
+        logger.exception(f"重新提取 {domain} 异常: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"重新提取异常: {str(e)}")
 
 @router.api_route("/download/{task_id}", methods=["GET", "HEAD"])
 async def download_original_file(

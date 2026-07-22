@@ -10,7 +10,7 @@ class EquipmentItem(BaseModel):
     specifications: Optional[str] = Field(None, description="规格型号或详细技术参数要求")
     quantity: Optional[float] = Field(None, description="数量（纯数字）")
     unit: Optional[str] = Field(None, description="单位（如：块、台、套、人月）")
-    brand_requirements: Optional[str] = Field(None, description="品牌或产地要求（如：'进口原装'、'指定华为/华三或同等及以上品牌'、'国产自主可控'）")
+    brand_requirements: Optional[str] = Field(None, description="品牌或产地要求（如：'进口原装'、'指定某品牌/某品牌或同等及以上品牌'、'国产自主可控'）")
     key_parameters: list[str] = Field(
         default_factory=list, 
         description="招标文件明确要求的核心技术指标/关键星号(*)参数"
@@ -23,7 +23,7 @@ class TechValidationRequirement(BaseModel):
     poc_demo_required: bool = Field(False, description="是否需要现场 POC 演示或软件系统功能答辩")
     test_report_requirements: list[str] = Field(
         default_factory=list, 
-        description="要求的第三方检测/测试报告明细（如：['须具备 CMA/CNAS 认证机构出具的抗震检测报告']）"
+        description="要求的第三方检测/测试报告明细（如：['须具备某种第三方认证机构出具的检测报告']）"
     )
 
 class EngineeringSchema(BaseModel):
@@ -36,7 +36,7 @@ class EngineeringSchema(BaseModel):
     # --- 2. 施工工况与技术实施难点 (检索工艺知识库) ---
     special_working_conditions: Optional[list[str]] = Field(
         default_factory=list, 
-        description="特殊/高难度施工/实施工况（如：['换瓦', '大跨度跨河布线', '不停机业务迁移', '夜间施工']）"
+        description="特殊/高难度施工/实施工况（如：['高空/跨区域布线', '不停机业务迁移', '夜间施工']）"
     )
     site_environment_constraints: Optional[str] = Field(
         None, 
@@ -78,10 +78,11 @@ class EngineeringService(BaseMetadataService):
 
 【提取指南】
 1. **主材配置与硬性技术指标（偏离表核心）**：核心设备的名称、规格、数量、品牌要求必须结构化提取。数量必须是纯数字。
+   - **关于 `specifications`（规格参数要求）**：**必须 100% 原汁原味完整摘录标书原文中的详细技术参数描述**（包含所有型号参数、物理指标、测试条件等），**绝对禁止**擅自删除、精简或用口语化文字进行模糊总结！
    - **关于 `key_parameters`**：请从原文中提炼具体的**技术参数指标**（如精确的厚度、材质要求、功率、吞吐量等具有明确物理/化学测量依据的约束），**绝对禁止**提取诸如“使用寿命长”、“防腐防水防火”、“风格协调”之类的假大空废话或主观描述！
    - **极度注意（防止断章取义）**：提取参数时，**必须将该指标生效的【前置条件/测试环境】一并提取**！例如，绝不能只提取“某指标≥某数值”，必须完整提取“在XXX温度、XXX压力、XXX测试条件约束下，该指标≥某数值”。必须将所有带 '*' 号的参数以及带有完整条件的明确技术门槛原汁原味地填入该数组。
 2. **特殊工况**：排查“现场踏勘”、“注意事项”。提取特殊的高成本/高风险工况（如“不停机业务迁移”、“夜间施工”）。
-3. **技术标准**：提取明确规定的“国家标准”、“行业标准”（如 GB 50174）。这决定了我们的编制依据。
+3. **技术标准**：提取明确规定的“国家标准”、“行业标准”。这决定了我们的编制依据。
 4. **技术验证与样品（死亡雷区）**：重点去《评标办法》或《投标人须知》中寻找“样品”、“检测报告”、“CMA”、“CNAS”、“现场演示(POC)”的字眼，这关乎是否废标。
 5. **安全与环保**：提取现场必须遵守的安全红线。
 

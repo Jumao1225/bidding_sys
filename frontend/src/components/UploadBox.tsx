@@ -12,6 +12,8 @@ export interface UploadBoxProps {
   onAnalyzingChange?: (isAnalyzing: boolean) => void;
   initialResult?: any;
   initialTaskId?: string | null;
+  onSupervisorUpdate?: (decision: any) => void;
+  onWorkerStatusChange?: (worker: string, status: string, summary?: string) => void;
 }
 
 // 高亮组件
@@ -83,7 +85,7 @@ const HighlightText = React.memo(({ text, resultData }: { text: string, resultDa
   );
 });
 
-export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingChange, initialResult = null, initialTaskId = null }: UploadBoxProps = {}) {
+export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingChange, initialResult = null, initialTaskId = null, onSupervisorUpdate, onWorkerStatusChange }: UploadBoxProps = {}) {
   const [isDragging, setIsDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [isAnalyzing, setIsAnalyzingInternal] = useState(false);
@@ -160,6 +162,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     if (!file) return;
 
     setIsAnalyzing(true);
+    if (onAnalyzingChange) onAnalyzingChange(true);
     setProgress(0);
     setStatusText("准备上传...");
     setResult(null);
@@ -218,11 +221,35 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
             if (msgData.status) setStatusText(msgData.status);
             if (msgData.progress) setProgress(msgData.progress);
             
-            if (msgData.agent_log && onTerminalMessage) {
-              onTerminalMessage({
-                id: Date.now().toString() + Math.random().toString(),
-                ...msgData.agent_log
-              });
+            if (msgData.agent_log) {
+              const log = msgData.agent_log;
+              if (onTerminalMessage) {
+                onTerminalMessage({
+                  id: Date.now().toString() + Math.random().toString(),
+                  ...log
+                });
+              }
+              
+              if (log.type === 'supervisor_decision' && onSupervisorUpdate) {
+                onSupervisorUpdate({
+                  currentDecision: log.reasoning,
+                  nextWorker: log.worker,
+                  completedSteps: log.completed_steps,
+                  retryCounts: log.retry_counts,
+                });
+              }
+              
+              if (log.type === 'worker_start' && onWorkerStatusChange) {
+                if (Array.isArray(log.worker)) {
+                  log.worker.forEach((w: string) => onWorkerStatusChange(w, 'running'));
+                } else {
+                  onWorkerStatusChange(log.worker, 'running');
+                }
+              }
+              
+              if (log.type === 'worker_complete' && onWorkerStatusChange) {
+                onWorkerStatusChange(log.worker, log.status === 'success' ? 'success' : 'failed', log.summary);
+              }
             }
             if (msgData.progress === 100) {
               if (msgData.result && !msgData.result.error) {
@@ -505,7 +532,10 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
 
               {activeTab === 'risk' && (
                 <div className="space-y-4 animate-fade-in">
-                  {result.risks_analysis?.map((risk: any, idx: number) => (
+                  {[...(result.risks_analysis || [])].sort((a: any, b: any) => {
+                    const order: Record<string, number> = { '高': 0, '中': 1, '低': 2 };
+                    return (order[a.severity] ?? 3) - (order[b.severity] ?? 3);
+                  }).map((risk: any, idx: number) => (
                     <div key={idx} className="p-5 rounded-xl border border-rose-100 bg-white shadow-sm hover:shadow-md transition-shadow relative overflow-hidden">
                       <div className={`absolute left-0 top-0 bottom-0 w-1 ${
                           risk.severity === '高' ? 'bg-rose-500' :

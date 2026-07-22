@@ -95,7 +95,7 @@ export function AgentTerminal({ isAnalyzing, messages }: AgentTerminalProps) {
         ) : (
           messages.map((msg, index) => (
             <div key={msg.id} className="animate-fade-in-up flex items-start gap-2.5 group">
-              {msg.type === 'info' && (
+              {(msg.type === 'info' || msg.type === 'supervisor_decision' || msg.type === 'worker_start') && (
                 <>
                   <ChevronRight size={15} className="text-blue-500 mt-0.5 shrink-0 opacity-70 group-hover:opacity-100 transition-opacity" />
                   <span className="text-slate-300 leading-relaxed">
@@ -111,7 +111,7 @@ export function AgentTerminal({ isAnalyzing, messages }: AgentTerminalProps) {
                   </span>
                 </>
               )}
-              {msg.type === 'success' && (
+              {(msg.type === 'success' || msg.type === 'worker_complete') && (
                 <>
                   <CheckCircle2 size={14} className="text-emerald-400 mt-0.5 shrink-0 drop-shadow-[0_0_3px_rgba(52,211,153,0.5)]" />
                   <span className="text-emerald-400/90 leading-relaxed">

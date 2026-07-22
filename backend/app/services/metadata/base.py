@@ -42,17 +42,24 @@ class BaseMetadataService:
         try:
             result_obj = llm_service.generate_structured_output(prompt=prompt, schema_cls=schema_cls, temperature=0.1)
         except Exception as e:
-            logger.error(f"结构化输出提取彻底失败: {e}")
-            raise ValueError(f"大模型提取失败: {e}")
+            logger.exception(f"❌ 结构化元数据提取彻底失败 ({schema_cls.__name__}): {e}")
+            raise ValueError(f"大模型提取失败: {e}") from e
         
-        # 自动落盘到 PostgreSQL
+        # 自动落盘到 PostgreSQL (防御性拦截)
         if self.db_model_cls and document_id:
-            self._save_to_db(document_id, result_obj)
+            try:
+                self._save_to_db(document_id, result_obj)
+            except Exception as db_err:
+                logger.warning(f"⚠️ 结构化数据提取成功，但落盘数据库失败 (文档ID: {document_id}): {db_err}")
             
         return result_obj
 
     def _save_to_db(self, document_id: str, pydantic_obj: BaseModel):
         """将提取的数据转存为 SQLAlchemy Model 并落盘。"""
+        if not document_id:
+            logger.warning(f"⚠️ 未指定 document_id，跳过 {self.db_model_cls.__name__} 自动落盘。")
+            return
+
         db: Session = SessionLocal()
         try:
             record = db.query(self.db_model_cls).filter(self.db_model_cls.document_id == document_id).first()
@@ -73,7 +80,8 @@ class BaseMetadataService:
                 from app.db.models.project import Document
                 doc = db.query(Document).filter(Document.id == document_id).first()
                 if not doc:
-                    raise ValueError(f"无法找到对应的文档记录以继承 tenant_id: {document_id}")
+                    logger.warning(f"⚠️ 数据库中无法找到对应的文档记录 (ID: {document_id}) 以继承 tenant_id，跳过持久化。")
+                    return
                     
                 record = self.db_model_cls(document_id=document_id, tenant_id=doc.tenant_id, **filtered_dict)
                 db.add(record)

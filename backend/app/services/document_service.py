@@ -54,6 +54,7 @@ class DocumentService:
             "extracted_text": doc_text,
             "qualifications_analysis": doc_obj.parsed_metadata.get("qualifications_analysis", {}) if doc_obj.parsed_metadata else {},
             "risks_analysis": doc_obj.parsed_metadata.get("risks_analysis", []) if doc_obj.parsed_metadata else [],
+            "cost_analysis": doc_obj.parsed_metadata.get("cost_analysis", {}) if doc_obj.parsed_metadata else {},
             "metadata": metadata_dict
         }
         

@@ -7,6 +7,7 @@ from app.db.session import SessionLocal
 from app.db.crud.document import document_crud
 from app.core.audit_decorator import audit_node
 
+
 @audit_node(name="MasterAgent")
 def master_agent_node(state: BiddingState) -> Dict[str, Any]:
     """
@@ -14,9 +15,12 @@ def master_agent_node(state: BiddingState) -> Dict[str, Any]:
     负责从 DB 拉取解析后的文本，利用大模型提取核心元数据（编号、限价、硬性资质、痛点等）。
     提取结果将落库到 Document.parsed_metadata，供下游 Worker 使用。
     """
-    logger.info("--- 启动 Master Agent ---")
+    from app.worker.tasks import emit_agent_log
+    logger.info("====== [Node] Master Agent Started ======")
     
+    task_id = state.get("task_id")
     document_id = state.get("document_id")
+    emit_agent_log("info", "启动元数据提取大脑...", extra={"type": "worker_start", "worker": "master_agent"})
     if not document_id:
         logger.error("State 中缺少 document_id，跳过 Master Agent")
         return {"status": "master_failed", "error": "Missing document_id"}
@@ -125,13 +129,23 @@ def master_agent_node(state: BiddingState) -> Dict[str, Any]:
 
         logger.info("Master Agent: 所有工具调用已结束，纯调度任务完成。")
         
+        summary = "成功提取5大元数据"
+        emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "master_agent", "status": "success", "summary": summary})
+
         return {
-            "status": "master_completed"
+            "status": "master_completed",
+            "completed_steps": ["master_agent"],
+            "worker_summaries": [{
+                "worker": "master_agent",
+                "status": "success",
+                "summary": summary
+            }]
         }
         
     except Exception as e:
         db.rollback()
         logger.exception("Master Agent 执行失败")
+        emit_agent_log("error", f"提取失败: {str(e)}", extra={"type": "worker_complete", "worker": "master_agent", "status": "failed", "summary": str(e)})
         return {"status": "master_failed", "error": str(e)}
     finally:
         db.close()
