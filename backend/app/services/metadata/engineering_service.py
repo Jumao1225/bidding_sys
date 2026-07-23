@@ -8,10 +8,10 @@ class EquipmentItem(BaseModel):
     """设备/软件/材料清单明细（支持生成技术偏离表）"""
     item_name: str = Field(..., description="设备/软件/材料名称")
     specifications: Optional[str] = Field(None, description="规格型号或详细技术参数要求")
-    quantity: Optional[float] = Field(None, description="数量（纯数字）")
-    unit: Optional[str] = Field(None, description="单位（如：块、台、套、人月）")
+    quantity: Optional[float] = Field(None, description="数量（纯数字）。若原文仅给出计价单位（如'平方米'）而未写明具体物理采购数量，必须输出 null！绝对禁止脑补填 1！")
+    unit: Optional[str] = Field(None, description="单位（如：平方米、块、台、套、人月）")
     brand_requirements: Optional[str] = Field(None, description="品牌或产地要求（如：'进口原装'、'指定某品牌/某品牌或同等及以上品牌'、'国产自主可控'）")
-    key_parameters: list[str] = Field(
+    key_parameters: Optional[list[str]] = Field(
         default_factory=list, 
         description="招标文件明确要求的核心技术指标/关键星号(*)参数"
     )
@@ -21,7 +21,7 @@ class TechValidationRequirement(BaseModel):
     sample_required: bool = Field(False, description="开标现场是否需要提供物理样品/样机")
     sample_description: Optional[str] = Field(None, description="样品/样机送达与封样要求")
     poc_demo_required: bool = Field(False, description="是否需要现场 POC 演示或软件系统功能答辩")
-    test_report_requirements: list[str] = Field(
+    test_report_requirements: Optional[list[str]] = Field(
         default_factory=list, 
         description="要求的第三方检测/测试报告明细（如：['须具备某种第三方认证机构出具的检测报告']）"
     )
@@ -75,10 +75,12 @@ class EngineeringService(BaseMetadataService):
 
 【零容忍数字幻觉（最高指令）】
 系统对参数极为严格，你提取的任何设备数量、技术指标必须在原文中有明确的出处。**绝对禁止**进行毫无根据的猜测、篡改或臆想。
+- **关于数量 `quantity`**：若标书原文中仅给出了计价单位（如“平方米”、“米”），但未标注具体物理采购数量，`quantity` 必须输出为 null，绝对禁止脑补填 1！
 
 【提取指南】
 1. **主材配置与硬性技术指标（偏离表核心）**：核心设备的名称、规格、数量、品牌要求必须结构化提取。数量必须是纯数字。
-   - **关于 `specifications`（规格参数要求）**：**必须 100% 原汁原味完整摘录标书原文中的详细技术参数描述**（包含所有型号参数、物理指标、测试条件等），**绝对禁止**擅自删除、精简或用口语化文字进行模糊总结！
+   - **关于 `specifications`（规格参数要求）**：**必须 100% 原汁原味完整摘录标书原文中的详细技术参数描述**（包含所有型号参数、材质、尺寸、物理/电气指标等）。
+   - **拒绝“详见XXX”废话（最高指令）**：若清单表格中写有“详见技术规格”、“详见项目需求”、“详见第五章”等引用说明，**绝不能直接把“详见XXX”当作规格参数！你必须从后文《技术规格书/项目需求》章节中找到该设备真实的详细规格与技术要求完整摘录填入！**
    - **关于 `key_parameters`**：请从原文中提炼具体的**技术参数指标**（如精确的厚度、材质要求、功率、吞吐量等具有明确物理/化学测量依据的约束），**绝对禁止**提取诸如“使用寿命长”、“防腐防水防火”、“风格协调”之类的假大空废话或主观描述！
    - **极度注意（防止断章取义）**：提取参数时，**必须将该指标生效的【前置条件/测试环境】一并提取**！例如，绝不能只提取“某指标≥某数值”，必须完整提取“在XXX温度、XXX压力、XXX测试条件约束下，该指标≥某数值”。必须将所有带 '*' 号的参数以及带有完整条件的明确技术门槛原汁原味地填入该数组。
 2. **特殊工况**：排查“现场踏勘”、“注意事项”。提取特殊的高成本/高风险工况（如“不停机业务迁移”、“夜间施工”）。

@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { useAuth } from '../contexts/AuthContext';
-import { apiFetch } from '../utils/api';
+import { apiFetch, getApiBaseUrl } from '../utils/api';
 
 export function Login() {
   const [email, setEmail] = useState('');
@@ -21,7 +21,7 @@ export function Login() {
     setLoading(true);
 
     try {
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+      const baseUrl = getApiBaseUrl();
       const formData = new URLSearchParams();
       formData.append('username', email); // OAuth2 规范要求字段名是 username
       formData.append('password', password);

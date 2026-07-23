@@ -4,7 +4,7 @@ import { motion } from 'framer-motion';
 import { QualificationCard, type Qualification } from '../components/qualifications/QualificationCard';
 import { QualificationUploadModal } from '../components/qualifications/QualificationUploadModal';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
 export function QualificationCenter() {
   const [qualifications, setQualifications] = useState<Qualification[]>([]);
@@ -18,7 +18,7 @@ export function QualificationCenter() {
   const fetchQualifications = async () => {
     setIsLoading(true);
     try {
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
       const res = await apiFetch(`${baseUrl}/api/v1/qualifications/`, {
         headers: { 'X-Tenant-ID': 'default-tenant' }
       });
@@ -42,7 +42,7 @@ export function QualificationCenter() {
   const handleDelete = async (id: string) => {
     if (!window.confirm('确认删除此资质文件？')) return;
     try {
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
       const res = await apiFetch(`${baseUrl}/api/v1/qualifications/${id}`, {
         method: 'DELETE',
         headers: { 'X-Tenant-ID': 'default-tenant' }
@@ -65,7 +65,7 @@ export function QualificationCenter() {
     if (!window.confirm(`确认删除选中的 ${selectedIds.size} 个资质文件吗？`)) return;
     
     try {
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
       // Implement batch deletion by calling individual DELETEs concurrently or a new batch endpoint
       // We'll use concurrent individual DELETEs for simplicity and avoiding new backend routes unless necessary
       const promises = Array.from(selectedIds).map(id => 

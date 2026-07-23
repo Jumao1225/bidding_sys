@@ -18,7 +18,7 @@ export function Home() {
   useEffect(() => {
     const fetchDocuments = async () => {
       try {
-        const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+        const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
         const res = await apiFetch(`${baseUrl}/api/v1/documents/`);
         if (res.ok) {
           const json = await res.json();
@@ -42,7 +42,7 @@ export function Home() {
     }
 
     try {
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
       const res = await apiFetch(`${baseUrl}/api/v1/documents/${docId}`, {
         method: 'DELETE'
       });
@@ -81,7 +81,7 @@ export function Home() {
             <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-teal-300">重塑投标分析工作流</span>
           </h2>
           <p className="text-lg text-slate-300/90 font-medium">
-            基于大模型驱动的审查引擎，三秒内完成数百页招标文件的资质拆解、成本测算与深层风险扫雷。
+            基于大模型驱动的审查引擎，高效完成数百页招标文件的资质拆解、成本测算与深层风险扫雷。
           </p>
         </div>
         

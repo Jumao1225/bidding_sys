@@ -167,10 +167,10 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     setStatusText("准备上传...");
     setResult(null);
 
-    const baseUrl = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || "";
 
-    // 获取真实公司资质数据
-    let realCompanyQuals = "本公司具有建筑工程施工总承包一级资质，注册资金5000万元，拥有 ISO9001 质量认证体系。"; // 默认 fallback
+    // 获取真实公司资质数据（无资质时保持为空，严禁使用虚假硬编码数据以防幻觉）
+    let realCompanyQuals = "";
     try {
       const qualRes = await apiFetch(`${baseUrl}/api/v1/qualifications/`, {
         headers: { 'X-Tenant-ID': 'default-tenant' }
@@ -312,7 +312,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     const fileType = actualFileName.split('.').pop() || "docx";
 
     return [{ 
-      uri: `${import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"}/api/v1/analysis/download/${taskId}`,
+      uri: `${import.meta.env.VITE_API_BASE_URL || ""}/api/v1/analysis/download/${taskId}`,
       fileName: actualFileName,
       fileType: fileType
     }];

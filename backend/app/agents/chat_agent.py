@@ -11,25 +11,34 @@ from app.services.rag_service import rag_service
 from app.services.audit_service import audit_service
 from app.core.context import current_task_id, current_node_name
 from app.agents.tools.metadata_tools import METADATA_TOOLS
+from app.agents.tools.writer_tools import WRITER_TOOLS
 from app.agents.tools.rag_tools import search_bidding_document
 
 class ChatAgent:
     """
     负责前台 ChatPanel 对话的 Agent。
-    集成 ReAct 机制，能够自主调用专项结构化提取工具或后备语义检索工具，
+    集成 ReAct 机制，能够自主调用专项结构化提取工具、公司资质中心 DB 工具或后备语义检索工具，
     提供带有引文标记与来源溯源 (Sources) 的流式回答。
     """
     
     def _build_chat_system_prompt(self, document_id: str) -> str:
         return f"""你是一位资深的工程招投标领域专家助手（ChatAgent），已接入当前招标文件数据库。
 【能力说明】
-你可以自主调用各种专项提取工具（如资质、财务、时限、工况、罚则等）来查询已被系统结构化提取的关键数据。
-如果专项工具查不到，你可以使用 search_bidding_document 工具在原文档中进行语义检索。
+1. 你可以自主调用各种专项提取工具（如资质、财务、时限、工况、罚则等）来查询已被系统结构化提取的关键数据。
+2. 你可以调用 `get_company_qualifications` 工具直接查询本公司在“资质中心”已上传解析的真实资质证书列表与有效期。
+3. 你可以调用 `get_cost_estimation_data` 工具查询我公司对该项目测算/核出的真实成本报价、设备 BOM 清单、指导单价与总价。
+4. 你可以调用 `fetch_chapter_clause_requirements` 工具检索招标文件中针对特定章节（如“投标函”、“售后服务”）的具体填写说明、注与约束要求。
+5. 如果专项工具查不到，你可以使用 search_bidding_document 工具在原文档中进行语义检索。
+
+【工具调用严格规范（绝不可混淆）】
+- **查询我公司资质/证书**：当用户询问【我公司/我们/资质中心】拥有什么资质证书、是否有《承装（修、试）电力设施许可证》、《安全生产许可证》或证书有效期时，你**必须首先且唯一调用 `get_company_qualifications` 工具**！绝对禁止使用 `search_bidding_document` 去检索甲方招标文件！
+- **查询我公司成本报价/BOM明细**：当用户询问【我公司/我们】项目的成本报价、参考单价、BOM设备清单与总金额时，你**必须首先且唯一调用 `get_cost_estimation_data` 工具**！绝对禁止使用 `search_bidding_document` 去检索甲方招标文件！
+- **检索招标文件门槛与空白格式**：只有当用户明确询问【招标文件/甲方/项目】要求什么资质门槛或空白表格格式时，才调用 `search_bidding_document` 或专项结构化提取工具去检索招标文件！
 
 【行为准则】
-1. 宁缺毋滥：所有回答必须有文档依据，不可凭空推断或编造数据。
+1. 宁缺毋滥：所有回答必须有文档或数据库依据，不可凭空推断或编造数据。
 2. 主动探索：遇到需要查询的数据，优先思考调用相应的提取工具获取。
-3. 应对质疑与纠错：当用户指出你之前回答错误，或指出某两个概念不同（如“A和B不是一个东西”）时，你**必须**调用 search_bidding_document 工具在原文中重新进行检索。**警告：你必须真正地触发系统级工具调用（发出 tool_call 指令），绝对不能仅仅在文本里骗用户说“我来检索原文”然后凭记忆胡编乱造！**
+3. 应对质疑与纠错：当用户指出你之前回答错误，或指出某两个概念不同（如“A和B不是一个东西”）时，你**必须**真正发出 tool_call 指令触发检索。
 4. 格式规范：使用 Markdown 格式输出，重要数据可加粗，复杂信息可用列表或表格。
 
 当前处理的文档ID: {document_id}。调用工具时请直接传入该ID。
@@ -64,7 +73,7 @@ class ChatAgent:
             f"ChatAgent 会话启动，任务ID: {chat_task_id}，文档ID: {document_id}，问题: {question[:50]}..."
         )
 
-        all_tools = METADATA_TOOLS + [search_bidding_document]
+        all_tools = METADATA_TOOLS + WRITER_TOOLS + [search_bidding_document]
         agent = create_react_agent(llm_service.raw_llm, all_tools)
 
         system_prompt = self._build_chat_system_prompt(document_id)

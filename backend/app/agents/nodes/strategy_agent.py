@@ -14,13 +14,31 @@ logger = logging.getLogger(__name__)
 def analyze_qualifications_node(state: BiddingState) -> dict:
     """
     将招标文件文本和公司已有资质发给大模型，进行三级评估。
+    自动查询资质中心 DB (CompanyQualification) 中的已上传证书并进行精确匹配。
     返回增量状态字典，用于更新 BiddingState。
     """
     company_quals = state.get("company_quals", "")
-    from app.worker.tasks import emit_agent_log
+    tenant_id = state.get("tenant_id") or "default-tenant"
     document_id = state.get("document_id")
     task_id = state.get("task_id")
+
+    from app.worker.tasks import emit_agent_log
+    from app.agents.tools.writer_tools import get_company_qualifications_tool
+
     emit_agent_log("info", "启动资质盘点专家...", extra={"type": "worker_start", "worker": "strategy_qual"})
+
+    # 动态查询资质中心数据库中的已解析证书
+    db_quals = get_company_qualifications_tool(tenant_id)
+    db_quals_summary = ""
+    if db_quals:
+        lines = []
+        for q in db_quals:
+            lines.append(f"- 证书/资质名称: {q['name']} | 等级/类别: {q['level']} | 持证公司: {q['company_name']} | 有效期: {q['expiry_date']}")
+        db_quals_summary = "【资质中心数据库记录 (来自于 CompanyQualification 表)】:\n" + "\n".join(lines)
+    else:
+        db_quals_summary = "【资质中心数据库暂无证书记录】"
+
+    company_quals_combined = f"{company_quals}\n\n{db_quals_summary}".strip()
     
     db: Session = SessionLocal()
     hard_quals_str = "无明确提取的硬性资质"
@@ -46,16 +64,16 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
         
     # [RAG 兜底] 全量章节拉取，防止 Master Agent 遗漏 (开启严格模式，关闭重写发散)
     rag_text = rag_service.search_bidding_document(
-        document_id, "投标人资格要求 资质 业绩 人员", top_k=3, disable_expansion=True
+        document_id, "投标人资格要求 资质 业绩 人员 许可证", top_k=3, disable_expansion=True
     )
     
     logger.info(f"--- Strategy Agent [履约盘点] ---")
     logger.info(f"Master Agent 提取的结构化资格要求: \n{hard_quals_str}")
-    logger.info(f"RAG 补充检索召回的原文章节长度: {len(rag_text)} 字符")
+    logger.info(f"资质中心 DB 匹配到 {len(db_quals)} 项已有证书")
     
     prompt = f"""
     你是一位资深的投标经理，需要从**投标方视角**全面盘点招标文件中的所有资格、资质、业绩和人员要求。
-    请结合总控智能体已经提取的结构化要求，以及检索到的原文片段，基于“我公司客观条件”进行全面、客观的能力评估。
+    请结合总控智能体已经提取的结构化要求，以及检索到的原文片段，基于“我公司客观条件与资质中心数据库记录”进行全面、客观的能力评估。
     
     【已提取的结构化资格要求】:
     {hard_quals_str}
@@ -63,21 +81,21 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
     【补充检索的原文章节 (可能包含遗漏的资格要求)】:
     {rag_text}
     
-    【我公司客观条件】:
-    {company_quals}
+    【我公司客观条件与资质中心数据库记录】:
+    {company_quals_combined}
     
-    【任务要求】:
-    1. **全面盘点**：请结合【已提取的结构化资格要求】和【补充检索的原文章节】，提取并盘点**所有的**投标人资格要求（包括但不限于：企业基本资质、体系认证、特定行业资质证书、财务要求、历史同类业绩要求、核心人员（项目经理等）资格要求等）。
-    2. **绝不遗漏**：绝对不能仅仅局限于已提取的结构化要求！如果【补充检索的原文章节】中存在任何其他的资格、资质或人员门槛，必须一并独立提取并纳入盘点。
-    3. 必须基于【我公司客观条件】进行比对，不要凭空捏造我公司的能力。如果我方资料中完全没有提到某项要求，请将其判定为"做不到"或"努力可做到"，并在理由中明确指出我方资料缺失。
+    【任务要求与资质比对规则】:
+    1. **全面盘点**：请结合【已提取的结构化资格要求】和【补充检索的原文章节】，提取并盘点**所有的**投标人资格要求（包括但不限于：企业基本资质、体系认证、特定行业资质许可证如《承装（修、试）电力设施许可证》、《安全生产许可证》、财务要求、同类业绩要求、核心人员等）。
+    2. **精确资质对比（极其重要）**：必须死死盯住【资质中心数据库记录】中的所有证书清单！只要资质中心库中包含相符或覆盖的证书（例如已有《承装（修、试）电力设施许可证》、《安全生产许可证》等），请判定状态为 "可以做到"，并在 reason 中写明我公司具备的具体证书名称和等级！绝对禁止视而不见而误判为 "资质中心未查到" 或 "缺失"！
+    3. 如果资质中心库与我方资料中确实完全没有提到某项要求，才将其判定为 "做不到" 或 "努力可做到"，并在理由中明确指出缺少该证书。
     
     请输出 JSON 格式，包含:
     - match_score: 整体匹配度评估分 (0-100)
     - items: 数组，包含每个要求的评估：
-      - requirement: 招标要求简述（如“必须具备有效的营业执照”、“项目经理需具备一级建造师证书”、“具有类似项目业绩”等）
+      - requirement: 招标要求简述（如“必须具备有效的营业执照”、“承装（修、试）电力设施许可证三级及以上”、“具有类似项目业绩”等）
       - exact_quote: 从原文中提取的**一字不差**的原句（必须完全匹配原文的子串，用于前端锚点高亮展示）
       - status: 必须是以下三种之一："可以做到", "努力可做到", "做不到"
-      - reason: 评估原因或行动建议
+      - reason: 评估原因或行动建议（如"我公司资质中心已具备《承装（修、试）电力设施许可证》三级，满足要求。"）
     """
     
     res = llm_service.generate_structured_json(prompt, temperature=0.0)

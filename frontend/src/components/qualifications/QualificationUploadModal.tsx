@@ -59,7 +59,7 @@ export function QualificationUploadModal({ isOpen, onClose, onSuccess, editData 
     const formData = new FormData();
     formData.append('file', file);
     
-    const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
     
     try {
       const res = await apiFetch(`${baseUrl}/api/v1/qualifications/upload`, {
@@ -99,7 +99,7 @@ export function QualificationUploadModal({ isOpen, onClose, onSuccess, editData 
     
     // 如果是处于编辑现有记录的模式，才调用后端删除接口
     if (editData) {
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
       try {
         if (qualId) {
           await apiFetch(`${baseUrl}/api/v1/qualifications/${qualId}`, {
@@ -127,7 +127,7 @@ export function QualificationUploadModal({ isOpen, onClose, onSuccess, editData 
   const handleSaveAll = async () => {
     if (!parsedDataList) return;
     
-    const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
     
     try {
       if (editData) {

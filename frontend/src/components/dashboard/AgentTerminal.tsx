@@ -1,13 +1,14 @@
 import React, { useEffect, useRef } from 'react';
 import { Terminal, Settings, CheckCircle2, XCircle, ChevronRight, Activity } from 'lucide-react';
 
-interface TerminalMessage {
+export interface TerminalMessage {
   id: string;
-  type: 'info' | 'tool_call' | 'success' | 'error';
+  type: 'info' | 'tool_call' | 'success' | 'error' | 'supervisor_decision' | 'worker_start' | 'worker_complete' | 'chapter_execution' | 'planner_tasks' | string;
   content: string;
+  extra?: Record<string, any>;
 }
 
-interface AgentTerminalProps {
+export interface AgentTerminalProps {
   isAnalyzing: boolean;
   messages: TerminalMessage[];
 }
@@ -55,7 +56,7 @@ export function AgentTerminal({ isAnalyzing, messages }: AgentTerminalProps) {
   }, [messages]);
 
   return (
-    <div className="bg-[#0b1121] rounded-2xl overflow-hidden shadow-2xl shadow-blue-900/20 border border-slate-700/60 font-mono flex flex-col transition-all h-[350px] relative">
+    <div className="bg-[#0b1121] rounded-2xl overflow-hidden shadow-2xl shadow-blue-900/20 border border-slate-700/60 font-mono flex flex-col transition-all min-h-[140px] max-h-[360px] relative">
       {/* 扫光效果 */}
       <div className="absolute inset-0 overflow-hidden pointer-events-none rounded-2xl z-0">
         {isAnalyzing && (
@@ -95,18 +96,10 @@ export function AgentTerminal({ isAnalyzing, messages }: AgentTerminalProps) {
         ) : (
           messages.map((msg, index) => (
             <div key={msg.id} className="animate-fade-in-up flex items-start gap-2.5 group">
-              {(msg.type === 'info' || msg.type === 'supervisor_decision' || msg.type === 'worker_start') && (
-                <>
-                  <ChevronRight size={15} className="text-blue-500 mt-0.5 shrink-0 opacity-70 group-hover:opacity-100 transition-opacity" />
-                  <span className="text-slate-300 leading-relaxed">
-                    <HighlightedText text={msg.content} />
-                  </span>
-                </>
-              )}
               {msg.type === 'tool_call' && (
                 <>
                   <Settings size={14} className="text-amber-400 mt-0.5 shrink-0 animate-[spin_4s_linear_infinite] opacity-90" />
-                  <span className="text-amber-200/90 font-medium leading-relaxed">
+                  <span className="text-amber-200/90 font-medium leading-relaxed break-all">
                     <HighlightedText text={msg.content} />
                   </span>
                 </>
@@ -114,7 +107,7 @@ export function AgentTerminal({ isAnalyzing, messages }: AgentTerminalProps) {
               {(msg.type === 'success' || msg.type === 'worker_complete') && (
                 <>
                   <CheckCircle2 size={14} className="text-emerald-400 mt-0.5 shrink-0 drop-shadow-[0_0_3px_rgba(52,211,153,0.5)]" />
-                  <span className="text-emerald-400/90 leading-relaxed">
+                  <span className="text-emerald-400/90 leading-relaxed break-all">
                     <HighlightedText text={msg.content} />
                   </span>
                 </>
@@ -122,7 +115,16 @@ export function AgentTerminal({ isAnalyzing, messages }: AgentTerminalProps) {
               {msg.type === 'error' && (
                 <>
                   <XCircle size={14} className="text-rose-400 mt-0.5 shrink-0 drop-shadow-[0_0_3px_rgba(244,63,94,0.5)]" />
-                  <span className="text-rose-400/90 leading-relaxed">
+                  <span className="text-rose-400/90 leading-relaxed break-all">
+                    <HighlightedText text={msg.content} />
+                  </span>
+                </>
+              )}
+              {/* 所有其他/默认信息类型全量安全渲染 */}
+              {!['tool_call', 'success', 'worker_complete', 'error'].includes(msg.type) && (
+                <>
+                  <ChevronRight size={15} className="text-blue-400 mt-0.5 shrink-0 opacity-80 group-hover:opacity-100 transition-opacity" />
+                  <span className="text-slate-300 leading-relaxed break-all">
                     <HighlightedText text={msg.content} />
                   </span>
                 </>

@@ -6,19 +6,19 @@ from app.db.models.metadata import QualificationMetadata
 
 class PersonnelRequirement(BaseModel):
     """核心人员资格要求"""
-    role: str = Field(..., description="岗位名称，如：项目经理、技术负责人、安全员")
-    cert_name: str = Field(..., description="证书名称及等级，如：一级建造师（电子与智能化）、PMP")
-    count: int = Field(1, description="要求人数")
-    is_mandatory: bool = Field(True, description="是否为硬性门槛（True为废标项，False为加分项）")
+    role: Optional[str] = Field("通用岗位", description="岗位名称，如：项目经理、技术负责人、安全员")
+    cert_name: Optional[str] = Field("无特定证书要求", description="证书名称及等级，如：一级建造师（电子与智能化）、PMP")
+    count: Optional[int] = Field(1, description="要求人数")
+    is_mandatory: Optional[bool] = Field(True, description="是否为硬性门槛（True为废标项，False为加分项）")
     other_requirements: Optional[str] = Field(None, description="其他要求（如：具备5年以上同类项目经验、提供近6个月社保证明）")
 
 class PerformanceRequirement(BaseModel):
     """历史业绩结构化门槛（方便 Agent 按照条件检索业绩库）"""
     time_frame_years: Optional[int] = Field(None, description="年限要求（如近3年，填入纯数字 3）")
     min_amount_wuyuan: Optional[float] = Field(None, description="单项合同最低金额门槛（单位：万元，如 500.0）")
-    required_count: int = Field(1, description="要求的同类业绩最少数量（如 2 个）")
+    required_count: Optional[int] = Field(1, description="要求的同类业绩最少数量（如 2 个）")
     keyword_or_domain: Optional[str] = Field(None, description="业绩领域/关键字（如：智慧园区、法务 RAG、数据中台）")
-    description: str = Field(..., description="业绩要求完整原文说明")
+    description: Optional[str] = Field("", description="业绩要求完整原文说明")
 
 class QualificationSchema(BaseModel):
     # --- 1. 基础准入与信用合规（一票否决项）---

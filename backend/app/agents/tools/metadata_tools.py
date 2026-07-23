@@ -97,7 +97,7 @@ def extract_timeline_info(document_id: str, search_keywords: str = "项目编号
     return _extract_and_format(timeline_service, document_id, search_keywords, section_title)
 
 @tool
-def extract_engineering_info(document_id: str, search_keywords: str = "主要设备 规格参数 特殊工况 现场施工难点 注意事项", section_title: str = None) -> str:
+def extract_engineering_info(document_id: str, search_keywords: str = "主要设备 规格参数 货物需求表 技术规格书 材质尺寸 参数要求 特殊工况 现场施工难点 注意事项", section_title: str = None) -> str:
     """
     【技术工况提取工具】
     当你需要分析工程量清单中的核心设备数量，或排查现场施工是否具有特殊高危工况（如跨河、带电、高空）时，调用此工具。

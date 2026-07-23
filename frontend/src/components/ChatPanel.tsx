@@ -178,7 +178,27 @@ function ThoughtProcessBlock({ toolCalls, inlineJson, thinkBlocks, isStreaming }
 
 // ==================== 主组件 ====================
 
-export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClose }: ChatPanelProps) {
+export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFullscreen, onClose }: ChatPanelProps) {
+  // 维护内部有效的 documentId，优先使用 prop 传入的 documentId，若无则尝试从 localStorage 获取
+  const [activeDocId, setActiveDocId] = useState<string | null>(
+    () => propDocumentId || localStorage.getItem('bidding_document_id')
+  );
+
+  // 监听 prop 变化以及全局 bidding_document_changed 自定义事件
+  useEffect(() => {
+    const handleDocChange = () => {
+      const current = propDocumentId || localStorage.getItem('bidding_document_id');
+      setActiveDocId(current);
+    };
+
+    handleDocChange();
+
+    window.addEventListener('bidding_document_changed', handleDocChange);
+    return () => {
+      window.removeEventListener('bidding_document_changed', handleDocChange);
+    };
+  }, [propDocumentId]);
+
   const getDefaultGreeting = (hasDoc: boolean): Message => ({
     role: 'ai',
     content: hasDoc
@@ -187,15 +207,15 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
   });
 
   const [messages, setMessages] = useState<Message[]>(() => {
-    if (documentId) {
-      const saved = localStorage.getItem(`chat_history_${documentId}`);
+    if (activeDocId) {
+      const saved = localStorage.getItem(`chat_history_${activeDocId}`);
       if (saved) {
         try {
           return JSON.parse(saved);
         } catch (e) {}
       }
     }
-    return [getDefaultGreeting(!!documentId)];
+    return [getDefaultGreeting(!!activeDocId)];
   });
   const [input, setInput] = useState('');
   /** true: 正在流式接收 AI 回复，此时禁止再次发送 */
@@ -216,10 +236,10 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
     }
   }, []);
 
-  // 当 documentId 变化时，重新加载对应的历史记录
+  // 当 activeDocId 变化时，重新加载对应的历史记录
   useEffect(() => {
-    if (documentId) {
-      const saved = localStorage.getItem(`chat_history_${documentId}`);
+    if (activeDocId) {
+      const saved = localStorage.getItem(`chat_history_${activeDocId}`);
       if (saved) {
         try {
           setMessages(JSON.parse(saved));
@@ -227,19 +247,19 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
         } catch (e) {}
       }
     }
-    setMessages([getDefaultGreeting(!!documentId)]);
-  }, [documentId]);
+    setMessages([getDefaultGreeting(!!activeDocId)]);
+  }, [activeDocId]);
 
   // 同步 messages 到 localStorage（过滤掉 isStreaming 状态）
   useEffect(() => {
-    if (documentId) {
+    if (activeDocId) {
       // 只有在非流式传输中，且有实际对话（超过1条）时才保存
       if (!isStreaming && messages.length > 0) {
         const toSave = messages.map(m => ({ ...m, isStreaming: false }));
-        localStorage.setItem(`chat_history_${documentId}`, JSON.stringify(toSave));
+        localStorage.setItem(`chat_history_${activeDocId}`, JSON.stringify(toSave));
       }
     }
-  }, [messages, documentId, isStreaming]);
+  }, [messages, activeDocId, isStreaming]);
 
   useEffect(() => {
     scrollToBottom();
@@ -252,7 +272,7 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
     if (!trimmedInput || isStreaming) return;
 
     // 检查 document_id
-    if (!documentId) {
+    if (!activeDocId) {
       setMessages(prev => [
         ...prev,
         { role: 'user', content: trimmedInput },
@@ -282,7 +302,7 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
     const history = messages.map(m => ({ role: m.role, content: m.content }));
 
     // 发起 SSE 流式请求
-    const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
     abortControllerRef.current = new AbortController();
 
     try {
@@ -290,7 +310,7 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          document_id: documentId,
+          document_id: activeDocId,
           question: trimmedInput,
           history,
         }),
@@ -423,7 +443,7 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
       // 聚焦回输入框
       setTimeout(() => inputRef.current?.focus(), 100);
     }
-  }, [input, isStreaming, documentId, messages]);
+  }, [input, isStreaming, activeDocId, messages]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -458,19 +478,19 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
             </div>
             <div
               className={`absolute bottom-0 right-0 w-3 h-3 border-2 border-white rounded-full transition-colors ${
-                documentId ? 'bg-green-400' : 'bg-amber-400'
+                activeDocId ? 'bg-green-400' : 'bg-amber-400'
               }`}
             />
           </div>
           <div className="flex-1 min-w-0">
             <h3 className="text-base font-extrabold text-slate-800">Copilot 助手</h3>
             <p className="text-xs text-slate-500 font-medium truncate">
-              {documentId ? '✅ 文档已加载，RAG 检索就绪' : '⚠️ 请先上传招标文件'}
+              {activeDocId ? '✅ 文档已加载，RAG 检索就绪' : '⚠️ 请先上传招标文件'}
             </p>
           </div>
           {/* 快捷按钮与操作区 */}
           <div className="flex items-center gap-2">
-            {documentId && (
+            {activeDocId && (
               <button
                 onClick={() => setInput('最高投标限价是多少？')}
                 className="text-xs bg-indigo-50 text-indigo-600 px-2 py-1.5 rounded-lg hover:bg-indigo-100 transition-colors font-medium whitespace-nowrap"
@@ -600,13 +620,13 @@ export function ChatPanel({ documentId, isFullscreen, onToggleFullscreen, onClos
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={documentId ? '询问标书细节... (Enter 发送)' : '请先上传招标文件...'}
+              placeholder={activeDocId ? '询问标书细节... (Enter 发送)' : '请先上传招标文件...'}
               disabled={isStreaming}
               className="w-full pl-4 pr-14 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:bg-white transition-all shadow-inner font-medium text-slate-700 disabled:opacity-60 disabled:cursor-not-allowed text-sm"
             />
             <button
               onClick={handleSend}
-              disabled={!input.trim() || isStreaming || !documentId}
+              disabled={!input.trim() || isStreaming || !activeDocId}
               className="absolute right-2 top-1/2 -translate-y-1/2 bg-blue-600 disabled:bg-slate-300 hover:bg-blue-700 text-white p-2.5 rounded-xl transition-all shadow-md active:scale-95 disabled:cursor-not-allowed"
             >
               {isStreaming ? (

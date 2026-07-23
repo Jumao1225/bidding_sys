@@ -7,12 +7,12 @@ from app.db.models.metadata import EvaluationMetadata
 class ScoreDetail(BaseModel):
     """动态评分项（递归或列表结构，适配任意评分表）"""
     item_code: Optional[str] = Field(None, description="评分项编号或序号，如 '1.1'、'技术三'")
-    category: str = Field(..., description="一级评分分类，如：商务分/技术分/价格分/资信分/服务分")
+    category: Optional[str] = Field("通用分", description="一级评分分类，如：商务分/技术分/价格分/资信分/服务分")
     sub_category: Optional[str] = Field(None, description="二级子项，如：团队人员配置、项目实施方案、同类业绩")
-    title: str = Field(..., description="评分项名称")
+    title: Optional[str] = Field("评分细则", description="评分项名称")
     max_score: Optional[float] = Field(None, description="本项最高分值")
     
-    scoring_criteria: str = Field(..., description="完整评分标准原文")
+    scoring_criteria: Optional[str] = Field("", description="完整评分标准原文")
     scoring_type: Optional[str] = Field(None, description="评分类型：加分项(bonus) / 扣分项(deduction) / 阶梯打分(ladder) / 专家打分(subjective)")
     
     rules_summary: Optional[list[str]] = Field(
@@ -21,15 +21,15 @@ class ScoreDetail(BaseModel):
     )
 
 class EvaluationSchema(BaseModel):
-    evaluation_method: str = Field("综合评分法", description="评标方法（如：综合评分法、最低投标价法、双信封法）")
-    total_score: float = Field(100.0, description="总分，通常为 100 (必须是纯数字)")
+    evaluation_method: Optional[str] = Field("综合评分法", description="评标方法（如：综合评分法、最低投标价法、双信封法）")
+    total_score: Optional[float] = Field(100.0, description="总分，通常为 100 (必须是纯数字)")
     
-    weight_distribution: dict[str, float] = Field(
+    weight_distribution: Optional[dict[str, float]] = Field(
         default_factory=dict, 
         description="各评分维度及其对应的权重分值 (值必须是纯数字，不要带'分'或'%'等单位)"
     )
 
-    score_tree: list[ScoreDetail] = Field(
+    score_tree: Optional[list[ScoreDetail]] = Field(
         default_factory=list, 
         description="提取出的所有评分细则明细列表"
     )
@@ -60,6 +60,16 @@ class EvaluationService(BaseMetadataService):
 请务必先在 `reasoning` 字段中写下你通盘梳理整个评分体系的逻辑脉络，然后再输出结构化 JSON。
 如果不包含某项内容，对应字段置空或返回空列表。绝不可主观推断或编造原文不存在的计分项。
 """
-        return self.extract(context, EvaluationSchema, system_prompt, document_id)
+        res = self.extract(context, EvaluationSchema, system_prompt, document_id)
+        if res:
+            if not res.evaluation_method:
+                res.evaluation_method = "综合评分法"
+            if not res.total_score:
+                res.total_score = 100.0
+            if res.weight_distribution is None:
+                res.weight_distribution = {}
+            if res.score_tree is None:
+                res.score_tree = []
+        return res
 
 evaluation_service = EvaluationService()

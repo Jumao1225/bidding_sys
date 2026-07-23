@@ -5,12 +5,12 @@ import { UploadBox } from '../components/UploadBox';
 import { CostTable } from '../components/CostTable';
 import { TimelineCard } from '../components/dashboard/TimelineCard';
 import { EngineeringCard } from '../components/dashboard/EngineeringCard';
-import { AgentTerminal } from '../components/dashboard/AgentTerminal';
 import { AgentOrchestrator } from '../components/dashboard/AgentOrchestrator';
-import type { WorkerStatus, SupervisorDecision } from '../components/dashboard/AgentOrchestrator';
+import type { WorkerStatus, SupervisorDecision, TerminalMessage } from '../components/dashboard/AgentOrchestrator';
 import { EvaluationCard } from '../components/dashboard/EvaluationCard';
 import { QualificationCard } from '../components/dashboard/QualificationCard';
 import { FinancialCard } from '../components/dashboard/FinancialCard';
+import { DraftCard } from '../components/DraftCard';
 
 export function AnalysisDashboard() {
   const { id } = useParams<{ id: string }>();
@@ -32,50 +32,45 @@ export function AnalysisDashboard() {
   const [workerStatuses, setWorkerStatuses] = useState<WorkerStatus[]>(initialWorkerStatuses);
 
   useEffect(() => {
-    const targetDocId = (id && id !== 'new') ? id : localStorage.getItem('bidding_document_id');
-    if (targetDocId && targetDocId !== 'new') {
-      localStorage.setItem('bidding_document_id', targetDocId);
+    // 1. 如果 URL 中包含明确的文档 ID，优先同步并广播
+    if (id && id !== 'new') {
+      localStorage.setItem('bidding_document_id', id);
       window.dispatchEvent(new Event('bidding_document_changed'));
-      
-      const loadHistory = async () => {
-        setIsLoadingHistory(true);
-        try {
-          const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-          const res = await apiFetch(`${baseUrl}/api/v1/documents/${targetDocId}/result`);
-          if (res.ok) {
-            const json = await res.json();
-            if (json.code === 200 && json.data) {
-              setResult(json.data);
-              setTerminalMessages([
-                { id: Date.now().toString(), type: 'success', content: '✅ 历史解析数据加载完毕。' }
-              ]);
-              // 为历史任务填充成功的 Worker 状态，以便显示调度大盘
-              setWorkerStatuses([
-                { name: 'master_agent', label: '元数据提取', status: 'success', retryCount: 0, summary: '已完成' },
-                { name: 'strategy_qual', label: '资质盘点', status: 'success', retryCount: 0, summary: '已完成' },
-                { name: 'strategy_risk', label: '风险排查', status: 'success', retryCount: 0, summary: '已完成' },
-                { name: 'cost_estimation', label: '成本核算', status: 'success', retryCount: 0, summary: '已完成' },
-                { name: 'writer_agent', label: '标书起草', status: 'success', retryCount: 0, summary: '已完成' },
-              ]);
-            }
-          }
-        } catch (err) {
-          console.error("Failed to load history", err);
-          setTerminalMessages([
-            { id: Date.now().toString(), type: 'error', content: '❌ 加载历史数据失败。' }
-          ]);
-        } finally {
-          setIsLoadingHistory(false);
-        }
-      };
-      
-      loadHistory();
+    } else if (id === 'new') {
+      localStorage.removeItem('bidding_document_id');
+      window.dispatchEvent(new Event('bidding_document_changed'));
     }
+
+    const targetDocId = (id && id !== 'new') ? id : localStorage.getItem('bidding_document_id');
+    if (!targetDocId) return;
+
+    setIsLoadingHistory(true);
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+
+    apiFetch(`${baseUrl}/api/v1/documents/${targetDocId}/result`)
+      .then(res => res.json())
+      .then(resJson => {
+        const docData = resJson?.data || resJson;
+        if (docData && (docData.document_id || docData.id)) {
+          setResult(docData);
+          const realDocId = docData.document_id || docData.id;
+          if (realDocId && realDocId !== localStorage.getItem('bidding_document_id')) {
+            localStorage.setItem('bidding_document_id', realDocId);
+            window.dispatchEvent(new Event('bidding_document_changed'));
+          }
+        }
+      })
+      .catch(err => {
+        console.error("恢复历史数据失败:", err);
+      })
+      .finally(() => {
+        setIsLoadingHistory(false);
+      });
   }, [id]);
 
 
   const handleTerminalMessage = (msg: any) => {
-    setTerminalMessages(prev => [...prev, msg]);
+    setTerminalMessages(prev => [...prev, { ...msg, id: Date.now().toString() }]);
   };
 
   const handleAnalysisSuccess = (res: any) => {
@@ -114,8 +109,10 @@ export function AnalysisDashboard() {
     ));
   };
 
+  const activeDocId = result?.document_id || result?.id || (id && id !== 'new' ? id : null) || localStorage.getItem('bidding_document_id') || undefined;
+
   const handleReextract = async (domain: string) => {
-    const targetDocId = (id && id !== 'new') ? id : (result?.document_id || localStorage.getItem('bidding_document_id'));
+    const targetDocId = activeDocId || (id && id !== 'new' ? id : null) || localStorage.getItem('bidding_document_id');
     if (!targetDocId) {
       setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: '❌ 重新提取失败: 未找到有效文档，请先上传并解析标书文件。' }]);
       alert("未找到有效文档ID，请先上传并解析标书文件。");
@@ -125,7 +122,7 @@ export function AnalysisDashboard() {
     setRetryingDomain(domain);
     setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'info', content: `正在重新提取专项领域: ${domain} ...` }]);
     try {
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
       const res = await apiFetch(`${baseUrl}/api/v1/analysis/${targetDocId}/reextract/${domain}`, {
         method: 'POST'
       });
@@ -137,6 +134,15 @@ export function AnalysisDashboard() {
               ...prev,
               cost_analysis: json.data
             }));
+          } else if (domain === 'writer' || domain === 'draft' || domain === 'writer_agent') {
+            setResult((prev: any) => ({
+              ...prev,
+              parsed_metadata: {
+                ...(prev?.parsed_metadata || {}),
+                draft_path: json.data?.draft_path,
+                bid_doc_outline: json.data?.bid_doc_outline || prev?.parsed_metadata?.bid_doc_outline
+              }
+            }));
           } else {
             setResult((prev: any) => ({
               ...prev,
@@ -146,7 +152,7 @@ export function AnalysisDashboard() {
               }
             }));
           }
-          const domainLabel = domain === 'cost_estimation' ? 'BOM 成本测算' : domain;
+          const domainLabel = domain === 'cost_estimation' ? 'BOM 成本测算' : domain === 'writer' ? '标书起草' : domain;
           setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'success', content: `✅ ${domainLabel} 领域重新提取/计算成功！` }]);
         } else {
           const errMsg = json.data?.error || json.message || '系统错误';
@@ -158,8 +164,7 @@ export function AnalysisDashboard() {
         setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: ${errMsg}` }]);
       }
     } catch (err: any) {
-      console.error(`Re-extract ${domain} failed`, err);
-      setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取异常: ${err?.message || '服务器未响应'}` }]);
+      setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取网络错误: ${err.message}` }]);
     } finally {
       setRetryingDomain(null);
     }
@@ -188,6 +193,10 @@ export function AnalysisDashboard() {
     matchScore = 0;
   }
 
+  const documentId = activeDocId;
+  const outline = result?.metadata?.bid_doc_outline || result?.parsed_metadata?.bid_doc_outline;
+  const draftPath = result?.metadata?.draft_path || result?.parsed_metadata?.draft_path;
+
   return (
     <div className="w-full space-y-10 animate-fade-in-up delay-100 pb-20">
       
@@ -213,20 +222,8 @@ export function AnalysisDashboard() {
         isActive={isAnalyzing}
         supervisorDecision={supervisorDecision}
         workerStatuses={workerStatuses}
+        terminalMessages={terminalMessages}
       />
-      
-      <details className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-sm border border-slate-200 overflow-hidden group">
-        <summary className="px-6 py-4 font-bold text-slate-700 cursor-pointer hover:bg-slate-50 transition-colors list-none flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <span className="text-slate-400">👨‍💻</span>
-            查看底层 Agent 详细交互日志
-          </div>
-          <span className="text-slate-400 group-open:rotate-180 transition-transform">▼</span>
-        </summary>
-        <div className="border-t border-slate-100">
-          <AgentTerminal isAnalyzing={isAnalyzing} messages={terminalMessages} />
-        </div>
-      </details>
         
       {/* KPI Cards */}
       <div className="grid grid-cols-2 gap-8">
@@ -255,25 +252,42 @@ export function AnalysisDashboard() {
       
       {/* 专项提取维度面板矩阵 - 5 大维度 Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-        {/* 新增的财务防线卡片 */}
+        {/* 核心财务防线卡片 */}
         <FinancialCard financial={fin} onReextract={() => handleReextract('financial')} isRetrying={retryingDomain === 'financial'} />
         
-        {/* 资质综合门槛卡片 */}
+        {/* 资质综合准入卡片 */}
         <QualificationCard qualification={qual} onReextract={() => handleReextract('qualification')} isRetrying={retryingDomain === 'qualification'} />
         
+        {/* 商务时限排期卡片 */}
         <TimelineCard timeline={tl} onReextract={() => handleReextract('timeline')} isRetrying={retryingDomain === 'timeline'} />
         
+        {/* 施工技术防线卡片 */}
         <EngineeringCard engineering={eng} onReextract={() => handleReextract('engineering')} isRetrying={retryingDomain === 'engineering'} />
         
-        <EvaluationCard evaluation={ev} onReextract={() => handleReextract('evaluation')} isRetrying={retryingDomain === 'evaluation'} />
+        {/* 评标办法与售后硬性约束 - 全宽横幅强化展示 */}
+        <div className="md:col-span-2">
+          <EvaluationCard evaluation={ev} onReextract={() => handleReextract('evaluation')} isRetrying={retryingDomain === 'evaluation'} />
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+      {/* BOM 成本核算表 */}
+      <div className="w-full">
         <CostTable 
           equipmentList={eng.main_equipment_list || []} 
           costAnalysis={result?.cost_analysis || {}} 
           onReextract={() => handleReextract('cost_estimation')}
           isRetrying={retryingDomain === 'cost_estimation'}
+        />
+      </div>
+
+      {/* 投标书草稿生成与终极交付 - 全宽横幅 */}
+      <div className="w-full">
+        <DraftCard 
+          documentId={activeDocId}
+          outline={outline}
+          draftPath={draftPath}
+          onReextract={() => handleReextract('writer')}
+          isRetrying={retryingDomain === 'writer'}
         />
       </div>
     </div>

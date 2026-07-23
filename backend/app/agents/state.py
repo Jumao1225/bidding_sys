@@ -25,6 +25,11 @@ class BiddingState(TypedDict):
     worker_summaries: Annotated[list, operator.add]  # Worker 执行摘要
     retry_counts: Dict[str, int]   # 各节点重试次数（上限 2 次）
 
+    # --- 动态章节拆解与模板填空任务状态 ---
+    chapter_tasks: List[Dict[str, Any]]   # 拆解出的各章节任务清单（一章节一任务）
+    chapter_results: Dict[str, Any]       # 各章节 Agent 填空与撰写后的结果池
+
+
     # 状态控制
     status: str
     error: str

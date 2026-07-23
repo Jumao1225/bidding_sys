@@ -187,6 +187,48 @@ class LLMService:
             raise e
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+    def generate_text(self, prompt: str, temperature: float = 0.3) -> str:
+        """
+        发送 Prompt 并返回纯文本生成结果。
+        """
+        if not self.is_configured:
+            raise ValueError("❌ 无法进行大模型解析：尚未配置有效的 OPENAI_API_KEY")
+
+        llm = self.get_llm(temperature=temperature, json_mode=False)
+        if llm is None:
+            raise ValueError("❌ 无法获取 LLM 实例")
+
+        try:
+            import time
+            start_time = time.time()
+            response = llm.invoke(prompt)
+            end_time = time.time()
+            content = str(response.content) if hasattr(response, 'content') else str(response)
+
+            prompt_tokens = 0
+            completion_tokens = 0
+            if hasattr(response, 'response_metadata') and 'token_usage' in response.response_metadata:
+                token_usage = response.response_metadata['token_usage']
+                prompt_tokens = token_usage.get('prompt_tokens', 0)
+                completion_tokens = token_usage.get('completion_tokens', 0)
+
+            audit_service.log_event(
+                action_type="llm_call_text",
+                inputs={"prompt": prompt},
+                outputs={"content": content},
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                execution_time_ms=int((end_time - start_time) * 1000)
+            )
+
+            return content.strip()
+        except Exception as e:
+            audit_service.log_event(action_type="llm_call_text", status="error", error_message=str(e))
+            logger.error(f"❌ LLM 文本生成过程发生异常: {str(e)}")
+            raise e
+
+
+    @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
     def generate_structured_output(self, prompt: str, schema_cls: Type[BaseModel], temperature: float = 0.1) -> BaseModel:
         """
         利用大模型原生的 Structured Outputs 能力直接生成校验过的 Pydantic 对象。

@@ -26,7 +26,7 @@ from app.api import deps
 async def upload_and_analyze(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="上传的招标文件 (Word/PDF 等)"),
-    company_quals: str = Form(..., description="我方公司的资质信息文本"),
+    company_quals: str = Form("", description="我方公司的资质信息文本"),
     current_user: User = Depends(deps.get_current_active_user)
 ):
     """
@@ -102,7 +102,7 @@ async def reextract_domain(
         "evaluation": extract_evaluation_info
     }
     
-    if domain not in domain_map and domain not in ("cost_estimation", "cost"):
+    if domain not in domain_map and domain not in ("cost_estimation", "cost", "writer", "draft", "writer_agent", "strategy_qual", "qualifications_analysis", "qual_analysis"):
         raise HTTPException(status_code=400, detail=f"未知的提取领域: {domain}")
         
     try:
@@ -141,6 +141,50 @@ async def reextract_domain(
                 db.commit()
                 
                 return success_response(data=cost_data, message="成本测算重新计算成功")
+
+            if domain in ("strategy_qual", "qualifications_analysis", "qual_analysis"):
+                from sqlalchemy.orm.attributes import flag_modified
+                from app.agents.nodes.strategy_agent import analyze_qualifications_node
+
+                state = {
+                    "document_id": document_id,
+                    "user_id": current_user.id,
+                    "tenant_id": current_user.tenant_id,
+                    "company_quals": (doc.parsed_metadata or {}).get("company_quals", "")
+                }
+                qual_result = analyze_qualifications_node(state)
+                qual_data = qual_result.get("qualifications_analysis", {})
+
+                parsed_metadata = dict(doc.parsed_metadata or {})
+                parsed_metadata["qualifications_analysis"] = qual_data
+                doc.parsed_metadata = parsed_metadata
+                flag_modified(doc, "parsed_metadata")
+                db.commit()
+
+                return success_response(data=qual_data, message="资质核对与能力盘点重新计算成功")
+
+            if domain in ("writer", "draft", "writer_agent"):
+                from app.agents.nodes.writer_agent_node import writer_agent_node
+                state = {
+                    "document_id": document_id,
+                    "user_id": current_user.id,
+                    "tenant_id": current_user.tenant_id,
+                    "company_quals": (doc.parsed_metadata or {}).get("company_quals", "")
+                }
+                writer_result = writer_agent_node(state)
+                
+                # 重新刷新从数据库读取最新 parsed_metadata 包含的 bid_doc_outline
+                doc_fresh = document_crud.get_document_by_id(db, document_id, current_user.id, current_user.tenant_id)
+                fresh_meta = doc_fresh.parsed_metadata if doc_fresh else {}
+
+                return success_response(
+                    data={
+                        "draft_path": writer_result.get("draft_path") or fresh_meta.get("draft_path"),
+                        "bid_doc_outline": fresh_meta.get("bid_doc_outline"),
+                        "status": "success"
+                    },
+                    message="投标书草稿重新生成成功"
+                )
             
             tool_func = domain_map[domain]
             # 调用工具提取（其内部已包含落盘逻辑）
@@ -166,6 +210,57 @@ async def reextract_domain(
     except Exception as e:
         logger.exception(f"重新提取 {domain} 异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"重新提取异常: {str(e)}")
+
+@router.get("/draft/download/{document_id}")
+async def download_bidding_draft(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    下载 AI 生成的投标书 Word 草稿 (.docx)
+    """
+    from app.db.crud.document import document_crud
+    doc = document_crud.get_document_by_id(db, document_id, current_user.id, current_user.tenant_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在或无权访问")
+        
+    parsed_meta = doc.parsed_metadata or {}
+    draft_path = parsed_meta.get("draft_path")
+    expected_path = f"uploads/drafts/draft_{document_id}.docx"
+    
+    # 智能缓存检查：若草稿文件已存在，直接秒级返回 FileResponse
+    target_file_path = draft_path if (draft_path and os.path.exists(draft_path)) else (expected_path if os.path.exists(expected_path) else None)
+    
+    if not target_file_path:
+        logger.info(f"磁盘未搜寻到草稿，触发在线动态生成草稿，文档ID: {document_id}")
+        try:
+            from app.agents.nodes.writer_agent_node import writer_agent_node
+            state = {
+                "document_id": document_id,
+                "user_id": current_user.id,
+                "tenant_id": current_user.tenant_id,
+                "company_quals": parsed_meta.get("company_quals", "")
+            }
+            writer_res = writer_agent_node(state)
+            target_file_path = writer_res.get("draft_path")
+            if not target_file_path or not os.path.exists(target_file_path):
+                raise HTTPException(status_code=404, detail="投标书草稿生成失败")
+        except Exception as gen_err:
+            logger.exception(f"动态生成草稿失败: {gen_err}")
+            raise HTTPException(status_code=500, detail=f"投标书草稿实时生成失败: {str(gen_err)}")
+    else:
+        logger.info(f"秒级命中磁盘缓存草稿，直接返回文件: {target_file_path}")
+            
+    clean_filename = doc.filename.rsplit('.', 1)[0]
+    filename = f"投标书草稿_{clean_filename}.docx"
+    
+    return FileResponse(
+        path=draft_path,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        content_disposition_type="attachment"
+    )
 
 @router.api_route("/download/{task_id}", methods=["GET", "HEAD"])
 async def download_original_file(
@@ -204,3 +299,4 @@ async def download_original_file(
         # Content-Disposition "inline" allows browser to try displaying it (good for PDF)
         content_disposition_type="inline"
     )
+

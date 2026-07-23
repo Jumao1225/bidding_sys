@@ -181,7 +181,9 @@ export function CostTable({ equipmentList = [], costAnalysis = {}, onReextract, 
                     </td>
                     <td className="p-4 whitespace-nowrap">
                       <span className="font-bold text-slate-700 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200/60">
-                        {item.qty} {item.unit || '台'}
+                        {item.qty !== null && item.qty !== undefined 
+                          ? `${item.qty} ${item.unit || ''}` 
+                          : (item.unit ? item.unit : '--')}
                       </span>
                     </td>
                     <td className="p-4 font-medium text-slate-600 whitespace-nowrap">
@@ -219,8 +221,10 @@ export function CostTable({ equipmentList = [], costAnalysis = {}, onReextract, 
                       等待核算
                     </td>
                     <td className="p-4">
-                      <span className="font-bold text-slate-700 bg-slate-50 px-2 py-1 rounded-md border border-slate-100">
-                        {item.quantity ?? '--'} {item.unit || ''}
+                      <span className="font-bold text-slate-700 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200/60 text-xs">
+                        {item.quantity !== null && item.quantity !== undefined 
+                          ? `${item.quantity} ${item.unit || ''}` 
+                          : (item.unit ? item.unit : '--')}
                       </span>
                     </td>
                     <td className="p-4 text-xs font-medium text-slate-400">

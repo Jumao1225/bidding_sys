@@ -90,11 +90,11 @@ def cost_node(state: BiddingState) -> dict:
     finally:
         db.close()
 
-    # 使用 RAG 靶向检索采购清单、货物需求一览表、技术规格
+    # 使用 RAG 靶向检索采购清单、货物需求一览表、技术规格书与详细参数
     rag_text = rag_service.search_bidding_document(
         document_id, 
-        "采购清单 货物需求一览表 设备清单 BOM 报价 技术规格 参数要求", 
-        top_k=6, 
+        "采购清单 货物需求一览表 设备清单 BOM 报价 技术规格书 材质尺寸 参数要求 项目需求", 
+        top_k=10, 
         disable_expansion=True
     )
     
@@ -119,7 +119,8 @@ def cost_node(state: BiddingState) -> dict:
        - 若存在【主控提取的标准设备需求清单】，你**必须 100% 完整保留**清单中的所有设备项目！
        - **绝对禁止修改设备原始名称(name)，绝对禁止擅自添加任何自定义后缀、符号或编号！**
        - 原始名称(name)必须与【主控提取的标准设备需求清单】中的名称 100% 完全一致！
-       - 规格参数要求(spec_requirement/specifications) **必须尽量原汁原味地保留标书原文中的参数描述，严禁归纳简化**！
+       - 规格参数要求(spec_requirement/specifications) **必须原汁原味地保留标书原文中的参数描述，严禁归纳简化**！
+       - **摒弃“详见XXX”空话 (重要)**：若继承的规格里写有“详见技术规格”、“详见项目需求”或只包含控制价文本，你**必须从【招标片段原文参考】中搜寻并替换为该设备真实的材质、尺寸、物理/电气等详细技术参数描述**！
        - 保留其原始采购数量(qty)、单位(unit)、品牌要求(brand_requirements)及关键星号参数(key_parameters)。
     2. 【参考价格库备注 (remark) 识别与打包统价防重复计算规则（重要）】：
        - 你**必须仔细阅读价格参考库中各条目的 `remark` 备注说明**！
@@ -167,7 +168,7 @@ def cost_node(state: BiddingState) -> dict:
             if orig_name:
                 item_dict["name"] = orig_name
 
-        qty = item_dict.get("qty", 1.0)
+        raw_qty = item_dict.get("qty")
         ref_price = item_dict.get("ref_price", 0.0)
         
         # 兼容防护：若对标分析及备注明确标明已在上一项或打包项目中包含，确保单价不重复计算
@@ -176,7 +177,17 @@ def cost_node(state: BiddingState) -> dict:
             ref_price = 0.0
             item_dict["ref_price"] = 0.0
 
-        subtotal = round(qty * ref_price, 2)
+        if raw_qty is not None:
+            try:
+                qty = float(raw_qty)
+                subtotal = round(qty * ref_price, 2)
+            except (ValueError, TypeError):
+                item_dict["qty"] = None
+                subtotal = 0.0
+        else:
+            item_dict["qty"] = None
+            subtotal = 0.0
+
         item_dict["subtotal"] = subtotal
         
         if ref_price <= 0:

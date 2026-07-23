@@ -19,7 +19,7 @@ class BondInfo(BaseModel):
     """保证金明细（投标/履约/质保）"""
     amount_description: str = Field(..., description="招标文件原文描述（如：'合同额的 2%'、'固定 10 万元'）")
     calculated_amount: Optional[float] = Field(None, description="换算出的纯数字金额（单位：元），方便比对")
-    acceptable_forms: list[str] = Field(
+    acceptable_forms: Optional[list[str]] = Field(
         default_factory=lambda: ["现金转账", "银行保函", "电子保函"], 
         description="允许的缴纳形式"
     )
