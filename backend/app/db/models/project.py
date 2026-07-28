@@ -1,7 +1,10 @@
 from sqlalchemy import String, Text, ForeignKey, Integer, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from typing import List, Optional
-from pgvector.sqlalchemy import Vector
+try:
+    from pgvector.sqlalchemy import Vector
+except ImportError:
+    from sqlalchemy import JSON as Vector
 from .base import TenantBase
 
 class Project(TenantBase):

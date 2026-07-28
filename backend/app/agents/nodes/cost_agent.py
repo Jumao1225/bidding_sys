@@ -224,6 +224,32 @@ def cost_node(state: BiddingState) -> dict:
             budget_status = f"预算可控 (预算使用率 {ratio}%)"
 
     logger.info(f"成本核算完成，总估算成本: {total_cost}，预算状态: {budget_status}，未匹配项: {unmatched_count}。")
+
+    # 同步落盘写入 cost_estimates 实体数据表
+    try:
+        from app.db.models.ai_analysis import CostEstimate
+        # 清理该文档已有的旧测算记录
+        db.query(CostEstimate).filter(CostEstimate.document_id == document_id).delete()
+        for item in calculated_items:
+            est = CostEstimate(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                project_id=document.project_id if document else None,
+                item_name=item.get("name", "未命名项"),
+                quantity=float(item.get("qty", 1.0)),
+                unit=item.get("unit", "台"),
+                unit_price=float(item.get("matched_ref_price", 0.0) or item.get("ref_price", 0.0)),
+                calculated_total=float(item.get("subtotal", 0.0)),
+                brand=item.get("brand_requirements", ""),
+                spec=item.get("spec_requirement", ""),
+                remark=item.get("comparison_note", "") or item.get("warning", "")
+            )
+            db.add(est)
+        db.commit()
+        logger.info(f"成功将 {len(calculated_items)} 条 BOM 测算细目同步落盘至 cost_estimates 数据表！")
+    except Exception as db_err:
+        db.rollback()
+        logger.warning(f"同步落盘至 cost_estimates 数据表发生非致命异常: {db_err}")
     
     summary = f"完成 BOM 成本核算：包含 {len(calculated_items)} 项设备，预估总成本 ¥{total_cost:,.2f}"
     if unmatched_count > 0:

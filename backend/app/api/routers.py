@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.endpoints import analysis, mineru, chat, document, qualification, auth, admin, business
+from app.api.endpoints import analysis, mineru, chat, document, qualification, auth, admin, business, bid_generator, company_profile, docx_debug
 from app.api import sse
 
 api_router = APIRouter()
@@ -13,3 +13,9 @@ api_router.include_router(qualification.router, prefix="/qualifications", tags=[
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
 api_router.include_router(business.router, prefix="/business", tags=["business"])
+api_router.include_router(bid_generator.router, prefix="/bidding", tags=["bidding"])
+api_router.include_router(company_profile.router, prefix="/company", tags=["company"])
+api_router.include_router(docx_debug.router, prefix="/docx", tags=["docx"])
+
+
+

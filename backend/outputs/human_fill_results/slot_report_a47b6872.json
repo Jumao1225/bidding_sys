@@ -1,0 +1,947 @@
+{
+  "document_id": "a47b6872-9600-4b30-abcb-4bf3692ec9ae",
+  "task_id": "task_1785141720",
+  "total_slots_detected": 55,
+  "total_slots_filled": 55,
+  "execution_time_ms": 45007,
+  "summary": "本文档包含大量需要投标人填写的空白槽位，主要集中在封面（项目名称、招标编号、投标人名称、日期），投标函（招标编号、签字人、公司名称、通讯地址等），开标一览表（总价和报价大写），授权委托书（委托人、受托人、法定代表人等），各类承诺书（单位名称、日期），以及多个表格（分项报价表、耗材表、实质性要求响应表、人员表、技术/商务偏离表）。关键字段包括公司名称、法定代表人、授权代表、项目编号、总价、工期等。建议投标人仔细核对所有空白处，避免遗漏。",
+  "slots_detected": [
+    {
+      "path": "/body/p[35]",
+      "run_index": null,
+      "label": "根据贵方的",
+      "raw_placeholder": "                    ",
+      "target_field_intent": "project_code",
+      "confidence_score": 0.9,
+      "reasoning": "文本'根据贵方的                   号招标文件'中，空白位于'贵方的'和'号招标文件'之间，根据上下文应为招标编号。"
+    },
+    {
+      "path": "/body/p[35]",
+      "run_index": null,
+      "label": "正式授权下述签字人",
+      "raw_placeholder": "       ",
+      "target_field_intent": "authorized_delegate",
+      "confidence_score": 0.9,
+      "reasoning": "文本'正式授权下述签字人       （姓名和职务）'，空白处应为签字人姓名。"
+    },
+    {
+      "path": "/body/p[35]",
+      "run_index": null,
+      "label": "（姓名和职务）",
+      "raw_placeholder": "（姓名和职务）",
+      "target_field_intent": "authorized_delegate",
+      "confidence_score": 0.8,
+      "reasoning": "括号内文字为说明，实际应填写具体姓名和职务。"
+    },
+    {
+      "path": "/body/p[35]",
+      "run_index": null,
+      "label": "代表我方",
+      "raw_placeholder": "                           ",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.95,
+      "reasoning": "文本'代表我方                           （投标人的名称）'，空白处应为投标人全称。"
+    },
+    {
+      "path": "/body/p[35]",
+      "run_index": null,
+      "label": "（投标人的名称）",
+      "raw_placeholder": "（投标人的名称）",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.9,
+      "reasoning": "括号内文字为说明，实际应填写投标人名称。"
+    },
+    {
+      "path": "/body/p[39]",
+      "run_index": null,
+      "label": "地    址：",
+      "raw_placeholder": "                                ",
+      "target_field_intent": "registered_address",
+      "confidence_score": 0.9,
+      "reasoning": "地址后面有大量空格，且为常见填空项。"
+    },
+    {
+      "path": "/body/p[40]",
+      "run_index": null,
+      "label": "邮    编：",
+      "raw_placeholder": "                                ",
+      "target_field_intent": "contact_phone",
+      "confidence_score": 0.7,
+      "reasoning": "邮编通常为数字，但此处空格无下划线，上下文为通讯地址，可填邮编或电话，根据字段名判断为邮编。"
+    },
+    {
+      "path": "/body/p[41]",
+      "run_index": null,
+      "label": "电    话：",
+      "raw_placeholder": "                                ",
+      "target_field_intent": "contact_phone",
+      "confidence_score": 0.95,
+      "reasoning": "电话字段明确。"
+    },
+    {
+      "path": "/body/p[42]",
+      "run_index": null,
+      "label": "传    真：",
+      "raw_placeholder": "                                ",
+      "target_field_intent": "contact_phone",
+      "confidence_score": 0.8,
+      "reasoning": "传真字段。"
+    },
+    {
+      "path": "/body/p[43]",
+      "run_index": null,
+      "label": "投标单位代表姓名（签字）：",
+      "raw_placeholder": "                ",
+      "target_field_intent": "authorized_delegate",
+      "confidence_score": 0.9,
+      "reasoning": "代表姓名。"
+    },
+    {
+      "path": "/body/p[44]",
+      "run_index": null,
+      "label": "投标单位名称：",
+      "raw_placeholder": "                            ",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.95,
+      "reasoning": "投标单位名称。"
+    },
+    {
+      "path": "/body/p[45]",
+      "run_index": null,
+      "label": "公    章：",
+      "raw_placeholder": "                               ",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.6,
+      "reasoning": "公章处通常盖物理章，但也可理解为单位名称。"
+    },
+    {
+      "path": "/body/p[46]",
+      "run_index": null,
+      "label": "日    期：",
+      "raw_placeholder": "     年      月     日",
+      "target_field_intent": "construction_period",
+      "confidence_score": 0.5,
+      "reasoning": "日期填空，但可能是签订日期，非工期。此处填日期。"
+    },
+    {
+      "path": "/body/p[48]",
+      "run_index": null,
+      "label": "投标人全称（加盖公章）：",
+      "raw_placeholder": "空",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.8,
+      "reasoning": "标签后无内容，但格式预留，常见填空。"
+    },
+    {
+      "path": "/body/p[49]",
+      "run_index": null,
+      "label": "法定代表人或授权代表签字（或盖章）：",
+      "raw_placeholder": "                       年     月    日",
+      "target_field_intent": "legal_representative",
+      "confidence_score": 0.7,
+      "reasoning": "签字和日期。"
+    },
+    {
+      "path": "/body/tbl[1]/tr[2]/tc[3]",
+      "run_index": null,
+      "label": "总价（元）",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "bid_price_numeric",
+      "confidence_score": 0.95,
+      "reasoning": "表格中第二行第三列为总价数值，内容为空。"
+    },
+    {
+      "path": "/body/tbl[1]/tr[2]/tc[4]",
+      "run_index": null,
+      "label": "备注",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "bid_price_numeric",
+      "confidence_score": 0.5,
+      "reasoning": "备注可能填写说明。"
+    },
+    {
+      "path": "/body/tbl[1]/tr[3]/tc[2]",
+      "run_index": null,
+      "label": "投标总报价（大写）",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "bid_price_chinese",
+      "confidence_score": 0.95,
+      "reasoning": "投标总报价大写单元格。"
+    },
+    {
+      "path": "/body/p[51]",
+      "run_index": null,
+      "label": "委托人：",
+      "raw_placeholder": "                                                   ",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.8,
+      "reasoning": "委托人应为投标人单位名称。"
+    },
+    {
+      "path": "/body/p[52]",
+      "run_index": null,
+      "label": "地址：",
+      "raw_placeholder": "                                   ",
+      "target_field_intent": "registered_address",
+      "confidence_score": 0.9,
+      "reasoning": "地址。"
+    },
+    {
+      "path": "/body/p[52]",
+      "run_index": null,
+      "label": "法定代表人：",
+      "raw_placeholder": "       ",
+      "target_field_intent": "legal_representative",
+      "confidence_score": 0.95,
+      "reasoning": "法定代表人姓名。"
+    },
+    {
+      "path": "/body/p[53]",
+      "run_index": null,
+      "label": "受托人：",
+      "raw_placeholder": "                             ",
+      "target_field_intent": "authorized_delegate",
+      "confidence_score": 0.9,
+      "reasoning": "受托人即授权代表姓名。"
+    },
+    {
+      "path": "/body/p[53]",
+      "run_index": null,
+      "label": "性别：",
+      "raw_placeholder": "                 ",
+      "target_field_intent": "authorized_delegate",
+      "confidence_score": 0.6,
+      "reasoning": "性别字段。"
+    },
+    {
+      "path": "/body/p[54]",
+      "run_index": null,
+      "label": "所在单位：",
+      "raw_placeholder": "                                                 ",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.85,
+      "reasoning": "所在单位通常为投标单位。"
+    },
+    {
+      "path": "/body/p[55]",
+      "run_index": null,
+      "label": "职务：",
+      "raw_placeholder": "                        ",
+      "target_field_intent": "authorized_delegate",
+      "confidence_score": 0.7,
+      "reasoning": "职务。"
+    },
+    {
+      "path": "/body/p[55]",
+      "run_index": null,
+      "label": "联系方式：",
+      "raw_placeholder": "                    ",
+      "target_field_intent": "contact_phone",
+      "confidence_score": 0.8,
+      "reasoning": "联系方式通常为电话。"
+    },
+    {
+      "path": "/body/p[56]",
+      "run_index": null,
+      "label": "兹委托受托人",
+      "raw_placeholder": "         ",
+      "target_field_intent": "authorized_delegate",
+      "confidence_score": 0.9,
+      "reasoning": "受托人姓名。"
+    },
+    {
+      "path": "/body/p[56]",
+      "run_index": null,
+      "label": "合法地代表我单位参加",
+      "raw_placeholder": "                  ",
+      "target_field_intent": "authorized_delegate",
+      "confidence_score": 0.6,
+      "reasoning": "此空可能为代理机构名称？但上下文是'参加                 组织的'，应为组织名称（招标代理机构名称）。"
+    },
+    {
+      "path": "/body/p[56]",
+      "run_index": null,
+      "label": "组织的",
+      "raw_placeholder": "              ",
+      "target_field_intent": "project_name",
+      "confidence_score": 0.8,
+      "reasoning": "组织的             项目，应为项目名称。"
+    },
+    {
+      "path": "/body/p[59]",
+      "run_index": null,
+      "label": "委托单位（公章）：",
+      "raw_placeholder": "                         ",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.9,
+      "reasoning": "委托单位名称。"
+    },
+    {
+      "path": "/body/p[61]",
+      "run_index": null,
+      "label": "法定代表人（签章）：",
+      "raw_placeholder": "                      ",
+      "target_field_intent": "legal_representative",
+      "confidence_score": 0.9,
+      "reasoning": "法定代表人签字。"
+    },
+    {
+      "path": "/body/p[63]",
+      "run_index": null,
+      "label": "日      期：",
+      "raw_placeholder": "       年     月     日",
+      "target_field_intent": "construction_period",
+      "confidence_score": 0.4,
+      "reasoning": "日期。"
+    },
+    {
+      "path": "/body/p[65]",
+      "run_index": null,
+      "label": "投标单位（公章）：",
+      "raw_placeholder": "                       ",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.9,
+      "reasoning": "投标单位公章。"
+    },
+    {
+      "path": "/body/p[67]",
+      "run_index": null,
+      "label": "日       期：",
+      "raw_placeholder": "       年      月      日",
+      "target_field_intent": "construction_period",
+      "confidence_score": 0.4,
+      "reasoning": "日期。"
+    },
+    {
+      "path": "/body/p[69]",
+      "run_index": null,
+      "label": "投标单位（签章）：",
+      "raw_placeholder": "空",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.7,
+      "reasoning": "签章处。"
+    },
+    {
+      "path": "/body/p[70]",
+      "run_index": null,
+      "label": "日期：",
+      "raw_placeholder": "年月日",
+      "target_field_intent": "construction_period",
+      "confidence_score": 0.4,
+      "reasoning": "日期填空。"
+    },
+    {
+      "path": "/body/tbl[2]",
+      "run_index": null,
+      "label": "序号1-18行（所有数据行）",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "bid_price_numeric",
+      "confidence_score": 0.8,
+      "reasoning": "分项报价表大量空白单元格，需填写货物名称、品牌、数量、单价等。此处合并处理，实际应分行。"
+    },
+    {
+      "path": "/body/tbl[2]/tr[19]/tc[2]",
+      "run_index": null,
+      "label": "大写：",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "bid_price_chinese",
+      "confidence_score": 0.95,
+      "reasoning": "大写金额单元格。"
+    },
+    {
+      "path": "/body/p[72]",
+      "run_index": null,
+      "label": "交货期限：",
+      "raw_placeholder": "空",
+      "target_field_intent": "construction_period",
+      "confidence_score": 0.8,
+      "reasoning": "标签后无内容。"
+    },
+    {
+      "path": "/body/tbl[3]",
+      "run_index": null,
+      "label": "常用零件表后几行",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "bid_price_numeric",
+      "confidence_score": 0.7,
+      "reasoning": "耗材报价表数据行空白。"
+    },
+    {
+      "path": "/body/tbl[4]/tr[2]/tc[2]",
+      "run_index": null,
+      "label": "实质性要求内容",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "qualification_cert",
+      "confidence_score": 0.5,
+      "reasoning": "需列出要求，但空白。"
+    },
+    {
+      "path": "/body/tbl[4]/tr[2]/tc[3]",
+      "run_index": null,
+      "label": "是否响应",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "qualification_cert",
+      "confidence_score": 0.6,
+      "reasoning": "需填是或否。"
+    },
+    {
+      "path": "/body/tbl[4]/tr[3]/tc[2]",
+      "run_index": null,
+      "label": "实质性要求内容",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "qualification_cert",
+      "confidence_score": 0.5,
+      "reasoning": "同上。"
+    },
+    {
+      "path": "/body/tbl[4]/tr[3]/tc[3]",
+      "run_index": null,
+      "label": "是否响应",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "qualification_cert",
+      "confidence_score": 0.6,
+      "reasoning": "同上。"
+    },
+    {
+      "path": "/body/tbl[4]/tr[4]/tc[2]",
+      "run_index": null,
+      "label": "实质性要求内容",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "qualification_cert",
+      "confidence_score": 0.5,
+      "reasoning": "同上。"
+    },
+    {
+      "path": "/body/tbl[4]/tr[4]/tc[3]",
+      "run_index": null,
+      "label": "是否响应",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "qualification_cert",
+      "confidence_score": 0.6,
+      "reasoning": "同上。"
+    },
+    {
+      "path": "/body/tbl[5]",
+      "run_index": null,
+      "label": "项目负责人表格数据行",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "qualification_cert",
+      "confidence_score": 0.7,
+      "reasoning": "人员介绍表多行空白。"
+    },
+    {
+      "path": "/body/tbl[6]",
+      "run_index": null,
+      "label": "技术要求响应表数据行",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "qualification_cert",
+      "confidence_score": 0.7,
+      "reasoning": "响应表多行空白。"
+    },
+    {
+      "path": "/body/tbl[7]",
+      "run_index": null,
+      "label": "商务条款响应表数据行",
+      "raw_placeholder": "空单元格",
+      "target_field_intent": "qualification_cert",
+      "confidence_score": 0.7,
+      "reasoning": "商务响应表多行空白。"
+    },
+    {
+      "path": "/body/p[75]",
+      "run_index": null,
+      "label": "投标人全称（加盖公章）：",
+      "raw_placeholder": "空",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.8,
+      "reasoning": "开标一览表上方。"
+    },
+    {
+      "path": "/body/p[76]",
+      "run_index": null,
+      "label": "法定代表人或授权代表签字（或盖章）：",
+      "raw_placeholder": "                       年     月    日",
+      "target_field_intent": "legal_representative",
+      "confidence_score": 0.7,
+      "reasoning": "签字日期。"
+    },
+    {
+      "path": "/body/p[78]",
+      "run_index": null,
+      "label": "投标单位（加盖公章）：",
+      "raw_placeholder": "空",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.8,
+      "reasoning": "承诺书底部。"
+    },
+    {
+      "path": "/body/p[79]",
+      "run_index": null,
+      "label": "年   月   日",
+      "raw_placeholder": "空",
+      "target_field_intent": "construction_period",
+      "confidence_score": 0.4,
+      "reasoning": "日期。"
+    },
+    {
+      "path": "/body/p[80]",
+      "run_index": null,
+      "label": "投标单位（加盖公章）：",
+      "raw_placeholder": "空",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.8,
+      "reasoning": "声明书底部。"
+    },
+    {
+      "path": "/body/p[81]",
+      "run_index": null,
+      "label": "年   月   日",
+      "raw_placeholder": "空",
+      "target_field_intent": "construction_period",
+      "confidence_score": 0.4,
+      "reasoning": "日期。"
+    }
+  ],
+  "filled_details": [
+    {
+      "path": "/body/p[35]",
+      "label": "根据贵方的",
+      "intent": "project_code",
+      "looked_up_value": "SZDZ-2026-NG008号",
+      "write_status": "success",
+      "execution_time_ms": 5
+    },
+    {
+      "path": "/body/p[35]",
+      "label": "正式授权下述签字人",
+      "intent": "authorized_delegate",
+      "looked_up_value": "李四",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[35]",
+      "label": "（姓名和职务）",
+      "intent": "authorized_delegate",
+      "looked_up_value": "李四",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[35]",
+      "label": "代表我方",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[35]",
+      "label": "（投标人的名称）",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 1
+    },
+    {
+      "path": "/body/p[39]",
+      "label": "地    址：",
+      "intent": "registered_address",
+      "looked_up_value": "四川省成都市高新区天府大道北段128号",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[40]",
+      "label": "邮    编：",
+      "intent": "contact_phone",
+      "looked_up_value": "028-85123456",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[41]",
+      "label": "电    话：",
+      "intent": "contact_phone",
+      "looked_up_value": "028-85123456",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[42]",
+      "label": "传    真：",
+      "intent": "contact_phone",
+      "looked_up_value": "028-85123456",
+      "write_status": "success",
+      "execution_time_ms": 1
+    },
+    {
+      "path": "/body/p[43]",
+      "label": "投标单位代表姓名（签字）：",
+      "intent": "authorized_delegate",
+      "looked_up_value": "李四",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[44]",
+      "label": "投标单位名称：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[45]",
+      "label": "公    章：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[46]",
+      "label": "日    期：",
+      "intent": "construction_period",
+      "looked_up_value": "接到采购人进场通知后60日内完成全容量并网发电并通过供电公司验收（发电计量表安装完成及低压并网各项手续完成）",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[48]",
+      "label": "投标人全称（加盖公章）：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 1
+    },
+    {
+      "path": "/body/p[49]",
+      "label": "法定代表人或授权代表签字（或盖章）：",
+      "intent": "legal_representative",
+      "looked_up_value": "张三",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/tbl[1]/tr[2]/tc[3]",
+      "label": "总价（元）",
+      "intent": "bid_price_numeric",
+      "looked_up_value": "967840.36",
+      "write_status": "success",
+      "execution_time_ms": 4
+    },
+    {
+      "path": "/body/tbl[1]/tr[2]/tc[4]",
+      "label": "备注",
+      "intent": "bid_price_numeric",
+      "looked_up_value": "967840.36",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/tbl[1]/tr[3]/tc[2]",
+      "label": "投标总报价（大写）",
+      "intent": "bid_price_chinese",
+      "looked_up_value": "玖拾陆万柒仟捌佰肆拾元叁角陆分",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[51]",
+      "label": "委托人：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[52]",
+      "label": "地址：",
+      "intent": "registered_address",
+      "looked_up_value": "四川省成都市高新区天府大道北段128号",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[52]",
+      "label": "法定代表人：",
+      "intent": "legal_representative",
+      "looked_up_value": "张三",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[53]",
+      "label": "受托人：",
+      "intent": "authorized_delegate",
+      "looked_up_value": "李四",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[53]",
+      "label": "性别：",
+      "intent": "authorized_delegate",
+      "looked_up_value": "李四",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[54]",
+      "label": "所在单位：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[55]",
+      "label": "职务：",
+      "intent": "authorized_delegate",
+      "looked_up_value": "李四",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[55]",
+      "label": "联系方式：",
+      "intent": "contact_phone",
+      "looked_up_value": "028-85123456",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[56]",
+      "label": "兹委托受托人",
+      "intent": "authorized_delegate",
+      "looked_up_value": "李四",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[56]",
+      "label": "合法地代表我单位参加",
+      "intent": "authorized_delegate",
+      "looked_up_value": "李四",
+      "write_status": "success",
+      "execution_time_ms": 1
+    },
+    {
+      "path": "/body/p[56]",
+      "label": "组织的",
+      "intent": "project_name",
+      "looked_up_value": "和烁热能公司屋顶（400kW）分布式光伏发电项目",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[59]",
+      "label": "委托单位（公章）：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[61]",
+      "label": "法定代表人（签章）：",
+      "intent": "legal_representative",
+      "looked_up_value": "张三",
+      "write_status": "success",
+      "execution_time_ms": 1
+    },
+    {
+      "path": "/body/p[63]",
+      "label": "日      期：",
+      "intent": "construction_period",
+      "looked_up_value": "接到采购人进场通知后60日内完成全容量并网发电并通过供电公司验收（发电计量表安装完成及低压并网各项手续完成）",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[65]",
+      "label": "投标单位（公章）：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[67]",
+      "label": "日       期：",
+      "intent": "construction_period",
+      "looked_up_value": "接到采购人进场通知后60日内完成全容量并网发电并通过供电公司验收（发电计量表安装完成及低压并网各项手续完成）",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[69]",
+      "label": "投标单位（签章）：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[70]",
+      "label": "日期：",
+      "intent": "construction_period",
+      "looked_up_value": "接到采购人进场通知后60日内完成全容量并网发电并通过供电公司验收（发电计量表安装完成及低压并网各项手续完成）",
+      "write_status": "success",
+      "execution_time_ms": 1
+    },
+    {
+      "path": "/body/tbl[2]",
+      "label": "序号1-18行（所有数据行）",
+      "intent": "bid_price_numeric",
+      "looked_up_value": "967840.36",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/tbl[2]/tr[19]/tc[2]",
+      "label": "大写：",
+      "intent": "bid_price_chinese",
+      "looked_up_value": "玖拾陆万柒仟捌佰肆拾元叁角陆分",
+      "write_status": "success",
+      "execution_time_ms": 4
+    },
+    {
+      "path": "/body/p[72]",
+      "label": "交货期限：",
+      "intent": "construction_period",
+      "looked_up_value": "接到采购人进场通知后60日内完成全容量并网发电并通过供电公司验收（发电计量表安装完成及低压并网各项手续完成）",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/tbl[3]",
+      "label": "常用零件表后几行",
+      "intent": "bid_price_numeric",
+      "looked_up_value": "967840.36",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/tbl[4]/tr[2]/tc[2]",
+      "label": "实质性要求内容",
+      "intent": "qualification_cert",
+      "looked_up_value": "[待手动补充资质证书: 实质性要求内容]",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/tbl[4]/tr[2]/tc[3]",
+      "label": "是否响应",
+      "intent": "qualification_cert",
+      "looked_up_value": "[待手动补充资质证书: 是否响应]",
+      "write_status": "success",
+      "execution_time_ms": 1
+    },
+    {
+      "path": "/body/tbl[4]/tr[3]/tc[2]",
+      "label": "实质性要求内容",
+      "intent": "qualification_cert",
+      "looked_up_value": "[待手动补充资质证书: 实质性要求内容]",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/tbl[4]/tr[3]/tc[3]",
+      "label": "是否响应",
+      "intent": "qualification_cert",
+      "looked_up_value": "[待手动补充资质证书: 是否响应]",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/tbl[4]/tr[4]/tc[2]",
+      "label": "实质性要求内容",
+      "intent": "qualification_cert",
+      "looked_up_value": "[待手动补充资质证书: 实质性要求内容]",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/tbl[4]/tr[4]/tc[3]",
+      "label": "是否响应",
+      "intent": "qualification_cert",
+      "looked_up_value": "[待手动补充资质证书: 是否响应]",
+      "write_status": "success",
+      "execution_time_ms": 1
+    },
+    {
+      "path": "/body/tbl[5]",
+      "label": "项目负责人表格数据行",
+      "intent": "qualification_cert",
+      "looked_up_value": "[待手动补充资质证书: 项目负责人表格数据行]",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/tbl[6]",
+      "label": "技术要求响应表数据行",
+      "intent": "qualification_cert",
+      "looked_up_value": "[待手动补充资质证书: 技术要求响应表数据行]",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/tbl[7]",
+      "label": "商务条款响应表数据行",
+      "intent": "qualification_cert",
+      "looked_up_value": "[待手动补充资质证书: 商务条款响应表数据行]",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[75]",
+      "label": "投标人全称（加盖公章）：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[76]",
+      "label": "法定代表人或授权代表签字（或盖章）：",
+      "intent": "legal_representative",
+      "looked_up_value": "张三",
+      "write_status": "success",
+      "execution_time_ms": 1
+    },
+    {
+      "path": "/body/p[78]",
+      "label": "投标单位（加盖公章）：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[79]",
+      "label": "年   月   日",
+      "intent": "construction_period",
+      "looked_up_value": "接到采购人进场通知后60日内完成全容量并网发电并通过供电公司验收（发电计量表安装完成及低压并网各项手续完成）",
+      "write_status": "success",
+      "execution_time_ms": 2
+    },
+    {
+      "path": "/body/p[80]",
+      "label": "投标单位（加盖公章）：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 3
+    },
+    {
+      "path": "/body/p[81]",
+      "label": "年   月   日",
+      "intent": "construction_period",
+      "looked_up_value": "接到采购人进场通知后60日内完成全容量并网发电并通过供电公司验收（发电计量表安装完成及低压并网各项手续完成）",
+      "write_status": "success",
+      "execution_time_ms": 3
+    }
+  ]
+}

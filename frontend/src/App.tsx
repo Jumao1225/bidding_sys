@@ -8,6 +8,8 @@ import { QualificationCenter } from './pages/QualificationCenter';
 import { PriceBookCenter } from './pages/PriceBookCenter';
 import { Login } from './pages/Login';
 import { SystemAdmin } from './pages/admin/SystemAdmin';
+import { CompanyProfilePage } from './pages/CompanyProfilePage';
+import { DocxDebuggerPage } from './pages/DocxDebuggerPage';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { AdminRoute } from './components/AdminRoute';
 
@@ -224,7 +226,9 @@ function App() {
                 <Route path="/" element={<Home />} />
                 <Route path="/analysis/:id" element={<AnalysisDashboard />} />
                 <Route path="/qualifications" element={<QualificationCenter />} />
+                <Route path="/company-profile" element={<CompanyProfilePage />} />
                 <Route path="/price-book" element={<PriceBookCenter />} />
+                <Route path="/docx-debugger" element={<DocxDebuggerPage />} />
                 <Route path="/admin/*" element={
                   <AdminRoute>
                     <SystemAdmin />

@@ -1,6 +1,9 @@
 """
 章节任务并发执行器 (WriterExecutorNode)
 
+@deprecated: 自 2026-07-27 起，WriterExecutor (方案 A) 已被 BidFillerAgent (方案 C) 替代。
+本文件保留以备参考，请勿在新代码中引用。
+
 功能：
 1. 接收从 Planner 拆解出的 ChapterTask 章节任务列表；
 2. 调度 Writer Tools 检索资质中心数据库 (CompanyQualification)、成本底价数据与章节特定条款；
@@ -12,7 +15,7 @@ import asyncio
 from typing import Dict, Any, List, Optional
 from loguru import logger
 from app.agents.nodes.writer_planner_node import ChapterTask
-from app.agents.nodes.writer_agent import num_to_rmb_chinese
+from app.utils.rmb_formatter import number_to_chinese_rmb
 from app.services.llm_service import llm_service
 from app.agents.tools.writer_tools import (
     get_company_qualifications_tool,

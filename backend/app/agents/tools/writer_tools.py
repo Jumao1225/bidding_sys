@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.db.models.business import CompanyQualification
 from app.services.rag_service import rag_service
-from app.agents.nodes.writer_agent import num_to_rmb_chinese
+from app.utils.rmb_formatter import number_to_chinese_rmb
 
 
 def get_company_qualifications_tool(tenant_id: str = None) -> List[Dict[str, Any]]:
@@ -75,7 +75,7 @@ def get_cost_estimation_data_tool(analysis_data: Dict[str, Any]) -> Dict[str, An
     cost_items = cost_analysis.get("items", [])
     total_cost = cost_analysis.get("total_cost", 0.0)
 
-    total_cost_rmb = num_to_rmb_chinese(total_cost) if total_cost > 0 else "零元整"
+    total_cost_rmb = number_to_chinese_rmb(total_cost) if total_cost > 0 else "零元整"
 
     return {
         "cost_items": cost_items,

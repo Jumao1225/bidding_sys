@@ -1,0 +1,46 @@
+{
+  "document_id": "test_doc_001",
+  "task_id": "test_task_123",
+  "total_slots_detected": 2,
+  "total_slots_filled": 2,
+  "execution_time_ms": 232,
+  "summary": "测试样本分析",
+  "slots_detected": [
+    {
+      "path": "/body/p[2]",
+      "run_index": 1,
+      "label": "投标人名称：",
+      "raw_placeholder": "______",
+      "target_field_intent": "company_name",
+      "confidence_score": 0.98,
+      "reasoning": "识别为公司名称"
+    },
+    {
+      "path": "/body/p[3]",
+      "run_index": 0,
+      "label": "统一社会信用代码：",
+      "raw_placeholder": "【 】",
+      "target_field_intent": "credit_code",
+      "confidence_score": 0.95,
+      "reasoning": "识别为信用代码"
+    }
+  ],
+  "filled_details": [
+    {
+      "path": "/body/p[2]",
+      "label": "投标人名称：",
+      "intent": "company_name",
+      "looked_up_value": "四川石楠建设工程有限公司",
+      "write_status": "success",
+      "execution_time_ms": 6
+    },
+    {
+      "path": "/body/p[3]",
+      "label": "统一社会信用代码：",
+      "intent": "credit_code",
+      "looked_up_value": "91510000MA6X12345X",
+      "write_status": "success",
+      "execution_time_ms": 5
+    }
+  ]
+}

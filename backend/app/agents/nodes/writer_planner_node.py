@@ -1,6 +1,9 @@
 """
 投标文件格式大章拆解与动态任务规划器 (WriterPlannerNode)
 
+@deprecated: 自 2026-07-27 起，WriterPlanner (方案 A) 已被 BidFillerAgent (方案 C) 替代。
+本文件保留以备参考，请勿在新代码中引用。
+
 功能：
 1. 提取招标文件中的【投标文件格式】章节大纲及原文档模版；
 2. 按照「一章节 = 一任务 = 一原模版」的原则，将格式大章拆解为多个 ChapterTask 任务；

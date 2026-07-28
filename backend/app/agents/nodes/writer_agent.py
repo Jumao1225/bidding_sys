@@ -21,200 +21,242 @@ from docx import Document as DocxDocument
 from docx.shared import Pt, Cm, Emu
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
+from docx.oxml import parse_xml, OxmlElement
+from docx.oxml.ns import nsdecls, qn
+from app.utils.rmb_formatter import number_to_chinese_rmb
 
 
 # ============================================================
 # 原生 .docx 深拷贝与数据位置换引擎 (100% 还原原标书视觉外观)
 # ============================================================
 
-def num_to_rmb_chinese(num: float) -> str:
-    """将数字金额转换为人民币大写"""
-    if num <= 0:
-        return "零元整"
-    
-    units = ["", "拾", "佰", "仟", "万", "拾万", "佰万", "仟万", "亿"]
-    num_chars = ["零", "壹", "贰", "叁", "肆", "伍", "陆", "柒", "捌", "玖"]
-    
-    str_num = f"{num:.2f}"
-    integer_part, decimal_part = str_num.split(".")
-    
-    res = ""
-    length = len(integer_part)
-    for i, char in enumerate(integer_part):
-        digit = int(char)
-        unit = units[length - i - 1]
-        if digit != 0:
-            res += num_chars[digit] + unit
+
+
+def _set_tc_text_cleanly(tc, val: str):
+    """
+    干净原位替换单元格文本：将 val 放入首个 <w:t> 节点，并将其余 <w:t> 节点清空。
+    若单元格全空（无 <w:t> 节点），自动在段落中追加 <w:r><w:t> 节点并写入。
+    """
+    t_nodes = [t for t in tc.iter() if t.tag.endswith('t')]
+    if t_nodes:
+        t_nodes[0].text = str(val)
+        for t in t_nodes[1:]:
+            t.text = ""
+    else:
+        p_nodes = [p for p in tc.iter() if p.tag.endswith('p')]
+        if p_nodes:
+            p = p_nodes[0]
         else:
-            if not res.endswith("零"):
-                res += "零"
-                
-    res = res.rstrip("零") + "元"
-    
-    jiao = int(decimal_part[0])
-    fen = int(decimal_part[1])
-    
-    if jiao > 0:
-        res += num_chars[jiao] + "角"
-    if fen > 0:
-        res += num_chars[fen] + "分"
-    if jiao == 0 and fen == 0:
-        res += "整"
-        
-    return res
+            p = parse_xml(f'<w:p {nsdecls("w")}/>')
+            tc.append(p)
+        r = parse_xml(f'<w:r {nsdecls("w")}><w:t xml:space="preserve">{str(val)}</w:t></w:r>')
+        p.append(r)
+
+
+def _fill_table_with_mapping(
+    table_elem, 
+    tr_elems: list, 
+    data_items: list, 
+    column_mappings: list, 
+    total_cost: float = 0.0
+):
+    """
+    通用矩阵填充器 (Zero Hardcoding):
+    根据 TableAgent 决定的 column_mappings，零硬编码将 data_items 动态塞入 Word 单元格！
+    """
+    if not tr_elems or not data_items:
+        return
+
+    header_tr = tr_elems[0]
+    # 移除模板展示行
+    for tr in tr_elems[1:]:
+        table_elem.remove(tr)
+
+    # 建立 col_index -> ColumnMapping 快捷映射
+    mapping_by_col = {m.col_index: m for m in column_mappings}
+
+    for i, item in enumerate(data_items):
+        row_tr = copy.deepcopy(header_tr)
+        tc_elems = [e for e in row_tr if e.tag.endswith('tc')]
+
+        for col_idx, tc in enumerate(tc_elems):
+            mapping = mapping_by_col.get(col_idx)
+            val = ""
+            if mapping:
+                fkey = mapping.field_key
+                default_v = mapping.default_val or ""
+
+                if fkey == "seq":
+                    val = str(i + 1)
+                elif fkey == "name":
+                    val = item.get("name") or item.get("item_name") or item.get("req") or default_v
+                elif fkey == "spec":
+                    val = str(item.get("spec_requirement") or item.get("spec") or item.get("model") or item.get("level") or default_v)[:40]
+                elif fkey == "brand":
+                    val = item.get("brand") or item.get("matched_brand") or default_v or "一线品牌"
+                elif fkey == "manufacturer":
+                    val = item.get("manufacturer") or item.get("matched_manufacturer") or item.get("factory") or item.get("company") or default_v or "知名品牌/合规厂家"
+                elif fkey == "unit":
+                    val = item.get("unit") or "项"
+                elif fkey == "qty":
+                    val = str(item.get("qty") or item.get("quantity") or "1")
+                elif fkey == "price":
+                    p = item.get("ref_price") or item.get("price") or 0.0
+                    val = f"{float(p):,.2f}"
+                elif fkey == "subtotal":
+                    sub = item.get("subtotal") or 0.0
+                    val = f"{float(sub):,.2f}"
+                elif fkey == "remark":
+                    val = item.get("remark") or default_v or "满足招标文件要求"
+                elif fkey == "status":
+                    val = item.get("status") or default_v or "完全响应"
+                elif fkey == "expiry":
+                    val = item.get("expiry") or item.get("expiry_date") or default_v or "长期有效"
+                elif fkey == "role":
+                    val = item.get("role") or default_v or "核心人员"
+                else:
+                    val = default_v
+
+            _set_tc_text_cleanly(tc, val)
+
+        table_elem.append(row_tr)
 
 
 def _populate_native_table(table_elem, current_section: str, metadata: dict, analysis: dict, chapter_results: Optional[dict] = None):
     """
-    针对原生的 OpenXML Table 节点 (w:tbl)，严格依据上下文章节 current_section 精准装配数据！
-    绝不跨章节乱塞 BOM 或乱填数据！
+    针对原生的 OpenXML Table 节点 (w:tbl)，利用 TableAgent 自主识别表格表头与列语义，
+    零硬编码地将 BOM 采购清单、资质证书、团队人员或响应条款填充至 Word 单元格中！
     """
-    cost = analysis.get("cost_analysis", {})
-    cost_items = cost.get("items", [])
-    total_cost = cost.get("total_cost", 0.0)
-
-    eval_data = metadata.get("evaluation", {})
-    qual_md = metadata.get("qualification", {})
-
     tr_elems = [e for e in table_elem if e.tag.endswith('tr')]
     if not tr_elems:
         return
 
-    # 1. 只有当处于【五、投标配置及分项报价表】章节时，才装配 BOM 采购清单！
-    if "投标配置及分项报价表" in current_section or "分项报价表" in current_section:
-        if cost_items and len(tr_elems) >= 1:
-            header_tr = tr_elems[0]
-            # 移除旧示范行
-            for tr in tr_elems[1:]:
-                table_elem.remove(tr)
-                
-            for i, item in enumerate(cost_items):
-                row_tr = copy.deepcopy(header_tr)
-                tc_elems = [e for e in row_tr if e.tag.endswith('tc')]
-                if len(tc_elems) >= 4:
-                    vals = [
-                        str(i + 1),
-                        item.get("name", ""),
-                        str(item.get("spec_requirement", ""))[:40],
-                        str(item.get("qty", "")),
-                        item.get("unit", ""),
-                        f"{item.get('ref_price', 0):,.2f}",
-                        f"{item.get('subtotal', 0):,.2f}"
-                    ]
-                    for idx, tc in enumerate(tc_elems):
-                        val_to_put = vals[idx] if idx < len(vals) else ""
-                        for t in tc.iter():
-                            if t.tag.endswith('t'):
-                                t.text = val_to_put
-                                break
-                table_elem.append(row_tr)
+    # 1. 提取表格第一行作为表头列名
+    header_tr = tr_elems[0]
+    tc_elems_header = [e for e in header_tr if e.tag.endswith('tc')]
+    if not tc_elems_header:
+        return
 
-    # 2. 只有当处于【三、开标一览表】章节时，才填入开标总价与大写金额！
-    elif "开标一览表" in current_section:
-        rmb_str = num_to_rmb_chinese(total_cost) if total_cost > 0 else "按分项汇总"
-        for tr in tr_elems[1:]:
-            for tc in tr.iter():
-                if tc.tag.endswith('tc'):
-                    tc_text = "".join(tc.itertext()).strip()
-                    if "大写" in tc_text or "人民币" in tc_text:
-                        for t in tc.iter():
-                            if t.tag.endswith('t'):
-                                t.text = f"人民币 {rmb_str}"
-                                break
-                    elif total_cost > 0 and ("¥" in tc_text or "元" in tc_text or tc_text == ""):
-                        for t in tc.iter():
-                            if t.tag.endswith('t'):
-                                if t.text is not None and any(char in t.text for char in ["元", "¥", "金额", ""]):
-                                    t.text = f"¥{total_cost:,.2f}"
-                                    break
+    header_texts = ["".join(tc.itertext()).strip() for tc in tc_elems_header]
 
-    # 3. 处于【资格审查】或【资质】章节表格时：优先装配资质中心 DB 中的已有证书！
-    elif "资格" in current_section or "资质" in current_section:
-        qual_rows = []
-        if chapter_results:
-            for tid, cres in chapter_results.items():
-                if cres.get("mapping_hint") == "qualification" and cres.get("table_rows"):
-                    qual_rows = cres.get("table_rows")
-                    break
-        if qual_rows and len(tr_elems) >= 1:
-            header_tr = tr_elems[0]
-            for tr in tr_elems[1:]:
-                table_elem.remove(tr)
-            for i, qitem in enumerate(qual_rows):
-                row_tr = copy.deepcopy(header_tr)
-                tc_elems = [e for e in row_tr if e.tag.endswith('tc')]
-                if len(tc_elems) >= 3:
-                    vals = [
-                        str(i + 1), 
-                        qitem.get("name", ""), 
-                        qitem.get("level", ""), 
-                        qitem.get("expiry", ""), 
-                        qitem.get("company", "")
-                    ]
-                    for idx, tc in enumerate(tc_elems):
-                        val_to_put = vals[idx] if idx < len(vals) else ""
-                        for t in tc.iter():
-                            if t.tag.endswith('t'):
-                                t.text = val_to_put
-                                break
-                table_elem.append(row_tr)
+    # 2. 调度 TableAgent 进行智能表格识别与列语义映射
+    from app.agents.nodes.table_agent import analyze_table_structure_and_map
+    decision = analyze_table_structure_and_map(header_texts, current_section)
 
-    # 4. 当处于【七、实质性条款响应对照表】时：装配硬性技术/商务响应条款
-    elif "实质性条款" in current_section or "条款响应" in current_section:
+    cost = analysis.get("cost_analysis", {})
+    cost_items = cost.get("items", [])
+    total_cost = cost.get("total_cost", 0.0)
+
+    timeline = metadata.get("timeline") or {}
+    project_name = timeline.get("project_name") or "分布式光伏发电项目"
+
+    # 3. 兜底获取 chapter_results 中的数据
+    if not cost_items and chapter_results:
+        for tid, cres in chapter_results.items():
+            if cres.get("mapping_hint") in ["pricing", "cost"] and cres.get("table_rows"):
+                cost_items = cres.get("table_rows")
+                break
+
+    qual_rows = []
+    if chapter_results:
+        for tid, cres in chapter_results.items():
+            if cres.get("mapping_hint") == "qualification" and cres.get("table_rows"):
+                qual_rows = cres.get("table_rows")
+                break
+
+    eval_data = metadata.get("evaluation", {})
+    qual_md = metadata.get("qualification", {})
+
+    # 4. 依据 TableAgent 决策结果调度通用矩阵填充器
+    if decision.table_type == "pricing_bom" and cost_items:
+        _fill_table_with_mapping(table_elem, tr_elems, cost_items, decision.column_mappings, total_cost)
+
+    elif decision.table_type == "qualification_certs" and qual_rows:
+        _fill_table_with_mapping(table_elem, tr_elems, qual_rows, decision.column_mappings, total_cost)
+
+    elif decision.table_type == "clause_compliance":
         hard_service = eval_data.get("hard_service_requirements") or {}
         hard_quals = qual_md.get("mandatory_qualifications") or []
         combined_requirements = []
         if isinstance(hard_service, dict):
             for k, v in hard_service.items():
-                combined_requirements.append({"req": f"{k}: {v}", "status": "完全响应"})
+                combined_requirements.append({"name": f"{k}: {v}", "spec": f"{k}: {v}", "status": "完全响应"})
         if isinstance(hard_quals, list):
             for q in hard_quals:
-                combined_requirements.append({"req": str(q), "status": "完全响应"})
+                combined_requirements.append({"name": str(q), "spec": str(q), "status": "完全响应"})
 
-        if combined_requirements and len(tr_elems) >= 1:
-            header_tr = tr_elems[0]
-            for tr in tr_elems[1:]:
-                table_elem.remove(tr)
-            for i, item in enumerate(combined_requirements):
-                row_tr = copy.deepcopy(header_tr)
-                tc_elems = [e for e in row_tr if e.tag.endswith('tc')]
-                if len(tc_elems) >= 3:
-                    vals = [str(i + 1), item["req"], item["status"], "符合招标文件规定"]
-                    for idx, tc in enumerate(tc_elems):
-                        val_to_put = vals[idx] if idx < len(vals) else ""
-                        for t in tc.iter():
-                            if t.tag.endswith('t'):
-                                t.text = val_to_put
-                                break
-                table_elem.append(row_tr)
+        if combined_requirements:
+            _fill_table_with_mapping(table_elem, tr_elems, combined_requirements, decision.column_mappings, total_cost)
 
-    # 5. 当处于【九、项目负责人及其他人员介绍】时：装配团队人员要求
-    elif "项目负责人" in current_section or "人员介绍" in current_section:
+    elif decision.table_type == "team_personnel":
         personnel = qual_md.get("personnel_requirements") or []
+        if personnel:
+            personnel_rows = []
+            for p in personnel:
+                if isinstance(p, dict):
+                    personnel_rows.append({"name": p.get("role", "核心人员"), "spec": p.get("requirement", "具备相应资格")})
+                else:
+                    personnel_rows.append({"name": str(p), "spec": "具备相应资格"})
+            _fill_table_with_mapping(table_elem, tr_elems, personnel_rows, decision.column_mappings, total_cost)
 
-        if personnel and len(tr_elems) >= 1:
-            header_tr = tr_elems[0]
-            for tr in tr_elems[1:]:
-                table_elem.remove(tr)
-            for i, p in enumerate(personnel):
-                row_tr = copy.deepcopy(header_tr)
-                tc_elems = [e for e in row_tr if e.tag.endswith('tc')]
-                role = p.get("role", "核心人员") if isinstance(p, dict) else "核心人员"
-                req = p.get("requirement", str(p)) if isinstance(p, dict) else str(p)
-                if len(tc_elems) >= 3:
-                    vals = [str(i + 1), role, req, "[拟派合格人员]", "[具备相应资格证书]"]
-                    for idx, tc in enumerate(tc_elems):
-                        val_to_put = vals[idx] if idx < len(vals) else ""
-                        for t in tc.iter():
-                            if t.tag.endswith('t'):
-                                t.text = val_to_put
-                                break
-                table_elem.append(row_tr)
+    elif decision.table_type == "opening_summary" or "开标一览表" in current_section:
+        # 原位填充开标一览表 (In-Place Fill)，100% 保持原生表格列宽、合并单元格与模板行
+        rmb_str = number_to_chinese_rmb(total_cost) if total_cost > 0 else ""
+        formatted_cost = f"¥{total_cost:,.2f}" if total_cost > 0 else ""
 
-    # 6. 处于其它章节表格：保持原模版框架
+        for tr in tr_elems[1:]:
+            row_text = "".join(tr.itertext()).strip()
+
+            # 1. 大写总报价行
+            if "大写" in row_text or "人民币" in row_text:
+                tc_nodes = [e for e in tr if e.tag.endswith('tc')]
+                for tc in tc_nodes:
+                    tc_text = "".join(tc.itertext()).strip()
+                    if ("大写" not in tc_text or tc_text == "") and rmb_str:
+                        _set_tc_text_cleanly(tc, f"人民币 {rmb_str}")
+                        break
+
+            # 2. 项目概况与小写总价行
+            else:
+                tc_nodes = [e for e in tr if e.tag.endswith('tc')]
+                if len(tc_nodes) >= 3:
+                    if project_name:
+                        _set_tc_text_cleanly(tc_nodes[0], project_name)
+                    # 单元格 1: 完美保留原模板自带的技术要求描述（绝不写死）
+                    c1_text = "".join(tc_nodes[1].itertext()).strip()
+                    if not c1_text:
+                        _set_tc_text_cleanly(tc_nodes[1], "完全响应招标文件技术要求")
+                    if formatted_cost:
+                        _set_tc_text_cleanly(tc_nodes[2], formatted_cost)
     else:
-        logger.info(f"章节 [{current_section}] 的表格保持原生模版框架")
+        logger.info(f"章节 [{current_section}] 的表格 TableAgent 判定保持原生模版框架")
+
+
+
+
+def replace_paragraph_text_smartly(elem, old_pattern: str, new_text: str) -> bool:
+    """
+    智能跨 Run / 跨 <w:t> 节点替换段落文本。
+    对段落拼接全文本，在第一个匹配的 <w:t> 节点上更新为 new_text，清空段落内后续匹配到的划线节点。
+    """
+    import re
+    t_nodes = [t for t in elem.iter() if t.tag.endswith('t') and t.text]
+    if not t_nodes:
+        return False
+
+    full_p_text = "".join(t.text for t in t_nodes)
+    if not re.search(old_pattern, full_p_text):
+        return False
+
+    # 使用正则替换全段文本
+    replaced_p_text = re.sub(old_pattern, new_text, full_p_text)
+
+    # 替换后的文本填入首个节点，后续节点置空
+    t_nodes[0].text = replaced_p_text
+    for t in t_nodes[1:]:
+        t.text = ""
+    return True
+
 
 
 def _replace_xml_element_variables(
@@ -226,6 +268,7 @@ def _replace_xml_element_variables(
 ):
     """
     在原生的 OpenXML Element 节点（段落或表格）中智能检索并按语义置换数据。
+    支持段落跨 Run / 跨 <w:t> 节点的划线占位符与标书字段语义置换。
     """
     if elem.tag.endswith('tbl'):
         _populate_native_table(elem, current_section, metadata, analysis, chapter_results)
@@ -233,40 +276,106 @@ def _replace_xml_element_variables(
 
     timeline = metadata.get("timeline") or {}
     project_name = timeline.get("project_name") or ""
-    project_id = timeline.get("project_id_code") or ""
+    project_id = timeline.get("project_id_code") or timeline.get("project_id") or ""
 
     contacts = timeline.get("contacts") or []
     tenderer = ""
     for c in contacts:
-        if isinstance(c, dict) and ("招标" in c.get("role_type", "") or "甲方" in c.get("role_type", "")):
-            tenderer = c.get("unit_name", "")
-            if tenderer:
-                break
+        if isinstance(c, dict):
+            role = c.get("role_type", "")
+            unit = c.get("unit_name", "")
+            if any(k in role for k in ["招标", "买方", "甲方", "业主", "建设"]):
+                tenderer = unit
+                if tenderer:
+                    break
+    if not tenderer:
+        tenderer = (
+            timeline.get("tenderer_name") or 
+            timeline.get("buyer_name") or 
+            timeline.get("unit_name") or 
+            timeline.get("project_owner") or ""
+        )
+
+    company_name = (
+        analysis.get("company_quals") or 
+        metadata.get("qualification", {}).get("company_name") or 
+        timeline.get("supplier_name") or 
+        timeline.get("company_name") or 
+        timeline.get("bidder_name") or ""
+    )
+
+    if not company_name:
+        try:
+            from app.agents.tools.writer_tools import get_company_qualifications_tool
+            quals = get_company_qualifications_tool()
+            if quals and isinstance(quals, list) and len(quals) > 0:
+                company_name = quals[0].get("company_name", "")
+        except Exception:
+            pass
 
     cost = analysis.get("cost_analysis") or {}
     total_cost = cost.get("total_cost", 0.0)
+    total_cost_rmb = number_to_chinese_rmb(total_cost) if total_cost > 0 else ""
+
+    p_text = "".join(elem.itertext()).strip()
+    import re
+    import datetime
+
+    # 仅在【封面】或【投标函】及其格式小节处理
+    is_target_section = any(k in current_section for k in ["封面", "投标函", "开标一览表"])
+
+    if is_target_section and p_text:
+        # 1. 项目名称替换
+        if ("项目名称：" in p_text or "项目名称:" in p_text) and not any(k in p_text for k in ["历史", "业绩", "拟派", "人员", "以往"]):
+            if project_name:
+                prefix = "项目名称：" if "项目名称：" in p_text else "项目名称:"
+                replace_paragraph_text_smartly(elem, r'项目名称[：:]\s*[_＿\s—]*.*$', f"{prefix}{project_name}")
+
+        # 2. 招标编号 / 项目编号替换
+        if ("招标编号：" in p_text or "招标编号:" in p_text or "项目编号：" in p_text or "项目编号:" in p_text):
+            if project_id:
+                prefix = "招标编号：" if "招标编号" in p_text else "项目编号："
+                replace_paragraph_text_smartly(elem, r'(招标编号|项目编号)[：:]\s*[_＿\s—]*.*$', f"{prefix}{project_id}")
+
+        # 3. 投标函 -> 致：XXX（招标人/买方单位）
+        if "投标函" in current_section and ("致：" in p_text or "致:" in p_text):
+            if tenderer:
+                prefix = "致：" if "致：" in p_text else "致:"
+                replace_paragraph_text_smartly(elem, r'致[：:]\s*[_＿\s—]*.*$', f"{prefix}{tenderer}：")
+
+        # 4. 投标函 -> 根据贵方的______号招标文件
+        if "投标函" in current_section and ("号招标文件" in p_text or "招标文件" in p_text):
+            if project_id:
+                replace_paragraph_text_smartly(elem, r'根据贵方的?\s*[_＿\s—]*号招标文件', f"根据贵方的 {project_id} 号招标文件")
+                replace_paragraph_text_smartly(elem, r'[_＿]{2,}\s*号招标文件', f"{project_id}号招标文件")
+
+        # 5. 投标函 -> 代表投标人______ (投标人的名称)
+        if "投标函" in current_section and ("代表投标人" in p_text or "投标人名称" in p_text):
+            if company_name:
+                replace_paragraph_text_smartly(elem, r'代表投标人\s*[_＿\s—]*（?投标人的名称）?', f"代表投标人：{company_name}")
+
+        # 6. 封面 & 投标函 -> 投标人名称：______
+        if ("封面" in current_section or "投标函" in current_section) and ("投标人名称：" in p_text or "投标人名称:" in p_text):
+            if company_name:
+                prefix = "投标人名称：" if "投标人名称：" in p_text else "投标人名称:"
+                replace_paragraph_text_smartly(elem, r'投标人名称[：:]\s*[_＿\s—]*.*$', f"{prefix}{company_name}")
+
+        # 7. 投标函 -> 授权下述签字人____ (姓名和职务)
+        if "投标函" in current_section and ("签字人" in p_text or "法定代表人" in p_text):
+            replace_paragraph_text_smartly(elem, r'签字人\s*[_＿\s—]*（?姓名和职务）?', "签字人 (法定代表人/授权代理人)")
+
+        # 8. 投标函 -> 投标总价与大写金额
+        if "投标函" in current_section and any(k in p_text for k in ["投标总价", "投标报价", "报价总额", "人民币"]):
+            if total_cost > 0:
+                replace_paragraph_text_smartly(elem, r'[_＿]{2,}', f" 人民币{total_cost_rmb}（¥{total_cost:,.2f}元） ")
+
+        # 9. 投标函 -> 日期：____年__月__日
+        if ("封面" in current_section or "投标函" in current_section) and ("日期：" in p_text or "日期:" in p_text or "年" in p_text and "月" in p_text and "日" in p_text):
+            curr_date_str = datetime.date.today().strftime("%Y 年 %m 月 %d 日")
+            replace_paragraph_text_smartly(elem, r'日期[：:]\s*[_＿\s—]*年[_＿\s—]*月[_＿\s—]*日', f"日期：{curr_date_str}")
+            replace_paragraph_text_smartly(elem, r'[_＿\s—]*年[_＿\s—]*月[_＿\s—]*日', curr_date_str)
 
 
-    for t_elem in elem.iter():
-        if t_elem.tag.endswith('t') and t_elem.text:
-            text = t_elem.text
-
-            # 精准前缀拦截：仅在【封面】或明确指代本项目的字段处替换
-            if ("封面" in current_section or "投标函" in current_section) and ("项目名称：" in text or "项目名称:" in text):
-                if not any(k in text for k in ["历史", "业绩", "拟派", "人员", "以往"]):
-                    if project_name and not any(char in text for char in ["和炼", "分布式", "发电"]):
-                        t_elem.text = f"项目名称：{project_name}"
-
-            elif ("封面" in current_section or "投标函" in current_section) and ("招标编号：" in text or "招标编号:" in text):
-                if project_id and not any(char in text for char in ["8535", "PROJ"]):
-                    t_elem.text = f"招标编号：{project_id}"
-
-            elif "投标函" in current_section and ("致：" in text or "致:" in text) and tenderer and "_" in text:
-                import re
-                t_elem.text = re.sub(r'致：\s*[_＿]{3,}', f"致：{tenderer}", text)
-
-            elif "投标函" in current_section and "买方" in text and tenderer and "_" in text:
-                t_elem.text = text.replace("买方的______号", f"买方的{project_id or '____'}号")
 
 
 def clone_format_section_from_original_docx(
@@ -341,20 +450,32 @@ def clone_format_section_from_original_docx(
             new_body.remove(child)
 
         current_section = "封面"
-        known_sections = [
-            "封面", "投标函", "开标一览表", "资格证明",
-            "投标配置及分项报价表", "常用零件及耗材",
-            "实质性条款", "设计方案", "项目负责人",
-            "投标人情况", "技术要求偏离", "商务要求偏离", "其他材料"
+        known_section_rules = [
+            ("封面", ["封面"]),
+            ("投标函", ["投标函"]),
+            ("开标一览表", ["开标一览表", "开标表"]),
+            ("资格证明", ["资格证明", "资格审查", "资格文件", "书面承诺"]),
+            ("投标配置及分项报价表", ["分项报价", "投标配置", "报价清单", "采购清单", "报价分析", "报价表"]),
+            ("常用零件及耗材", ["常用零件", "耗材报价"]),
+            ("实质性条款", ["实质性", "响应对照表", "硬性要求"]),
+            ("设计方案", ["设计方案", "技术方案", "施工组织"]),
+            ("项目负责人", ["项目负责人", "人员介绍", "团队人员", "人员配备"]),
+            ("投标人情况", ["投标人情况", "投标人简介"]),
+            ("技术要求偏离", ["技术要求偏离", "技术偏离"]),
+            ("商务要求偏离", ["商务条款偏离", "商务偏离"]),
+            ("其他材料", ["其他材料", "其它材料"])
         ]
 
         for elem in target_elements:
             text_content = "".join(elem.itertext()).strip()
-            if elem.tag.endswith('p'):
-                for sec_name in known_sections:
-                    if sec_name in text_content and len(text_content) < 60:
-                        current_section = sec_name
-                        break
+            if elem.tag.endswith('p') and text_content:
+                clean_text = re.sub(r'\s+', '', text_content)
+                if len(clean_text) < 60:
+                    for sec_name, keywords in known_section_rules:
+                        if any(kw in clean_text for kw in keywords):
+                            current_section = sec_name
+                            break
+
 
             copied_elem = copy.deepcopy(elem)
             _replace_xml_element_variables(copied_elem, current_section, metadata, analysis, chapter_results)

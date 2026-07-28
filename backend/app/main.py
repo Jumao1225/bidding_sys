@@ -1,3 +1,12 @@
+import sys
+import asyncio
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
 import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -17,7 +26,7 @@ from app.services.llm_service import llm_service
 async def lifespan(app: FastAPI):
     # Startup
     setup_app_logging()
-    logger.info("🚀 智能投标系统后端启动成功")
+    logger.info("🚀 智能投标系统后端启动成功 (全量模块已热重载 v3)")
     
     # 预加载 Embedding 模型，使其一直常驻后台内存/显存
     try:

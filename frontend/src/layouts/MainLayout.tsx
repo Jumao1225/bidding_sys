@@ -14,9 +14,21 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (path === '/') return location.pathname === '/';
     if (path === '/analysis') return location.pathname.startsWith('/analysis');
     if (path === '/qualifications') return location.pathname.startsWith('/qualifications');
+    if (path === '/company-profile') return location.pathname.startsWith('/company-profile');
     if (path === '/price-book') return location.pathname.startsWith('/price-book');
     if (path === '/admin') return location.pathname.startsWith('/admin');
+    if (path === '/docx-debugger') return location.pathname.startsWith('/docx-debugger');
     return false;
+  };
+
+  const getPageTitle = () => {
+    if (location.pathname.startsWith('/company-profile')) return '企业基础档案管理';
+    if (location.pathname.startsWith('/qualifications')) return '企业资质中心';
+    if (location.pathname.startsWith('/price-book')) return '成本报价知识库';
+    if (location.pathname.startsWith('/admin')) return '系统运维管理';
+    if (location.pathname.startsWith('/analysis')) return '智能文档解析';
+    if (location.pathname.startsWith('/docx-debugger')) return 'Word 格式与指令改写调试';
+    return '系统总览';
   };
 
   const getLinkClass = (path: string) => 
@@ -70,7 +82,25 @@ export default function MainLayout({ children }: MainLayoutProps) {
             <span className={isActive('/price-book') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>成本报价</span>
           </Link>
 
+          <p className="px-4 text-[10px] font-bold tracking-widest text-slate-500 mb-3 mt-6 uppercase font-mono">Debug Tools</p>
+
+          <Link to="/docx-debugger" className={getLinkClass('/docx-debugger')}>
+            {isActive('/docx-debugger') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+            <svg className={`w-5 h-5 mr-3 ${isActive('/docx-debugger') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+            </svg>
+            <span className={isActive('/docx-debugger') ? "relative z-10 font-bold" : "group-hover:translate-x-1 transition-transform duration-300"}>Word 调试</span>
+          </Link>
+
           <p className="px-4 text-[10px] font-bold tracking-widest text-slate-500 mb-3 mt-6 uppercase">Resources</p>
+
+          <Link to="/company-profile" className={getLinkClass('/company-profile')}>
+            {isActive('/company-profile') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+            <svg className={`w-5 h-5 mr-3 ${isActive('/company-profile') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5m0 0h4m-4 0V11m0 4h4" />
+            </svg>
+            <span className={isActive('/company-profile') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>企业档案</span>
+          </Link>
 
           <Link to="/qualifications" className={getLinkClass('/qualifications')}>
             {isActive('/qualifications') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
@@ -117,7 +147,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
         <header className="h-20 glass sticky top-0 z-30 flex items-center justify-between px-10 rounded-b-3xl mx-4 mb-4 mt-0 shadow-sm border-t-0">
           <div className="flex items-center">
             <div className="h-8 w-1 bg-blue-600 rounded-full mr-4"></div>
-            <h2 className="text-xl font-bold text-slate-800 tracking-tight">文档解析引擎</h2>
+            <h2 className="text-xl font-bold text-slate-800 tracking-tight">{getPageTitle()}</h2>
           </div>
           <div className="flex items-center space-x-6">
             <button className="text-slate-400 hover:text-blue-600 transition-colors">

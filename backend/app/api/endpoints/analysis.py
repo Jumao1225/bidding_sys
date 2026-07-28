@@ -6,6 +6,7 @@ import os
 import uuid
 from pathlib import Path
 import glob
+from datetime import datetime
 
 from app.schemas.response.common import ResponseModel, success_response
 from app.worker.tasks import analyze_bidding_doc
@@ -102,7 +103,7 @@ async def reextract_domain(
         "evaluation": extract_evaluation_info
     }
     
-    if domain not in domain_map and domain not in ("cost_estimation", "cost", "writer", "draft", "writer_agent", "strategy_qual", "qualifications_analysis", "qual_analysis"):
+    if domain not in domain_map and domain not in ("cost_estimation", "cost", "writer", "draft", "writer_agent", "strategy_qual", "qualifications_analysis", "qual_analysis", "opening_summary", "opening_summary_agent"):
         raise HTTPException(status_code=400, detail=f"未知的提取领域: {domain}")
         
     try:
@@ -121,6 +122,25 @@ async def reextract_domain(
         token_tenant = current_tenant_id.set(current_user.tenant_id)
         
         try:
+            if domain in ("opening_summary", "opening_summary_agent"):
+                from app.agents.nodes.opening_summary_agent import generate_opening_summary_node
+                state = {
+                    "document_id": document_id,
+                    "user_id": current_user.id,
+                    "tenant_id": current_user.tenant_id
+                }
+                summary_res = generate_opening_summary_node(state)
+                doc_fresh = document_crud.get_document_by_id(db, document_id, current_user.id, current_user.tenant_id)
+                fresh_meta = doc_fresh.parsed_metadata if doc_fresh else {}
+                return success_response(
+                    data={
+                        "opening_summary_path": summary_res.get("opening_summary_path") or fresh_meta.get("opening_summary_path"),
+                        "opening_summary_data": summary_res.get("summary_data") or fresh_meta.get("opening_summary_data"),
+                        "status": "success"
+                    },
+                    message="开标一览表编写成功"
+                )
+
             if domain in ("cost_estimation", "cost"):
                 from sqlalchemy.orm.attributes import flag_modified
                 from app.agents.nodes.cost_agent import cost_node
@@ -257,6 +277,51 @@ async def download_bidding_draft(
     
     return FileResponse(
         path=draft_path,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        content_disposition_type="attachment"
+    )
+
+@router.get("/opening-summary/download/{document_id}")
+async def download_opening_summary(
+    document_id: str,
+    force: bool = True,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    实时触发 OpeningSummaryAgent 编写并下载最新版《开标一览表》Word 文档 (.docx)
+    """
+    from app.db.crud.document import document_crud
+    doc = document_crud.get_document_by_id(db, document_id, current_user.id, current_user.tenant_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在或无权访问")
+        
+    logger.info(f"⚡ 点击导出开标一览表，实时调度 OpeningSummaryAgent 生成最新文件，文档ID: {document_id}")
+    try:
+        import importlib
+        import app.agents.nodes.opening_summary_agent as osa_mod
+        importlib.reload(osa_mod)
+        
+        state = {
+            "document_id": document_id,
+            "user_id": current_user.id,
+            "tenant_id": current_user.tenant_id
+        }
+        summary_res = osa_mod.generate_opening_summary_node(state)
+        target_file_path = summary_res.get("opening_summary_path")
+        if not target_file_path or not os.path.exists(target_file_path):
+            raise HTTPException(status_code=404, detail="开标一览表实时起草失败")
+    except Exception as gen_err:
+        logger.exception(f"实时起草开标一览表失败: {gen_err}")
+        raise HTTPException(status_code=500, detail=f"开标一览表实时生成失败: {str(gen_err)}")
+            
+    clean_filename = doc.filename.rsplit('.', 1)[0]
+    timestamp_str = datetime.now().strftime('%H%M%S')
+    filename = f"开标一览表_{clean_filename}_{timestamp_str}.docx"
+    
+    return FileResponse(
+        path=target_file_path,
         filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         content_disposition_type="attachment"
