@@ -184,7 +184,7 @@ async def reextract_domain(
                 return success_response(data=qual_data, message="资质核对与能力盘点重新计算成功")
 
             if domain in ("writer", "draft", "writer_agent"):
-                from app.agents.nodes.writer_agent_node import writer_agent_node
+                from app.agents.bid_filler_agent import bid_filler_orchestrator_node as writer_agent_node
                 state = {
                     "document_id": document_id,
                     "user_id": current_user.id,
@@ -255,7 +255,7 @@ async def download_bidding_draft(
     if not target_file_path:
         logger.info(f"磁盘未搜寻到草稿，触发在线动态生成草稿，文档ID: {document_id}")
         try:
-            from app.agents.nodes.writer_agent_node import writer_agent_node
+            from app.agents.bid_filler_agent import bid_filler_orchestrator_node as writer_agent_node
             state = {
                 "document_id": document_id,
                 "user_id": current_user.id,

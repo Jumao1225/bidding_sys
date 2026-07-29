@@ -518,12 +518,12 @@ def generate_opening_summary_node(state: dict) -> dict:
         company_name = getattr(user, 'company_name', None) if user else None
 
         # 多层级级联整合
-        clean_doc_name = doc.filename.rsplit('.', 1)[0] if doc.filename else "招投标项目"
+        clean_doc_name = doc.filename.rsplit('.', 1)[0] if doc.filename else "[待补充项目名称]"
         final_project_name = p_name or parsed_metadata.get("project_name") or parsed_metadata.get("financial", {}).get("project_name") or clean_doc_name
-        final_project_code = p_code or parsed_metadata.get("project_code") or parsed_metadata.get("financial", {}).get("project_code") or "SZDZ-2026-001"
-        final_bidder_name = company_name or parsed_metadata.get("bidder_name") or parsed_metadata.get("company_quals") or "响应方投标有限公司"
-        final_total_cost = calc_total if calc_total > 0 else (limit_amt if limit_amt > 0 else (budget_amt if budget_amt > 0 else (parsed_metadata.get("cost_analysis", {}).get("total_cost", 0.0) or 1181380.0)))
-        final_period = period_desc or (f"{period_days}日历天" if period_days else "60日历天")
+        final_project_code = p_code or parsed_metadata.get("project_code") or parsed_metadata.get("financial", {}).get("project_code") or "[待补充项目编号]"
+        final_bidder_name = company_name or parsed_metadata.get("bidder_name") or parsed_metadata.get("company_quals") or "[待补充投标人名称]"
+        final_total_cost = calc_total if calc_total > 0 else (limit_amt if limit_amt > 0 else (budget_amt if budget_amt > 0 else (parsed_metadata.get("cost_analysis", {}).get("total_cost", 0.0) or 0.0)))
+        final_period = period_desc or (f"{period_days}日历天" if period_days else "[待补充工期]")
 
     finally:
         db.close()

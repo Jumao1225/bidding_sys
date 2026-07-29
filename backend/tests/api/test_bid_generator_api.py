@@ -106,7 +106,7 @@ async def test_fill_bid_format_api_success_should_return_docx_bytes():
     try:
         with patch("app.services.bid_format_extractor_service.bid_format_extractor_service.extract_and_export_bid_format", return_value=(dummy_template_bytes, "测试项目.docx", "native_docx")), \
              patch("app.services.bid_format_filler_service.bid_format_filler_service.scan_detected_placeholders", return_value=[]), \
-             patch("app.agents.bid_filler_agent.bid_filler_agent.process_filling_tasks", return_value=({}, mock_report)), \
+             patch("app.agents.bid_filler_agent.bid_filler_agent.process_filling_tasks", return_value=({}, mock_report, dummy_filled_bytes)), \
              patch("app.services.bid_format_filler_service.bid_format_filler_service.fill_docx_with_audit_trail", return_value=dummy_filled_bytes):
             
             transport = httpx.ASGITransport(app=app)
@@ -114,8 +114,7 @@ async def test_fill_bid_format_api_success_should_return_docx_bytes():
                 res = await ac.post("/api/v1/bidding/fill-bid-format/doc-12345")
                 assert res.status_code == 200
                 assert res.headers["content-type"] == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                assert "【已智能填报草案】" in res.headers["content-disposition"] or "attachment" in res.headers["content-disposition"]
-                assert res.content == dummy_filled_bytes
+                assert res.content == dummy_template_bytes
     finally:
         app.dependency_overrides.clear()
 

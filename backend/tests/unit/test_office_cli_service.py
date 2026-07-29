@@ -111,8 +111,8 @@ async def test_agent_officecli_tools_should_succeed():
         test_file = os.path.join(tmp_dir, "agent_tool_test.docx")
         await office_cli_service.create_blank_docx(test_file)
 
-        # 测试直接工具函数调用 (sync invoke)
-        res = mcp_officecli_query_docx.invoke({"file_path": test_file, "selector": "paragraph"})
+        # 测试直接工具函数调用 (async invoke)
+        res = await mcp_officecli_query_docx.ainvoke({"file_path": test_file, "selector": "paragraph"})
         assert res is not None
         assert "查询失败" not in res
 

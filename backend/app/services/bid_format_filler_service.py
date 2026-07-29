@@ -726,15 +726,34 @@ class BidFormatFillerService:
         :param tenant_id: 租户 ID
         :return: 填报总结字典 (含 success, total_slots_detected, total_slots_filled, audit_report)
         """
-        logger.info(f"🚀 [BidFormatFillerService] 调用拟人化 Agent 填报服务入口, doc_id: {document_id}")
-        from app.agents.human_like_bid_agent import human_like_bid_filler_agent
-        res = await human_like_bid_filler_agent.execute_fill_pipeline(
-            document_id=document_id,
-            template_doc_path=template_doc_path,
-            output_doc_path=output_doc_path,
-            tenant_id=tenant_id
-        )
-        return dict(res)
+        logger.info(f"🚀 [BidFormatFillerService] 收到填报请求，自动转接至最高级全自主核心 Agent 组 (BidFillerAgent), doc_id: {document_id}")
+        from app.agents.bid_filler_agent import bid_filler_agent
+        from app.schemas.bid_filler_schema import CompanyProfile
+        from app.db.session import SessionLocal
+        with open(template_doc_path, "rb") as f:
+            content_bytes = f.read()
+        db = SessionLocal()
+        try:
+            _, audit_report, filled_bytes = bid_filler_agent.process_filling_tasks(
+                db=db,
+                document_id=document_id,
+                profile=CompanyProfile(),
+                detected_placeholders=[],
+                original_docx=content_bytes,
+            )
+        finally:
+            db.close()
+        if filled_bytes and len(filled_bytes) > 0:
+            with open(output_doc_path, "wb") as f:
+                f.write(filled_bytes)
+            logger.info(f"   🎉 标书生成完毕并完成持久化存储: {output_doc_path}")
+        items = audit_report.items if (audit_report and hasattr(audit_report, 'items')) else []
+        return {
+            "success": bool(filled_bytes and len(filled_bytes) > 0),
+            "total_slots_detected": len(items),
+            "total_slots_filled": len(items),
+            "audit_report": [item.model_dump() if hasattr(item, "model_dump") else getattr(item, "dict", lambda: dict(item))() for item in items]
+        }
 
 
     def _format_cell(self, cell, font_context: Optional[Dict[str, Any]] = None, underline: bool = False) -> None:

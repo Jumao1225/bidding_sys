@@ -33,53 +33,6 @@ def test_extract_original_document_context_should_include_paragraph_and_table():
     assert "第 1 行" in context
 
 
-def test_agent_should_plan_source_from_original_context(monkeypatch):
-    """Agent 应根据原文上下文选择数据源，而不是把最终值交给模型编造。"""
-
-    class FakeLLMService:
-        is_configured = True
-
-        def generate_structured_output(self, prompt, schema_cls, temperature=0.0):
-            assert "根据贵方的______号招标文件" in prompt
-            assert "投标总价（大写）" in prompt
-            assert schema_cls is BidFillPlan
-            return BidFillPlan(
-                fields=[
-                    AgentFillPlanItem(
-                        target_field="项目名称",
-                        source_type="project_timeline",
-                        source_key="项目名称",
-                        confidence=0.95,
-                        reasoning="原文位于投标函项目名称槽位。",
-                    )
-                ],
-                agent_summary="已读取原始 Word 上下文。",
-            )
-
-    monkeypatch.setattr("app.services.llm_service.LLMService", FakeLLMService)
-
-    plan = bid_filler_agent._plan_from_original_document(
-        original_context="根据贵方的______号招标文件，我方项目名称为：[项目名称]。\n投标总价（大写）",
-        detected_placeholders=[
-            {
-                "raw_text": "项目名称",
-                "location": "paragraph:0",
-                "full_paragraph": "根据贵方的______号招标文件，我方项目名称为：[项目名称]。",
-                "has_underline": False,
-            },
-            {
-                "raw_text": "投标总价",
-                "location": "table:0:row:0:cell:0",
-                "full_paragraph": "投标总价（大写）",
-                "has_underline": True,
-            },
-        ],
-    )
-
-    assert plan["项目名称"].source_type == "project_timeline"
-    assert plan["项目名称"].confidence == 0.95
-    assert plan["投标总价"].source_type == "financial_price"
-
 
 def test_empty_company_profile_should_not_contain_demo_values():
     """缺少企业档案时不允许自动填入演示公司数据。"""

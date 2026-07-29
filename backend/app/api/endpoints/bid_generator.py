@@ -196,6 +196,16 @@ async def trigger_human_like_bid_filling(
     from app.schemas.bid_filler_schema import CompanyProfile
     from app.agents.bid_filler_agent import bid_filler_agent
 
+    # 清理旧结果文件（防止 download 读到过期数据；文件被占用时跳过）
+    drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
+    old_result = os.path.join(drafts_dir, f"human_fill_result_{document_id[:8]}.docx")
+    if os.path.exists(old_result):
+        try:
+            os.remove(old_result)
+            logger.info(f"   🧹 已清理旧结果文件: {old_result}")
+        except PermissionError:
+            logger.warning(f"   ⚠️ 旧结果文件被占用，将覆盖写入: {old_result}")
+
     logger.info("   🤖 启动 BidFillerAgent（方案 C）自主阅读文档 + 专家撰写...")
     _, audit_report, filled_bytes = bid_filler_agent.process_filling_tasks(
         db=db,
@@ -205,14 +215,21 @@ async def trigger_human_like_bid_filling(
         original_docx=template_bytes,
     )
 
-    # 持久化结果供 download 端点读取，避免重复执行
-    if filled_bytes:
-        drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
-        os.makedirs(drafts_dir, exist_ok=True)
-        result_path = os.path.join(drafts_dir, f"human_fill_result_{document_id[:8]}.docx")
-        with open(result_path, "wb") as f:
-            f.write(filled_bytes)
-        logger.info(f"   💾 方案 C 填报结果已保存至: {result_path}")
+    # 将工作副本重命名为最终结果（Agent 直接在副本上修改，无需二次保存）
+    working_path = os.path.join(drafts_dir, f"bid_fill_{document_id[:8]}.docx")
+    result_path = os.path.join(drafts_dir, f"human_fill_result_{document_id[:8]}.docx")
+    if os.path.exists(working_path):
+        try:
+            if os.path.exists(result_path):
+                os.remove(result_path)
+            os.rename(working_path, result_path)
+            logger.info(f"   💾 工作副本已重命名为最终结果: {result_path}")
+        except (PermissionError, OSError) as e:
+            # 重命名失败时降级为复制
+            logger.warning(f"   ⚠️ 重命名失败({e})，降级为复制")
+            if filled_bytes:
+                with open(result_path, "wb") as f:
+                    f.write(filled_bytes)
 
     return {
         "document_id": document_id,

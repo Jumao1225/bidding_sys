@@ -1,14 +1,14 @@
 import os
 import pytest
 from pathlib import Path
-from app.services.mineru_service import MinerUService
+from app.services.parsers.mineru_parser import MinerUParser
 
 
 def test_mineru_check_availability():
     """
     测试环境探测功能，能够返回正确的诊断字典格式
     """
-    service = MinerUService()
+    service = MinerUParser()
     avail = service.check_availability()
     
     assert isinstance(avail, dict)
@@ -25,8 +25,8 @@ def test_parse_file_with_docx_fixture():
     
     assert os.path.exists(word_fixture_path), f"测试用例需要的 Word Fixture 不存在: {word_fixture_path}"
 
-    service = MinerUService()
-    result = service.parse_file(file_path=str(word_fixture_path), task_id="test_unit_task_001")
+    service = MinerUParser()
+    result = service.parse(file_path=str(word_fixture_path), task_id="test_unit_task_001")
 
     # 1. 验证结果结构完整
     assert result["task_id"] == "test_unit_task_001"

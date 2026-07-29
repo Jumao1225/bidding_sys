@@ -117,30 +117,11 @@ def query_company_profile_tool(field_key: str) -> str:
     try:
         profile = db.query(CompanyProfileModel).first()
 
-        # 仅在显式开启 DEMO 模式时使用示例数据（默认生产环境关闭）
-        _DEMO_MODE = os.getenv("BID_FILLER_DEMO_MODE", "0") == "1"
-        demo_defaults = {
-            "company_name": "四川石楠建设工程有限公司",
-            "legal_representative": "张三",
-            "authorized_delegate": "李四",
-            "credit_code": "91510000MA6X12345X",
-            "registered_address": "四川省成都市高新区天府大道北段128号",
-            "contact_phone": "028-85123456",
-            "email": "contact@shinan-build.com",
-            "bank_name": "中国工商银行股份有限公司成都高新支行",
-            "bank_account": "4402 2011 0910 0123 456",
-        } if _DEMO_MODE else {}
-
         if profile:
             val = getattr(profile, std_key, None)
             if val and str(val).strip():
                 logger.info(f"🛠️ [DB Tool] 成功从 PostgreSQL (company_profiles.{std_key}) 查询到真实数据: '{val}'")
                 return str(val).strip()
-
-        fallback_val = demo_defaults.get(std_key, "")
-        if fallback_val:
-            logger.info(f"🛠️ [DB Tool] DB 中 {std_key} 为空，使用预置企业档案默认值: '{fallback_val}'")
-            return fallback_val
 
         logger.warning(f"🛠️ [DB Tool] 字段 '{field_key}' 在企业档案库中不存在或未配置")
         return f"[待手动补充: {field_key}]"
@@ -156,10 +137,10 @@ def query_company_profile_tool(field_key: str) -> str:
 def query_company_qualification_tool(cert_keyword: str) -> str:
     """
     [数据库直查工具] 查询企业资质与证书数据库 (company_qualifications 表)。
-    适用于查询营业执照、ISO9001 质量认证、ISO14001 环境认证、ISO45001、ISO27001 信息安全认证、高新技术企业证书、软件著作权、企业信用等级 AAA 等。
+    根据关键字搜索已录入的资质证书，返回证书名称、等级、有效期。
 
-    :param cert_keyword: 证书名称关键字 (如 'ISO9001', '信息安全', '营业执照', '高企', '资质')
-    :return: 包含证书名称、等级、有效期等信息的标准格式文本
+    :param cert_keyword: 证书名称关键字（必须来自招标文件原文中明确要求的资质名称）
+    :return: 匹配的资质证书记录文本
     """
     logger.info(f"🛠️ [DB Tool] query_company_qualification_tool 被调用, 关键字: '{cert_keyword}'")
     if not cert_keyword:
@@ -259,11 +240,15 @@ def query_project_metadata_tool(document_id: str, field_key: str) -> str:
             elif any(k in key_lower for k in ["标准", "规范", "standard"]):
                 if eng_meta.mandatory_standards:
                     return json.dumps(eng_meta.mandatory_standards, ensure_ascii=False)
+            elif any(k in key_lower for k in ["工程", "engineering", "技术", "特殊工况", "现场"]):
+                # 通用工程查询 → 返回完整 engineering_metadata
+                result = {k: v for k, v in eng_meta.__dict__.items() if not k.startswith('_')}
+                return json.dumps(result, ensure_ascii=False, default=str)
 
         # 4. 查评标方法与权重 (evaluation_metadata)
         eval_meta = db.query(EvaluationMetadata).filter(EvaluationMetadata.document_id == document_id).first()
         if eval_meta:
-            if any(k in key_lower for k in ["评标", "评审", "evaluation"]):
+            if any(k in key_lower for k in ["评标", "评审", "evaluation", "评分", "权重"]):
                 if eval_meta.evaluation_method:
                     return eval_meta.evaluation_method
 
@@ -287,12 +272,12 @@ def query_project_metadata_tool(document_id: str, field_key: str) -> str:
 @tool
 def query_financial_quotation_tool(document_id: str, field_key: str) -> str:
     """
-    [数据库直查工具] 全量查询财务报价、BOM 清单、保证金及付款条款数据 (financial_metadata / cost_estimates / market_price_references 表)。
-    支持计算并输出阿拉伯数字总价、标准【汉字大写金额】、投标保证金、履约保证金及付款节点要求。
+    [数据库直查工具] 全量查询财务报价、BOM 清单、分项造价、保证金及付款条款数据 (financial_metadata / cost_estimates / market_price_references 表)。
+    支持查询【分项报价清单 (cost_estimates/bom)】并输出各分项名称、品牌、数量、单价与小计，也可输出阿拉伯数字总价、标准【汉字大写金额】、投标保证金、履约保证金及付款节点要求。
 
     :param document_id: 招标文件 ID
-    :param field_key: 查询类型 ('total_price_numeric', 'total_price_chinese', 'bid_price_chinese', 'bid_bond', 'performance_bond', 'payment_milestones')
-    :return: 价格、保证金或付款条款字符串
+    :param field_key: 查询类型 ('cost_estimates', 'bom_list', 'total_price_numeric', 'total_price_chinese', 'bid_price_chinese', 'bid_bond', 'performance_bond', 'payment_milestones')
+    :return: 分项报价明细列表、价格、保证金或付款条款字符串
     """
     logger.info(f"🛠️ [DB Tool] query_financial_quotation_tool 被调用, doc_id: '{document_id}', 字段: '{field_key}'")
     db: Session = SessionLocal()
@@ -311,12 +296,25 @@ def query_financial_quotation_tool(document_id: str, field_key: str) -> str:
 
         # 2. 查询成本测算总价与大写转换
         cost_items = db.query(CostEstimate).filter(CostEstimate.document_id == document_id).all()
+        
+        # 针对分项清单、BOM 表或分项单价/合价查询，返回每行精细列表
+        if any(k in key_lower for k in ["cost", "bom", "item", "清单", "明细", "分项", "配置", "设备", "sub", "quote", "报价"]):
+            if not cost_items:
+                return "[未查到相关 BOM / 成本测算分项清单]"
+            res_items = []
+            for item in cost_items:
+                brand_str = f" [品牌: {item.brand}]" if getattr(item, 'brand', None) else ""
+                spec_str = f" [规格: {item.spec}]" if getattr(item, 'spec', None) else ""
+                res_items.append(
+                    f"- {item.item_name}{brand_str}{spec_str} | 数量: {item.quantity}{item.unit} | 参考单价: {item.unit_price}元 | 测算合计合价(总价): {item.calculated_total}元 | 备注: {getattr(item, 'remark', '')}"
+                )
+            logger.info(f"🛠️ [DB Tool] 成功查得并回传 {len(res_items)} 条 BOM 分项成本报价明细")
+            return "\n".join(res_items)
+
         if cost_items:
             total_price = sum(item.calculated_total for item in cost_items)
         else:
-            # 仅在显式开启 DEMO 模式时使用示例金额兜底（默认生产环境返回 0）
-            _DEMO_MODE = os.getenv("BID_FILLER_DEMO_MODE", "0") == "1"
-            total_price = 967840.36 if _DEMO_MODE else 0.0
+            total_price = 0.0
 
         if any(k in key_lower for k in ["大写", "chinese"]):
             chinese_upper = number_to_chinese_rmb(total_price)
@@ -337,11 +335,11 @@ def query_financial_quotation_tool(document_id: str, field_key: str) -> str:
 @tool
 def query_market_price_reference_tool(item_name: str) -> str:
     """
-    [数据库直查工具] 查询市场设备/材料参考指导价数据库 (market_price_references 表)。
-    适用于查询特定设备、软硬件、材料的参考单价、品牌、规格型号与生产厂商。
+    [数据库直查工具] 查询市场设备/材料参考指导价以及 BOM 历史报价数据库 (market_price_references 及 cost_estimates 表)。
+    适用于查询特定设备（如某核心主机、某配套总成）、软硬件、材料、耗材的参考单价、品牌、规格型号以及系统测算的单价和分项合价。
 
-    :param item_name: 品目/设备/材料名称关键字 (如 '服务器', '光伏组件', '开关柜', '变压器')
-    :return: 包含品名、品牌、规格、参考单价的标准文本说明
+    :param item_name: 品目/设备/材料名称关键字（支持单关键词或复合关键词，如 'XXX主设备'、'XXX配件 某推荐品牌' 或 '某设备名称 XXX技术规范'）
+    :return: 包含品名、品牌、规格、参考单价、建议数量与总价等完整维度的指导意见
     """
     logger.info(f"🛠️ [DB Tool] query_market_price_reference_tool 被调用, 品目关键字: '{item_name}'")
     if not item_name:
@@ -349,20 +347,46 @@ def query_market_price_reference_tool(item_name: str) -> str:
 
     db: Session = SessionLocal()
     try:
+        clean_kw = item_name.strip()
+        # 1. 优先尝试完全精准模糊匹配
         items = db.query(MarketPriceReference).filter(
-            MarketPriceReference.item_name.ilike(f"%{item_name}%")
+            MarketPriceReference.item_name.ilike(f"%{clean_kw}%")
         ).all()
 
+        # 2. 如果无精准结果，则采取多关键字切分匹配（如 "XXX核心设备 某厂牌 XXX型号" -> ["XXX核心设备", "某厂牌"]）
+        if not items and (" " in clean_kw or "/" in clean_kw or "—" in clean_kw or "-" in clean_kw):
+            tokens = [t for t in clean_kw.replace("/", " ").replace("—", " ").replace("-", " ").split() if len(t) >= 2]
+            for t in tokens:
+                sub_res = db.query(MarketPriceReference).filter(
+                    MarketPriceReference.item_name.ilike(f"%{t}%")
+                ).all()
+                for r in sub_res:
+                    if r.id not in [x.id for x in items]:
+                        items.append(r)
+
+        res_list = []
         if items:
-            res_list = []
             for it in items:
                 brand_str = f" [品牌: {it.brand}]" if it.brand else ""
                 spec_str = f" [规格: {it.spec}]" if it.spec else ""
-                res_list.append(f"{it.item_name}{brand_str}{spec_str}: {it.unit_price}元/{it.unit}")
+                res_list.append(f"【市场参考单价】{it.item_name}{brand_str}{spec_str}: 单价 {it.unit_price}元/{it.unit} (说明: {getattr(it, 'remark', '')})")
 
-            return "; ".join(res_list)
+        # 3. 联合直查本系统 CostEstimate 成本估算底单（能够提供真实的数量与合计合价/总价，弥补缺失）
+        first_word = clean_kw.split()[0] if " " in clean_kw else clean_kw
+        cost_matches = db.query(CostEstimate).filter(
+            CostEstimate.item_name.ilike(f"%{first_word}%")
+        ).all()
+        if cost_matches:
+            for c in cost_matches:
+                brand_str = f" [品牌: {c.brand}]" if getattr(c, 'brand', None) else ""
+                res_list.append(
+                    f"【本期项目BOM实测记录】{c.item_name}{brand_str} | 推荐数量: {c.quantity}{c.unit} | 测算单价: {c.unit_price}元 | 分项估算总价(合价): {c.calculated_total}元"
+                )
 
-        return f"[未查到 '{item_name}' 市场参考指导价]"
+        if res_list:
+            return "\n".join(res_list)
+
+        return f"[未查到与 '{item_name}' 相关的参考指导价与合价]"
 
     except Exception as e:
         logger.exception(f"🛠️ [DB Tool] query_market_price_reference_tool 执行异常: {str(e)}")
@@ -376,8 +400,8 @@ def query_evaluation_method_tool(document_id: str, detail_type: str = "method") 
     """
     [数据库直查工具] 独立直查本招投标项目的评标方法、评标办法与评审打分细则 (evaluation_metadata 表)。
     可单独查询：
-    - evaluation_method: 评标办法名称 (如 '综合评估法', '经评审的最低投标价法')
-    - total_score: 评标总分 (如 '100分')
+    - evaluation_method: 评标办法名称
+    - total_score: 评标总分
     - weight_distribution: 商务/技术/价格权重分值分配 JSON
     - score_tree: 详细打分细则树 JSON
 
@@ -399,11 +423,6 @@ def query_evaluation_method_tool(document_id: str, detail_type: str = "method") 
                 logger.info(f"🛠️ [DB Tool] 查得真实评标办法: '{eval_meta.evaluation_method}{score_str}'")
                 return f"{eval_meta.evaluation_method}{score_str}"
 
-        # 仅在显式开启 DEMO 模式时使用演示评标办法（默认生产环境如实返回空）
-        _DEMO_MODE = os.getenv("BID_FILLER_DEMO_MODE", "0") == "1"
-        if _DEMO_MODE:
-            logger.info("🛠️ [DB Tool] DB 中未录入 evaluation_metadata，使用标准演示评标办法")
-            return "综合评估法 (商务30分 + 技术50分 + 报价20分)"
         logger.warning("🛠️ [DB Tool] DB 中未录入 evaluation_metadata，返回待补充标记")
         return "[待补充: 评标办法未录入系统]"
 
