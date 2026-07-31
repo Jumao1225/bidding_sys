@@ -50,7 +50,7 @@ class MinerUParser(BaseParser):
         file_path: str,
         task_id: str,
         model_version: str = "vlm",
-        max_poll_seconds: int = 120
+        max_poll_seconds: int = 600
     ) -> Optional[str]:
         if not self.api_token:
             logger.warning("未配置 MINERU_API_TOKEN，无法发起云端 HTTP 接口调用。")
@@ -69,7 +69,9 @@ class MinerUParser(BaseParser):
             apply_url = f"{self.api_base_url}/file-urls/batch"
             apply_payload = {
                 "files": [{"name": sanitized_name, "data_id": task_id}],
-                "model_version": model_version
+                "model_version": model_version,
+                "is_ocr": True,
+                "enable_table": True
             }
             logger.info(f"正在向 MinerU 云端 API 申请上传凭证 ({sanitized_name})")
             res = requests.post(apply_url, headers=headers, json=apply_payload, timeout=30, proxies={"http": None, "https": None})
@@ -92,13 +94,19 @@ class MinerUParser(BaseParser):
                 upload_res = requests.put(upload_url, data=f, headers=upload_headers, timeout=120, proxies={"http": None, "https": None})
                 upload_res.raise_for_status()
 
-            logger.info(f"文件流直传成功，正在向 MinerU 轮询解析任务状态 (batch_id: {batch_id})...")
+            logger.info(f"文件流直传成功，正在向 MinerU 轮询解析任务状态 (batch_id: {batch_id})，最高等待可容受 600s...")
 
             query_url = f"{self.api_base_url}/extract-results/batch/{batch_id}"
             start_time = time.time()
+            last_log_time = start_time
             full_zip_url: Optional[str] = None
 
             while time.time() - start_time < max_poll_seconds:
+                elapsed_sec = int(time.time() - start_time)
+                if time.time() - last_log_time >= 15:
+                    logger.info(f"⌛ 正在等待 MinerU 深度 OCR 解构与转换... 已经过 {elapsed_sec} 秒 / 上限 {max_poll_seconds} 秒")
+                    last_log_time = time.time()
+
                 poll_res = requests.get(query_url, headers={"Authorization": f"Bearer {self.api_token}"}, timeout=20, proxies={"http": None, "https": None})
                 if poll_res.status_code == 200:
                     poll_data = poll_res.json()
@@ -110,6 +118,7 @@ class MinerUParser(BaseParser):
                             state = task_item.get("state")
                             if state == "done":
                                 full_zip_url = task_item.get("full_zip_url")
+                                logger.info(f"✅ MinerU 解析圆满完结（总耗时 {elapsed_sec}s），开始拉取精装 Markdown...")
                                 break
                             elif state == "failed":
                                 err_msg = task_item.get("err_msg", "未知错误")
@@ -119,7 +128,7 @@ class MinerUParser(BaseParser):
                 time.sleep(3)
 
             if not full_zip_url:
-                logger.error(f"MinerU 轮询超时 ({max_poll_seconds}s) 或未获取到 full_zip_url")
+                logger.error(f"❌ MinerU 轮询极限超时 ({max_poll_seconds}s) 或未能捕获全量返回包！")
                 return None
 
             try:

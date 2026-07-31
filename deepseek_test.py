@@ -22,7 +22,7 @@ headers = {
 }
 data = {
     "model": model_name,
-    "messages": [{"role": "user", "content": "你好"}]
+    "messages": [{"role": "user", "content": "你是什么模型"}]
 }
 
 try:

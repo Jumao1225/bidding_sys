@@ -130,10 +130,13 @@ class RAGService:
                             if chunk.section_title and chunk.section_title != "无章节/正文":
                                 hit_section_titles.add(chunk.section_title)
                             else:
-                                # 对于没有明确章节的段落，回退到物理滑窗 ±1
-                                final_output_chunks.add(chunk)
-                                if idx > 0: final_output_chunks.add(chunk_list[idx - 1])
-                                if idx < len(chunk_list) - 1: final_output_chunks.add(chunk_list[idx + 1])
+                                # 对于没有明确章节的段落，回退到物理滑窗 ±1（严格排除 0 号目录页干扰）
+                                if chunk.chunk_index > 0:
+                                    final_output_chunks.add(chunk)
+                                if idx > 1:
+                                    final_output_chunks.add(chunk_list[idx - 1])
+                                if idx < len(chunk_list) - 1:
+                                    final_output_chunks.add(chunk_list[idx + 1])
                             
                 if context_mode != "window":
                     # 将命中章节内的**所有切片**完整拼入结果，实现“按章召回”

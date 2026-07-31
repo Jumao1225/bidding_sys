@@ -34,11 +34,17 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
         file_path = document.file_path
         logger.info(f"开始处理文档: {file_path}")
 
-        # 如果文件状态已完成（通过文件哈希匹配复用），则直接跳过冗长的解析流程
+        # 如果文件状态已完成（通过文件哈希匹配复用），需确切判定数据库切片不为空
         if document.parse_status == "completed":
-            logger.info("文档已处于解析完成状态，直接复用切片与向量数据。")
-            emit_agent_log("info", "检测到同名且同内容的文件缓存，已跳过 MinerU 解析，极速启动 Agent 智能体网络...")
-            return {"status": "parser_completed"}
+            chunk_count = db.query(DocChunk).filter(DocChunk.document_id == document.id).count()
+            if chunk_count > 0:
+                logger.info("文档既往状态完备，复用既有的知识体系结构。")
+                emit_agent_log("info", "匹配同名完整文档缓存中，直接启用智能模型网络！")
+                return {"status": "parser_completed"}
+            else:
+                logger.warning("⚠️ 此文档虽标记完成但实体切片数为 0（疑遭直接手清），重置为重构阶段进入实效切割！")
+                document.parse_status = "parsing"
+                db.commit()
 
         # 2. 解析和切片（先解析，成功后再清理旧数据，避免解析失败导致数据全丢）
         import os

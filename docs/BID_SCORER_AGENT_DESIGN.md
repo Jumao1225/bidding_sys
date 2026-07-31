@@ -295,24 +295,136 @@ def build_bid_scorer_graph():
 | **Schema** | NEW | `backend/app/schemas/bid_scorer_schema.py` | 请求/响应 Schema |
 | **Agent** | NEW | `backend/app/agents/bid_scorer_agent.py` | **核心**: 4 节点 Map-Reduce StateGraph |
 | **Tools** | NEW | `backend/app/agents/tools/bid_scorer_tools.py` | RAG 检索 + LLM 批量打分封装 |
-| **Service** | NEW | `backend/app/services/bid_scorer_service.py` | 业务编排入口 |
-| **API** | NEW | `backend/app/api/endpoints/bid_scorer.py` | 4 个 API 端点 |
-| **API** | MODIFY | `backend/app/main.py` | 注册路由 |
+| **Service** | NEW | `backend/app/services/bid_scorer_service.py` | 业务编排入口 + 轻量解析编排 |
+| **API** | NEW | `backend/app/api/endpoints/bid_scorer.py` | 5 个 API 端点（含投标文件上传） |
+| **API** | MODIFY | `backend/app/api/routers.py` | 注册 bid_scorer 路由 |
 
 ---
 
-## 8. API 端点设计
+## 8. 前置数据流 — 投标文件轻量上传端点
+
+### 8.1 为什么需要独立上传端点
+
+现有的 `POST /analysis/upload-and-analyze` 上传后会触发**完整的招标分析流水线**（parser → master_agent 提取 5 大元数据 → strategy → cost → writer），这是为**招标文件（甲方）**设计的。
+
+而 BidScorerAgent 需要的**投标文件（我方标书）**只需要 3 步：
+1. 物理层解析（MinerU / python-docx）
+2. 语义切片（Chunking）
+3. 向量化（BGE-M3 Embedding）
+
+**不需要**元数据提取、资质评估、成本核算等后续分析步骤。因此新增一个轻量端点。
+
+### 8.2 完整使用流程
+
+```
+用户操作流程：
+
+1️⃣ 上传招标文件（已有功能）
+   POST /api/v1/analysis/upload-and-analyze
+   → 返回 task_id，后台完整解析
+   → 产出: evaluation_metadata.score_tree（评分维度）
+   → 产出: doc_id = source_doc_id（招标文件 ID）
+
+2️⃣ 上传投标文件（新增端点）
+   POST /api/v1/bid-scorer/upload-bid
+   → 只做 parse + chunk + embedding
+   → 产出: doc_id = document_id（投标文件 ID）
+   → 产出: doc_chunks（向量化切片，供 RAG 检索）
+
+3️⃣ 触发打分
+   POST /api/v1/bid-scorer/score
+   → 传入 document_id（投标文件）+ source_doc_id（招标文件）
+   → Agent 从 source_doc_id 读评分规则，从 document_id 的 chunks 中 RAG 检索
+   → 返回打分报告
+```
+
+### 8.3 轻量上传端点设计
+
+```python
+@router.post("/upload-bid", response_model=ResponseModel[dict])
+async def upload_bid_document(
+    file: UploadFile = File(..., description="上传的投标文件 (Word/PDF)"),
+    source_doc_id: str = Form(..., description="关联的招标文件 Document ID（评分维度来源）"),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    上传投标文件并执行轻量解析（只做 parse + chunk + embedding，不跑分析流水线）。
+    
+    前置条件：source_doc_id 对应的招标文件必须已完成解析，且 evaluation_metadata.score_tree 非空。
+    
+    返回:
+        document_id: 投标文件的唯一 ID，后续传给 /score 端点使用
+        chunk_count: 切片数量
+        parse_status: 解析状态
+    """
+```
+
+**内部执行流程**：
+
+```python
+# 1. 验证 source_doc_id 的 evaluation_metadata 存在且 score_tree 非空
+eval_meta = db.query(EvaluationMetadata).filter(
+    EvaluationMetadata.document_id == source_doc_id
+).first()
+if not eval_meta or not eval_meta.score_tree:
+    raise HTTPException(400, "关联的招标文件尚未提取评分维度，请先完成招标文件分析")
+
+# 2. 保存上传文件
+file_path = save_uploaded_file(file, upload_dir)
+
+# 3. 创建 Document 记录（标记 doc_type="bid" 区分于招标文件）
+doc = Document(
+    tenant_id=current_user.tenant_id,
+    user_id=current_user.id,
+    project_id=project.id,
+    filename=file.filename,
+    file_path=file_path,
+    parse_status="parsing",
+    parsed_metadata={"doc_type": "bid", "source_doc_id": source_doc_id}
+)
+
+# 4. 复用现有 extractor_service 解析 + 切片
+chunks = extractor_service.parse_and_chunk(file_path)
+
+# 5. 复用现有 llm_service 生成 Embedding
+embeddings = llm_service.generate_embeddings([c.page_content for c in chunks])
+
+# 6. 批量写入 doc_chunks 表
+for chunk, embedding in zip(chunks, embeddings):
+    db_chunk = DocChunk(
+        tenant_id=current_user.tenant_id,
+        document_id=doc.id,
+        content=chunk.page_content,
+        chunk_index=chunk.metadata.get("chunk_index"),
+        section_title=chunk.metadata.get("section_title"),
+        embedding=embedding,
+        ...
+    )
+
+# 7. 返回 document_id
+return {"document_id": doc.id, "chunk_count": len(chunks), "parse_status": "completed"}
+```
+
+> **设计要点**：
+> - 完全复用现有的 `extractor_service.parse_and_chunk()` 和 `llm_service.generate_embeddings()` 基础设施
+> - 核心逻辑与 `parser_worker_node` 完全一致，只是不触发后续的 LangGraph 分析流水线
+> - `parsed_metadata` 中记录 `doc_type: "bid"` 和 `source_doc_id`，建立投标文件与招标文件的关联关系
+
+---
+
+## 9. API 端点设计
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/bid-scorer/score` | 触发对指定标书的 AI 打分 |
+| **POST** | `/bid-scorer/upload-bid` | **上传投标文件**（轻量解析：parse + chunk + embedding） |
+| **POST** | `/bid-scorer/score` | 触发对指定标书的 AI 打分 |
 | GET | `/bid-scorer/results/{document_id}` | 获取指定标书的所有历史打分结果 |
 | GET | `/bid-scorer/results/{document_id}/latest` | 获取最新一次打分结果 |
 | GET | `/bid-scorer/detail/{result_id}` | 获取某次打分的逐项明细 |
 
 ---
 
-## 9. 验证计划
+## 10. 验证计划
 
 ### 自动化测试
 
@@ -320,7 +432,7 @@ def build_bid_scorer_graph():
 # 单元测试 — 共识计算 + 护栏逻辑
 pytest tests/unit/test_bid_scorer_consensus.py -v
 
-# 集成测试 — 完整 Map-Reduce 打分流程
+# 集成测试 — 完整打分流程（上传 + 解析 + 打分）
 pytest tests/integration/test_bid_scorer_flow.py -v
 
 # API 接口测试
@@ -329,9 +441,11 @@ pytest tests/api/test_bid_scorer_api.py -v
 
 ### 手工验证
 
-1. 确认 `evaluation_metadata.score_tree` 已有数据（通过前序流程生成）
-2. 确认标书文档已完成解析（`doc_chunks` 存在且有向量）
-3. 调用 `POST /bid-scorer/score` 触发打分
-4. 验证返回报告：逐项分数 + 三轮原始分数 + 总分 + 改进建议
-5. 验证数据库 `bid_score_results` 和 `bid_score_items` 已落库
-6. 重复调用验证：得分波动应在 ±3% 以内（三轮共识生效）
+1. 通过 `POST /analysis/upload-and-analyze` 上传招标文件，完成全流程分析
+2. 确认 `evaluation_metadata.score_tree` 已入库（可通过 `/analysis/{doc_id}/reextract/evaluation` 重新提取）
+3. 通过 `POST /bid-scorer/upload-bid` 上传我方投标文件，传入 `source_doc_id`
+4. 验证返回的 `document_id` 和 `chunk_count`，确认 `doc_chunks` 已入库
+5. 调用 `POST /bid-scorer/score` 传入两个 ID，触发打分
+6. 验证返回报告：逐项分数 + 三轮原始分数 + 总分 + 改进建议
+7. 验证数据库 `bid_score_results` 和 `bid_score_items` 已落库
+8. 重复调用验证：得分波动应在 ±3% 以内（三轮共识生效）

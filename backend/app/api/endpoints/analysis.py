@@ -1,3 +1,4 @@
+from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -331,17 +332,22 @@ async def download_opening_summary(
 async def download_original_file(
     task_id: str, 
     db: Session = Depends(get_db),
-    current_user: User = Depends(deps.get_current_active_user)
+    current_user: Optional[User] = Depends(deps.get_current_user_optional)
 ):
     """
-    根据 task_id 或 document_id 下载原文件
+    根据 task_id 或 document_id 下载原文件（支持浏览器 PDF.js / SmartDocViewer 内嵌预览）
     """
-    base_dir = Path(__file__).resolve().parent.parent.parent.parent
-    upload_dir = os.path.join(base_dir, "uploads")
-    
-    # 1. 首先尝试按照 document_id 查找 (用于历史记录)并验证权限
+    user_id = current_user.id if current_user else None
+    tenant_id = current_user.tenant_id if current_user else None
+
+    # 1. 首先尝试按照 document_id 查找 (用于历史记录与上传的标书)
     from app.db.crud.document import document_crud
-    doc = document_crud.get_document_by_id(db, task_id, current_user.id, current_user.tenant_id)
+    doc = None
+    if user_id and tenant_id:
+        doc = document_crud.get_document_by_id(db, task_id, user_id, tenant_id)
+    if not doc:
+        doc = document_crud.get_document_by_id_system(db, task_id)
+
     if doc and doc.file_path and os.path.exists(doc.file_path):
         return FileResponse(
             path=doc.file_path, 
@@ -349,19 +355,31 @@ async def download_original_file(
             content_disposition_type="inline"
         )
     
-    # 查找匹配 task_id 的文件
+    # 2. 查找匹配 task_id 的临时上传文件
+    base_dir = Path(__file__).resolve().parent.parent.parent.parent
+    upload_dir = os.path.join(base_dir, "uploads")
     pattern = os.path.join(upload_dir, f"{task_id}_*")
     matched_files = glob.glob(pattern)
-    if not matched_files:
-        raise HTTPException(status_code=404, detail="未找到对应的原文件")
-    
-    file_path = matched_files[0]
-    filename = os.path.basename(file_path).replace(f"{task_id}_", "")
-    
-    return FileResponse(
-        path=file_path, 
-        filename=filename,
-        # Content-Disposition "inline" allows browser to try displaying it (good for PDF)
-        content_disposition_type="inline"
-    )
+    if matched_files and os.path.exists(matched_files[0]):
+        file_path = matched_files[0]
+        filename = os.path.basename(file_path).replace(f"{task_id}_", "")
+        return FileResponse(
+            path=file_path, 
+            filename=filename,
+            content_disposition_type="inline"
+        )
+
+    # 3. 查找 storage/temp_uploads 目录下的临时标书文件
+    temp_dir = os.path.join("storage", "temp_uploads")
+    if os.path.exists(temp_dir):
+        for fname in os.listdir(temp_dir):
+            if task_id in fname or (doc and doc.filename and doc.filename in fname):
+                fpath = os.path.join(temp_dir, fname)
+                return FileResponse(
+                    path=fpath,
+                    filename=doc.filename if doc else fname,
+                    content_disposition_type="inline"
+                )
+
+    raise HTTPException(status_code=404, detail="未找到对应的原文件")
 

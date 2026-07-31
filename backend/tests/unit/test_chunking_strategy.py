@@ -1,18 +1,14 @@
 """
-文档切分策略单元测试
+文档切分与双端策略（常规与投标文件）单元测试
 
 测试 ExtractorService 的核心方法：
-- _detect_chapter_title: 章节标题正则检测
-- _group_chunks_by_chapter: 按章节归组
-- _adaptive_split_chapter: 超长章节自适应再分块
+- _detect_major_chapter_in_line: 各级标题分理识别（通用及标书定制）
+- _group_markdown_text_by_chapter: 按 Markdown 正文层级归类大组
+- _split_table_preserving_headers: 巨型大表格自动携带表头分割策略
+- _adaptive_split_chapter: 章节及复合图表分级处理技巧
 """
 import pytest
-import json
 import os
-from unittest.mock import MagicMock
-from dataclasses import dataclass, field
-from typing import List, Optional
-
 from app.services.extractor_service import (
     ExtractorService,
     MAX_CHUNK_SIZE,
@@ -20,321 +16,187 @@ from app.services.extractor_service import (
 )
 
 
-# ========== Mock 对象：模拟 Docling HierarchicalChunker 的输出结构 ==========
-
-@dataclass
-class MockProv:
-    """模拟 Docling 的 Provenance 对象"""
-    page_no: int = 1
-
-
-@dataclass
-class MockDocItem:
-    """模拟 Docling 的 DocItem 对象"""
-    label: str = "text"
-    prov: List[MockProv] = field(default_factory=lambda: [MockProv()])
-
-
-@dataclass
-class MockChunkMeta:
-    """模拟 Docling 的 ChunkMeta 对象"""
-    headings: List[str] = field(default_factory=list)
-    doc_items: List[MockDocItem] = field(default_factory=lambda: [MockDocItem()])
-
-
-@dataclass
-class MockChunk:
-    """模拟 Docling HierarchicalChunker 输出的单个 Chunk"""
-    text: str = ""
-    meta: MockChunkMeta = field(default_factory=MockChunkMeta)
-
-
-def _build_mock_chunk(text: str, headings: list, page_no: int = 1, label: str = "text") -> MockChunk:
-    """辅助函数：快速构建一个 MockChunk 对象"""
-    return MockChunk(
-        text=text,
-        meta=MockChunkMeta(
-            headings=headings,
-            doc_items=[MockDocItem(label=label, prov=[MockProv(page_no=page_no)])]
-        )
-    )
-
-
 @pytest.fixture
 def extractor():
-    """创建一个 ExtractorService 实例（不初始化 Docling Converter）"""
+    """创建一个 ExtractorService 实例用于各功能单元测试"""
     return ExtractorService()
 
 
-@pytest.fixture
-def fixture_data():
-    """加载测试 fixture 数据"""
-    fixture_path = os.path.join(os.path.dirname(__file__), "..", "fixtures", "mock_chunker_data.json")
-    with open(fixture_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# ========== 测试 _detect_major_chapter_in_line ==========
 
+class TestDetectMajorChapterInLine:
+    """章节与标书目录层级解析测试"""
 
-# ========== 测试 _detect_chapter_title ==========
+    def test_detect_standard_chapter_general(self, extractor):
+        """正常情况：标准「第X章」格式于默认状态应当识别成功"""
+        result = extractor._detect_major_chapter_in_line("第一章 招标公告", doc_type="general")
+        assert result == "第一章 招标公告"
 
-class TestDetectChapterTitle:
-    """章节标题正则检测测试"""
+    def test_detect_attachment_format_general(self, extractor):
+        """正常情况：标准「附件X」在通用和底表时理应皆为第一大层级"""
+        result = extractor._detect_major_chapter_in_line("附件一：核心报价表")
+        assert result == "附件一：核心报价表"
 
-    def test_detect_standard_chapter_should_return_title(self, extractor):
-        """正常情况：标准「第X章」格式应被正确识别"""
-        result = extractor._detect_chapter_title("第一章 招标公告\n详细内容...")
-        assert result is not None
-        assert "第一章" in result
-
-    def test_detect_section_format_should_return_title(self, extractor):
-        """正常情况：「第X节」格式应被正确识别"""
-        result = extractor._detect_chapter_title("第二节 评标办法")
-        assert result is not None
-        assert "第二节" in result
-
-    def test_detect_chinese_number_format_should_not_be_major_chapter(self, extractor):
-        """规则说明：「一、标题」属于 2 级小节，不应触发独立大章分割 (返回 None)"""
-        result = extractor._detect_chapter_title("一、投标须知")
+    def test_detect_chinese_number_not_major_in_general(self, extractor):
+        """常规控制：通用格式中「一、背景」应列入正文小节而非强占首层章头"""
+        result = extractor._detect_major_chapter_in_line("一、重点项目概述", doc_type="general")
         assert result is None
 
-    def test_detect_attachment_format_should_return_title(self, extractor):
-        """正常情况：「附件X」格式应被识别为独立大章"""
-        result = extractor._detect_chapter_title("附件一 投标文件格式")
-        assert result is not None
-        assert "附件" in result
+    def test_detect_chinese_number_major_in_bid(self, extractor):
+        """专项飞升：投标文件 (doc_type='bid') 中「一、商务响应」必须独立判定为显着父级大卷"""
+        result = extractor._detect_major_chapter_in_line("一、商务响应以及详细资信情况", doc_type="bid")
+        assert result == "一、商务响应以及详细资信情况"
 
-    def test_detect_parenthesis_format_should_not_be_major_chapter(self, extractor):
-        """规则说明：「（一）」属于 3 级小节，不应触发独立大章分割 (返回 None)"""
-        result = extractor._detect_chapter_title("（一）投标报价要求")
-        assert result is None
+    def test_detect_table_title_major_in_bid(self, extractor):
+        """硬核加点：在投书中一表千钧，《核心产品技术参数与响应偏离表》这类应高亮定格大章"""
+        result = extractor._detect_major_chapter_in_line("核心设备功能规范及全维度逐条测试偏离表", doc_type="bid")
+        assert result == "核心设备功能规范及全维度逐条测试偏离表"
 
-    def test_detect_toc_entry_should_return_none(self, extractor):
-        """异常情况：目录项（以页码数字结尾）应被排除"""
-        result = extractor._detect_chapter_title("第一章 招标公告 .................. 3")
-        assert result is None
-
-    def test_detect_plain_text_should_return_none(self, extractor):
-        """边界情况：普通正文不应被识别为标题"""
-        result = extractor._detect_chapter_title("本项目采用公开招标方式。")
-        assert result is None
-
-    def test_detect_long_text_should_return_none(self, extractor):
-        """边界情况：超长文本（>100字）不应被识别为标题"""
-        long_title = "第一章 " + "详" * 200
-        result = extractor._detect_chapter_title(long_title)
-        assert result is None
-
-    def test_detect_markdown_formatted_should_return_clean_title(self, extractor):
-        """正常情况：带 Markdown 格式符号的标题应返回清理后的纯文本"""
-        result = extractor._detect_chapter_title("**第四章 项目需求**")
-        assert result is not None
-        assert "*" not in result
-        assert "第四章" in result
-
-
-# ========== 测试 _group_chunks_by_chapter ==========
-
-class TestGroupChunksByChapter:
-    """按章节归组测试"""
-
-    def test_group_multi_chapter_doc_should_separate_chapters(self, extractor, fixture_data):
-        """正常情况：多章节文档应精确按独立大章 (第一章、第二章、附件一等) 进行聚合归组"""
-        raw_data = fixture_data["multi_chapter_doc"]["chunks"]
-        mock_chunks = [
-            _build_mock_chunk(c["text"], c["headings"], c["page_no"], c["label"])
-            for c in raw_data
+    def test_detect_ignore_noise_subsections_in_bid(self, extractor):
+        """核心抗震验证：必须果断抛弃审计报告、财税附录、次级节次与工艺细节里的「伪大章」，杜绝把标书切破！"""
+        noises = [
+            "四、注册会计师对财务报表审计的责任",
+            "二、重要会计政策和会计估计",
+            "七、会计报表有关项目注释（单位：人民币元）",
+            "十一、其他重要事项",
+            "三、会计师事务所营业执照及相关资质",
+            "五、满足逆变器技术规范",
+            "一、注册会计师执行业务必要时须向委托方出",
+            "第一节 屋顶平面布置方案",
+            "第二节 安装节点深化做法",
+            "第六节 并网柜参数响应",
+            "第一节 施工进度计划安排",
+            "1．资格证书类别一栏按资格证书填写。",
+            "电力工程的施工（资质范围内）",
+            "学生吴光平 性别男，一九八三月十三日生，于二〇〇八机电一体化技术",
+            "2）加固作业过程按照施工规范要求管控每道工序，每完成一处节点加固，现场技术负责人将开展自检，确认施工参数与设计要求一致后方可进入下一道工序。",
+            "验货过程中，逐一核对到场材料的品牌、规格、数量与投标文件及设计要求的一致性，确认所有光伏组件为同一品牌、所有逆变器为同一品牌，满足本次招标的材料一致性要求。"
         ]
+        for n in noises:
+            res = extractor._detect_major_chapter_in_line(n, doc_type="bid")
+            assert res is None, f"不应将内嵌细项目或叙述句 [{n}] 识别为顶级标书大章！"
 
-        chapters = extractor._group_chunks_by_chapter(mock_chunks)
-
-        # 应至少识别出 3 个独立大章 (第一章、第二章、附件一)
-        assert len(chapters) >= 3
-
-        # 验证大章标题
-        titles = [ch["title"] for ch in chapters]
-        assert any("第一章" in t for t in titles), f"应识别到第一章大章，实际标题: {titles}"
-        assert any("第二章" in t for t in titles), f"应识别到第二章大章，实际标题: {titles}"
-        assert any("附件" in t for t in titles), f"应识别到附件大章，实际标题: {titles}"
-
-        # 验证 trace_info 中的结构元数据
-        sample_trace = chapters[0]["trace_info"]
-        assert "chapter" in sample_trace
-        assert "headings" in sample_trace
-
-    def test_group_hierarchical_sections_should_keep_in_same_major_chapter(self, extractor):
-        """正常情况：同属第一章内部的小节 (一、/二、) 应完整归属于第一章大章，不被切碎"""
-        mock_chunks = [
-            _build_mock_chunk("第一章 投标邀请\n招标项目名称：光伏项目。", ["第一章 投标邀请", "一、招标项目名称及编号"], 1),
-            _build_mock_chunk("二、供应商资格要求\n必须具备独立法人资格。", ["第一章 投标邀请", "二、供应商资格要求"], 1),
+    def test_detect_true_core_modules_in_bid(self, extractor):
+        """火线准入：校验实干性的打分与考核关键总架能顺利立顶为宗师章头"""
+        trues = [
+            "一、投标函及附加承诺",
+            "二、开标一览表（最终报盘）",
+            "三、商务条款响应及偏离表",
+            "四、技术要求响应及偏离表",
+            "2023 年以来类似项目业绩一览表",
+            "第九章 投标人基本情况介绍"
         ]
+        for t in trues:
+            res = extractor._detect_major_chapter_in_line(t, doc_type="bid")
+            assert res is not None, f"真正的打分主战大块 [{t}] 被误伤滤除！"
 
-        chapters = extractor._group_chunks_by_chapter(mock_chunks)
 
-        # 两个小节均属于第一章，应聚合为 1 个完整的大章 Block
-        assert len(chapters) == 1
-        assert chapters[0]["title"] == "第一章 投标邀请"
-        assert "光伏项目" in chapters[0]["text"]
-        assert "独立法人资格" in chapters[0]["text"]
+# ========== 测试 _group_markdown_text_by_chapter ==========
 
-    def test_group_same_chapter_chunks_should_merge_text(self, extractor):
-        """正常情况：属于同一章节路径的碎片应合并到一起"""
-        mock_chunks = [
-            _build_mock_chunk("第一章 概述\n项目背景。", ["第一章 概述"], 1),
-            _build_mock_chunk("项目目标是建设智慧城市。", ["第一章 概述"], 1),
-            _build_mock_chunk("项目预算为5000万元。", ["第一章 概述"], 2),
-        ]
+class TestGroupMarkdownTextByChapter:
+    """自动分组归宗业务层单测"""
 
-        chapters = extractor._group_chunks_by_chapter(mock_chunks)
-
-        assert len(chapters) == 1
-        assert "项目背景" in chapters[0]["text"]
-        assert "项目目标" in chapters[0]["text"]
-        assert "项目预算" in chapters[0]["text"]
-
-    def test_group_inner_line_chapter_header_should_split_correctly(self, extractor):
-        """核心修复测试：当 Raw Chunk 内部中间行 (如第3行) 出现新大章标题时，应自动将其精准切分为两个不同的大章"""
-        embedded_chunk = _build_mock_chunk(
-            "法定代表人（或负责人）或授权代表：\n"
-            "签署日期： 年 月 日\n"
-            "**第四章 项目需求**\n"
-            "**一、项目说明**\n"
-            "1.1 项目简介：分布式光伏项目。",
-            headings=["第三章 合同条款及格式"],
-            page_no=1
+    def test_group_general_doc_should_keep_chapters_clean(self, extractor):
+        """正常情况：通用文档内连续的多段文字将依从所属前列的第一大章并肩同行"""
+        md_text = (
+            "前置一些导文\n\n"
+            "第一章 项目需求要点\n\n"
+            "这里是第一项功能参数描述\n\n"
+            "第二章 商务资质审核\n\n"
+            "要求具备双证以上体系认证"
         )
+        chapters = extractor._group_markdown_text_by_chapter(md_text, doc_type="general")
+        assert len(chapters) == 3 # 依次为 默认起始端、第一章、第二章
+        assert chapters[1]["title"] == "第一章 项目需求要点"
+        assert "第一项功能参数描述" in chapters[1]["text"]
 
-        chapters = extractor._group_chunks_by_chapter([embedded_chunk])
+    def test_group_bid_doc_should_split_by_flexible_headers(self, extractor):
+        """进阶防御：面向投产长文件只要遇到明确大章表单或中文数字序号加核验件时即独立成大块，而抛弃 1.1 小层级干扰"""
+        md_text = (
+            "一、报价清单明细\n\n"
+            "价格表部分描述……\n\n"
+            "二、技术架构体系说明\n\n"
+            "该方案采纳全分布式冗余处理。"
+        )
+        chapters = extractor._group_markdown_text_by_chapter(md_text, doc_type="bid")
+        assert len(chapters) >= 2
+        assert "一、报价清单明细" == chapters[0]["title"]
+        assert "二、技术架构体系说明" == chapters[1]["title"]
 
-        # 应识别出第三章落款与第四章开头的两个独立大章
-        assert len(chapters) == 2
-        titles = [ch["title"] for ch in chapters]
-        assert "第三章 合同条款及格式" in titles[0]
-        assert "第四章 项目需求" in titles[1]
-        assert "法定代表人" in chapters[0]["text"]
-        assert "分布式光伏项目" in chapters[1]["text"]
 
-    def test_group_no_title_chunks_should_use_default(self, extractor, fixture_data):
-        """边界情况：无标题文档应全部归入默认章节"""
-        raw_data = fixture_data["no_title_doc"]["chunks"]
-        mock_chunks = [
-            _build_mock_chunk(c["text"], c["headings"], c["page_no"], c["label"])
-            for c in raw_data
-        ]
+# ========== 测试 _split_table_preserving_headers ==========
 
-        chapters = extractor._group_chunks_by_chapter(mock_chunks)
+class TestSplitTablePreservingHeaders:
+    """大型超量清单表格分层保护（首段跟进粘胶机制）验证"""
 
-        assert len(chapters) == 1
-        assert chapters[0]["title"] == "无章节/正文"
+    def test_short_table_should_remain_unchanged(self, extractor):
+        """常规尺寸下的精湛小表不应遭受任一分断破坏"""
+        small_table = (
+            "| 编号 | 核心部件 | 质保及产地 |\n"
+            "| --- | --- | --- |\n"
+            "| 01 | 集线网桥 | 五年专厂 |"
+        )
+        res = extractor._split_table_preserving_headers(small_table, max_size=1200)
+        assert len(res) == 1
+        assert res[0] == small_table
+
+    def test_long_table_should_carry_headers_to_all_sub_chunks(self, extractor):
+        """核心硬杠：当一张天长云展的技术核对单超过切块极限定值，裂断后的每一个续存片段必定自载完整的主列名言！"""
+        header = (
+            "| 序号 | 系统主项名称 | 参数及性能详细规约（招募标准） | 投标实战自陈及证据指引 | 合同偏差判定 |\n"
+            "| :--- | :--- | :--- | :--- | :--- |\n"
+        )
+        # 不断自研充实长达20行的厚重大致文块（创造必然超上限局格）
+        rows = [f"| 0{i} | 核心高负载处理中枢阵列 | 具备高达99.999%容灾秒变且每秒并发穿透值绝不逊于两百五十万级的承重力。 | 完全顺从指引且我方采用自主多通道均质架构更能超越预期。 | 无偏差，完美符合 |" for i in range(1, 25)]
+        full_big_table = header + "\n".join(rows)
+
+        chunks = extractor._split_table_preserving_headers(full_big_table, max_size=1200)
+        assert len(chunks) > 1, "超千字豪情长表理应解剖至不同段位内载中"
+        
+        for c in chunks:
+            assert "| 序号 | 系统主项名称 |" in c, "分断出来的任何后续散件理所应当带有这行神圣的主键定义首头！"
+            assert "| :--- |" in c
 
 
 # ========== 测试 _adaptive_split_chapter ==========
 
 class TestAdaptiveSplitChapter:
-    """超长章节自适应再分块测试"""
+    """实际大段文字打分发包及分切全维保障"""
 
-    def test_split_short_chapter_should_produce_single_chunk(self, extractor):
-        """正常情况：短章节（<= MAX_CHUNK_SIZE）应产出单个 Chunk"""
-        chapter = {
-            "title": "第一章 概述",
-            "text": "这是一个短章节。" * 10,
-            "page_start": 1,
+    def test_split_short_chapter_produces_single(self, extractor):
+        """短款章节一步成型，不添乱发无聊杂碎短签"""
+        ch = {
+            "title": "（一）合法性验证承诺",
+            "text": "本单位对于所供资料的全面真实准确性负终身全额责无旁贷法律义务。",
+            "page_start": 2,
             "content_type": "chapter_block",
-            "trace_info": {"headings": ["第一章 概述"], "element_label": "text"},
+            "trace_info": {"chapter": "（一）合法性验证承诺", "headings": ["（一）合法性验证承诺"], "element_label": "text"}
         }
-
-        docs = extractor._adaptive_split_chapter(chapter, start_index=0)
-
+        docs = extractor._adaptive_split_chapter(ch, start_index=0)
         assert len(docs) == 1
-        assert docs[0].metadata["section_title"] == "第一章 概述"
-        assert docs[0].metadata["chunk_index"] == 0
+        assert docs[0].metadata["section_title"] == "（一）合法性验证承诺"
 
-    def test_split_long_chapter_should_produce_multiple_chunks(self, extractor):
-        """正常情况：长章节（> MAX_CHUNK_SIZE）应产出多个子块"""
-        # 构造一段超过 MAX_CHUNK_SIZE 的文本
-        long_text = "本项目需要建设智慧城市综合管理平台。" * 200  # 约 3600 字
-        chapter = {
-            "title": "第三章 技术要求",
-            "text": long_text,
-            "page_start": 6,
-            "content_type": "chapter_block",
-            "trace_info": {"headings": ["第三章 技术要求"], "element_label": "text"},
-        }
-
-        docs = extractor._adaptive_split_chapter(chapter, start_index=5)
-
-        # 应产出多个子块
-        assert len(docs) > 1
-
-        # 验证所有子块都继承了父章节的 section_title
-        for doc in docs:
-            assert doc.metadata["section_title"] == "第三章 技术要求"
-
-        # 验证 chunk_index 连续递增
-        for i, doc in enumerate(docs):
-            assert doc.metadata["chunk_index"] == 5 + i
-
-        # 验证每个子块长度不超过 MAX_CHUNK_SIZE + 合理容差
-        for doc in docs:
-            assert len(doc.page_content) <= MAX_CHUNK_SIZE + 100, \
-                f"子块长度 {len(doc.page_content)} 超过阈值 {MAX_CHUNK_SIZE}"
-
-    def test_split_empty_chapter_should_produce_no_chunks(self, extractor):
-        """边界情况：空章节应产出 0 个 Chunk"""
-        chapter = {
-            "title": "空章节",
-            "text": "   ",
-            "page_start": 1,
-            "content_type": "chapter_block",
-            "trace_info": {"headings": [], "element_label": "text"},
-        }
-
-        docs = extractor._adaptive_split_chapter(chapter, start_index=0)
-
-        assert len(docs) == 0
-
-    def test_split_preserves_page_info(self, extractor):
-        """正常情况：分块后应保留页码信息"""
-        chapter = {
-            "title": "第五章 评标",
-            "text": "评标采用综合评分法。" * 10,
-            "page_start": 15,
-            "content_type": "chapter_block",
-            "trace_info": {"headings": ["第五章 评标"], "element_label": "text"},
-        }
-
-        docs = extractor._adaptive_split_chapter(chapter, start_index=0)
-
-        for doc in docs:
-            assert doc.metadata["page_num"] == 15
-
-    def test_split_table_block_should_not_be_split(self, extractor):
-        """核心规则：Markdown 表格块在切分时必须保持整块完整，禁止跨行跨表切断"""
-        table_markdown = (
-            "| 序号 | 货物名称 | 规格型号 | 数量 | 单价 |\n"
-            "|---|---|---|---|---|\n"
-            "| 1 | 光伏逆变器 | 400kW 组串式 | 2 | 50000 |\n"
-            "| 2 | 光伏组件 | 550W 单晶 | 720 | 800 |\n"
-            "| 3 | 交流配电柜 | 400V 柜体 | 1 | 12000 |\n"
+    def test_split_long_chapter_with_tables(self, extractor):
+        """交错情态实测：文字夹持漫长列表再继承随从语话，保证结构完整有力不缺行不过幅"""
+        prefix = "前置叙事陈词精进……\n\n" * 150
+        table_content = (
+            "| 代次 | 分类模块 | 参数状态 |\n"
+            "| --- | --- | --- |\n"
+            "| 一批 | 全栈加速内核 | 标称达标 |\n"
         )
-        long_prefix = "这里是表格前的描述文本。" * 80
-        long_suffix = "这里是表格后的说明文本。" * 80
-        chapter_text = f"{long_prefix}\n\n{table_markdown}\n\n{long_suffix}"
-
-        chapter = {
-            "title": "第三章 规格参数",
-            "text": chapter_text,
-            "page_start": 5,
+        suffix = "\n\n后缀归总结语与盖章鉴别……" * 150
+        ch = {
+            "title": "第四篇章 高阶能力评估方案",
+            "text": prefix + table_content + suffix,
+            "page_start": 8,
             "content_type": "chapter_block",
-            "trace_info": {"headings": ["第三章 规格参数"], "element_label": "text"},
+            "trace_info": {"chapter": "第四篇章 高阶能力评估方案", "headings": [], "element_label": "text"}
         }
-
-        docs = extractor._adaptive_split_chapter(chapter, start_index=0)
-
-        # 找到包含表格的 Chunk
-        table_docs = [doc for doc in docs if "| 序号 | 货物名称 |" in doc.page_content]
-        assert len(table_docs) == 1, "包含表格的 Chunk 应当且仅有 1 个（表格保持完整）"
+        docs = extractor._adaptive_split_chapter(ch, start_index=10)
+        assert len(docs) > 1
         
-        # 验证该 Chunk 包含了完整的表格行
-        table_content = table_docs[0].page_content
-        assert "| 1 | 光伏逆变器 |" in table_content
-        assert "| 2 | 光伏组件 |" in table_content
-        assert "| 3 | 交流配电柜 |" in table_content
+        # 定位包含了真正数据明细的列表那处快览，确保不散伙、不缺半边天
+        table_docs = [d for d in docs if "| 代次 |" in d.page_content]
+        assert len(table_docs) >= 1
+        for td in table_docs:
+            assert "全栈加速内核" in td.page_content

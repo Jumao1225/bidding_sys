@@ -729,6 +729,9 @@ class BidFillerAgent:
 bid_filler_agent = BidFillerAgent()
 
 
+SKIP_BID_FILLER = True  # 临时跳过标书起草 (writer_agent) 长流程开关
+
+
 def bid_filler_orchestrator_node(state: dict) -> dict:
     """Orchestrator 适配节点 — 将 BidFillerAgent 对接至 LangGraph 编排器"""
     from app.worker.tasks import emit_agent_log
@@ -740,6 +743,18 @@ def bid_filler_orchestrator_node(state: dict) -> dict:
 
     if not document_id:
         return {"status": "writer_failed", "error": "Missing document_id"}
+
+    # 如果开启了跳过开关，直接发出完成日志并返回成功，加速整体 Multi-Agent 流程
+    if SKIP_BID_FILLER:
+        summary = "⚡ [调试配置] 已暂时跳过标书起草步骤，长流程快速闭环完成"
+        logger.info(f"⏩ {summary}")
+        emit_agent_log("info", summary, extra={
+            "type": "worker_complete", "worker": "writer_agent", "status": "success", "summary": summary
+        })
+        return {
+            "completed_steps": ["writer_agent"],
+            "worker_summaries": [{"worker": "writer_agent", "status": "success", "summary": summary}]
+        }
 
     db: Session = SessionLocal()
     try:

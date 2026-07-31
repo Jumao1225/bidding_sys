@@ -11,6 +11,8 @@ from .metadata import (
     EngineeringMetadata,
     EvaluationMetadata,
 )
+from .bid_score import BidScoreResult, BidScoreItem
+
 __all__ = [
     "Base",
     "TenantBase",
@@ -30,4 +32,7 @@ __all__ = [
     "TimelineMetadata",
     "EngineeringMetadata",
     "EvaluationMetadata",
+    "BidScoreResult",
+    "BidScoreItem",
 ]
+

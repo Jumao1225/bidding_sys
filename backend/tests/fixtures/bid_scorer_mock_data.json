@@ -1,0 +1,96 @@
+{
+  "sample_score_tree": [
+    {
+      "item_code": "1.1",
+      "category": "技术分",
+      "sub_category": "系统方案",
+      "title": "系统整体架构设计",
+      "max_score": 10.0,
+      "scoring_criteria": "设计优良得10分，较好得6-9分，一般得1-5分，无设计得0分",
+      "scoring_type": "subjective",
+      "rules_summary": ["架构清晰优良得10分", "缺失内容按阶梯扣分"]
+    },
+    {
+      "item_code": "1.2",
+      "category": "技术分",
+      "sub_category": "团队资质",
+      "title": "项目负责人资质",
+      "max_score": 5.0,
+      "scoring_criteria": "具有高级专业技术职称和PMP证书得5分，仅具有一项得3分，均不具有得0分",
+      "scoring_type": "ladder",
+      "rules_summary": ["高级职称得2分", "PMP证书得3分"]
+    }
+  ],
+  "llm_round1_response": [
+    {
+      "item_code": "1.1",
+      "ai_score": 8.0,
+      "confidence": 0.9,
+      "scoring_basis": "「本项目采用高可用分布式架构和微服务治理方案」架构设计较为完整",
+      "deduction_reason": "缺少针对极端网络风暴场景的容灾说明",
+      "suggestion": "建议在技术架构方案中补充极端大流量测试与容灾策略"
+    },
+    {
+      "item_code": "1.2",
+      "ai_score": 5.0,
+      "confidence": 1.0,
+      "scoring_basis": "「项目经理张文静持有信息系统项目管理师（高级）证书及PMP证书」",
+      "deduction_reason": null,
+      "suggestion": null
+    }
+  ],
+  "llm_round2_response": [
+    {
+      "item_code": "1.1",
+      "ai_score": 9.0,
+      "confidence": 0.85,
+      "scoring_basis": "「本项目采用高可用分布式架构和微服务治理方案」",
+      "deduction_reason": "细节图表示不够详尽",
+      "suggestion": "补充详细的技术演进架构图"
+    },
+    {
+      "item_code": "1.2",
+      "ai_score": 5.0,
+      "confidence": 1.0,
+      "scoring_basis": "「项目经理张文静持有信息系统项目管理师（高级）证书及PMP证书」",
+      "deduction_reason": null,
+      "suggestion": null
+    }
+  ],
+  "llm_round3_response": [
+    {
+      "item_code": "1.1",
+      "ai_score": 8.5,
+      "confidence": 0.9,
+      "scoring_basis": "「本项目采用高可用分布式架构和微服务治理方案」整体表现好",
+      "deduction_reason": "小节缺少压测数据支撑",
+      "suggestion": "补充吞吐量和延迟等指标数据"
+    },
+    {
+      "item_code": "1.2",
+      "ai_score": 5.0,
+      "confidence": 1.0,
+      "scoring_basis": "「项目经理张文静持有信息系统项目管理师（高级）证书及PMP证书」",
+      "deduction_reason": null,
+      "suggestion": null
+    }
+  ],
+  "llm_exceed_score_response": [
+    {
+      "item_code": "1.1",
+      "ai_score": 15.0,
+      "confidence": 0.9,
+      "scoring_basis": "超出满分测试",
+      "deduction_reason": null,
+      "suggestion": null
+    },
+    {
+      "item_code": "1.2",
+      "ai_score": -2.0,
+      "confidence": 0.9,
+      "scoring_basis": "负分测试",
+      "deduction_reason": "严重扣分",
+      "suggestion": null
+    }
+  ]
+}

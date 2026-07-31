@@ -38,6 +38,7 @@ backend/*.sqlite
 backend/*.sqlite3
 models/
 backend/uploads/
+backend/storage/
 
 # Testing & Coverage
 .coverage

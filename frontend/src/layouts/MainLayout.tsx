@@ -13,6 +13,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
   const isActive = (path: string) => {
     if (path === '/') return location.pathname === '/';
     if (path === '/analysis') return location.pathname.startsWith('/analysis');
+    if (path === '/bid-scorer') return location.pathname.startsWith('/bid-scorer');
     if (path === '/qualifications') return location.pathname.startsWith('/qualifications');
     if (path === '/company-profile') return location.pathname.startsWith('/company-profile');
     if (path === '/price-book') return location.pathname.startsWith('/price-book');
@@ -25,6 +26,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (location.pathname.startsWith('/company-profile')) return '企业基础档案管理';
     if (location.pathname.startsWith('/qualifications')) return '企业资质中心';
     if (location.pathname.startsWith('/price-book')) return '成本报价知识库';
+    if (location.pathname.startsWith('/bid-scorer')) return '智能标书多维度穿透测评';
     if (location.pathname.startsWith('/admin')) return '系统运维管理';
     if (location.pathname.startsWith('/analysis')) return '智能文档解析';
     if (location.pathname.startsWith('/docx-debugger')) return 'Word 格式与指令改写调试';
@@ -82,6 +84,14 @@ export default function MainLayout({ children }: MainLayoutProps) {
             <span className={isActive('/price-book') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>成本报价</span>
           </Link>
 
+          <Link to="/bid-scorer" className={getLinkClass('/bid-scorer')}>
+            {isActive('/bid-scorer') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+            <svg className={`w-5 h-5 mr-3 ${isActive('/bid-scorer') ? 'text-emerald-400 font-extrabold' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300 text-emerald-300/80'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z" />
+            </svg>
+            <span className={isActive('/bid-scorer') ? "relative z-10 font-bold text-emerald-300" : "group-hover:translate-x-1 transition-transform duration-300 text-slate-200"}>智能评标打分</span>
+          </Link>
+
           <p className="px-4 text-[10px] font-bold tracking-widest text-slate-500 mb-3 mt-6 uppercase font-mono">Debug Tools</p>
 
           <Link to="/docx-debugger" className={getLinkClass('/docx-debugger')}>
@@ -128,7 +138,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
                 OP
               </div>
               <div>
-                <p className="text-sm font-bold text-slate-200 group-hover:text-white transition-colors">{user?.name || 'Operator'}</p>
+                <p className="text-sm font-bold text-slate-200 group-hover:text-white transition-colors">{user?.name || user?.username || user?.email?.split('@')[0] || 'Operator'}</p>
                 <p className="text-[11px] text-slate-500">{user?.email || 'admin@bidding.ai'}</p>
               </div>
             </div>

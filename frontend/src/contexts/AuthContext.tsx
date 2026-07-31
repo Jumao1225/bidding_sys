@@ -7,6 +7,8 @@ interface User {
   email: string;
   tenant_id: string;
   role: string;
+  name?: string;
+  username?: string;
 }
 
 interface AuthContextType {
