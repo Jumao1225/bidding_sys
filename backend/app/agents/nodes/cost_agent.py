@@ -255,7 +255,7 @@ def cost_node(state: BiddingState) -> dict:
     if unmatched_count > 0:
         summary += f"（{unmatched_count} 项未在库中找到参考价）"
 
-    emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "cost_estimation", "status": "success", "summary": summary})
+    emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "cost_estimation", "status": "success", "summary": summary, "document_id": document_id})
     
     return {
         "cost_analysis": {

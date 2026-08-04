@@ -103,7 +103,7 @@ class BidFormatExtractorService:
 
     def _is_toc_line(self, text: str, element=None) -> bool:
         """
-        严密判定某个段落是否为目录页/导引线（TOC Line）
+        严密判定某个段落是否为目录页/导引线/目录项（TOC Line）
         """
         if not text:
             return False
@@ -119,21 +119,27 @@ class BidFormatExtractorService:
                     return True
                 if 'w:fldSimple' in xml_str and 'TOC' in xml_str:
                     return True
+                if 'w:instrText' in xml_str and 'TOC' in xml_str:
+                    return True
             except Exception:
                 pass
 
-        # 2. 匹配连点线加数字页码，如 "........ 40" 或 "………… 40" 或 "┈ 40"
-        if re.search(r'[\.….┈\-_]{2,}\s*\d+$', clean_txt):
+        # 2. 匹配目录导引线及页码 (如 ".......... -3-"、".......... 55"、".......... -55-"、"…… 40"、"...... 55页")
+        if re.search(r'[\.….┈\-_]{2,}\s*[-–—\s]*\d+[-–—\s\.\)\]页]*$', clean_txt):
             return True
 
-        # 3. 匹配包含制表符或多连点且末尾是页码数字
-        if re.search(r'[\.….┈\-_]{2,}', clean_txt) and re.search(r'\d+$', clean_txt):
+        # 3. 匹配包含多连点/制表符且末尾包含页码数字（兼容各种页码修饰符如 -55- 或 55页）
+        if re.search(r'[\.….┈\-_]{2,}', clean_txt) and re.search(r'\d+[-–—\s\.\)\]页]*$', clean_txt):
             return True
 
-        # 4. 匹配制表符/空格+末尾纯页码数字，且整句字符长度较短（如 "第六章 投标文件格式  40"）
-        if re.search(r'[\s\t]+\d+$', clean_txt) and len(clean_txt) < 80:
+        # 4. 匹配制表符或多连点后跟着页码数字（如 "第六章 投标文件格式  -55-"）
+        if re.search(r'[\s\t]+[-–—\s]*\d+[-–—\s\.\)\]页]*$', clean_txt) and len(clean_txt) < 100:
             if re.search(r'[\.….┈\-_]', clean_txt) or '\t' in text:
                 return True
+
+        # 5. 纯目录卷标/目录标题行 (如 "第一卷"、"第二卷"、"第三卷"、"目  录")
+        if re.search(r'^\s*(?:第[一二三四五六七八九十\d]+卷|目\s*录|Table\s*of\s*Contents)\s*$', clean_txt):
+            return True
 
         return False
 
@@ -223,8 +229,20 @@ class BidFormatExtractorService:
             end_index = len(children)
             logger.info("投标文件格式章节无后续主大章，全量延伸提取至文件末尾")
 
-        # 提取切片范围元素，并删除之外的所有子元素
+        # 提取切片范围元素
         target_elements = children[start_index:end_index]
+        if not target_elements:
+            return None
+
+        # 【核心防护】：自动剪除切片头部残留的目录行、卷标行或导引线节点 (如 "第一卷"、"第一章 招标公告...-3-" 等)
+        while target_elements:
+            first_txt = "".join(target_elements[0].itertext()).strip()
+            if self._is_toc_line(first_txt, target_elements[0]):
+                logger.info(f"   ✂️ 自动剪除切片头部残留目录节点: '{first_txt[:50]}'")
+                target_elements.pop(0)
+            else:
+                break
+
         if not target_elements:
             return None
 
@@ -321,17 +339,21 @@ class BidFormatExtractorService:
 
     def _slice_text_by_keywords(self, full_text: str) -> str:
         """
-        在纯文本中截取“投标文件格式”章节
+        在纯文本中截取“投标文件格式”章节（自动排除目录 TOC 行）
         """
         lines = full_text.split('\n')
         start_idx = -1
         for i, l in enumerate(lines):
             if any(pat.search(l) for pat in self.chapter_start_patterns):
-                start_idx = i
-                break
+                if not self._is_toc_line(l):
+                    start_idx = i
+                    break
 
         if start_idx != -1:
-            return "\n".join(lines[start_idx:])
+            slice_lines = lines[start_idx:]
+            while slice_lines and self._is_toc_line(slice_lines[0]):
+                slice_lines.pop(0)
+            return "\n".join(slice_lines)
         return full_text
 
     def _build_fallback_structure(self, filename: str) -> BidFormatStructure:

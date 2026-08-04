@@ -210,8 +210,9 @@ class ExtractorService:
         if re.search(r'(详见|参见|遵循|依据|见)\s*第[一二三四五六七八九十\d]+[章部分篇]', clean):
             return None
 
-        # 1. 优先校验 TOC 目录白名单 (支持归一化全等与前后缀包含)
-        if toc_chapters:
+        # 1. 只有当 doc_type != "general" (如投标文件 "bid") 时才校验 TOC 目录白名单；
+        # 对于招标文件 (doc_type == "general")，复刻上一版 (c307c34) 逻辑：仅按 MAJOR_CHAPTER_PATTERNS (第X章/附件X) 划分顶级大章，防止目录过细导致文档被切成几百个小碎片
+        if doc_type != "general" and toc_chapters:
             clean_norm = self._normalize_title_for_matching(clean)
             for tc in toc_chapters:
                 tc_norm = self._normalize_title_for_matching(tc)
@@ -267,7 +268,9 @@ class ExtractorService:
             except Exception as e:
                 logger.warning(f"无法读取 PDF 物理页码索引: {e}")
 
-        toc_chapters = self._extract_toc_chapters(markdown_text, doc_type=doc_type)
+        # 仅在处理投标文件 (doc_type == "bid") 时提取 TOC 目录白名单；
+        # 招标文件 (doc_type == "general") 完全跳过 TOC 目录提取，防止误搜目录碎块
+        toc_chapters = self._extract_toc_chapters(markdown_text, doc_type=doc_type) if doc_type == "bid" else []
         grouped_chapters: Dict[str, Dict[str, Any]] = {}
         chapter_order: List[str] = []
         current_chapter: str = "无章节/正文"
@@ -425,12 +428,11 @@ class ExtractorService:
             return True
         return False
 
-    def _adaptive_split_chapter(self, chapter: Dict[str, Any], start_index: int) -> List[Document]:
+    def _adaptive_split_chapter(self, chapter: Dict[str, Any], start_index: int, doc_type: str = "general") -> List[Document]:
         """
         对单个大章进行自适应分块：
-        - 优先以二级标题 (##) 作为切分边界，保证同一二级标题下的内容尽量在同一分块内。
-        - 保护表格与其上下文尽量在同一块中，禁止表格单独成块剥离上下文。
-        - 容忍包含表格或短前置文本的 Chunk 适度超过 MAX_CHUNK_SIZE，避免切碎上下文。
+        - 若 doc_type == "general" (招标文件)：复刻上一版 (c307c34) 策略，保留完整的大章/段落结构，表格随文本平滑切割；
+        - 若 doc_type == "bid" (投标文件)：维持最新的专属策略，表格 100% 独立成块，超长表格拼接原始表头说明并注入 chunk_level 溯源属性。
         """
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         
@@ -441,7 +443,109 @@ class ExtractorService:
             return docs
         
         chapter_title = chapter["title"]
-        
+
+        # ========== 模式 1: 招标文件 (doc_type == "general") 复刻上一版切块逻辑 ==========
+        if doc_type == "general":
+            if len(chapter_text) <= MAX_CHUNK_SIZE:
+                docs.append(Document(
+                    page_content=chapter_text,
+                    metadata={
+                        "section_title": chapter_title,
+                        "chunk_index": start_index,
+                        "page_num": chapter["page_start"],
+                        "content_type": chapter["content_type"],
+                        "trace_info": chapter["trace_info"],
+                        "source": "",
+                    }
+                ))
+            else:
+                logger.info(f"招标文件大章 [{chapter_title}] 文本长度 {len(chapter_text)} 字 > {MAX_CHUNK_SIZE}，启动上一版平滑拆分逻辑。")
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=MAX_CHUNK_SIZE,
+                    chunk_overlap=CHUNK_OVERLAP,
+                    separators=["\n## ", "\n\n", "\n", "。", "；", ".", " "],
+                    length_function=len,
+                )
+
+                lines = chapter_text.split('\n')
+                h2_sections = []
+                curr_sec = []
+                for line in lines:
+                    if line.strip().startswith("## "):
+                        if curr_sec:
+                            h2_sections.append("\n".join(curr_sec))
+                            curr_sec = []
+                    curr_sec.append(line)
+                if curr_sec:
+                    h2_sections.append("\n".join(curr_sec))
+
+                sub_texts: List[str] = []
+                current_chunk_parts: List[str] = []
+                current_chunk_len = 0
+
+                for h2_sec in h2_sections:
+                    h2_sec_stripped = h2_sec.strip()
+                    if not h2_sec_stripped:
+                        continue
+                    
+                    if current_chunk_len + len(h2_sec_stripped) <= MAX_CHUNK_SIZE:
+                        current_chunk_parts.append(h2_sec_stripped)
+                        current_chunk_len += len(h2_sec_stripped)
+                        continue
+                    
+                    if current_chunk_len > 300:
+                        sub_texts.append("\n\n".join(current_chunk_parts))
+                        current_chunk_parts = []
+                        current_chunk_len = 0
+                    
+                    if current_chunk_len + len(h2_sec_stripped) <= MAX_CHUNK_SIZE:
+                        current_chunk_parts.append(h2_sec_stripped)
+                        current_chunk_len += len(h2_sec_stripped)
+                    else:
+                        blocks = self._extract_text_and_table_blocks(h2_sec_stripped)
+                        for b in blocks:
+                            b_type = b["type"]
+                            b_content = b["content"].strip()
+                            if not b_content:
+                                continue
+                            
+                            if b_type == "table":
+                                if current_chunk_len + len(b_content) > MAX_CHUNK_SIZE and current_chunk_len > 300:
+                                    sub_texts.append("\n\n".join(current_chunk_parts))
+                                    current_chunk_parts = []
+                                    current_chunk_len = 0
+                                
+                                current_chunk_parts.append(b_content)
+                                current_chunk_len += len(b_content)
+                            else:
+                                splits = splitter.split_text(b_content)
+                                for s in splits:
+                                    if current_chunk_len + len(s) > MAX_CHUNK_SIZE and current_chunk_len > 300:
+                                        sub_texts.append("\n\n".join(current_chunk_parts))
+                                        current_chunk_parts = [s]
+                                        current_chunk_len = len(s)
+                                    else:
+                                        current_chunk_parts.append(s)
+                                        current_chunk_len += len(s)
+
+                if current_chunk_parts:
+                    sub_texts.append("\n\n".join(current_chunk_parts))
+
+                for j, sub_text in enumerate(sub_texts):
+                    docs.append(Document(
+                        page_content=sub_text,
+                        metadata={
+                            "section_title": chapter_title,
+                            "chunk_index": start_index + j,
+                            "page_num": chapter["page_start"],
+                            "content_type": chapter["content_type"],
+                            "trace_info": chapter["trace_info"],
+                            "source": "",
+                        }
+                    ))
+            return docs
+
+        # ========== 模式 2: 投标文件 (doc_type == "bid") 维持现行精细化分块逻辑 ==========
         if len(chapter_text) <= MAX_CHUNK_SIZE:
             has_tbl = self._check_has_table(chapter_text)
             docs.append(Document(
@@ -465,8 +569,8 @@ class ExtractorService:
             ))
         else:
             logger.info(
-                f"章节 [{chapter_title}] 文本长度 {len(chapter_text)} 字 > {MAX_CHUNK_SIZE}，"
-                f"启动语义聚类及表格防割裂分块。"
+                f"投标文件章节 [{chapter_title}] 文本长度 {len(chapter_text)} 字 > {MAX_CHUNK_SIZE}，"
+                f"启动表格隔离及表头自动补全拆分逻辑。"
             )
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size=MAX_CHUNK_SIZE,
@@ -619,7 +723,7 @@ class ExtractorService:
         final_docs: List[Document] = []
         chunk_index = 0
         for chapter in chapters:
-            sub_docs = self._adaptive_split_chapter(chapter, start_index=chunk_index)
+            sub_docs = self._adaptive_split_chapter(chapter, start_index=chunk_index, doc_type=doc_type)
             for doc in sub_docs:
                 doc.metadata["source"] = file_path
                 doc.metadata["md_file_path"] = md_file_path

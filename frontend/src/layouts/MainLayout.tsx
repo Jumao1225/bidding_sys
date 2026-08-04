@@ -18,7 +18,6 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (path === '/company-profile') return location.pathname.startsWith('/company-profile');
     if (path === '/price-book') return location.pathname.startsWith('/price-book');
     if (path === '/admin') return location.pathname.startsWith('/admin');
-    if (path === '/docx-debugger') return location.pathname.startsWith('/docx-debugger');
     return false;
   };
 
@@ -29,7 +28,6 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (location.pathname.startsWith('/bid-scorer')) return '智能标书多维度穿透测评';
     if (location.pathname.startsWith('/admin')) return '系统运维管理';
     if (location.pathname.startsWith('/analysis')) return '智能文档解析';
-    if (location.pathname.startsWith('/docx-debugger')) return 'Word 格式与指令改写调试';
     return '系统总览';
   };
 
@@ -90,16 +88,6 @@ export default function MainLayout({ children }: MainLayoutProps) {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z" />
             </svg>
             <span className={isActive('/bid-scorer') ? "relative z-10 font-bold text-emerald-300" : "group-hover:translate-x-1 transition-transform duration-300 text-slate-200"}>智能评标打分</span>
-          </Link>
-
-          <p className="px-4 text-[10px] font-bold tracking-widest text-slate-500 mb-3 mt-6 uppercase font-mono">Debug Tools</p>
-
-          <Link to="/docx-debugger" className={getLinkClass('/docx-debugger')}>
-            {isActive('/docx-debugger') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
-            <svg className={`w-5 h-5 mr-3 ${isActive('/docx-debugger') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-            </svg>
-            <span className={isActive('/docx-debugger') ? "relative z-10 font-bold" : "group-hover:translate-x-1 transition-transform duration-300"}>Word 调试</span>
           </Link>
 
           <p className="px-4 text-[10px] font-bold tracking-widest text-slate-500 mb-3 mt-6 uppercase">Resources</p>

@@ -15,11 +15,12 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 
 export interface SmartDocViewerProps {
   documents: { uri: string; fileName: string; fileType: string }[];
+  zoomLevel?: number;
 }
 
 const RENDERERS = [LocalDocxRenderer, ...DocViewerRenderers];
 
-export const SmartDocViewer = memo(function SmartDocViewer({ documents }: SmartDocViewerProps) {
+export const SmartDocViewer = memo(function SmartDocViewer({ documents, zoomLevel = 100 }: SmartDocViewerProps) {
   const doc = documents[0];
   const [numPages, setNumPages] = useState<number>(0);
   const [pdfError, setPdfError] = useState<string>('');
@@ -29,6 +30,7 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents }: SmartD
   }
 
   const isPdf = doc.fileType?.toLowerCase() === 'pdf' || doc.fileName?.toLowerCase().endsWith('.pdf');
+  const scale = zoomLevel / 100;
 
   if (isPdf) {
     const token = localStorage.getItem('bidding_token');
@@ -36,8 +38,10 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents }: SmartD
       ? { url: doc.uri, httpHeaders: { Authorization: `Bearer ${token}` } } 
       : doc.uri;
 
+    const targetWidth = Math.round(850 * scale);
+
     return (
-      <div className="flex-1 w-full h-full bg-[#f3f4f6]">
+      <div className="flex-1 w-full h-full bg-[#f3f4f6] overflow-auto custom-scrollbar">
         <Document
           file={pdfFile}
           onLoadSuccess={({ numPages }) => setNumPages(numPages)}
@@ -52,13 +56,13 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents }: SmartD
               totalCount={numPages}
               className="custom-scrollbar"
               itemContent={(index) => (
-                <div className="flex justify-center my-6 mx-auto overflow-hidden">
+                <div className="flex justify-center my-6 mx-auto overflow-visible">
                   <Page
                     pageNumber={index + 1}
                     renderTextLayer={true}
                     renderAnnotationLayer={true}
                     className="shadow-lg bg-white"
-                    width={850}
+                    width={targetWidth}
                     loading={
                       <div className="h-[1200px] w-[850px] bg-white animate-pulse shadow-md flex flex-col items-center justify-center text-slate-400">
                         <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-200 border-t-blue-600 mb-4"></div>
@@ -75,12 +79,17 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents }: SmartD
     );
   }
 
-  // Word 文档 (Docx) 退回原渲染器，但加上 content-visibility 优化
+  // Word 文档 (Docx) 退回原渲染器，支持动态 zoom 缩放与双向滚动
   const token = localStorage.getItem('bidding_token');
   const requestHeaders = token ? { Authorization: `Bearer ${token}` } : {};
 
   return (
-    <div className="flex-1 w-full bg-[#f3f4f6] h-full overflow-y-auto custom-scrollbar smart-doc-container">
+    <div 
+      className="flex-1 w-full bg-[#f3f4f6] h-full overflow-auto custom-scrollbar smart-doc-container"
+      style={{
+        zoom: scale
+      }}
+    >
       <style>{`
         /* 核心优化：利用 content-visibility 自动跳过屏幕外 DOCX 节点的重排与绘制 */
         .smart-doc-container .document-container, 

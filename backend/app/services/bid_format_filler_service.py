@@ -290,13 +290,17 @@ class BidFormatFillerService:
 
         # 1. 优先判断并整体替换拆分日期格式 (如 "____年___月___日" 或 "日  期：  年  月  日")
         if re.search(r'[\s_]{2,}年[\s_]*月[\s_]*日', text):
-            date_val = replacement_map.get("投标日期") or "2026年06月30日"
+            date_val = replacement_map.get("投标日期") or replacement_map.get("日期")
+            if not date_val:
+                return False
             # 从日期中解析出年、月、日
             import re as date_re
             d_m = date_re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', date_val)
-            y_str = d_m.group(1) if d_m else "2026"
-            m_str = d_m.group(2) if d_m else "06"
-            d_str = d_m.group(3) if d_m else "30"
+            if not d_m:
+                return False
+            y_str = d_m.group(1)
+            m_str = f"{int(d_m.group(2)):02d}"
+            d_str = f"{int(d_m.group(3)):02d}"
 
             # 原位精确拆分替换
             new_text = date_re.sub(r'[\s_]{2,}年', f"{y_str}年", text)

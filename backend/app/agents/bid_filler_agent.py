@@ -22,6 +22,8 @@ from typing import Dict, Any, List, Optional, TypedDict
 from loguru import logger
 from sqlalchemy.orm import Session
 from docx import Document
+from docx.oxml import parse_xml
+from docx.oxml.ns import qn, nsdecls
 import io
 
 from langchain_core.tools import tool
@@ -259,6 +261,14 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
                     summary = (res.get("summary") or "")[:100]
                     if status == "success":
                         logger.info(f"   ✅ [{title}] 成功 ({tools} 次工具调用) — {summary}")
+                        try:
+                            from app.worker.tasks import emit_agent_log
+                            p_cnt = res.get("proposals_count", 0)
+                            emit_agent_log("info", f"✅ [章节Worker] 【{title}】填报完成 ({tools}次工具调用, {p_cnt}条提案)", extra={
+                                "type": "chapter_execution", "worker": "writer_agent", "chapter": title
+                            })
+                        except Exception:
+                            pass
                     else:
                         logger.warning(f"   ⚠️ [{title}] {status} — {res.get('error', res.get('summary', ''))[:100]}")
                 except Exception as e:
@@ -428,6 +438,227 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 # 3. Review Agent — 审查 Worker 提案 + 执行写盘
 # ============================================================
 
+def _extract_prefix_from_text(text: str, orig_ctx: str = "") -> str:
+    """
+    全方位精细提取标书原文字段标签前缀：
+    优先从真实 Word 节点文本 text 中提炼，若为空则结合 orig_ctx。
+    支持：
+    1. 含有冒号的前缀 (如 "投标人名称（盖章）：____" 或 "投标人名称（盖章）：北京某某公司" -> "投标人名称（盖章）：")
+    2. 包含下划线/括号占位符的前缀 (如 "投标人名称（盖章）____" -> "投标人名称（盖章）：")
+    3. 常见标书字段名称无冒号的情况 (如 "投标人名称" -> "投标人名称：")
+    """
+    source = text.strip() if text and text.strip() else orig_ctx.strip()
+    if not source:
+        return ""
+
+    clean_src = re.sub(r'^(?:\[正文段落\s*\d+\]|\[表格\s*\d+\]|表格第\s*\d+\s*个表[，,\s]*第\s*\d+\s*行[，,\s]*第\s*\d+\s*列[:：]?)\s*', '', source).strip()
+    if not clean_src:
+        return ""
+
+    # 场景 1: 包含冒号的标签前缀 (如 "投标人名称（盖章）：____" 或 "投标人名称（盖章）：北京公司")
+    m_colon = re.search(r'^\s*([^\n_\[］\[\]]{2,50}?[:：])', clean_src)
+    if m_colon:
+        p_str = m_colon.group(1).strip()
+        if not re.search(r'(?:表格|第\s*\d+\s*行|第\s*\d+\s*列)', p_str) and not p_str.startswith("http"):
+            return p_str
+
+    # 场景 2: 匹配占位符前无冒号的文本: "投标人名称____" 或 "投标人名称[占位符]"
+    m_ph = re.search(r'^\s*([^\n_\[］\[\]]{1,50}?)\s*(?:_{2,}|\[[^\]]+\]|［[^］]+］)', clean_src)
+    if m_ph:
+        prefix = m_ph.group(1).rstrip()
+        if prefix and not prefix.startswith("http"):
+            if not prefix.endswith((':', '：')) and re.search(r'[\u4e00-\u9fa5]', prefix):
+                prefix += "："
+            return prefix
+
+    # 场景 3: 匹配常见无冒号无划线的标书纯关键字标签: "投标人名称"、"法定代表人"、"项目编号"
+    m_kw = re.search(r'^\s*((?:\d+[\.\、\s]*)?(?:项目名称|项目编号|招标文件编号|投标人|单位全称|单位名称|法定代表人|法人代表|授权代理人|委托代理人|地址|通信地址|注册地址|电话|联系电话|联系方式|传真|邮编|邮政编码|电子邮箱|邮箱|开户银行|开户行|银行账号|账号|身份证号码|身份证|工期|交货期|质量标准|质量要求|投标保证金|投标总价|投标报价|总报价|投标日期)[^:：_\[］\n]*)$', clean_src)
+    if m_kw:
+        kw_prefix = m_kw.group(1).strip()
+        if not kw_prefix.endswith((':', '：')):
+            kw_prefix += "："
+        return kw_prefix
+
+    return ""
+
+
+def _extract_label_prefix(ctx_str: str) -> str:
+    """兼容适配封装：从文本提取前缀标签"""
+    return _extract_prefix_from_text("", ctx_str)
+
+
+def _find_paragraph_by_path(doc: Document, path: str):
+    """根据 XPath 定位 Word 文档中的 Paragraph 节点 (兼容正整数索引与 @paraId)"""
+    if not path or not doc:
+        return None
+
+    # 1. 尝试匹配 @paraId 属性定位
+    m_paraid = re.search(r'@paraId=([A-Fa-f0-9]+)', path)
+    if m_paraid:
+        target_para_id = m_paraid.group(1).upper()
+        for p in doc.paragraphs:
+            if hasattr(p, '_element') and p._element.get(qn('w:paraId')) == target_para_id:
+                return p
+        for t in doc.tables:
+            for row in t.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        if hasattr(p, '_element') and p._element.get(qn('w:paraId')) == target_para_id:
+                            return p
+
+    # 2. 表格单元格节点定位: /body/tbl[T]/tr[R]/tc[C]
+    tbl_match = re.search(r'/tbl\[(\d+)\]/tr\[(\d+)\]/tc\[(\d+)\]', path)
+    if tbl_match:
+        tbl_idx = int(tbl_match.group(1)) - 1
+        tr_idx = int(tbl_match.group(2)) - 1
+        tc_idx = int(tbl_match.group(3)) - 1
+        if 0 <= tbl_idx < len(doc.tables):
+            t = doc.tables[tbl_idx]
+            if 0 <= tr_idx < len(t.rows):
+                row = t.rows[tr_idx]
+                if 0 <= tc_idx < len(row.cells):
+                    cell = row.cells[tc_idx]
+                    p_match = re.search(r'/p\[(\d+)\]$', path)
+                    p_sub_idx = int(p_match.group(1)) - 1 if p_match else 0
+                    if 0 <= p_sub_idx < len(cell.paragraphs):
+                        return cell.paragraphs[p_sub_idx]
+                    elif cell.paragraphs:
+                        return cell.paragraphs[0]
+
+    # 3. 正文段落定位: /body/p[N]
+    p_match = re.search(r'/p\[(\d+)\]$', path)
+    if p_match:
+        p_idx = int(p_match.group(1)) - 1
+        if 0 <= p_idx < len(doc.paragraphs):
+            return doc.paragraphs[p_idx]
+
+    return None
+
+
+def _apply_run_underline_xml(run, enable: bool = True) -> None:
+    """为 python-docx Run 节点强力施加或移除 Word 原生 OpenXML <w:u w:val="single"/> 下划线"""
+    if enable:
+        run.underline = True
+        try:
+            rPr = run._element.get_or_add_rPr()
+            u_node = rPr.find(qn('w:u'))
+            if u_node is None:
+                u_elem = parse_xml(r'<w:u %s w:val="single"/>' % nsdecls('w'))
+                rPr.append(u_elem)
+        except Exception:
+            pass
+    else:
+        run.underline = False
+        try:
+            rPr = run._element.get_or_add_rPr()
+            u_node = rPr.find(qn('w:u'))
+            if u_node is not None:
+                rPr.remove(u_node)
+        except Exception:
+            pass
+
+
+def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
+    """
+    DOM 级标书全量原位替换与下划线强力美化引擎：
+    1. 直接从 Word 节点读取真实原文；
+    2. 提炼并 100% 留存原标书字段标签前缀 (如 '投标人名称（单位盖章）：')，绝对不擦除原文；
+    3. 表格外部的正文段落填报内容统一加 Word 原生下划线 (<w:u w:val="single"/>)；
+    4. 表格内部的单元格填报内容取消下划线（确保表格内文字整洁无误）；
+    5. 单次内存处理刷盘，性能与呈现效果兼备。
+    """
+    if not docx_path or not os.path.exists(docx_path) or not proposals:
+        return 0
+
+    try:
+        doc = Document(docx_path)
+        success_count = 0
+
+        for p_item in proposals:
+            path = str(p_item.get("path", "")).strip()
+            proposed_val = str(p_item.get("proposed_text", "")).strip()
+            orig_ctx = str(p_item.get("original_context", "")).strip()
+
+            if not path or not proposed_val or proposed_val.startswith("["):
+                continue
+
+            # 路径精准度拦截：过滤粗粒度容器路径
+            if re.search(r'/(?:tbl|tr)\[\d+\]$', path):
+                continue
+
+            # 定位真实 Word DOM Paragraph 节点
+            p_elem = _find_paragraph_by_path(doc, path)
+            if not p_elem:
+                continue
+
+            # 判断该节点是否位于表格内部：路径中包含 /tbl[N] 或 DOM 父级为 w:tc 单元格
+            is_in_table = bool(re.search(r'/tbl\[\d+\]', path))
+            if not is_in_table and hasattr(p_elem, '_element') and p_elem._element is not None:
+                parent = p_elem._element.getparent()
+                if parent is not None and str(parent.tag).endswith('tc'):
+                    is_in_table = True
+
+            # 关键下划线策略：表格外部填报施加下划线，表格内部填报取消下划线
+            use_underline = not is_in_table
+
+            real_text = p_elem.text or ""
+            # 从真实 DOM 文本提炼前缀标签，无果则从 orig_ctx 提炼
+            prefix = _extract_prefix_from_text(real_text, orig_ctx)
+
+            # 拆分日期格式 ("2026年06月30日")
+            d_match = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', proposed_val)
+            if d_match and ("年" in real_text or "月" in real_text or "日" in real_text or "日期" in orig_ctx or "年" in orig_ctx):
+                y_s, m_s, d_s = d_match.group(1), d_match.group(2), d_match.group(3)
+                p_elem._element.clear_content()
+
+                if prefix:
+                    _apply_run_underline_xml(p_elem.add_run(prefix), False)
+
+                _apply_run_underline_xml(p_elem.add_run(y_s), use_underline)
+                _apply_run_underline_xml(p_elem.add_run("年"), False)
+                _apply_run_underline_xml(p_elem.add_run(m_s), use_underline)
+                _apply_run_underline_xml(p_elem.add_run("月"), False)
+                _apply_run_underline_xml(p_elem.add_run(d_s), use_underline)
+                _apply_run_underline_xml(p_elem.add_run("日"), False)
+                success_count += 1
+                continue
+
+            # 处理带有前缀标签的字段 (如 "投标人名称（单位盖章）：____")
+            if prefix:
+                clean_prefix = re.sub(r'[\s:：_\[］\[\]（）\(\)]', '', prefix)
+                clean_val = re.sub(r'[\s:：_\[］\[\]（）\(\)]', '', proposed_val)
+
+                if clean_prefix and clean_val.startswith(clean_prefix):
+                    val_content = proposed_val[len(prefix):] if proposed_val.startswith(prefix) else proposed_val
+                    p_elem._element.clear_content()
+                    _apply_run_underline_xml(p_elem.add_run(prefix), False)
+                    if val_content:
+                        _apply_run_underline_xml(p_elem.add_run(val_content), use_underline)
+                else:
+                    p_elem._element.clear_content()
+                    _apply_run_underline_xml(p_elem.add_run(prefix), False)
+                    _apply_run_underline_xml(p_elem.add_run(proposed_val), use_underline)
+                success_count += 1
+            else:
+                # 无前缀标签节点
+                p_elem._element.clear_content()
+                _apply_run_underline_xml(p_elem.add_run(proposed_val), use_underline)
+                success_count += 1
+
+        if success_count > 0:
+            doc.save(docx_path)
+            logger.info(f"   🛡️ [DOM 原位填报与美化] 成功原位写入并修饰 {success_count} 条提案（表格外保留下划线, 表格内取消下划线）")
+        return success_count
+    except Exception as exc:
+        logger.error(f"   ❌ DOM 级写盘填报异常: {exc}")
+        return 0
+
+
+def _apply_underline_to_filled_doc(docx_temp_path: str, proposals: List[Dict]) -> None:
+    """兼容封装：调用 DOM 原位填报与美化引擎"""
+    fill_docx_proposals_in_dom(docx_temp_path, proposals)
+
+
 def proposals_to_commands(proposals: List[Dict]) -> tuple:
     """将 Worker 提案转换为 OfficeCLI 写盘命令，返回 (commands, approved, rejected)"""
     commands = []
@@ -436,15 +667,31 @@ def proposals_to_commands(proposals: List[Dict]) -> tuple:
     for p in proposals:
         path = str(p.get("path", "")).strip()
         text = str(p.get("proposed_text", "")).strip()
+        orig_context = str(p.get("original_context", "")).strip()
+
         # 移除对 source_tool 为 none 的硬编码拦截；只要非空且不为占位异常提示即予以放行
         if not text or text.startswith("[待补充") or text.startswith("[建议") or text.startswith("[查询") or text.startswith("[错误"):
             rejected += 1; continue
         if not path:
             rejected += 1; continue
         
-        # 修复与优化：表格单元格 XPath 若止步于 /tc[N] 直写易出发 Path not found 剔除，自动补正到单元格第一段
+        # 路径精准度保护：如果是容器节点（/tbl[N] 或 /tr[N]），丢弃该粗粒度提案，防止误覆盖表头或行首单元格
+        if re.search(r'/(?:tbl|tr)\[\d+\]$', path):
+            logger.warning(f"   ⚠️ [Reviewer] 丢弃非精准表格容器路径: {path}，防止误覆盖表头")
+            rejected += 1; continue
+
+        # 表格单元格 XPath 若止步于 /tc[N]，自动补正到该具体单元格的第一段 /p[1]
         if re.search(r'/tc\[\d+\]$', path):
             path += "/p[1]"
+
+        # 原文前缀绝对保护逻辑：检查 original_context 是否包含前缀标签，防止擦除原标书文本
+        prefix = _extract_label_prefix(orig_context)
+        if prefix:
+            clean_prefix = re.sub(r'[\s:：_\[］\[\]（）\(\)]', '', prefix)
+            clean_text = re.sub(r'[\s:：_\[］\[\]（）\(\)]', '', text)
+            if clean_prefix and not clean_text.startswith(clean_prefix):
+                text = f"{prefix}{text}"
+                logger.info(f"   🛡️ [前缀保护] 自动为路径 {path} 补全原文标签: {prefix}")
 
         commands.append({"command": "set", "path": path, "props": {"text": text}})
         approved += 1
@@ -538,10 +785,10 @@ def review_node(state: BidFillerState) -> Dict[str, Any]:
         from langchain_core.messages import SystemMessage
 
         try:
-            # 由 Python 底座绝对保障：一锤子不漏地全部直接写入 DOM，消弭用 LLM 去拼巨长写入 JSON 调用时造成的漏掉及丢失故障！
+            # 由 Python DOM 底座绝对保障：先直接读取真实 Word 节点提炼标签前缀，并全量注入原生 OpenXML 下划线！
             cmds, fb_approved, fb_rejected = _proposals_to_commands(worker_proposals)
-            _fallback_write_commands(docx_temp_path, cmds, audit_items, fb_approved, fb_rejected)
-            logger.info(f"   🔒 [系统强制写入安全锁] 底层全表写入已执行完毕 ({fb_approved} 条打入, {fb_rejected} 条过滤)，启动 Review Agent 进场开展复核报告生成...")
+            _fallback_write_commands(docx_temp_path, cmds, audit_items, fb_approved, fb_rejected, worker_proposals)
+            logger.info(f"   🔒 [系统强制写入安全锁] DOM 级原位写入与下划线美化已完成 ({fb_approved} 条打入, {fb_rejected} 条过滤)，启动 Review Agent 进场开展复核报告生成...")
 
             # [优化点1：零度审核确切行文] 质检与校验不可有推断漂移，锁于 0.0 温度
             reviewer_llm = llm_service.get_llm(temperature=0.0, json_mode=False) or llm_service.raw_llm
@@ -563,12 +810,12 @@ def review_node(state: BidFillerState) -> Dict[str, Any]:
             logger.warning(f"   ⚠️ Review Agent 质检上层报告超时或中断（不可逆物理写入已稳妥执成）: {e}")
             if not any(getattr(item, 'source_type', '') == 'fallback' for item in audit_items):
                 cmds, fb_approved, fb_rejected = _proposals_to_commands(worker_proposals)
-                _fallback_write_commands(docx_temp_path, cmds, audit_items, fb_approved, fb_rejected)
+                _fallback_write_commands(docx_temp_path, cmds, audit_items, fb_approved, fb_rejected, worker_proposals)
     else:
         # 无 LLM → 预校验后直接写盘
         cmds, approved, rejected = _proposals_to_commands(worker_proposals)
         logger.info(f"   📋 预校验: {approved} approve + {rejected} reject → 直接写盘")
-        _fallback_write_commands(docx_temp_path, cmds, audit_items, approved, rejected)
+        _fallback_write_commands(docx_temp_path, cmds, approved, rejected, worker_proposals)
 
     return {"audit_items": audit_items, "docx_temp_path": docx_temp_path}
 
@@ -579,6 +826,7 @@ def _fallback_write_commands(
     audit_items: List,
     approved: int = 0,
     rejected: int = 0,
+    proposals: Optional[List[Dict]] = None,
 ) -> Dict[str, Any]:
     """降级模式：LLM 不可用时，直接执行预转换好的写盘命令
 
@@ -588,6 +836,7 @@ def _fallback_write_commands(
         audit_items: 审计记录列表（原地追加）
         approved: 预校验通过的 Proposal 数量
         rejected: 预校验拒绝的 Proposal 数量
+        proposals: Worker 原始提案列表（用于精确格式修饰）
     """
     import asyncio, concurrent.futures
     from app.mcp.office_cli_client import office_cli_mcp_client
@@ -599,6 +848,8 @@ def _fallback_write_commands(
     if commands:
         coro = office_cli_mcp_client.batch_update(docx_temp_path, json.dumps(commands, ensure_ascii=False))
         _sync(coro)
+        if proposals:
+            _apply_underline_to_filled_doc(docx_temp_path, proposals)
     logger.info(f"   ✍️ [Fallback] 执行 {len(commands)} 条写盘命令（{approved} 通过, {rejected} 拒绝）")
     audit_items.append(FillingAuditItem(
         target_field="[Review 降级]", raw_requirement=f"降级写盘: {approved}A+{rejected}R",
@@ -729,12 +980,13 @@ class BidFillerAgent:
 bid_filler_agent = BidFillerAgent()
 
 
-SKIP_BID_FILLER = True  # 临时跳过标书起草 (writer_agent) 长流程开关
+SKIP_BID_FILLER = os.getenv("SKIP_BID_FILLER", "false").lower() in ("true", "1", "yes")  # 开关控制：默认 False (开启真实标书起草流程)
 
 
 def bid_filler_orchestrator_node(state: dict) -> dict:
     """Orchestrator 适配节点 — 将 BidFillerAgent 对接至 LangGraph 编排器"""
     from app.worker.tasks import emit_agent_log
+    from app.core.config import settings
     document_id = state.get("document_id")
     tenant_id = state.get("tenant_id") or "default-tenant"
 
@@ -744,12 +996,15 @@ def bid_filler_orchestrator_node(state: dict) -> dict:
     if not document_id:
         return {"status": "writer_failed", "error": "Missing document_id"}
 
+    # 从 .env / Settings 动态读取开关配置 (false: 开启真实起草; true: 临时调试跳过)
+    skip_bid_filler = os.getenv("SKIP_BID_FILLER", "false").lower() in ("true", "1", "yes")
+
     # 如果开启了跳过开关，直接发出完成日志并返回成功，加速整体 Multi-Agent 流程
-    if SKIP_BID_FILLER:
+    if skip_bid_filler:
         summary = "⚡ [调试配置] 已暂时跳过标书起草步骤，长流程快速闭环完成"
         logger.info(f"⏩ {summary}")
         emit_agent_log("info", summary, extra={
-            "type": "worker_complete", "worker": "writer_agent", "status": "success", "summary": summary
+            "type": "worker_complete", "worker": "writer_agent", "status": "success", "summary": summary, "document_id": document_id
         })
         return {
             "completed_steps": ["writer_agent"],
@@ -787,7 +1042,7 @@ def bid_filler_orchestrator_node(state: dict) -> dict:
 
         summary = "已成功由 BidFillerAgent (Multi-Agent) 完成投标书 Word 草稿生成"
         emit_agent_log("info", summary, extra={
-            "type": "worker_complete", "worker": "writer_agent", "status": "success", "summary": summary
+            "type": "worker_complete", "worker": "writer_agent", "status": "success", "summary": summary, "document_id": document_id
         })
         return {
             "completed_steps": ["writer_agent"], "draft_path": draft_path,

@@ -130,7 +130,7 @@ def master_agent_node(state: BiddingState) -> Dict[str, Any]:
         logger.info("Master Agent: 所有工具调用已结束，纯调度任务完成。")
         
         summary = "成功提取5大元数据"
-        emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "master_agent", "status": "success", "summary": summary})
+        emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "master_agent", "status": "success", "summary": summary, "document_id": document_id})
 
         return {
             "status": "master_completed",

@@ -13,11 +13,12 @@ export interface UploadBoxProps {
   initialResult?: any;
   initialTaskId?: string | null;
   onSupervisorUpdate?: (decision: any) => void;
-  onWorkerStatusChange?: (worker: string, status: string, summary?: string) => void;
+  onWorkerStatusChange?: (worker: string, status: string, summary?: string, documentId?: string) => void;
 }
 
 // 高亮组件
-const HighlightText = React.memo(({ text, resultData }: { text: string, resultData: any }) => {
+const HighlightText = React.memo(({ text, resultData, targetQuote }: { text: string, resultData: any, targetQuote?: string | null }) => {
+  const virtuosoRef = useRef<any>(null);
   const paragraphs = useMemo(() => text.split('\n'), [text]);
 
   const highlightList = useMemo(() => {
@@ -34,6 +35,27 @@ const HighlightText = React.memo(({ text, resultData }: { text: string, resultDa
     }
     return list;
   }, [resultData]);
+
+  // 监听 targetQuote 变动，自动计算目标段落索引并平滑滚动定位
+  useEffect(() => {
+    if (!targetQuote || !text || paragraphs.length === 0) return;
+    const cleanQuote = targetQuote.trim();
+    if (!cleanQuote) return;
+
+    let targetIdx = paragraphs.findIndex(p => p.includes(cleanQuote));
+    if (targetIdx === -1 && cleanQuote.length > 5) {
+      const subQuote = cleanQuote.slice(0, 8);
+      targetIdx = paragraphs.findIndex(p => p.includes(subQuote));
+    }
+
+    if (targetIdx !== -1 && virtuosoRef.current) {
+      virtuosoRef.current.scrollToIndex({
+        index: targetIdx,
+        align: 'center',
+        behavior: 'smooth'
+      });
+    }
+  }, [targetQuote, paragraphs, text]);
 
   const renderParagraph = (index: number, pText: string) => {
     if (!pText.trim()) return <div className="h-4" />;
@@ -62,8 +84,11 @@ const HighlightText = React.memo(({ text, resultData }: { text: string, resultDa
       else if (h.type === '努力可做到' || h.type === '中') colorClass = 'bg-orange-200 text-orange-900 border-b-2 border-orange-500 shadow-sm';
       else if (h.type === '可以做到' || h.type === '低') colorClass = 'bg-green-200 text-green-900 border-b-2 border-green-500 shadow-sm';
 
+      const isSelected = targetQuote && h.quote && (h.quote.includes(targetQuote) || targetQuote.includes(h.quote));
+      const activeClass = isSelected ? 'ring-4 ring-blue-500 ring-offset-2 scale-105 shadow-xl font-extrabold animate-pulse' : '';
+
       nodes.push(
-        <mark key={`mark-${i}`} className={`${colorClass} px-1 rounded cursor-help hover:ring-2 hover:ring-offset-1 transition-all duration-200`} title={h.obj.reason || h.obj.description}>
+        <mark key={`mark-${i}`} className={`${colorClass} ${activeClass} px-1.5 py-0.5 rounded cursor-help hover:ring-2 hover:ring-offset-1 transition-all duration-300`} title={h.obj.reason || h.obj.description}>
           {pText.substring(h.start, h.end)}
         </mark>
       );
@@ -77,6 +102,7 @@ const HighlightText = React.memo(({ text, resultData }: { text: string, resultDa
 
   return (
     <Virtuoso 
+      ref={virtuosoRef}
       style={{ height: '100%', width: '100%' }}
       data={paragraphs}
       itemContent={renderParagraph}
@@ -112,6 +138,79 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     Number(localStorage.getItem('bidding_split_ratio')) || 60
   ); 
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [targetQuote, setTargetQuote] = useState<string | null>(null);
+  const [zoomLevel, setZoomLevel] = useState<number>(100);
+
+  const handleZoomIn = () => setZoomLevel(prev => Math.min(prev + 15, 200));
+  const handleZoomOut = () => setZoomLevel(prev => Math.max(prev - 15, 50));
+  const handleZoomReset = () => setZoomLevel(100);
+
+  const handleCardClick = (exactQuote?: string, fallbackText?: string) => {
+    const quoteToUse = exactQuote || fallbackText;
+    if (!quoteToUse) return;
+    
+    setTargetQuote(quoteToUse);
+
+    // 针对 原文件预览 模式：采用多词切片重合度打分算法（Keyword Overlap Scoring），完美匹配“联合投标”与“联合体投标”等微小文字差异
+    if (viewMode === 'original') {
+      setTimeout(() => {
+        const cleanQuote = quoteToUse.trim();
+        if (!cleanQuote) return;
+        
+        // 1. 获取所有精细的段落 <p> 与文本 <span> 节点
+        const candidates = Array.from(document.querySelectorAll(
+          '.smart-doc-container .docx-wrapper p, .smart-doc-container p, .react-pdf__Page__textContent span'
+        )) as HTMLElement[];
+
+        // 2. 提取目标句中的核心关键词列表（按 2-3 字滑窗切词）
+        const rawKeywords = cleanQuote.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '');
+        const keywords: string[] = [];
+        for (let i = 0; i < rawKeywords.length - 1; i += 2) {
+          keywords.push(rawKeywords.slice(i, i + 3));
+        }
+
+        // 3. 计算每个 DOM 节点的重合度得分
+        let bestScore = 0;
+        let bestElem: HTMLElement | null = null;
+
+        candidates.forEach(el => {
+          const txt = (el.textContent || '').trim();
+          if (!txt || txt.length > 500) return; // 排除包围大容器
+
+          let score = 0;
+
+          // 字符串完全包含加高分
+          if (txt.includes(cleanQuote)) {
+            score += 100;
+          }
+
+          // 核心关键词匹配累加得分
+          keywords.forEach(kw => {
+            if (kw && txt.includes(kw)) {
+              score += 20;
+            }
+          });
+
+          // 业务核心词汇（如“联合”、“投标”、“不允许”）加权，完美支持“联合投标”对齐“联合体投标”
+          if (cleanQuote.includes("联合") && txt.includes("联合")) score += 40;
+          if (cleanQuote.includes("不允许") && (txt.includes("不允许") || txt.includes("不接受") || txt.includes("不得"))) score += 30;
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestElem = el;
+          }
+        });
+
+        if (bestElem && bestScore >= 20) {
+          bestElem.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          bestElem.classList.add('ring-4', 'ring-blue-500', 'ring-offset-4', 'bg-amber-200/90', 'text-slate-900', 'rounded-lg', 'p-1', 'transition-all', 'duration-500', 'animate-pulse', 'z-20', 'relative');
+          setTimeout(() => {
+            bestElem?.classList.remove('ring-4', 'ring-blue-500', 'ring-offset-4', 'bg-amber-200/90', 'text-slate-900', 'rounded-lg', 'p-1', 'animate-pulse', 'z-20', 'relative');
+          }, 4000);
+        }
+      }, 150);
+    }
+  };
 
   // 不再将 result, taskId, fileName 写入 localStorage，一切依赖历史记录或单次会话
   
@@ -223,6 +322,9 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
             
             if (msgData.agent_log) {
               const log = msgData.agent_log;
+              if (log.document_id) {
+                localStorage.setItem('bidding_document_id', log.document_id);
+              }
               if (onTerminalMessage) {
                 onTerminalMessage({
                   id: Date.now().toString() + Math.random().toString(),
@@ -248,7 +350,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
               }
               
               if (log.type === 'worker_complete' && onWorkerStatusChange) {
-                onWorkerStatusChange(log.worker, log.status === 'success' ? 'success' : 'failed', log.summary);
+                onWorkerStatusChange(log.worker, log.status === 'success' ? 'success' : 'failed', log.summary, log.document_id);
               }
             }
             if (msgData.progress === 100) {
@@ -303,8 +405,10 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     if (onAnalysisSuccess) onAnalysisSuccess(null);
   };
 
+  const activeDocOrTaskId = taskId || (result && (result.document_id || result.id)) || initialTaskId;
+
   const viewerDocuments = useMemo(() => {
-    if (!taskId) return [];
+    if (!activeDocOrTaskId) return [];
     
     // 如果是上传成功后的单次会话，fileName 有值
     // 如果是恢复的历史记录，result 中会带回 filename
@@ -312,11 +416,11 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     const fileType = actualFileName.split('.').pop() || "docx";
 
     return [{ 
-      uri: `${import.meta.env.VITE_API_BASE_URL || ""}/api/v1/analysis/download/${taskId}`,
+      uri: `${import.meta.env.VITE_API_BASE_URL || ""}/api/v1/analysis/download/${activeDocOrTaskId}`,
       fileName: actualFileName,
       fileType: fileType
     }];
-  }, [taskId, fileName, result]);
+  }, [activeDocOrTaskId, fileName, result]);
 
   const leftPanelContent = useMemo(() => {
     return (
@@ -332,6 +436,33 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
             </div>
           </div>
           <div className="flex items-center gap-3">
+            {/* 原文件预览 专属 缩放比例控制工具 */}
+            {viewMode === 'original' && (
+              <div className="flex items-center bg-slate-100 p-1 rounded-lg gap-1 border border-slate-200 shadow-2xs">
+                <button 
+                  onClick={handleZoomOut}
+                  className="px-2 py-0.5 text-xs font-bold text-slate-600 hover:bg-white hover:text-blue-600 rounded transition-all shadow-2xs cursor-pointer select-none"
+                  title="缩小原文件 (Zoom Out)"
+                >
+                  -
+                </button>
+                <span 
+                  onClick={handleZoomReset}
+                  className="px-2 py-0.5 text-xs font-semibold text-slate-600 hover:text-blue-600 cursor-pointer min-w-[42px] text-center select-none"
+                  title="点击重置为 100% 原始大小"
+                >
+                  {zoomLevel}%
+                </span>
+                <button 
+                  onClick={handleZoomIn}
+                  className="px-2 py-0.5 text-xs font-bold text-slate-600 hover:bg-white hover:text-blue-600 rounded transition-all shadow-2xs cursor-pointer select-none"
+                  title="放大原文件 (Zoom In)"
+                >
+                  +
+                </button>
+              </div>
+            )}
+
             <span className="text-xs text-slate-400 font-medium bg-slate-100 px-2 py-1 rounded-md">悬浮高亮查看说明</span>
             
             {/* 全屏切换按钮 */}
@@ -350,11 +481,11 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
         </div>
         <div className={`flex-1 flex flex-col gpu-layer ${viewMode === 'text' ? 'overflow-y-auto custom-scrollbar p-6' : 'overflow-hidden'}`}>
           {viewMode === 'text' ? (
-            <HighlightText text={result?.extracted_text || ""} resultData={result} />
+            <HighlightText text={result?.extracted_text || ""} resultData={result} targetQuote={targetQuote} />
           ) : (
-            taskId ? (
+            activeDocOrTaskId ? (
               <div className="flex-1 w-full bg-[#f3f4f6] h-full">
-                <SmartDocViewer documents={viewerDocuments} />
+                <SmartDocViewer documents={viewerDocuments} zoomLevel={zoomLevel} />
               </div>
             ) : (
               <div className="flex items-center justify-center h-full text-slate-400">正在加载原文件...</div>
@@ -363,7 +494,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
         </div>
       </div>
     );
-  }, [viewMode, taskId, viewerDocuments, result, isFullscreen]);
+  }, [viewMode, activeDocOrTaskId, viewerDocuments, result, isFullscreen, targetQuote, zoomLevel]);
 
   return (
     <motion.div 
@@ -505,16 +636,24 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
               {activeTab === 'qual' && (
                 <div className="space-y-4 animate-fade-in">
                   {result.qualifications_analysis?.items?.map((item: any, idx: number) => (
-                    <div key={idx} className="p-5 rounded-xl border border-slate-200 bg-white shadow-sm hover:shadow-md transition-shadow">
+                    <div 
+                      key={idx} 
+                      onClick={() => handleCardClick(item.exact_quote, item.requirement)}
+                      className="p-5 rounded-xl border border-slate-200 bg-white shadow-sm hover:shadow-md hover:border-blue-405 hover:bg-blue-50/20 cursor-pointer transition-all active:scale-[0.99] group/card"
+                      title="点击跳转左侧原文出处定位"
+                    >
                       <div className="flex justify-between items-start mb-3">
-                        <h4 className="font-bold text-slate-800 leading-tight pr-4">{item.requirement}</h4>
-                        <span className={`flex-shrink-0 px-3 py-1 text-xs rounded-full font-bold shadow-sm ${
-                          item.status === '做不到' ? 'bg-red-100 text-red-700 border border-red-200' :
-                          item.status === '努力可做到' ? 'bg-orange-100 text-orange-700 border border-orange-200' :
-                          'bg-green-100 text-green-700 border border-green-200'
-                        }`}>
-                          {item.status}
-                        </span>
+                        <h4 className="font-bold text-slate-800 leading-tight pr-4 flex-1">{item.requirement}</h4>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="text-[10px] text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full font-bold opacity-0 group-hover/card:opacity-100 transition-opacity shadow-xs">🎯 定位原文</span>
+                          <span className={`px-3 py-1 text-xs rounded-full font-bold shadow-sm ${
+                            item.status === '做不到' ? 'bg-red-100 text-red-700 border border-red-200' :
+                            item.status === '努力可做到' ? 'bg-orange-100 text-orange-700 border border-orange-200' :
+                            'bg-green-100 text-green-700 border border-green-200'
+                          }`}>
+                            {item.status}
+                          </span>
+                        </div>
                       </div>
                       <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
                         <p className="text-sm text-slate-600"><span className="font-bold text-slate-700 mr-2">🤖 AI 分析:</span>{item.reason}</p>
@@ -536,7 +675,12 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                     const order: Record<string, number> = { '高': 0, '中': 1, '低': 2 };
                     return (order[a.severity] ?? 3) - (order[b.severity] ?? 3);
                   }).map((risk: any, idx: number) => (
-                    <div key={idx} className="p-5 rounded-xl border border-rose-100 bg-white shadow-sm hover:shadow-md transition-shadow relative overflow-hidden">
+                    <div 
+                      key={idx} 
+                      onClick={() => handleCardClick(risk.exact_quote, risk.description)}
+                      className="p-5 rounded-xl border border-rose-100 bg-white shadow-sm hover:shadow-md hover:border-rose-400 hover:bg-rose-50/20 cursor-pointer transition-all active:scale-[0.99] group/card relative overflow-hidden"
+                      title="点击跳转左侧原文出处定位"
+                    >
                       <div className={`absolute left-0 top-0 bottom-0 w-1 ${
                           risk.severity === '高' ? 'bg-rose-500' :
                           risk.severity === '中' ? 'bg-orange-400' :
@@ -546,13 +690,16 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                         <div className="flex items-center space-x-2">
                           <span className="font-bold text-slate-800">{risk.risk_type}</span>
                         </div>
-                        <span className={`px-3 py-1 text-xs rounded-full font-bold shadow-sm ${
-                          risk.severity === '高' ? 'bg-rose-100 text-rose-700 border border-rose-200' :
-                          risk.severity === '中' ? 'bg-orange-100 text-orange-700 border border-orange-200' :
-                          'bg-blue-100 text-blue-700 border border-blue-200'
-                        }`}>
-                          {risk.severity}风险
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] text-rose-600 bg-rose-50 px-2 py-0.5 rounded-full font-bold opacity-0 group-hover/card:opacity-100 transition-opacity shadow-xs">📍 定位原文</span>
+                          <span className={`px-3 py-1 text-xs rounded-full font-bold shadow-sm ${
+                            risk.severity === '高' ? 'bg-rose-100 text-rose-700 border border-rose-200' :
+                            risk.severity === '中' ? 'bg-orange-100 text-orange-700 border border-orange-200' :
+                            'bg-blue-100 text-blue-700 border border-blue-200'
+                          }`}>
+                            {risk.severity}风险
+                          </span>
+                        </div>
                       </div>
                       <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 ml-2">
                         <p className="text-sm text-slate-600"><span className="font-bold text-slate-700 mr-2">⚠️ 描述:</span>{risk.description}</p>

@@ -42,17 +42,23 @@ def test_slice_text_by_keywords_should_locate_bid_format_chapter():
 
 
 def test_is_toc_line_should_correctly_identify_table_of_contents_lines():
-    """测试 _is_toc_line 能否精准判断目录连点页码行，防止误杀切片"""
+    """测试 _is_toc_line 能否精准判断带-3- / -55- 及第一卷等目录连点页码行，防止误杀切片"""
     toc_line_1 = "第六章 投标文件格式 .................... 40"
     toc_line_2 = "第七章 合同条款................................... 55"
     toc_line_3 = "第六章 投标文件格式\t40"
-    
+    toc_line_4 = "第一章 招标公告........................-3-"
+    toc_line_5 = "第六章 投标文件格式....................-55-"
+    toc_line_vol = "第一卷"
+
     body_line_1 = "第六章 投标文件格式"
     body_line_2 = "附件一 投标函"
 
     assert bid_format_extractor_service._is_toc_line(toc_line_1) is True
     assert bid_format_extractor_service._is_toc_line(toc_line_2) is True
     assert bid_format_extractor_service._is_toc_line(toc_line_3) is True
+    assert bid_format_extractor_service._is_toc_line(toc_line_4) is True
+    assert bid_format_extractor_service._is_toc_line(toc_line_5) is True
+    assert bid_format_extractor_service._is_toc_line(toc_line_vol) is True
 
     assert bid_format_extractor_service._is_toc_line(body_line_1) is False
     assert bid_format_extractor_service._is_toc_line(body_line_2) is False

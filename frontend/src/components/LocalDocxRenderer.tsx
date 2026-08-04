@@ -49,7 +49,7 @@ export const LocalDocxRenderer: DocRenderer = ({ mainState: { currentDocument } 
   }, [currentDocument]);
 
   return (
-    <div className="relative w-full h-full bg-[#f3f4f6] overflow-hidden rounded-xl">
+    <div className="relative w-full h-full bg-[#f3f4f6] overflow-auto custom-scrollbar rounded-xl">
       {loading && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/80 backdrop-blur-sm z-10">
           <div className="animate-spin rounded-full h-10 w-10 border-4 border-blue-100 border-t-blue-600 mb-3"></div>

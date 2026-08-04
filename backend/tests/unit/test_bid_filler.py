@@ -126,6 +126,187 @@ def test_proposals_to_commands_should_handle_none_source_and_wrap_tc():
     assert para_cmd["props"]["text"] == "电力工程施工总承包二级"
 
 
+def test_proposals_to_commands_should_preserve_label_prefix():
+    """测试 proposals_to_commands 在提案未携带标签前缀时，能依据 original_context 自动保留并补全字段前缀"""
+    from app.agents.bid_filler_agent import proposals_to_commands, _extract_label_prefix
+
+    # 1. 验证 _extract_label_prefix 提炼能力
+    assert _extract_label_prefix("投标人名称（单位盖章）：__________________________") == "投标人名称（单位盖章）："
+    assert _extract_label_prefix("地    址：__________________________") == "地    址："
+    assert _extract_label_prefix("项目编号：[项目编号]") == "项目编号："
+
+    # 2. 验证 proposals_to_commands 前缀自动防护
+    mock_proposals = [
+        {
+            "source_tool": "query_company_profile_tool",
+            "path": "/body/p[12]",
+            "original_context": "投标人名称（单位盖章）：__________________________",
+            "proposed_text": "北京某某科技有限公司",
+        },
+        {
+            "source_tool": "query_company_profile_tool",
+            "path": "/body/p[13]",
+            "original_context": "地    址：__________________________",
+            "proposed_text": "地    址：北京市海淀区中关村南大街1号",
+        },
+        {
+            "source_tool": "query_financial_quotation_tool",
+            "path": "/body/tbl[1]/tr[2]/tc[2]",
+            "original_context": "表格第 1 个表，第 2 行，第 2 列：",
+            "proposed_text": "15.00万元",
+        }
+    ]
+
+    cmds, approved, rejected = proposals_to_commands(mock_proposals)
+    assert approved == 3
+    assert cmds[0]["props"]["text"] == "投标人名称（单位盖章）：北京某某科技有限公司"
+    # 已自带前缀的不重复拼接
+    assert cmds[1]["props"]["text"] == "地    址：北京市海淀区中关村南大街1号"
+    # 无标签的数值单元格保持纯数值
+    assert cmds[2]["props"]["text"] == "15.00万元"
+
+
+def test_apply_underline_to_filled_doc_should_set_underline_on_value_run():
+    """测试 _apply_underline_to_filled_doc 能给填报值拆成带下划线的 Run，且保持前缀标签无下划线"""
+    import tempfile, os
+    from docx import Document
+    from app.agents.bid_filler_agent import _apply_underline_to_filled_doc
+
+    doc = Document()
+    doc.add_paragraph("投标人名称（单位盖章）：北京某某科技有限公司")
+    
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+    
+    try:
+        doc.save(temp_path)
+        proposals = [{
+            "path": "/body/p[1]",
+            "original_context": "投标人名称（单位盖章）：__________________________",
+            "proposed_text": "北京某某科技有限公司"
+        }]
+        
+        _apply_underline_to_filled_doc(temp_path, proposals)
+        
+        res_doc = Document(temp_path)
+        p = res_doc.paragraphs[0]
+        assert len(p.runs) == 2
+        assert p.runs[0].text == "投标人名称（单位盖章）："
+        assert p.runs[0].underline is False or p.runs[0].underline is None
+        assert p.runs[1].text == "北京某某科技有限公司"
+        assert p.runs[1].underline is True
+        assert "w:u" in p.runs[1]._element.xml
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_fill_docx_proposals_in_dom_should_preserve_real_labels_and_add_underline():
+    """测试 DOM 引擎从真实 Word 节点读取原文，保留前缀标签并成功注入 OpenXML 下划线"""
+    import tempfile, os
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom, _extract_prefix_from_text
+
+    # 1. 验证 _extract_prefix_from_text 各种提炼场景
+    assert _extract_prefix_from_text("投标人全称（盖章）__________________________") == "投标人全称（盖章）："
+    assert _extract_prefix_from_text("地    址：__________________________") == "地    址："
+    assert _extract_prefix_from_text("项目名称") == "项目名称："
+
+    doc = Document()
+    doc.add_paragraph("投标人全称（盖章）：__________________________")
+    doc.add_paragraph("法定代表人（签字）：__________________________")
+    
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+    
+    try:
+        doc.save(temp_path)
+        proposals = [
+            {
+                "path": "/body/p[1]",
+                "original_context": "正文段落 1",  # 哪怕 Worker 上下文丢失，DOM 引擎仍能从真实 Word 读取
+                "proposed_text": "四川某某实业有限公司"
+            },
+            {
+                "path": "/body/p[2]",
+                "original_context": "法定代表人（签字）：__________________________",
+                "proposed_text": "李四"
+            }
+        ]
+        
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count == 2
+        
+        res_doc = Document(temp_path)
+        p1 = res_doc.paragraphs[0]
+        assert len(p1.runs) == 2
+        assert p1.runs[0].text == "投标人全称（盖章）："
+        assert p1.runs[0].underline is False or p1.runs[0].underline is None
+        assert p1.runs[1].text == "四川某某实业有限公司"
+        assert p1.runs[1].underline is True
+        assert "w:u" in p1.runs[1]._element.xml
+
+        p2 = res_doc.paragraphs[1]
+        assert len(p2.runs) == 2
+        assert p2.runs[0].text == "法定代表人（签字）："
+        assert p2.runs[1].text == "李四"
+        assert "w:u" in p2.runs[1]._element.xml
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_fill_docx_proposals_underline_policy_outside_vs_inside_table():
+    """测试 DOM 引擎策略：表格外正文填报施加下划线，表格内单元格填报取消下划线"""
+    import tempfile, os
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    doc.add_paragraph("投标人名称（单位盖章）：__________________________")
+    tbl = doc.add_table(rows=1, cols=2)
+    tbl.rows[0].cells[0].paragraphs[0].text = "投标总价："
+    tbl.rows[0].cells[1].paragraphs[0].text = "__________________________"
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+        proposals = [
+            {
+                "path": "/body/p[1]",
+                "original_context": "投标人名称（单位盖章）：__________________________",
+                "proposed_text": "北京某某科技有限公司"
+            },
+            {
+                "path": "/body/tbl[1]/tr[1]/tc[2]",
+                "original_context": "表格第 1 个表，第 1 行，第 2 列",
+                "proposed_text": "15.00万元"
+            }
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count == 2
+
+        res_doc = Document(temp_path)
+        # 1. 验证表格外正文段落：数据值带有下划线
+        p_body = res_doc.paragraphs[0]
+        assert len(p_body.runs) == 2
+        assert p_body.runs[1].text == "北京某某科技有限公司"
+        assert p_body.runs[1].underline is True
+        assert "w:u" in p_body.runs[1]._element.xml
+
+        # 2. 验证表格内单元格：数据值没有下划线
+        p_cell = res_doc.tables[0].rows[0].cells[1].paragraphs[0]
+        assert p_cell.runs[0].text == "15.00万元"
+        assert p_cell.runs[0].underline is False or p_cell.runs[0].underline is None
+        assert "w:u" not in p_cell.runs[0]._element.xml
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def test_db_tools_quotation_and_market_price_should_return_full_bom():
     """测试财务报价及指导单价检索 DB 工具能正确支持全量 BOM 成本测算合价与模糊词条组合联查"""
     from app.agents.tools.bid_db_tools import query_market_price_reference_tool, query_financial_quotation_tool
@@ -141,3 +322,24 @@ def test_db_tools_quotation_and_market_price_should_return_full_bom():
     # 3. 验证财务接口通过 cost_estimates 关键字段一次性直接拉取完整的分项清单表
     res_bom = query_financial_quotation_tool.invoke({"document_id": "06a4abb2-4817-43fc-aa6f-f5f4901025ae", "field_key": "cost_estimates"})
     assert "673492.47" in res_bom and "69330.0" in res_bom and "18360.7" in res_bom
+
+
+def test_parse_proposals_unescaped_quotes_and_object_recovery():
+    """测试 Worker 提案解析器能否容错自动修复内层未转义双引号，并在语法崩溃时实施逐个对象拯救机制"""
+    from app.agents.bid_filler_workers import _parse_proposals
+
+    # 包含内层半角双引号 "招标编号：__号" 的日志真实范例片段
+    bad_raw_json = (
+        '[\n'
+        '  {"path": "/body/p[1]", "original_context": "招标", "source_data": "008号", "proposed_text": "008号", '
+        '"reasoning": "原文"招标编号：__号"为空白待填"},\n'
+        '  {"path": "/body/tbl[1]/tr[2]/tc[1]", "proposed_text": "1", "reasoning": "正常项"}\n'
+        ']'
+    )
+
+    proposals = _parse_proposals(bad_raw_json)
+    assert len(proposals) == 2
+    assert proposals[0]["path"] == "/body/p[1]"
+    assert "招标编号" in proposals[0]["reasoning"]
+    assert proposals[1]["proposed_text"] == "1"
+

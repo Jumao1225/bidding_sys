@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import { apiFetch } from '../utils/api';
 import { UploadBox } from '../components/UploadBox';
@@ -18,6 +18,7 @@ export function AnalysisDashboard() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [retryingDomain, setRetryingDomain] = useState<string | null>(null);
+  const hasAutoDownloadedRef = useRef(false);
   
   const [result, setResult] = useState<any>(null);
 
@@ -73,11 +74,40 @@ export function AnalysisDashboard() {
     setTerminalMessages(prev => [...prev, { ...msg, id: Date.now().toString() }]);
   };
 
+  const autoDownloadDraft = async (targetDocId: string) => {
+    if (hasAutoDownloadedRef.current) return;
+    hasAutoDownloadedRef.current = true;
+
+    try {
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+      const response = await apiFetch(`${baseUrl}/api/v1/analysis/draft/download/${targetDocId}`);
+      if (!response.ok) return;
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `投标书草稿_${targetDocId.slice(0, 8)}.docx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+
+      setTerminalMessages(prev => [
+        ...prev,
+        { id: Date.now().toString() + "_dl", type: 'success', content: '🎉 标书起草完成！已自动触发浏览器下载 Word 投标书草稿。' }
+      ]);
+    } catch (err) {
+      console.error("自动下载标书草稿失败:", err);
+    }
+  };
+
   const handleAnalysisSuccess = (res: any) => {
     setResult(res);
     if (res.document_id) {
       localStorage.setItem('bidding_document_id', res.document_id);
       window.dispatchEvent(new Event('bidding_document_changed'));
+      autoDownloadDraft(res.document_id);
     }
     setTerminalMessages(prev => [
       ...prev,
@@ -88,6 +118,7 @@ export function AnalysisDashboard() {
   const handleAnalyzingChange = (analyzing: boolean) => {
     setIsAnalyzing(analyzing);
     if (analyzing) {
+      hasAutoDownloadedRef.current = false;
       setWorkerStatuses(initialWorkerStatuses);
       setSupervisorDecision(undefined);
       setTerminalMessages([{ id: Date.now().toString(), type: 'info', content: '等待主控 Agent 调度...' }]);
@@ -103,10 +134,34 @@ export function AnalysisDashboard() {
     }
   };
 
-  const handleWorkerStatusChange = (workerName: string, status: string, summary?: string) => {
+  const fetchLatestResult = (targetDocId: string) => {
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+    apiFetch(`${baseUrl}/api/v1/documents/${targetDocId}/result`)
+      .then(res => res.json())
+      .then(resJson => {
+        const docData = resJson?.data || resJson;
+        if (docData && (docData.document_id || docData.id)) {
+          setResult(docData);
+        }
+      })
+      .catch(err => {
+        console.error("增量获取最新结果失败:", err);
+      });
+  };
+
+  const handleWorkerStatusChange = (workerName: string, status: string, summary?: string, docId?: string) => {
     setWorkerStatuses(prev => prev.map(w => 
       w.name === workerName ? { ...w, status: status as any, summary: summary || w.summary } : w
     ));
+    if (status === 'success') {
+      const targetDocId = docId || activeDocId || localStorage.getItem('bidding_document_id');
+      if (targetDocId) {
+        fetchLatestResult(targetDocId);
+        if (workerName === 'writer_agent' || workerName === 'writer' || workerName === 'draft') {
+          autoDownloadDraft(targetDocId);
+        }
+      }
+    }
   };
 
   const activeDocId = result?.document_id || result?.id || (id && id !== 'new' ? id : null) || localStorage.getItem('bidding_document_id') || undefined;

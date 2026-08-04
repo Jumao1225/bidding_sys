@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     MINERU_API_TOKEN: str = os.getenv("MINERU_API_TOKEN", "")
     MINERU_API_BASE_URL: str = os.getenv("MINERU_API_BASE_URL", "https://mineru.net/api/v4")
 
+    # Multi-Agent 标书起草长流程开关 (false: 开启; true: 跳过)
+    SKIP_BID_FILLER: bool = os.getenv("SKIP_BID_FILLER", "false").lower() in ("true", "1", "yes")
+
+
     class Config:
         env_file = ("../.env", ".env")
         case_sensitive = True

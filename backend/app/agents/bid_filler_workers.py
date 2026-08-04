@@ -163,8 +163,11 @@ def build_worker_prompt(
 【硬约束】
 - 🚫 只调研，不写盘！
 - source_data 必须来自 DB，查不到则 source_data="[待补充]", source_tool="none"
+- 🚫 【防幻觉与伪造日期封杀法则】：若从 DB 未查到真实日期或数据，proposed_text 必须设为 "[待补充]"，绝对严禁自行捏造任何假日期（如 "2026年6月30日"）或虚构数值！
 - 每个查询前先确认原文中确实要求了该数据项
-- 不要凭经验猜测原文没要求的资质/证书/设备名称"""
+- ⚠️ 格式安全：字段值（如 original_context, reasoning）中如需包含双引号，请务必替换为中文双引号“”或进行标准转义 \"，绝对禁止直接在字符串内部书写未经转义的半角双引号 "！
+- ⚠️ 路径精准度：path 必须精准定位到具体段落 /p[N] 或表格单元格 /tr[ROW]/tc[COL]/p[1]，绝对禁止返回粗粒度的表格容器 /tbl[N] 或整行 /tr[N]！
+- ⚠️ 原文标签前缀绝对保护：若目标节点包含字段名称/前缀标签（如"投标人名称（单位盖章）：____"、"法定代表人（签字）：____"、"地 址：____"、"项目编号：____"），proposed_text 必须完整包含原前缀标签（如"投标人名称（单位盖章）：北京某某科技有限公司"），绝对禁止仅输出孤立填报值导致原文标签被擦除！对于表格无标签单元格，proposed_text 可填纯数值。"""
 
     user_prompt = f"""【调研任务】
 - 文档 ID: {document_id}
@@ -236,11 +239,34 @@ def run_chapter_worker(
         logger.info(f"❄️ [零温防偏锁定] Worker [{chapter_title}] ({cat}) → 分配无震动恒等模型 (temperature={target_temp})")
 
         agent = create_react_agent(worker_llm, worker_tools)
+        import time
+        t_start = time.time()
         result = agent.invoke({
             "messages": [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)],
         })
+        t_end = time.time()
         final_msg = result["messages"][-1].content
         tool_calls = sum(1 for m in result["messages"] if hasattr(m, 'tool_calls') and m.tool_calls)
+
+        # 提取 Token 消耗与审计事件记录
+        p_tok, c_tok = 0, 0
+        for m in result.get("messages", []):
+            if hasattr(m, "response_metadata") and isinstance(m.response_metadata, dict):
+                usage = m.response_metadata.get("token_usage") or m.response_metadata.get("usage") or {}
+                p_tok += usage.get("prompt_tokens", 0)
+                c_tok += usage.get("completion_tokens", 0)
+
+        from app.services.audit_service import audit_service
+        audit_service.log_event(
+            action_type="llm_call_worker",
+            node_name=f"BidFillerWorker-{chapter_title[:30]}",
+            inputs={"chapter_title": chapter_title, "category": cat, "document_id": document_id},
+            outputs={"proposals_count": sum(1 for p in result["messages"] if hasattr(p, 'tool_calls') and p.tool_calls), "summary": final_msg[:300]},
+            prompt_tokens=p_tok,
+            completion_tokens=c_tok,
+            execution_time_ms=int((t_end - t_start) * 1000),
+            status="success"
+        )
 
         # 解析 Worker 输出的 JSON 提案列表
         proposals = _parse_proposals(final_msg)
@@ -256,7 +282,11 @@ def run_chapter_worker(
                 _WORKER_PROPOSALS[document_id].extend(proposals)
 
         n = len(proposals)
-        logger.info(f"✅ [Worker] [{chapter_title}] 完成（{tool_calls} 次工具调用, {n} 个提案）")
+        logger.info(
+            f"✅ [Worker Agent 完成] [{chapter_title}] | 耗时: {int((t_end - t_start) * 1000)}ms | "
+            f"工具调用: {tool_calls} 次 | 提案: {n} 个 | "
+            f"Prompt Tokens: {p_tok:,} | Completion Tokens: {c_tok:,} | Total: {p_tok + c_tok:,}"
+        )
         return {
             "chapter_title": chapter_title, "mapping_hint": mapping_hint,
             "category": cat, "status": "success",
@@ -274,8 +304,21 @@ def run_chapter_worker(
         }
 
 
+def _repair_json_unescaped_quotes(json_str: str) -> str:
+    """自动对 JSON 字符串值中未经转义的半角双引号进行容错替换"""
+    import re
+    def fix_field_val(m):
+        prefix = m.group(1)   # `"reasoning": "`
+        content = m.group(2)  # `原文"招标编号..."`
+        suffix = m.group(3)   # `"`
+        fixed_content = content.replace('"', '”')
+        return f'{prefix}{fixed_content}{suffix}'
+    pattern = r'("(?:path|original_context|source_data|source_tool|proposed_text|reasoning|chapter_title|mapping_hint)"\s*:\s*")([\s\S]*?)("\s*[,\}])'
+    return re.sub(pattern, fix_field_val, json_str)
+
+
 def _parse_proposals(raw_text: str) -> List[Dict[str, Any]]:
-    """从 Worker 的最终回复中提取 JSON 提案列表"""
+    """从 Worker 的最终回复中提取 JSON 提案列表（包含多重智能容错与对象恢复机制）"""
     import re
     if not raw_text:
         return []
@@ -300,14 +343,52 @@ def _parse_proposals(raw_text: str) -> List[Dict[str, Any]]:
                 return _json.loads(match.group(0))
             except Exception:
                 continue
-    # 策略4: 修复常见 JSON 错误后重试（尾部多余逗号等）
-    match = re.search(r'\[\s*\{[\s\S]*?\}\s*\]', cleaned)
+    # 策略4: 修复常见 JSON 错误后重试（尾部多余逗号、非法未转义双引号修补）
+    match = re.search(r'\[\s*\{[\s\S]*?\}\s*\]', cleaned, re.DOTALL)
     if match:
+        raw_json_array = match.group(0)
         try:
-            fixed = re.sub(r',\s*\]', ']', match.group(0))  # 去尾部逗号
+            fixed = re.sub(r',\s*\]', ']', raw_json_array)  # 去尾部逗号
             fixed = re.sub(r',\s*\}', '}', fixed)
             return _json.loads(fixed)
         except Exception:
             pass
-    logger.warning(f"   ⚠️ [Worker] 无法解析提案 JSON ({len(raw_text)} 字符):\n{raw_text}")
+        # 针对字符串内部未转义双引号实施智能修复
+        try:
+            repaired = _repair_json_unescaped_quotes(raw_json_array)
+            repaired = re.sub(r',\s*\]', ']', repaired)
+            repaired = re.sub(r',\s*\}', '}', repaired)
+            data = _json.loads(repaired)
+            if isinstance(data, list):
+                logger.info(f"   💡 [Worker 自动修复] 成功修补字符串内部未转义双引号，恢复 {len(data)} 条提案")
+                return data
+        except Exception:
+            pass
+
+    # 策略5: 对象级逐项恢复机制（Chunk-by-chunk Object Recovery）
+    # 当整组数组解析语法崩溃时，按单独的 {...} 提案对象正则扫描抓取
+    obj_matches = re.finditer(r'\{\s*"path"\s*:[\s\S]*?\}', raw_text)
+    recovered = []
+    for m in obj_matches:
+        candidate = m.group(0)
+        try:
+            item = _json.loads(candidate)
+            if isinstance(item, dict) and "path" in item:
+                recovered.append(item)
+                continue
+        except Exception:
+            pass
+        try:
+            repaired_cand = _repair_json_unescaped_quotes(candidate)
+            item = _json.loads(repaired_cand)
+            if isinstance(item, dict) and "path" in item:
+                recovered.append(item)
+        except Exception:
+            pass
+
+    if recovered:
+        logger.info(f"   🛡️ [Worker 对象拯救机制] 从语法崩溃的回复中逐个拯救恢复出 {len(recovered)} 条合法提案！")
+        return recovered
+
+    logger.warning(f"   ⚠️ [Worker] 无法解析提案 JSON ({len(raw_text)} 字符):\n{raw_text[:500]}...")
     return []

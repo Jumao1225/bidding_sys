@@ -101,7 +101,7 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
     res = llm_service.generate_structured_json(prompt, temperature=0.0)
     
     summary = f"完成资质评估，得分 {res.get('match_score', 0)}"
-    emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "strategy_qual", "status": "success", "summary": summary})
+    emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "strategy_qual", "status": "success", "summary": summary, "document_id": document_id})
     
     return {
         "qualifications_analysis": res,
@@ -190,7 +190,7 @@ def identify_risks_node(state: BiddingState) -> dict:
         risks = []
         
     summary = f"排查出 {len(risks)} 项风险"
-    emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "strategy_risk", "status": "success", "summary": summary})
+    emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "strategy_risk", "status": "success", "summary": summary, "document_id": document_id})
     
     return {
         "risks_analysis": risks,

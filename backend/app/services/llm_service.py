@@ -153,6 +153,12 @@ class LLMService:
                 token_usage = response.response_metadata['token_usage']
                 prompt_tokens = token_usage.get('prompt_tokens', 0)
                 completion_tokens = token_usage.get('completion_tokens', 0)
+
+            exec_time_ms = int((end_time - start_time) * 1000)
+            logger.info(
+                f"🤖 [LLM 调用完成] ({settings.LLM_MODEL_NAME}) | 耗时: {exec_time_ms}ms | "
+                f"Prompt: {prompt_tokens:,} | Completion: {completion_tokens:,} | Total: {prompt_tokens + completion_tokens:,}"
+            )
                 
             audit_service.log_event(
                 action_type="llm_call",
@@ -160,7 +166,7 @@ class LLMService:
                 outputs={"content": content},
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                execution_time_ms=int((end_time - start_time) * 1000)
+                execution_time_ms=exec_time_ms
             )
             
             # 强化型 Markdown 代码块与前导/后置文本清洗
@@ -212,13 +218,19 @@ class LLMService:
                 prompt_tokens = token_usage.get('prompt_tokens', 0)
                 completion_tokens = token_usage.get('completion_tokens', 0)
 
+            exec_time_ms = int((end_time - start_time) * 1000)
+            logger.info(
+                f"🤖 [LLM 文本生成完成] ({settings.LLM_MODEL_NAME}) | 耗时: {exec_time_ms}ms | "
+                f"Prompt: {prompt_tokens:,} | Completion: {completion_tokens:,} | Total: {prompt_tokens + completion_tokens:,}"
+            )
+
             audit_service.log_event(
                 action_type="llm_call_text",
                 inputs={"prompt": prompt},
                 outputs={"content": content},
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                execution_time_ms=int((end_time - start_time) * 1000)
+                execution_time_ms=exec_time_ms
             )
 
             return content.strip()
@@ -268,7 +280,16 @@ class LLMService:
         schema_dict = schema_cls.model_json_schema() if hasattr(schema_cls, "model_json_schema") else schema_cls.schema()
         schema_json = json.dumps(schema_dict, indent=2, ensure_ascii=False)
             
-        fallback_prompt = f"{prompt}\n\n【强制格式约束】\n必须返回严格符合以下 JSON Schema 的纯 JSON 格式：\n{schema_json}\n\n[极其重要]\n1. 只能输出纯 JSON 数据，绝对不要用 ```json 标签包裹！\n2. 确保所有的双引号、括号、逗号等符号完美匹配，不允许出现任何语法错误。"
+        fallback_prompt = (
+            f"{prompt}\n\n"
+            f"【强制格式约束】\n"
+            f"请从原文中提取真实的业务数据，返回一个填入了具体提取结果的 JSON 数据对象 (Data Instance)，"
+            f"必须严格符合以下 JSON Schema 结构定义：\n{schema_json}\n\n"
+            f"【极其重要 - 严格禁止事项】\n"
+            f"1. 你必须返回填写了真实提取数据的 JSON 对象，绝对禁止直接复制或返回 JSON Schema 的定义字典本身！（严禁在 JSON 键值中包含 'title', 'description', 'anyOf', 'properties', '$defs' 等 Schema 定义元信息）！\n"
+            f"2. 只能输出纯 JSON 数据对象（以 {{ 开头、以 }} 结尾），绝对不要用 markdown 代码块包裹！\n"
+            f"3. 确保所有的双引号、括号、逗号等符号完美匹配，数值字段必须为纯数字，不可附带文字单位。"
+        )
         
         extracted_dict = self.generate_structured_json(fallback_prompt, temperature=temperature)
         
@@ -277,8 +298,8 @@ class LLMService:
             expected_fields = set(schema_cls.model_fields.keys()) if hasattr(schema_cls, "model_fields") else set(schema_cls.__fields__.keys())
             # 如果当前字典的顶层不包含 Schema 期望的字段，检查是否被大模型在最外层包装了一层 root key
             if not any(field in extracted_dict for field in expected_fields):
-                # 检查常见的大模型包装 Key
-                candidates = [schema_cls.__name__, schema_cls.__name__.lower(), "data", "result", "output", "properties", "response"]
+                # 检查常见的大模型包装 Key（已剔除 "properties"，防止误解包 Schema 元数据）
+                candidates = [schema_cls.__name__, schema_cls.__name__.lower(), "data", "result", "output", "response"]
                 unwrapped = False
                 for cand in candidates:
                     if cand in extracted_dict and isinstance(extracted_dict[cand], dict):
@@ -286,11 +307,11 @@ class LLMService:
                         extracted_dict = extracted_dict[cand]
                         unwrapped = True
                         break
-                # 如果没有匹配到常用名称，但顶层只有唯一的 1 个 Key 且值也是字典，自动解包该 Key
+                # 如果没有匹配到常用名称，但顶层只有唯一的 1 个 Key 且值也是字典（避开 properties 键），自动解包该 Key
                 if not unwrapped and len(extracted_dict) == 1:
+                    single_key = list(extracted_dict.keys())[0]
                     single_val = list(extracted_dict.values())[0]
-                    if isinstance(single_val, dict):
-                        single_key = list(extracted_dict.keys())[0]
+                    if isinstance(single_val, dict) and single_key != "properties":
                         logger.info(f"💡 自动解包唯一外层 Key '{single_key}'...")
                         extracted_dict = single_val
 

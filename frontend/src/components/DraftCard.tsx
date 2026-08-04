@@ -111,11 +111,6 @@ export const DraftCard: React.FC<DraftCardProps> = ({
       }
 
       setDownloadNotice(`✅ 拟人化 Agent 成功完成槽位感知与填报（共识别填报 ${filledCount} 个槽位），已自动下载 Word！`);
-      
-      // 显示审计报告模态框
-      setAuditReportData(resData);
-      setShowAuditModal(true);
-      
       setTimeout(() => setDownloadNotice(null), 8000);
     } catch (err: any) {
       setDownloadNotice(`❌ 拟人化 Agent 填报失败: ${err.message || '未知错误'}`);

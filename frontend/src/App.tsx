@@ -229,7 +229,6 @@ function App() {
                 <Route path="/qualifications" element={<QualificationCenter />} />
                 <Route path="/company-profile" element={<CompanyProfilePage />} />
                 <Route path="/price-book" element={<PriceBookCenter />} />
-                <Route path="/docx-debugger" element={<DocxDebuggerPage />} />
                 <Route path="/bid-scorer" element={<BidScorerLab />} />
                 <Route path="/admin/*" element={
                   <AdminRoute>
