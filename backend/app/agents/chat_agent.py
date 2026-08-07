@@ -13,12 +13,13 @@ from app.core.context import current_task_id, current_node_name
 from app.agents.tools.metadata_tools import METADATA_TOOLS
 from app.agents.tools.writer_tools import WRITER_TOOLS
 from app.agents.tools.rag_tools import search_bidding_document, get_full_chapter_text
+from app.skills.registry import discover_skills_and_tools
 
 class ChatAgent:
     """
     负责前台 ChatPanel 对话的 Agent。
     集成 ReAct 机制，能够自主调用专项结构化提取工具、公司资质中心 DB 工具或后备语义检索工具，
-    提供带有引文标记与来源溯源 (Sources) 的流式回答。
+    支持自动发现 Skill 与 Tool 机制，提供带有引文标记与来源溯源 (Sources) 的流式回答。
     """
     
     def _build_chat_system_prompt(self, document_id: str) -> str:
@@ -56,7 +57,7 @@ class ChatAgent:
     ) -> AsyncGenerator[str, None]:
         """
         流式聊天生成器 (ReAct Agent 架构)：
-        1. 初始化 Tool-Calling Agent
+        1. 初始化 Tool-Calling Agent（自动发现 Skill 与 Tool）
         2. 使用 astream_events 拦截 on_tool_start 和 on_chat_model_stream
         3. 将工具调用记录推送到前端并写入 Audit 数据库
         4. 收集所有查询词，最后合并引文来源
@@ -75,7 +76,15 @@ class ChatAgent:
             f"ChatAgent 会话启动，任务ID: {chat_task_id}，文档ID: {document_id}，问题: {question[:50]}..."
         )
 
-        all_tools = METADATA_TOOLS + WRITER_TOOLS + [search_bidding_document, get_full_chapter_text]
+        # 核心保证工具 + 全自动发现系统的所有技能与工具
+        core_tools = METADATA_TOOLS + WRITER_TOOLS + [search_bidding_document, get_full_chapter_text]
+        discovered_tools = discover_skills_and_tools(package_names=["app.skills", "app.agents.tools"])
+        
+        # 按照工具名称进行合并与去重
+        tools_dict = {tool.name: tool for tool in (core_tools + discovered_tools)}
+        all_tools = list(tools_dict.values())
+        logger.info(f"ChatAgent 成功装载 {len(all_tools)} 个可用 Skill 与 Tool。")
+
         agent = create_react_agent(llm_service.raw_llm, all_tools)
 
         system_prompt = self._build_chat_system_prompt(document_id)
