@@ -348,10 +348,29 @@ async def download_original_file(
     if not doc:
         doc = document_crud.get_document_by_id_system(db, task_id)
 
+    def _get_preview_file_and_name(fpath: str, fname: str) -> tuple[str, str]:
+        """对于旧版 .doc 格式，优先交付已转换好的 .docx 文件，以便前端 docx-preview 本地渲染引擎精准呈现"""
+        if fpath.lower().endswith(".doc"):
+            docx_path = fpath + "x"
+            if os.path.exists(docx_path):
+                docx_name = (fname[:-4] if fname.lower().endswith(".doc") else fname) + ".docx"
+                return docx_path, docx_name
+            else:
+                try:
+                    from app.services.extractor_service import ExtractorService
+                    docx_path = ExtractorService().convert_doc_to_docx(fpath)
+                    if os.path.exists(docx_path):
+                        docx_name = (fname[:-4] if fname.lower().endswith(".doc") else fname) + ".docx"
+                        return docx_path, docx_name
+                except Exception as e:
+                    logger.warning(f"在线预览 .doc 转 .docx 抛出异常: {str(e)}")
+        return fpath, fname
+
     if doc and doc.file_path and os.path.exists(doc.file_path):
+        target_path, target_filename = _get_preview_file_and_name(doc.file_path, doc.filename)
         return FileResponse(
-            path=doc.file_path, 
-            filename=doc.filename,
+            path=target_path, 
+            filename=target_filename,
             content_disposition_type="inline"
         )
     
@@ -363,9 +382,10 @@ async def download_original_file(
     if matched_files and os.path.exists(matched_files[0]):
         file_path = matched_files[0]
         filename = os.path.basename(file_path).replace(f"{task_id}_", "")
+        target_path, target_filename = _get_preview_file_and_name(file_path, filename)
         return FileResponse(
-            path=file_path, 
-            filename=filename,
+            path=target_path, 
+            filename=target_filename,
             content_disposition_type="inline"
         )
 
@@ -375,9 +395,11 @@ async def download_original_file(
         for fname in os.listdir(temp_dir):
             if task_id in fname or (doc and doc.filename and doc.filename in fname):
                 fpath = os.path.join(temp_dir, fname)
+                orig_name = doc.filename if doc else fname
+                target_path, target_filename = _get_preview_file_and_name(fpath, orig_name)
                 return FileResponse(
-                    path=fpath,
-                    filename=doc.filename if doc else fname,
+                    path=target_path,
+                    filename=target_filename,
                     content_disposition_type="inline"
                 )
 

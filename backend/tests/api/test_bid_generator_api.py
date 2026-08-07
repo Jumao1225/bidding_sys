@@ -119,3 +119,53 @@ async def test_fill_bid_format_api_success_should_return_docx_bytes():
         app.dependency_overrides.clear()
 
 
+@pytest.mark.asyncio
+async def test_get_bidding_documents_list_valid_documents_should_return_list():
+    """测试获取招标文件列表 /documents-list 接口成功返回解析好的文档列表"""
+    mock_doc = MagicMock()
+    mock_doc.id = "doc-test-999"
+    mock_doc.filename = "某高标准农田建设项目招标文件.pdf"
+    mock_doc.parsed_metadata = {"project_name": "某高标准农田建设项目", "project_code": "XM20260806"}
+    mock_doc.created_at = MagicMock()
+    mock_doc.created_at.strftime.return_value = "2026-08-06 16:00"
+
+    mock_db = MagicMock()
+
+    try:
+        with patch("app.db.crud.document.document_crud.get_all_documents", return_value=[mock_doc]):
+            app.dependency_overrides[get_db] = lambda: mock_db
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.get("/api/v1/bidding/documents-list")
+                assert res.status_code == 200
+                data = res.json()
+                assert len(data) == 1
+                assert data[0]["id"] == "doc-test-999"
+                assert "某高标准农田建设项目" in data[0]["display_label"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_bid_fill_worker_logs_no_logs_should_return_empty_items():
+    """测试在文档尚无 Agent 填报履历时调用 worker-logs 接口，安全返回空项目列表而非 500"""
+    mock_db = MagicMock()
+    mock_query = MagicMock()
+    mock_query.filter.return_value.order_by.return_value.all.return_value = []
+    mock_db.query.return_value = mock_query
+
+    try:
+        app.dependency_overrides[get_db] = lambda: mock_db
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            res = await ac.get("/api/v1/bidding/fill-bid-format/doc-empty-logs/worker-logs")
+            assert res.status_code == 200
+            data = res.json()
+            assert data["document_id"] == "doc-empty-logs"
+            assert data["total_workers_count"] == 0
+            assert data["worker_items"] == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+

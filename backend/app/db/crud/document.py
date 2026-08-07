@@ -6,12 +6,14 @@ from app.db.models.metadata import (
 )
 
 class CRUDDocument:
-    def get_all_documents(self, db: Session, user_id: str, tenant_id: str):
-        """获取当前用户本租户下的所有文档记录并按ID倒序"""
-        return db.query(Document).filter(
-            Document.user_id == user_id, 
-            Document.tenant_id == tenant_id
-        ).order_by(Document.id.desc()).all()
+    def get_all_documents(self, db: Session, user_id: str = None, tenant_id: str = None):
+        """获取所有文档记录并按ID倒序；若指定了 user_id 或 tenant_id 则按条件过滤"""
+        query = db.query(Document)
+        if user_id:
+            query = query.filter(Document.user_id == user_id)
+        if tenant_id:
+            query = query.filter(Document.tenant_id == tenant_id)
+        return query.order_by(Document.id.desc()).all()
 
     def get_document_by_id(self, db: Session, doc_id: str, user_id: str, tenant_id: str):
         """根据文档 ID 及权限获取单条记录"""

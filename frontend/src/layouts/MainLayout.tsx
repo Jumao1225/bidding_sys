@@ -14,6 +14,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (path === '/') return location.pathname === '/';
     if (path === '/analysis') return location.pathname.startsWith('/analysis');
     if (path === '/bid-scorer') return location.pathname.startsWith('/bid-scorer');
+    if (path === '/agent-audit') return location.pathname.startsWith('/agent-audit');
     if (path === '/qualifications') return location.pathname.startsWith('/qualifications');
     if (path === '/company-profile') return location.pathname.startsWith('/company-profile');
     if (path === '/price-book') return location.pathname.startsWith('/price-book');
@@ -26,10 +27,12 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (location.pathname.startsWith('/qualifications')) return '企业资质中心';
     if (location.pathname.startsWith('/price-book')) return '成本报价知识库';
     if (location.pathname.startsWith('/bid-scorer')) return '智能标书多维度穿透测评';
+    if (location.pathname.startsWith('/agent-audit')) return 'Agent 运行履历与思维链控制台';
     if (location.pathname.startsWith('/admin')) return '系统运维管理';
     if (location.pathname.startsWith('/analysis')) return '智能文档解析';
     return '系统总览';
   };
+
 
   const getLinkClass = (path: string) => 
     isActive(path) 
@@ -89,6 +92,16 @@ export default function MainLayout({ children }: MainLayoutProps) {
             </svg>
             <span className={isActive('/bid-scorer') ? "relative z-10 font-bold text-emerald-300" : "group-hover:translate-x-1 transition-transform duration-300 text-slate-200"}>智能评标打分</span>
           </Link>
+
+          <Link to="/agent-audit" className={getLinkClass('/agent-audit')}>
+            {isActive('/agent-audit') && <div className="absolute inset-0 bg-purple-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+            <svg className={`w-5 h-5 mr-3 ${isActive('/agent-audit') ? 'text-purple-400 font-extrabold' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300 text-purple-300/80'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+            </svg>
+            <span className={isActive('/agent-audit') ? "relative z-10 font-bold text-purple-300" : "group-hover:translate-x-1 transition-transform duration-300 text-slate-200"}>标书生成与撰写控制台</span>
+          </Link>
+
+
 
           <p className="px-4 text-[10px] font-bold tracking-widest text-slate-500 mb-3 mt-6 uppercase">Resources</p>
 

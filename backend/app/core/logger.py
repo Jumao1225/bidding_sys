@@ -56,10 +56,17 @@ def setup_app_logging():
         logging.getLogger(name).handlers = [InterceptHandler()]
         logging.getLogger(name).propagate = False
 
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     # 配置 Loguru 的输出端 (控制台和文件)
     logger.configure(
         handlers=[
             {"sink": sys.stdout, "level": logging.DEBUG, "format": format_record},
+
             {
                 "sink": "logs/app.log", 
                 "level": logging.INFO, 

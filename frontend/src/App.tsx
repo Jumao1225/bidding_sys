@@ -8,11 +8,15 @@ import { QualificationCenter } from './pages/QualificationCenter';
 import { PriceBookCenter } from './pages/PriceBookCenter';
 import { Login } from './pages/Login';
 import { SystemAdmin } from './pages/admin/SystemAdmin';
+
 import { CompanyProfilePage } from './pages/CompanyProfilePage';
 import { DocxDebuggerPage } from './pages/DocxDebuggerPage';
 import { BidScorerLab } from './pages/BidScorerLab';
+import { AgentAuditPage } from './pages/AgentAuditPage';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { AdminRoute } from './components/AdminRoute';
+
+
 
 function App() {
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -230,11 +234,13 @@ function App() {
                 <Route path="/company-profile" element={<CompanyProfilePage />} />
                 <Route path="/price-book" element={<PriceBookCenter />} />
                 <Route path="/bid-scorer" element={<BidScorerLab />} />
+                <Route path="/agent-audit/:documentId?" element={<AgentAuditPage />} />
                 <Route path="/admin/*" element={
                   <AdminRoute>
                     <SystemAdmin />
                   </AdminRoute>
                 } />
+
               </Routes>
             </MainLayout>
 

@@ -89,29 +89,118 @@ class ExtractorService:
             return False
 
     def convert_doc_to_docx(self, doc_path: str) -> str:
+        """
+        将旧版 .doc 格式转换为新版 .docx 格式。
+        支持多级降级与容错策略：
+        1. 在系统 PATH 或 Windows 常见安装目录中查找 LibreOffice (soffice.exe) 进行命令行无头转换。
+        2. 在 Windows 环境下降级使用 MS Word (win32com) COM 接口转换。
+        3. 降级尝试使用第三方 doc2docx 转换库。
+        若所有转换方案均无法正常工作，抛出包含明确归因说明的 RuntimeError。
+        """
+        import shutil
         import subprocess
+        import sys
+
         docx_path = doc_path + "x"
         if os.path.exists(docx_path):
             return docx_path
-            
-        try:
-            logger.info(f"开始使用 LibreOffice 转换 .doc 到 .docx: {doc_path}")
-            cmd = [
-                "soffice", "--headless", "--convert-to", "docx",
-                doc_path, "--outdir", os.path.dirname(doc_path)
+
+        errors: List[str] = []
+
+        # 1. 优先查找并尝试 LibreOffice (soffice) 转换
+        soffice_bin = shutil.which("soffice")
+        if not soffice_bin and sys.platform == "win32":
+            # 在 Windows 常见默认安装路径中搜索 LibreOffice
+            candidate_paths = [
+                os.environ.get("SOFFICE_PATH", ""),
+                r"C:\Program Files\LibreOffice\program\soffice.exe",
+                r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+                r"D:\Program Files\LibreOffice\program\soffice.exe",
             ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if result.returncode != 0:
-                raise RuntimeError(f"LibreOffice 转换失败: {result.stderr}")
-                 
-            if not os.path.exists(docx_path):
-                raise RuntimeError("转换命令执行成功，但未生成目标 .docx 文件")
-                 
-            logger.info(f"转换成功: {docx_path}")
-            return docx_path
+            for candidate in candidate_paths:
+                if candidate and os.path.isfile(candidate):
+                    soffice_bin = candidate
+                    break
+
+        if soffice_bin:
+            try:
+                logger.info(f"开始使用 LibreOffice ({soffice_bin}) 转换 .doc 到 .docx: {doc_path}")
+                cmd = [
+                    soffice_bin, "--headless", "--convert-to", "docx",
+                    doc_path, "--outdir", os.path.dirname(doc_path)
+                ]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+                if result.returncode == 0 and os.path.exists(docx_path):
+                    logger.info(f"LibreOffice 转换成功: {docx_path}")
+                    return docx_path
+                else:
+                    err_text = result.stderr.strip() if result.stderr else "未知终端错误"
+                    logger.warning(f"LibreOffice 执行未返回预期文件 (Exit Code {result.returncode}): {err_text}")
+                    errors.append(f"LibreOffice 转换失败: {err_text}")
+            except Exception as e:
+                logger.warning(f"LibreOffice 转换过程抛出异常: {str(e)}")
+                errors.append(f"LibreOffice 异常: {str(e)}")
+        else:
+            logger.warning("未能在 PATH 或标准路径中找到 LibreOffice (soffice)，准备尝试备选方案")
+
+        # 2. 在 Windows 环境下降级使用 MS Word (win32com) 转换
+        if sys.platform == "win32":
+            try:
+                logger.info(f"尝试使用 MS Word (win32com) 降级转换 .doc 到 .docx: {doc_path}")
+                import win32com.client
+                import pythoncom
+
+                pythoncom.CoInitialize()
+                word = None
+                try:
+                    word = win32com.client.DispatchEx("Word.Application")
+                    word.Visible = False
+                    word.DisplayAlerts = False
+                    abs_doc = os.path.abspath(doc_path)
+                    abs_docx = os.path.abspath(docx_path)
+                    doc = word.Documents.Open(abs_doc)
+                    # FileFormat=16 对应 Word 的 wdFormatXMLDocument (.docx) 格式
+                    doc.SaveAs2(abs_docx, FileFormat=16)
+                    doc.Close()
+                    if os.path.exists(docx_path):
+                        logger.info(f"MS Word (win32com) 转换成功: {docx_path}")
+                        return docx_path
+                finally:
+                    if word:
+                        try:
+                            word.Quit()
+                        except Exception as quit_err:
+                            logger.warning(f"关闭 MS Word COM 对象异常: {str(quit_err)}")
+                    pythoncom.CoUninitialize()
+            except Exception as e:
+                logger.warning(f"MS Word (win32com) 转换过程抛出异常: {str(e)}")
+                errors.append(f"MS Word (win32com) 异常: {str(e)}")
+
+        # 3. 降级尝试使用 doc2docx 库
+        try:
+            import importlib
+            doc2docx_mod = importlib.import_module("doc2docx")
+            convert_func = getattr(doc2docx_mod, "convert", None)
+            if convert_func:
+                logger.info(f"尝试使用 doc2docx 库转换 .doc 到 .docx: {doc_path}")
+                convert_func(doc_path, docx_path)
+                if os.path.exists(docx_path):
+                    logger.info(f"doc2docx 转换成功: {docx_path}")
+                    return docx_path
+        except (ImportError, ModuleNotFoundError):
+            pass
         except Exception as e:
-            logger.error(f".doc 转 .docx 失败: {str(e)}")
-            raise e
+            logger.warning(f"doc2docx 转换抛出异常: {str(e)}")
+            errors.append(f"doc2docx 异常: {str(e)}")
+
+        # 4. 若全线方案均无法完成转换，抛出清晰异常说明
+        detail_msg = "; ".join(errors) if errors else "系统未检测到 LibreOffice 或 MS Word 转换引擎"
+        err_msg = (
+            f".doc 转 .docx 失败：{detail_msg}。"
+            f"建议：请在服务器/本地安装 LibreOffice 并将其添加至系统环境变量 PATH，或安装 Microsoft Word。"
+        )
+        logger.error(err_msg)
+        raise RuntimeError(err_msg)
 
     def _clean_toc_title(self, text: str) -> str:
         """清理目录与标题中的引导线、页码、Markdown 符号等干扰字符"""

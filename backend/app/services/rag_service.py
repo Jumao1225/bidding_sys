@@ -248,4 +248,43 @@ class RAGService:
             logger.warning(f"获取 RAG 来源切片失败，降级返回空列表: {str(e)}")
             return []
 
+    def get_full_chapter_text(self, document_id: str, chapter_name: str) -> str:
+        """
+        获取指定文档中某个章节的 100% 连贯全文原文（无 Top-K 向量截断）。
+        在数据库中按 section_title 匹配并按 DocChunk.chunk_index 顺序拼接所有相关切片。
+        """
+        if not document_id or not chapter_name:
+            return "错误：必须提供 document_id 和 chapter_name"
+
+        clean_name = chapter_name.strip()
+        db: Session = SessionLocal()
+        try:
+            chunks = (
+                db.query(DocChunk)
+                .filter(
+                    DocChunk.document_id == document_id,
+                    DocChunk.section_title.ilike(f"%{clean_name}%")
+                )
+                .order_by(DocChunk.chunk_index)
+                .all()
+            )
+
+            if not chunks:
+                logger.info(f"RAGService: 未能通过章节关键字 '%{clean_name}%' 找到任何切片 (文档ID: {document_id})")
+                return f"未能在文档中检索到章节名称匹配 '{chapter_name}' 的任何段落。"
+
+            matched_sections = list(dict.fromkeys([c.section_title for c in chunks if c.section_title]))
+            content_blocks = [c.content for c in chunks if c.content]
+            merged_content = "\n\n".join(content_blocks)
+
+            hdr = f"=== 章节【{', '.join(matched_sections)}】完整原文 (共 {len(chunks)} 个段落) ===\n\n"
+            return hdr + merged_content
+        except Exception as e:
+            logger.exception(f"获取整章原文发生异常 ({chapter_name}): {e}")
+            return f"获取整章原文发生异常: {str(e)}"
+        finally:
+            db.close()
+
+
 rag_service = RAGService()
+

@@ -74,6 +74,9 @@ export const LocalDocxRenderer: DocRenderer = ({ mainState: { currentDocument } 
 // 声明支持的文件类型和权重（高权重可以覆盖默认的在线预览插件）
 LocalDocxRenderer.fileTypes = [
   "docx", 
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  "doc",
+  "msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/msword"
 ];
 LocalDocxRenderer.weight = 10;

@@ -47,3 +47,33 @@ def search_bidding_document(document_id: str, query: str) -> str:
         
     except Exception as e:
         return f"RAG 检索过程中发生错误: {str(e)}"
+
+@tool
+def get_full_chapter_text(document_id: str, chapter_name: str) -> str:
+    """
+    【整章原文提取工具】
+    当你需要完整阅读招标文档中某个特定章节（如"合同条款"、"项目需求"、"投标人须知"、"评标办法"）的全部段落原文，
+    以便进行地毯式提炼（如编制商务条款偏离表、排查废标红线）时，调用此工具。
+    与普通 RAG 检索不同，本工具不会进行 Top-K 向量截断，而是按顺序拼接返回该章节的 100% 完整上下文。
+
+    参数:
+      - document_id: 必须提供，当前处理的招标文档ID
+      - chapter_name: 章节名称关键字（如 "合同条款", "项目需求", "投标人须知", "评标办法"）
+    """
+    try:
+        from app.worker.tasks import emit_agent_log
+        from app.agents.tools.security import validate_document_access
+
+        if not validate_document_access(document_id):
+            return f"拒绝访问：您无权检索文档 {document_id} 的原文内容。"
+
+        emit_agent_log("tool_call", f"调用工具: 正在获取章节 [{chapter_name}] 的 100% 顺序全文原文...")
+
+        res = rag_service.get_full_chapter_text(document_id, chapter_name)
+        emit_agent_log("success", f"✅ 成功获取章节 [{chapter_name}] 的全量原文。")
+        return res
+    except Exception as e:
+        return f"获取整章原文时发生错误: {str(e)}"
+
+RAG_TOOLS = [search_bidding_document, get_full_chapter_text]
+

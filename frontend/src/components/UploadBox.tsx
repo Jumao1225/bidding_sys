@@ -412,8 +412,17 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     
     // 如果是上传成功后的单次会话，fileName 有值
     // 如果是恢复的历史记录，result 中会带回 filename
-    const actualFileName = fileName || (result && result.filename) || "document.docx";
-    const fileType = actualFileName.split('.').pop() || "docx";
+    const rawFileName = fileName || (result && result.filename) || "document.docx";
+    let actualFileName = rawFileName;
+    let fileType = rawFileName.split('.').pop()?.toLowerCase() || "docx";
+
+    // 旧版 .doc 格式由后端接口自动交付转换为 .docx 的二进制流，此处前端归一化为 docx 以便使用 docx-preview 本地渲染
+    if (fileType === "doc") {
+      fileType = "docx";
+      if (actualFileName.toLowerCase().endsWith(".doc")) {
+        actualFileName = actualFileName.slice(0, -4) + ".docx";
+      }
+    }
 
     return [{ 
       uri: `${import.meta.env.VITE_API_BASE_URL || ""}/api/v1/analysis/download/${activeDocOrTaskId}`,

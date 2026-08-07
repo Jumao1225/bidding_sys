@@ -120,11 +120,11 @@ def query_company_profile_tool(field_key: str) -> str:
         if profile:
             val = getattr(profile, std_key, None)
             if val and str(val).strip():
-                logger.info(f"🛠️ [DB Tool] 成功从 PostgreSQL (company_profiles.{std_key}) 查询到真实数据: '{val}'")
+                logger.info(f"🛠️ [DB Tool] 成功从数据库 (company_profiles.{std_key}) 查询到真实数据: '{val}'")
                 return str(val).strip()
 
-        logger.warning(f"🛠️ [DB Tool] 字段 '{field_key}' 在企业档案库中不存在或未配置")
-        return f"[待手动补充: {field_key}]"
+        logger.warning(f"🛠️ [DB Tool] 字段 '{field_key}' 在企业档案数据库中尚未录入")
+        return f"[待补充: {field_key}]"
 
     except Exception as e:
         logger.exception(f"🛠️ [DB Tool] query_company_profile_tool 执行异常: {str(e)}")
@@ -252,15 +252,25 @@ def query_project_metadata_tool(document_id: str, field_key: str) -> str:
                 if eval_meta.evaluation_method:
                     return eval_meta.evaluation_method
 
-        # 5. 查 Document parsed_metadata
+        # 5. 查 Document 实体及 parsed_metadata
         doc = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
-        if doc and doc.parsed_metadata:
-            val = doc.parsed_metadata.get(field_key) or doc.parsed_metadata.get("project_name")
-            if val:
-                return str(val)
+        if doc:
+            if any(k in key_lower for k in ["项目名称", "工程名称", "project_name"]):
+                if getattr(doc, "project_name", None):
+                    return doc.project_name
+                elif doc.filename:
+                    clean_name = doc.filename.replace("Frontend Uploads (", "").replace(")", "").replace(".docx", "").replace(".pdf", "")
+                    return clean_name.strip()
+            elif any(k in key_lower for k in ["编号", "代码", "project_code", "project_id"]):
+                if getattr(doc, "project_code", None):
+                    return doc.project_code
+            elif doc.parsed_metadata:
+                val = doc.parsed_metadata.get(field_key) or doc.parsed_metadata.get("project_name")
+                if val:
+                    return str(val)
 
         logger.warning(f"🛠️ [DB Tool] 项目元数据中未查到 '{field_key}'")
-        return f"[待手动补充项目元数据: {field_key}]"
+        return f"[待补充: {field_key}]"
 
     except Exception as e:
         logger.exception(f"🛠️ [DB Tool] query_project_metadata_tool 执行异常: {str(e)}")
@@ -300,7 +310,7 @@ def query_financial_quotation_tool(document_id: str, field_key: str) -> str:
         # 针对分项清单、BOM 表或分项单价/合价查询，返回每行精细列表
         if any(k in key_lower for k in ["cost", "bom", "item", "清单", "明细", "分项", "配置", "设备", "sub", "quote", "报价"]):
             if not cost_items:
-                return "[未查到相关 BOM / 成本测算分项清单]"
+                return "[待补充: 成本测算与 BOM 分项清单数据库尚未录入]"
             res_items = []
             for item in cost_items:
                 brand_str = f" [品牌: {item.brand}]" if getattr(item, 'brand', None) else ""
@@ -311,17 +321,17 @@ def query_financial_quotation_tool(document_id: str, field_key: str) -> str:
             logger.info(f"🛠️ [DB Tool] 成功查得并回传 {len(res_items)} 条 BOM 分项成本报价明细")
             return "\n".join(res_items)
 
-        if cost_items:
-            total_price = sum(item.calculated_total for item in cost_items)
-        else:
-            total_price = 0.0
+        if not cost_items:
+            return "[待补充: 财务总报价与分项测算数据尚未录入]"
+
+        total_price = sum(item.calculated_total for item in cost_items)
 
         if any(k in key_lower for k in ["大写", "chinese"]):
             chinese_upper = number_to_chinese_rmb(total_price)
             logger.info(f"🛠️ [DB Tool] 成功计算投标总价汉字大写: {total_price} -> '{chinese_upper}'")
             return chinese_upper
         else:
-            num_str = f"{total_price:.2f}"
+            num_str = f"{total_price:,.2f}"
             logger.info(f"🛠️ [DB Tool] 成功查询投标总价阿拉伯数字: '{num_str}' 元")
             return num_str
 

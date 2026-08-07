@@ -58,15 +58,15 @@ async def global_exception_handler(request: Request, exc: Exception):
 # 注册日志拦截中间件
 app.add_middleware(LoggingMiddleware)
 
-# CORS 配置
-if settings.BACKEND_CORS_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# CORS 全量跨域配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if not settings.BACKEND_CORS_ORIGINS else [str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
+    allow_origin_regex=".*",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(api_router, prefix=settings.API_V1_STR)
 

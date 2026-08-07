@@ -172,10 +172,24 @@ export function Home() {
                   }`}>
                     {doc.status === 'completed' ? '解析完成' : doc.status === 'pending' ? '排队中/解析中' : '解析失败'}
                   </span>
-                  <span className="text-indigo-500 text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity flex items-center">
-                    查看看板
-                    <svg className="w-3 h-3 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7"></path></svg>
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        localStorage.setItem('bidding_document_id', doc.id);
+                        navigate(`/agent-audit/${doc.id}`);
+                      }}
+                      className="px-2 py-1 text-[11px] font-bold bg-purple-50 hover:bg-purple-100 text-purple-700 rounded-lg transition-all border border-purple-200/60 flex items-center gap-1 shadow-xs hover:scale-105"
+                      title="选定该招标文件并自动撰写标书"
+                    >
+                      <span>✨ 生成标书</span>
+                    </button>
+                    <span className="text-indigo-500 text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity flex items-center">
+                      查看看板
+                      <svg className="w-3 h-3 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7"></path></svg>
+                    </span>
+                  </div>
                 </div>
               </motion.div>
             ))}

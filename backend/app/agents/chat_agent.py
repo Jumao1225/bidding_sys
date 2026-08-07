@@ -12,7 +12,7 @@ from app.services.audit_service import audit_service
 from app.core.context import current_task_id, current_node_name
 from app.agents.tools.metadata_tools import METADATA_TOOLS
 from app.agents.tools.writer_tools import WRITER_TOOLS
-from app.agents.tools.rag_tools import search_bidding_document
+from app.agents.tools.rag_tools import search_bidding_document, get_full_chapter_text
 
 class ChatAgent:
     """
@@ -31,9 +31,11 @@ class ChatAgent:
 5. 如果专项工具查不到，你可以使用 search_bidding_document 工具在原文档中进行语义检索。
 
 【工具调用严格规范（绝不可混淆）】
+- **交叉章节与复杂商务条款检索**：当用户询问涉及多个章节（如《商务条款偏离表》、《合同条款》、《投标人须知》）的交叉对照或整体响应时，你**必须分别调用 `get_full_chapter_text(document_id, chapter_name)` 获取相关各章节的 100% 全量原文**，绝对不能依赖 Top-K 截断检索！
 - **查询我公司资质/证书**：当用户询问【我公司/我们/资质中心】拥有什么资质证书、是否有《承装（修、试）电力设施许可证》、《安全生产许可证》或证书有效期时，你**必须首先且唯一调用 `get_company_qualifications` 工具**！绝对禁止使用 `search_bidding_document` 去检索甲方招标文件！
 - **查询我公司成本报价/BOM明细**：当用户询问【我公司/我们】项目的成本报价、参考单价、BOM设备清单与总金额时，你**必须首先且唯一调用 `get_cost_estimation_data` 工具**！绝对禁止使用 `search_bidding_document` 去检索甲方招标文件！
 - **检索招标文件门槛与空白格式**：只有当用户明确询问【招标文件/甲方/项目】要求什么资质门槛或空白表格格式时，才调用 `search_bidding_document` 或专项结构化提取工具去检索招标文件！
+
 
 【行为准则】
 1. 宁缺毋滥：所有回答必须有文档或数据库依据，不可凭空推断或编造数据。
@@ -73,7 +75,7 @@ class ChatAgent:
             f"ChatAgent 会话启动，任务ID: {chat_task_id}，文档ID: {document_id}，问题: {question[:50]}..."
         )
 
-        all_tools = METADATA_TOOLS + WRITER_TOOLS + [search_bidding_document]
+        all_tools = METADATA_TOOLS + WRITER_TOOLS + [search_bidding_document, get_full_chapter_text]
         agent = create_react_agent(llm_service.raw_llm, all_tools)
 
         system_prompt = self._build_chat_system_prompt(document_id)
@@ -131,8 +133,10 @@ class ChatAgent:
                         "extract_timeline_info": "查询商务时限要求",
                         "extract_engineering_info": "查询技术与工况要求",
                         "extract_evaluation_info": "查询评标办法与罚则",
-                        "search_bidding_document": "在标书原文中检索细节"
+                        "search_bidding_document": "在标书原文中检索细节",
+                        "get_full_chapter_text": "获取指定章节全量原文"
                     }
+
                     friendly_name = tool_desc_map.get(tool_name, tool_name)
                     
                     msg_content = f"正在{friendly_name}...\n`{tool_name}({json.dumps(tool_inputs, ensure_ascii=False)})`"

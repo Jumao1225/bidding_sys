@@ -3,7 +3,12 @@
  */
 export function getApiBaseUrl(): string {
   let url = (import.meta.env.VITE_API_BASE_URL || '').trim();
-  if (!url) return '';
+  if (!url) {
+    if (typeof window !== 'undefined' && window.location && window.location.hostname) {
+      return `http://${window.location.hostname}:8000`;
+    }
+    return 'http://127.0.0.1:8000';
+  }
   if (url.startsWith('http://') || url.startsWith('https://')) {
     return url.replace(/\/+$/, '');
   }
@@ -12,6 +17,7 @@ export function getApiBaseUrl(): string {
   }
   return `http://${url}`.replace(/\/+$/, '');
 }
+
 
 export const API_BASE_URL = getApiBaseUrl();
 

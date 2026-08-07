@@ -60,9 +60,37 @@ class FillingAuditItem(BaseModel):
     agent_reasoning: str = Field(default="", description="Agent 对原文语义的判断理由")
 
 
+class ReviewFinding(BaseModel):
+    """深度质检审查发现条目（由 Review Engine 各管线产出）"""
+    rule_id: str = Field(description="审查管线规则 ID（如 R1-UNFILLED、R3-SUM-MISMATCH）")
+    severity: Literal["error", "warning", "info"] = Field(
+        default="info", description="严重级别：error（必须修正）、warning（建议修正）、info（参考信息）"
+    )
+    path: str = Field(default="N/A", description="问题所在的 Word XPath 路径")
+    description: str = Field(default="", description="人类可读的问题描述")
+    current_value: str = Field(default="", description="当前填写值")
+    expected_value: str = Field(default="", description="期望值（如有）")
+    auto_fixable: bool = Field(default=False, description="是否可被自动修正")
+    fix_proposal: Optional[Dict[str, Any]] = Field(
+        default=None, description="自动修正方案（修正后的 proposal 字典）"
+    )
+
+
 class BidFillRequest(BaseModel):
     """标书自动填报 API 请求入参"""
-    company_profile: Optional[CompanyProfile] = Field(default_factory=CompanyProfile, description="自定义投标人档案（不传则使用系统默认公司数据）")
+    company_profile: Optional[CompanyProfile] = Field(
+        default_factory=CompanyProfile, description="自定义投标人档案（不传则使用系统默认公司数据）"
+    )
+    custom_instructions: Optional[str] = Field(
+        default=None,
+        description="全局自定义填写指令（会注入到每个 Worker 子 Agent 的提示词中）。"
+                    "例如：'所有日期统一填写为 YYYY年MM月DD日'、'投标总价按 XXX 折报价'"
+    )
+    category_hints: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="按章节类别的额外指令（key 为 category 或 mapping_hint，value 为额外指令）。"
+                    "例如：{'pricing': '报价表中所有单价上浮 X%', 'bid_letter': '投标函落款日期填 YYYY年MM月DD日'}"
+    )
 
 
 class BidFillAuditReport(BaseModel):
@@ -70,4 +98,11 @@ class BidFillAuditReport(BaseModel):
     document_id: str
     total_fields_count: int = 0
     audit_items: List[FillingAuditItem] = Field(default_factory=list)
+    review_findings: List[ReviewFinding] = Field(
+        default_factory=list, description="深度质检审查发现列表"
+    )
+    review_summary: str = Field(
+        default="", description="质检审查摘要统计（如: 2 errors, 3 warnings, 5 infos）"
+    )
     summary_note: str = ""
+

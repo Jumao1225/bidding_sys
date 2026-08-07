@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
-import { apiFetch } from '../utils/api';
+import { useNavigate } from 'react-router-dom';
+import { apiFetch, API_BASE_URL } from '../utils/api';
+
 
 interface DraftCardProps {
   documentId?: string;
@@ -12,10 +14,10 @@ interface DraftCardProps {
 export const DraftCard: React.FC<DraftCardProps> = ({
   documentId,
   outline,
-  draftPath,
   onReextract,
   isRetrying = false
 }) => {
+  const navigate = useNavigate();
   const [isDownloading, setIsDownloading] = useState(false);
   const [isDownloadingSummary, setIsDownloadingSummary] = useState(false);
   const [isExtractingFormat, setIsExtractingFormat] = useState(false);
@@ -24,6 +26,10 @@ export const DraftCard: React.FC<DraftCardProps> = ({
   const [showAuditModal, setShowAuditModal] = useState(false);
   const [auditReportData, setAuditReportData] = useState<any>(null);
   const [isLoadingAudit, setIsLoadingAudit] = useState(false);
+  const [auditTab, setAuditTab] = useState<'workers' | 'fields'>('workers');
+  const [expandedWorkerId, setExpandedWorkerId] = useState<string | null>(null);
+
+
 
   const activeId = documentId || localStorage.getItem('bidding_document_id') || undefined;
   const isAvailable = Boolean(activeId);
@@ -172,8 +178,7 @@ export const DraftCard: React.FC<DraftCardProps> = ({
     setShowAuditModal(true);
 
     try {
-      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
-      const response = await apiFetch(`${baseUrl}/api/v1/bidding/fill-bid-format/${targetDocId}/audit-report`);
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/bidding/fill-bid-format/${targetDocId}/audit-report`);
       if (!response.ok) throw new Error("获取核查报告失败");
       const data = await response.json();
       setAuditReportData(data);
@@ -182,6 +187,7 @@ export const DraftCard: React.FC<DraftCardProps> = ({
     } finally {
       setIsLoadingAudit(false);
     }
+
   };
 
   const handleDownload = async () => {
@@ -442,6 +448,20 @@ export const DraftCard: React.FC<DraftCardProps> = ({
               )}
             </button>
 
+            {/* 核心功能3：跳转标书智能撰写与 Agent 控制台 */}
+            <button
+              onClick={() => {
+                if (activeId) {
+                  localStorage.setItem('bidding_document_id', activeId);
+                  navigate(`/agent-audit/${activeId}`);
+                }
+              }}
+              className="w-full py-2.5 px-4 font-bold text-xs rounded-xl border border-purple-300 bg-purple-50 hover:bg-purple-100 text-purple-700 transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-98"
+              title="前往标书智能撰写与 Agent 思维链控制台"
+            >
+              <span>🚀 前往标书智能撰写控制台</span>
+            </button>
+
             <div className="text-[11px] text-slate-400 text-center font-medium pt-1">
               ✓ 物理 DOM 感知 + 大模型纯自主识别 + SQL 零幻觉查库填报
             </div>
@@ -468,14 +488,29 @@ export const DraftCard: React.FC<DraftCardProps> = ({
                   <p className="text-purple-200 text-xs mt-0.5">全流程展示 Agent 调用的 Tool 名字、数据库来源表/列及填报数值与样式</p>
                 </div>
               </div>
-              <button 
-                type="button"
-                onClick={() => setShowAuditModal(false)}
-                className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 active:bg-white/30 text-white font-bold flex items-center justify-center transition-colors cursor-pointer text-base"
-                title="关闭弹窗"
-              >
-                ✕
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAuditModal(false);
+                    if (activeId) {
+                      navigate(`/agent-audit/${activeId}`);
+                    }
+                  }}
+                  className="px-3.5 py-1.5 bg-white/10 hover:bg-white/20 active:bg-white/30 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 transition-colors cursor-pointer border border-white/20"
+                >
+                  <span>🚀 全屏思维链控制台</span>
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => setShowAuditModal(false)}
+                  className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 active:bg-white/30 text-white font-bold flex items-center justify-center transition-colors cursor-pointer text-base"
+                  title="关闭弹窗"
+                >
+                  ✕
+                </button>
+              </div>
+
             </div>
 
             {/* Modal Body */}
@@ -487,76 +522,179 @@ export const DraftCard: React.FC<DraftCardProps> = ({
                 </div>
               ) : auditReportData ? (
                 <div className="space-y-4">
-                  <div className="p-3 bg-purple-50 border border-purple-200 rounded-xl flex items-center justify-between text-xs text-purple-900 font-medium">
-                    <span>{auditReportData.summary_note || '对齐任务处理完成'}</span>
-                    <span className="font-bold bg-purple-200 text-purple-800 px-2.5 py-0.5 rounded-full">
-                      已核查待填项: {auditReportData.total_fields_count || 0} 个
-                    </span>
+                  {/* Tab Navigation */}
+                  <div className="flex items-center gap-3 border-b border-slate-200 pb-3">
+                    <button
+                      type="button"
+                      onClick={() => setAuditTab('workers')}
+                      className={`px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+                        auditTab === 'workers'
+                          ? 'bg-purple-900 text-white shadow-md'
+                          : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span>🧠 子 Agent 思考心路与执行履历</span>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] ${auditTab === 'workers' ? 'bg-purple-700 text-white' : 'bg-slate-100 text-slate-600'}`}>
+                        {auditReportData?.total_workers_count || auditReportData?.worker_items?.length || 0}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setAuditTab('fields')}
+                      className={`px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+                        auditTab === 'fields'
+                          ? 'bg-purple-900 text-white shadow-md'
+                          : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span>🔍 字段级对齐核查表</span>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] ${auditTab === 'fields' ? 'bg-purple-700 text-white' : 'bg-slate-100 text-slate-600'}`}>
+                        {auditReportData?.total_fields_count || auditReportData?.audit_items?.length || 0}
+                      </span>
+                    </button>
                   </div>
 
-                  <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-xs">
-                    <table className="w-full text-left text-xs border-collapse">
-                      <thead>
-                        <tr className="bg-slate-100/80 text-slate-700 font-bold border-b border-slate-200">
-                          <th className="p-3">待填字段 / 位置</th>
-                          <th className="p-3">Agent 调用的 Tool</th>
-                          <th className="p-3">数据库来源表 & 字段</th>
-                          <th className="p-3">数据库原始值</th>
-                          <th className="p-3">填入 Word 的最终文本</th>
-                          <th className="p-3">Agent 思考理由 (Thought)</th>
-                          <th className="p-3 text-center">下划线</th>
-                          <th className="p-3 text-center">状态</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100 text-slate-700">
-                        {auditReportData.audit_items && auditReportData.audit_items.length > 0 ? (
-                          auditReportData.audit_items.map((item: any, idx: number) => (
-                            <tr key={idx} className="hover:bg-purple-50/30 transition-colors">
-                              <td className="p-3 font-semibold text-slate-900">{item.target_field}</td>
-                              <td className="p-3 font-mono text-purple-700 bg-purple-50/50 px-2 py-0.5 rounded text-[11px] border border-purple-100">
-                                {item.tool_called}
-                              </td>
-                              <td className="p-3 font-mono text-slate-600 text-[11px]">{item.data_source_table}</td>
-                              <td className="p-3 text-slate-600">{item.db_raw_value}</td>
-                              <td className="p-3 font-bold text-emerald-800 bg-emerald-50/40 px-2 py-1 rounded">
-                                {item.final_filled_value}
-                              </td>
-                              <td className="p-3 text-slate-500 italic text-[11px] max-w-[180px] truncate" title={item.agent_reasoning}>
-                                {item.agent_reasoning || "结合上下文自动推演"}
-                              </td>
-                              <td className="p-3 text-center">
-                                {item.has_underline ? (
-                                  <span className="px-2 py-0.5 bg-blue-50 text-blue-700 font-bold rounded text-[10px] border border-blue-200">
-                                    保留下划线
-                                  </span>
-                                ) : (
-                                  <span className="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[10px]">
-                                    无下划线
-                                  </span>
+                  {/* Tab 1: Sub-Agent Thoughts & Execution Cards */}
+                  {auditTab === 'workers' && (
+                    <div>
+                      {auditReportData.worker_items && auditReportData.worker_items.length > 0 ? (
+                        <div className="space-y-3">
+                          {auditReportData.worker_items.map((worker: any, idx: number) => {
+                            const isExpanded = expandedWorkerId === (worker.id || `worker-${idx}`);
+                            return (
+                              <div key={worker.id || idx} className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden transition-all hover:border-purple-300">
+                                <div 
+                                  onClick={() => setExpandedWorkerId(isExpanded ? null : (worker.id || `worker-${idx}`))}
+                                  className="p-4 bg-slate-50/80 hover:bg-purple-50/40 cursor-pointer flex items-center justify-between transition-colors select-none"
+                                >
+                                  <div className="flex items-center gap-3">
+                                    <span className="w-8 h-8 rounded-xl bg-purple-100 text-purple-800 flex items-center justify-center font-bold text-xs shrink-0">
+                                      #{idx + 1}
+                                    </span>
+                                    <div>
+                                      <div className="flex items-center gap-2 flex-wrap">
+                                        <h4 className="font-bold text-slate-900 text-sm">{worker.chapter_title || worker.node_name}</h4>
+                                        <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-bold">
+                                          {worker.status === 'success' ? '✅ 执行成功' : worker.status}
+                                        </span>
+                                        <span className="px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 text-[10px] font-semibold border border-blue-100">
+                                          写盘提案: {worker.proposals_count || 0} 项
+                                        </span>
+                                      </div>
+                                      <div className="flex items-center gap-4 text-[11px] text-slate-500 mt-1 font-mono flex-wrap">
+                                        <span>节点: {worker.node_name}</span>
+                                        <span>耗时: {(worker.execution_time_ms / 1000).toFixed(1)}s</span>
+                                        <span>Tokens: {worker.total_tokens?.toLocaleString() || 0}</span>
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  <div className="flex items-center gap-2 text-xs text-purple-700 font-bold shrink-0 ml-2">
+                                    <span>{isExpanded ? '收起思考过程' : '查看思考全过程 & 写盘细节'}</span>
+                                    <span className={`transform transition-transform text-sm ${isExpanded ? 'rotate-180' : ''}`}>▼</span>
+                                  </div>
+                                </div>
+
+                                {isExpanded && (
+                                  <div className="p-5 border-t border-slate-200 bg-white text-xs text-slate-700 space-y-3">
+                                    <div className="p-3 bg-purple-50/60 rounded-xl border border-purple-100 font-bold text-purple-900 flex items-center gap-2">
+                                      <span>🧠 Agent 识别总结与推导全过程 (Thought & Operation Summary)</span>
+                                    </div>
+                                    <div className="bg-slate-900 text-slate-100 p-4 rounded-2xl font-mono text-[11px] leading-relaxed whitespace-pre-wrap overflow-x-auto custom-scrollbar border border-slate-800">
+                                      {worker.summary}
+                                    </div>
+                                  </div>
                                 )}
-                              </td>
-                              <td className="p-3 text-center">
-                                <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 font-bold rounded-full text-[10px]">
-                                  {item.alignment_status}
-                                </span>
-                              </td>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="text-center py-12 bg-white rounded-2xl border border-dashed border-slate-300">
+                          <span className="text-3xl mb-2 block">🤖</span>
+                          <p className="text-slate-500 text-xs">暂未查到该文档的子 Agent 执行履历（可重新点击自动填报触发 Agent 生成）</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Tab 2: Field Alignment Table */}
+                  {auditTab === 'fields' && (
+                    <div>
+                      <div className="p-3 bg-purple-50 border border-purple-200 rounded-xl flex items-center justify-between text-xs text-purple-900 font-medium mb-3">
+                        <span>{auditReportData.summary_note || '对齐任务处理完成'}</span>
+                        <span className="font-bold bg-purple-200 text-purple-800 px-2.5 py-0.5 rounded-full">
+                          已核查待填项: {auditReportData.total_fields_count || 0} 个
+                        </span>
+                      </div>
+
+                      <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-xs">
+                        <table className="w-full text-left text-xs border-collapse">
+                          <thead>
+                            <tr className="bg-slate-100/80 text-slate-700 font-bold border-b border-slate-200">
+                              <th className="p-3">待填字段 / 位置</th>
+                              <th className="p-3">Agent 调用的 Tool</th>
+                              <th className="p-3">数据库来源表 & 字段</th>
+                              <th className="p-3">数据库原始值</th>
+                              <th className="p-3">填入 Word 的最终文本</th>
+                              <th className="p-3">Agent 思考理由 (Thought)</th>
+                              <th className="p-3 text-center">下划线</th>
+                              <th className="p-3 text-center">状态</th>
                             </tr>
-                          ))
-                        ) : (
-                          <tr>
-                            <td colSpan={8} className="p-6 text-center text-slate-400">
-                              未检索到待填项对齐记录
-                            </td>
-                          </tr>
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 text-slate-700">
+                            {auditReportData.audit_items && auditReportData.audit_items.length > 0 ? (
+                              auditReportData.audit_items.map((item: any, idx: number) => (
+                                <tr key={idx} className="hover:bg-purple-50/30 transition-colors">
+                                  <td className="p-3 font-semibold text-slate-900">{item.target_field}</td>
+                                  <td className="p-3 font-mono text-purple-700 bg-purple-50/50 px-2 py-0.5 rounded text-[11px] border border-purple-100">
+                                    {item.tool_called}
+                                  </td>
+                                  <td className="p-3 font-mono text-slate-600 text-[11px]">{item.data_source_table}</td>
+                                  <td className="p-3 text-slate-600">{item.db_raw_value}</td>
+                                  <td className="p-3 font-bold text-emerald-800 bg-emerald-50/40 px-2 py-1 rounded">
+                                    {item.final_filled_value}
+                                  </td>
+                                  <td className="p-3 text-slate-500 italic text-[11px] max-w-[180px] truncate" title={item.agent_reasoning}>
+                                    {item.agent_reasoning || "结合上下文自动推演"}
+                                  </td>
+                                  <td className="p-3 text-center">
+                                    {item.has_underline ? (
+                                      <span className="px-2 py-0.5 bg-blue-50 text-blue-700 font-bold rounded text-[10px] border border-blue-200">
+                                        保留下划线
+                                      </span>
+                                    ) : (
+                                      <span className="px-2 py-0.5 bg-slate-100 text-slate-500 rounded text-[10px]">
+                                        无下划线
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="p-3 text-center">
+                                    <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 font-bold rounded-full text-[10px]">
+                                      {item.alignment_status}
+                                    </span>
+                                  </td>
+                                </tr>
+                              ))
+                            ) : (
+                              <tr>
+                                <td colSpan={8} className="p-6 text-center text-slate-400">
+                                  未检索到待填项对齐记录
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="text-center py-10 text-slate-400 text-sm">暂无核查报告数据</div>
               )}
             </div>
+
 
             {/* Modal Footer */}
             <div className="p-4 bg-slate-100 border-t border-slate-200 flex justify-end shrink-0">

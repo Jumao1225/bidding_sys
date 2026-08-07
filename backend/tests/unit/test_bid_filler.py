@@ -307,6 +307,47 @@ def test_fill_docx_proposals_underline_policy_outside_vs_inside_table():
             os.remove(temp_path)
 
 
+def test_fill_docx_proposals_inplace_sub_replacement_preserves_surrounding_text():
+    """测试核心算法：原位切片替换 100% 物理保留占位符前后的所有模板文本，彻底防止丢失原文"""
+    import tempfile, os
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    doc.add_paragraph("根据贵方的 SZDZ-2026-NG008 号招标文件，正式授权下述签字人____代表我方____公司（投标人的名称），全权处理本次项目投标。")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+        proposals = [
+            {
+                "path": "/body/p[1]",
+                "original_context": "根据贵方的 SZDZ-2026-NG008 号招标文件，正式授权下述签字人____代表我方....",
+                "proposed_text": "张三"
+            }
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count == 1
+
+        res_doc = Document(temp_path)
+        p = res_doc.paragraphs[0]
+        # 断言应该切片为 3 段 Run：[前文模板, 填入值, 后文模板]
+        assert len(p.runs) == 3
+        assert p.runs[0].text == "根据贵方的 SZDZ-2026-NG008 号招标文件，正式授权下述签字人"
+        assert p.runs[0].underline is False or p.runs[0].underline is None
+        assert p.runs[1].text == "张三"
+        assert p.runs[1].underline is True
+        assert p.runs[2].text == "代表我方____公司（投标人的名称），全权处理本次项目投标。"
+        assert p.runs[2].underline is False or p.runs[2].underline is None
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+
 def test_db_tools_quotation_and_market_price_should_return_full_bom():
     """测试财务报价及指导单价检索 DB 工具能正确支持全量 BOM 成本测算合价与模糊词条组合联查"""
     from app.agents.tools.bid_db_tools import query_market_price_reference_tool, query_financial_quotation_tool
