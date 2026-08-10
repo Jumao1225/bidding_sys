@@ -232,7 +232,151 @@ async def reextract_domain(
         logger.exception(f"重新提取 {domain} 异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"重新提取异常: {str(e)}")
 
+from pydantic import BaseModel, Field
+
+class CostItemUpdateRequest(BaseModel):
+    name: str = Field(..., description="项目/设备名称")
+    spec_requirement: str = Field(default="", description="规格或说明")
+    qty: Optional[float] = Field(default=1.0, description="数量")
+    unit: str = Field(default="项", description="单位")
+    ref_price: float = Field(default=0.0, description="参考单价")
+    matched_name: str = Field(default="", description="匹配设备名称")
+    matched_brand: str = Field(default="", description="匹配品牌")
+    matched_model: str = Field(default="", description="匹配型号")
+    matched_manufacturer: str = Field(default="", description="匹配厂商")
+    key_parameters: List[str] = Field(default_factory=list, description="关键参数")
+    brand_requirements: str = Field(default="", description="品牌要求")
+    match_quality: str = Field(default="手动添加", description="匹配置信度")
+    warning: str = Field(default="", description="提示说明")
+    comparison_note: str = Field(default="", description="对比说明")
+
+class CostAnalysisUpdateRequest(BaseModel):
+    items: List[CostItemUpdateRequest] = Field(..., description="BOM成本分项列表")
+    analysis_summary: Optional[str] = Field(default="", description="成本核算总结")
+
+@router.put("/{document_id}/cost-analysis", response_model=ResponseModel[dict])
+async def update_cost_analysis(
+    document_id: str,
+    payload: CostAnalysisUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    手动更新/保存 BOM 成本核算明细与自定义费用分项。
+    同时重新汇总预估总成本、联动更新预算状态，并同步落盘至 CostEstimate 数据库实体表。
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.db.crud.document import document_crud
+    from app.db.models.ai_analysis import CostEstimate
+    import re
+
+    # 1. 鉴权验证：确保文档属于当前用户
+    doc = document_crud.get_document_by_id(db, document_id, current_user.id, current_user.tenant_id)
+    if not doc:
+        raise HTTPException(status_code=403, detail="无权访问该文档或文档不存在")
+
+    # 2. 重新计算小计与预估总成本
+    calculated_items = []
+    total_cost = 0.0
+    unmatched_count = 0
+
+    for item in payload.items:
+        item_dict = item.model_dump()
+        raw_qty = item_dict.get("qty")
+        ref_price = float(item_dict.get("ref_price") or 0.0)
+        
+        try:
+            qty = float(raw_qty) if raw_qty is not None else 1.0
+        except (ValueError, TypeError):
+            qty = 1.0
+            item_dict["qty"] = 1.0
+
+        subtotal = round(qty * ref_price, 2)
+        item_dict["subtotal"] = subtotal
+        
+        if ref_price <= 0:
+            unmatched_count += 1
+            if not item_dict.get("match_quality"):
+                item_dict["match_quality"] = "未匹配"
+
+        total_cost += subtotal
+        calculated_items.append(item_dict)
+
+    total_cost = round(total_cost, 2)
+
+    # 3. 评估预算状态
+    parsed_metadata = dict(doc.parsed_metadata or {})
+    budget_limit = parsed_metadata.get("budget_limit")
+    budget_status = "预算未设置"
+    budget_numeric = None
+
+    if budget_limit:
+        try:
+            cleaned_budget = re.sub(r'[^\d.]', '', str(budget_limit))
+            if cleaned_budget:
+                budget_numeric = float(cleaned_budget)
+        except Exception as e:
+            logger.warning(f"解析预算数字失败: {budget_limit}, error: {e}")
+
+    if budget_numeric and budget_numeric > 0:
+        ratio = round((total_cost / budget_numeric) * 100, 1)
+        if total_cost > budget_numeric:
+            budget_status = f"已超出预算上限 (预算使用率 {ratio}%, 超额 ¥{round(total_cost - budget_numeric, 2)})"
+        elif ratio >= 90:
+            budget_status = f"接近预算上限 (预算使用率 {ratio}%)"
+        else:
+            budget_status = f"预算可控 (预算使用率 {ratio}%)"
+
+    cost_data = {
+        "items": calculated_items,
+        "total_cost": total_cost,
+        "unmatched_count": unmatched_count,
+        "budget_limit": budget_limit,
+        "budget_status": budget_status,
+        "analysis_summary": payload.analysis_summary or (parsed_metadata.get("cost_analysis") or {}).get("analysis_summary", "已完成手动调整与成本核算汇总。")
+    }
+
+    # 4. 持久化至 parsed_metadata JSONB
+    parsed_metadata["cost_analysis"] = cost_data
+    doc.parsed_metadata = parsed_metadata
+    flag_modified(doc, "parsed_metadata")
+
+    # 5. 同步落盘至 CostEstimate 实体数据表
+    try:
+        from app.db.models.project import Project
+        valid_project_id = doc.project_id
+        if valid_project_id:
+            proj_exists = db.query(Project).filter(Project.id == valid_project_id).first()
+            if not proj_exists:
+                valid_project_id = None
+
+        db.query(CostEstimate).filter(CostEstimate.document_id == document_id).delete()
+        for item in calculated_items:
+            est = CostEstimate(
+                tenant_id=current_user.tenant_id,
+                document_id=document_id,
+                project_id=valid_project_id,
+                item_name=item.get("name", "未命名项"),
+                quantity=float(item.get("qty") or 1.0),
+                unit=item.get("unit", "项"),
+                unit_price=float(item.get("ref_price") or 0.0),
+                calculated_total=float(item.get("subtotal") or 0.0),
+                brand=item.get("brand_requirements", "") or item.get("matched_brand", ""),
+                spec=item.get("spec_requirement", "") or item.get("matched_model", ""),
+                remark=item.get("comparison_note", "") or item.get("warning", "") or "手动新增/调整项目"
+            )
+            db.add(est)
+        db.commit()
+        logger.info(f"成功更新文档 {document_id} 的 BOM 成本测算，共 {len(calculated_items)} 项，总额: ¥{total_cost}")
+    except Exception as db_err:
+        logger.exception(f"更新 CostEstimate 实体表异常: {db_err}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"数据落盘失败: {str(db_err)}")
+
+    return success_response(data=cost_data, message="BOM 成本测算数据保存成功")
+
 @router.get("/draft/download/{document_id}")
+
 async def download_bidding_draft(
     document_id: str,
     db: Session = Depends(get_db),

@@ -328,9 +328,18 @@ export function AnalysisDashboard() {
       {/* BOM 成本核算表 */}
       <div className="w-full">
         <CostTable 
+          documentId={activeDocId}
           equipmentList={eng.main_equipment_list || []} 
           costAnalysis={result?.cost_analysis || {}} 
           onReextract={() => handleReextract('cost_estimation')}
+          onCostUpdated={(updatedCost) => {
+            if (result) {
+              setResult({
+                ...result,
+                cost_analysis: updatedCost
+              });
+            }
+          }}
           isRetrying={retryingDomain === 'cost_estimation'}
         />
       </div>

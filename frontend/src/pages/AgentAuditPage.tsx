@@ -184,24 +184,29 @@ export const AgentAuditPage: React.FC = () => {
 
     setIsGenerating(true);
     setIsLivePolling(true);
-    setNotice('⚡ SSE 实时推流已建立：Agent 专家团队思考推导、调库与原位写盘正以 0 延迟秒级长链接实时推流至前端...');
+    setNotice('⚡ 正在启动 AI 团队全自主标书撰写：正在清理上一轮履历并建立 0 延迟实时推流...');
     setError(null);
 
     // 清空历史旧履历，重置呈现最新一轮 Agent 思考与原位落盘弹增过程
     setWorkers([]);
     setSelectedWorkerId(null);
 
-    // 开启 SSE 0 延迟实时推流
-    setupSSELogStream(activeDocId);
-
     try {
-      const response = await apiFetch(`${API_BASE_URL}/api/v1/bidding/agent-fill-bid-format/${activeDocId}`, {
+      // 先发起 POST 请求，触发后端瞬间清理旧日志并写入初始 in_progress 记录
+      const postPromise = apiFetch(`${API_BASE_URL}/api/v1/bidding/agent-fill-bid-format/${activeDocId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           custom_instructions: customInstruction || undefined
         })
       });
+
+      // 延迟 200ms 开启 SSE 0 延迟实时推流，确保能够精确捕获到最新的 in_progress 状态与实时卡片
+      setTimeout(() => {
+        setupSSELogStream(activeDocId);
+      }, 200);
+
+      const response = await postPromise;
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
@@ -327,22 +332,6 @@ export const AgentAuditPage: React.FC = () => {
 
         {/* 顶部右侧核心触发操作 */}
         <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => {
-              setIsLivePolling(!isLivePolling);
-              fetchWorkerLogs(activeDocId, false);
-            }}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer border ${
-              isLivePolling || isGenerating
-                ? 'bg-purple-900/80 border-purple-500 text-purple-200 shadow-md shadow-purple-900/50'
-                : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
-            }`}
-            title="点击切换 1.5 秒自动实时探针轮询"
-          >
-            <span className={isLivePolling || isGenerating ? "animate-spin text-purple-400" : ""}>📡</span>
-            <span>{isLivePolling || isGenerating ? "实时思考探针中 (1.5s)" : "开启 1.5s 实时探针"}</span>
-          </button>
 
           <button
             type="button"

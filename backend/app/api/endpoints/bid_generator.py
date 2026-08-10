@@ -676,16 +676,30 @@ def trigger_agent_bid_filling(
         custom_instructions = request_body.custom_instructions
         category_hints = request_body.category_hints
 
-    # 清理该文档上一次的填报审计日志，为全新一轮运行提供实时卡片弹增与追溯空间
+    # 清理该文档上一次的填报审计日志，并立即注入全局起始 in_progress 记录，为全新一轮运行提供实时卡片弹增与追溯空间
     try:
         from app.db.models.audit import AgentAuditLog
-        old_logs = db.query(AgentAuditLog).all()
-        for l in old_logs:
-            if l.inputs and isinstance(l.inputs, dict) and l.inputs.get("document_id") == document_id:
-                db.delete(l)
+        from sqlalchemy import cast, String
+        db.query(AgentAuditLog).filter(
+            cast(AgentAuditLog.inputs, String).like(f"%{document_id}%")
+        ).delete(synchronize_session=False)
+
+        init_log = AgentAuditLog(
+            task_id=document_id,
+            tenant_id=t_id,
+            user_id=u_id,
+            node_name="Supervisor-总控调度",
+            action_type="llm_call_supervisor",
+            status="in_progress",
+            inputs={"document_id": document_id, "chapter_title": "Supervisor-总控调度", "msg": "准备启动新一轮 Agent 全自主起草..."},
+            outputs={"summary": "正在初始化 Agent 专家团队与指令解析..."}
+        )
+        db.add(init_log)
         db.commit()
+        logger.info(f"成功清理旧日志并写入初始 in_progress 状态记录，doc_id={document_id}")
     except Exception as del_err:
         logger.warning(f"清理旧 AuditLog 异常: {del_err}")
+        db.rollback()
 
     template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
         db=db,
