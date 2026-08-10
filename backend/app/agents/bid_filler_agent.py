@@ -28,6 +28,7 @@ from docx.oxml.ns import qn, nsdecls
 import io
 
 from langchain_core.tools import tool
+from app.core.sandbox import AgentSandbox
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage
@@ -422,14 +423,8 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     MAX_RETRIES = int(os.getenv("BID_FILLER_MAX_RETRIES", "2"))
     last_error: Optional[str] = None
 
-    sandbox_backup_path = None
-    if docx_temp_path and os.path.exists(docx_temp_path):
-        try:
-            sandbox_backup_path = docx_temp_path + ".sandbox_backup"
-            shutil.copy2(docx_temp_path, sandbox_backup_path)
-            logger.info(f"   📦 [Sandbox] 已创建 Word 文件快照备份")
-        except Exception as snap_exc:
-            logger.warning(f"   ⚠️ [Sandbox] 备份失败: {snap_exc}")
+    # 初始化 Agent 规范化沙箱实例
+    sandbox = AgentSandbox(allowed_paths=[docx_temp_path] if docx_temp_path else None)
 
     # [优化点1：强制锁死温度零度采样] 保证主调大脑章节判定和工具决计逻辑无随机波动
     supervisor_llm = llm_service.get_llm(temperature=0.0, json_mode=False) or llm_service.raw_llm
@@ -438,17 +433,12 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             logger.info(f"   🧠 启动 Supervisor Agent（{len(supervisor_tools)} 个决策工具, 第 {attempt}/{MAX_RETRIES} 次）...")
-            result = supervisor_agent.invoke({
-                "messages": [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)],
-            })
+            with sandbox.transaction([docx_temp_path] if docx_temp_path else None):
+                result = supervisor_agent.invoke({
+                    "messages": [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)],
+                })
             final_msg = result["messages"][-1].content
             logger.info(f"   🧠 Supervisor 完成决策:\n{final_msg}")
-
-            if sandbox_backup_path and os.path.exists(sandbox_backup_path):
-                try:
-                    os.remove(sandbox_backup_path)
-                except Exception:
-                    pass
 
             audit_items.append(FillingAuditItem(
                 target_field="[Supervisor 调度]",
@@ -530,12 +520,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 
         except Exception as agent_exc:
             last_error = str(agent_exc)
-            logger.warning(f"   ⚠️ Supervisor 第 {attempt}/{MAX_RETRIES} 次失败: {agent_exc}")
-            if sandbox_backup_path and os.path.exists(sandbox_backup_path) and docx_temp_path:
-                try:
-                    shutil.copy2(sandbox_backup_path, docx_temp_path)
-                except Exception:
-                    pass
+            logger.warning(f"   ⚠️ Supervisor 第 {attempt}/{MAX_RETRIES} 次失败 (沙箱已触发快照自动恢复): {agent_exc}")
             if attempt < MAX_RETRIES:
                 import time as _time
                 _time.sleep(2)
@@ -543,11 +528,6 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
                 logger.error(f"   ❌ Supervisor 已达最大重试次数")
 
     if last_error:
-        if sandbox_backup_path and os.path.exists(sandbox_backup_path):
-            try:
-                os.remove(sandbox_backup_path)
-            except Exception:
-                pass
         emit_error_msg = last_error[:200]
         audit_items.append(FillingAuditItem(
             target_field="[Supervisor 执行失败]",

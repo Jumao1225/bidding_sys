@@ -151,6 +151,7 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "") -> List:
             auto_index=auto_index
         )
 
+    from app.agents.tools.style_extractor_tool import extract_text_by_style
     worker_tools = list(db_tools) + [
         officecli_query_structure,
         officecli_write_slot_value,
@@ -158,8 +159,9 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "") -> List:
         officecli_fill_table_rows,
         get_full_chapter_text,
         search_bidding_document,
+        extract_text_by_style,
     ]
-    logger.info(f"   🛠️ [Worker 工具包] 组装完成: {len(db_tools)} DB工具 + 4 Office CLI 工具 + 2 RAG/全章检索工具")
+    logger.info(f"   🛠️ [Worker 工具包] 组装完成: {len(db_tools)} DB工具 + 4 Office CLI 工具 + 2 RAG/全章检索工具 + 1 样式定向提取工具")
     return worker_tools
 
 
@@ -199,6 +201,10 @@ def build_worker_prompt(
      - 针对扫描到的具体字段，主动调用 DB 工具集（企业信息、资质库、人员库、业绩库、财务库等）检索真实数据。
      - 🛑 **查无结果立刻止步**：若 DB 工具返回 "未找到..."、"尚未录入" 或空记录，**严禁换用类似关键词重复循环调库**！应当立即将该槽位标记或写为 "[待补充: <字段名>]"，并直接完成该句/表单写盘。
      - 🚫 **杜绝伪造假数据**：绝对严禁捏造假数据或伪造日期！写盘完成后必须立即输出总结表格并终止工具调用，绝对不能死循环！
+   - 🎨 **文档精细样式感知与定向提取规约**：
+     - 遇到需根据特定字体格式属性（如“参考第四章中斜体且带有下划线的文字”）响应时，文档中的斜体下划线文本已被转义为 `<span class="style-italic-underline"><u>*文本*</u></span>`。
+     - 亦可直接调用 `extract_text_by_style(file_path, chapter_keyword, style_type="italic_underline")` 工具进行特定章节格式文本的定向提取！
+
 
 
 3. ✍️ **一并写盘 (原子化长句 & 表格填写铁律 — 严禁假写)**：

@@ -62,6 +62,58 @@ class DocxParser(BaseParser):
 
         return False
 
+    @staticmethod
+    def _render_styled_paragraph(paragraph: Any) -> str:
+        """
+        渲染包含精细样式的段落文本。
+        遍历段落中的每个 Run 节点，抓取加粗、斜体、下划线及字体颜色属性，并转义为规范的 Markdown / HTML 标签。
+        """
+        if not hasattr(paragraph, "runs") or not paragraph.runs:
+            return paragraph.text.strip() if hasattr(paragraph, "text") else ""
+
+        styled_parts: List[str] = []
+        for run in paragraph.runs:
+            text = run.text
+            if not text:
+                continue
+
+            # 抓取基础样式属性
+            is_bold = bool(run.bold)
+            is_italic = bool(run.italic)
+            is_underline = bool(run.underline)
+
+            # 抓取字体颜色
+            color_rgb = None
+            try:
+                if run.font and run.font.color and run.font.color.rgb:
+                    color_rgb = str(run.font.color.rgb)
+            except Exception:
+                color_rgb = None
+
+            # 样式转义判断逻辑
+            # 1. 优先处理复合样式（斜体 + 下划线）
+            if is_italic and is_underline:
+                rendered = f'<span class="style-italic-underline"><u>*{text}*</u></span>'
+            elif is_bold and is_italic:
+                rendered = f'***{text}***'
+            elif is_bold:
+                rendered = f'**{text}**'
+            elif is_italic:
+                rendered = f'*{text}*'
+            elif is_underline:
+                rendered = f'<u>{text}</u>'
+            else:
+                rendered = text
+
+            # 2. 附加颜色转义
+            if color_rgb:
+                rendered = f'<span style="color:#{color_rgb}">{rendered}</span>'
+
+            styled_parts.append(rendered)
+
+        styled_text = "".join(styled_parts).strip()
+        return styled_text if styled_text else paragraph.text.strip()
+
     def _convert_docx_to_markdown(self, docx_path: str) -> str:
         if not os.path.exists(docx_path):
             raise FileNotFoundError(f"未找到指定的 Word 文件: {docx_path}")
@@ -92,6 +144,8 @@ class DocxParser(BaseParser):
                         is_caption = self._is_table_caption(text, p)
                         break
 
+                styled_text = self._render_styled_paragraph(p)
+
                 style_name = p.style.name.lower() if p.style else ""
                 if "heading 1" in style_name:
                     md_lines.append(f"# {text}\n")
@@ -102,24 +156,33 @@ class DocxParser(BaseParser):
                 elif ORDINAL_HEADING_PATTERN.match(text):
                     md_lines.append(f"## {text}\n")
                 elif is_caption:
-                    md_lines.append(f"\n**{text}**")
+                    md_lines.append(f"\n**{styled_text}**")
                 else:
                     if any(pat.match(text) for pat in MAJOR_CHAPTER_PATTERNS):
                         md_lines.append(f"# {text}\n")
                     else:
-                        md_lines.append(f"{text}\n")
+                        md_lines.append(f"{styled_text}\n")
 
             elif child.tag.endswith('tbl'):
                 table = Table(child, doc)
                 if not table.rows:
                     continue
                 md_lines.append("\n")
-                headers = [cell.text.strip().replace("\n", " ") for cell in table.rows[0].cells]
+
+                def _get_row_cells_styled(row):
+                    cell_texts = []
+                    for cell in row.cells:
+                        p_texts = [DocxParser._render_styled_paragraph(cp) for cp in cell.paragraphs]
+                        combined = " ".join([pt for pt in p_texts if pt]).replace("\n", " ").strip()
+                        cell_texts.append(combined if combined else cell.text.strip().replace("\n", " "))
+                    return cell_texts
+
+                headers = _get_row_cells_styled(table.rows[0])
                 md_lines.append("| " + " | ".join(headers) + " |")
                 md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-                
+
                 for row in table.rows[1:]:
-                    row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                    row_cells = _get_row_cells_styled(row)
                     md_lines.append("| " + " | ".join(row_cells) + " |")
                 md_lines.append("\n")
 
