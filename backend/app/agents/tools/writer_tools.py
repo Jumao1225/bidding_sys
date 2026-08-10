@@ -41,15 +41,19 @@ def get_company_qualifications_tool(tenant_id: str = None) -> List[Dict[str, Any
         ).order_by(CompanyQualification.created_at.desc()).all()
 
         results = []
+        from app.agents.tools.bid_db_tools import resolve_qualification_image_path
         for q in quals:
             expiry_str = q.expiry_date.strftime("%Y-%m-%d") if q.expiry_date else "长期有效"
+            img_path, img_exists = resolve_qualification_image_path(q.file_url)
             results.append({
                 "id": q.id,
                 "name": q.name or "未命名资质",
                 "level": q.level or "通用",
                 "company_name": q.company_name or "",
                 "expiry_date": expiry_str,
-                "file_url": q.file_url or ""
+                "file_url": q.file_url or "",
+                "local_image_path": img_path or "",
+                "image_exists": img_exists
             })
         logger.info(f"成功从资质中心 DB 查询到 {len(results)} 条公司资质证书记录 (tenant_id={effective_tenant})")
         return results

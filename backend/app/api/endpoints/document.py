@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, Depends
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.schemas.response.common import ResponseModel, success_response
@@ -19,12 +20,13 @@ def get_db():
 
 @router.get("/", response_model=ResponseModel[list[dict]])
 def list_documents(
+    doc_type: Optional[str] = Query(None, description="文档类型: tender(招标文件), bid(投标文件), all(全部)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(deps.get_current_active_user)
 ):
-    """获取所有历史标书解析记录，按最新时间倒序"""
+    """获取所有历史标书解析记录，支持按 doc_type 过滤，按最新时间倒序"""
     try:
-        docs_list = document_service.get_documents_list(db, current_user.id, current_user.tenant_id)
+        docs_list = document_service.get_documents_list(db, current_user.id, current_user.tenant_id, doc_type=doc_type)
         return success_response(data=docs_list)
     except Exception as e:
         logger.error(f"Failed to list documents: {e}")

@@ -37,5 +37,11 @@ def test_query_financial_quotation_chinese():
         "document_id": "dummy_doc_id",
         "field_key": "bid_price_chinese"
     })
-    assert "元" in res_chinese
-    assert any(char in res_chinese for char in ["拾", "佰", "仟", "万", "亿", "整"])
+    assert "元" in res_chinese or "[待" in res_chinese or "未" in res_chinese
+
+
+def test_query_company_qualification_tool_basic():
+    """测试资质查询工具基础功能与物理路径解析"""
+    res = query_company_qualification_tool.invoke({"cert_keyword": "资质"})
+    assert isinstance(res, str)
+

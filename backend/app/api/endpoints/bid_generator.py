@@ -38,19 +38,24 @@ router = APIRouter()
 
 @router.get("/documents-list")
 def get_bidding_documents_list(
+    doc_type: Optional[str] = None,
     db: Session = Depends(deps.get_db),
     current_user: Optional[User] = Depends(deps.get_current_user_optional)
 ):
     """
     获取系统中已上传并解析的全套招标文件列表，供前端智能撰写控制台下拉框选择
+    默认仅返回 doc_type=tender 的招标文件
     """
     from app.db.crud.document import document_crud
     user_id = current_user.id if current_user else None
     tenant_id = current_user.tenant_id if current_user else None
     
-    docs = document_crud.get_all_documents(db, user_id, tenant_id)
+    # 默认针对标书撰写拉取仅招标文件
+    target_type = doc_type if doc_type else "tender"
+    
+    docs = document_crud.get_all_documents(db, user_id, tenant_id, doc_type=target_type)
     if not docs or len(docs) == 0:
-        docs = document_crud.get_all_documents(db, None, None)
+        docs = document_crud.get_all_documents(db, None, None, doc_type=target_type)
 
     res = []
     for d in docs:
@@ -75,13 +80,13 @@ def get_bidding_documents_list(
         res.append({
             "id": d.id,
             "filename": d.filename,
+            "doc_type": pm.get("doc_type", "tender"),
             "project_name": proj_name or d.filename,
             "project_code": proj_code or "--",
             "display_label": display_label,
             "parse_status": d.parse_status or "completed",
-            "created_at": d.created_at.strftime("%Y-%m-%d %H:%M") if hasattr(d, "created_at") and d.created_at else "未知时间"
+            "created_at": d.created_at.isoformat() if hasattr(d, "created_at") and d.created_at else None
         })
-
     return res
 
 

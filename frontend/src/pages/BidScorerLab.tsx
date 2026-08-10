@@ -278,7 +278,7 @@ export const BidScorerLab: React.FC = () => {
 
             <div className="mt-4 space-y-3">
               <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                选择已被平台解析成功的历史招标法则书 :
+                选择已被平台解析成功的历史招标文件 (裁判标尺) :
               </label>
               {loadingDocs ? (
                 <div className="p-3 text-center text-xs text-slate-400 animate-pulse bg-slate-950/50 rounded-xl border border-slate-800">
@@ -291,11 +291,11 @@ export const BidScorerLab: React.FC = () => {
                   className="w-full bg-slate-950/80 text-white font-medium text-sm rounded-xl border border-slate-700 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 outline-none p-3 transition-colors cursor-pointer"
                 >
                   {tenderDocs.length === 0 ? (
-                    <option value="">（未检索到可承用的成熟招标文档，请至智能解析建业）</option>
+                    <option value="">（未检索到可承用的招标文件，请先在智能解析上传）</option>
                   ) : (
                     tenderDocs.map((d) => (
                       <option key={d.id} value={d.id} className="bg-slate-900 py-2">
-                        📑 [{d.filename}] (主干ID: {d.id.slice(0, 8)}...)
+                        📑 [招标文件] {d.filename} (ID: {d.id.slice(0, 8)}...)
                       </option>
                     ))
                   )}
@@ -303,14 +303,14 @@ export const BidScorerLab: React.FC = () => {
               )}
               <p className="text-xs text-slate-400 leading-normal pt-1 flex items-start gap-1.5">
                 <span className="text-emerald-400 font-bold">•</span>
-                当前选中主尺将严加固死其自身内部之 <strong>score_tree</strong>；杜绝串卷与外连网络瞎猜！您也可随意跨组挑另一名老卷一验同一单。
+                当前选中主尺将严加固死其自身内部之 <strong>score_tree</strong>；已从 `uploads/tenders/` 专属目录隔离读取！
               </p>
             </div>
           </div>
 
           <div className="mt-6 pt-4 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-500 font-mono">
-            <span>当前选中主干裁判锁ID:</span>
-            <span className="font-bold text-slate-300">{selectedSourceId ? selectedSourceId.slice(0, 12) + '...' : 'NONE_LOCKED'}</span>
+            <span>当前选中招标文件 ID:</span>
+            <span className="font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">{selectedSourceId ? selectedSourceId.slice(0, 12) + '...' : 'NONE_LOCKED'}</span>
           </div>
         </div>
 
@@ -320,10 +320,10 @@ export const BidScorerLab: React.FC = () => {
             <div className="flex items-center justify-between pb-4 border-b border-slate-800">
               <div className="flex items-center space-x-2.5">
                 <Upload className="w-5 h-5 text-cyan-400" />
-                <h2 className="text-base font-extrabold tracking-wide text-white uppercase">2. 进驻侯判候选文件与打机并发激活</h2>
+                <h2 className="text-base font-extrabold tracking-wide text-white uppercase">2. 上传待测投标文件 (Bid Document)</h2>
               </div>
               <span className="text-xs font-mono text-cyan-300 bg-cyan-500/10 px-2.5 py-0.5 rounded-full border border-cyan-500/20">
-                专跑无长阻流道
+                存储于 uploads/bids/ 目录
               </span>
             </div>
 
@@ -345,10 +345,14 @@ export const BidScorerLab: React.FC = () => {
                   <FileText className="w-5 h-5" />
                 </div>
                 <span className="text-sm font-semibold text-slate-200 text-center truncate w-full px-2">
-                  {selectedFile ? selectedFile.name : "点击拉取待阅底书 (.pdf/.docx)"}
+                  {selectedFile ? (
+                    <span className="text-cyan-300 font-bold">📝 [投标文件] {selectedFile.name}</span>
+                  ) : (
+                    "点击上传待测投标文件 (.pdf/.docx)"
+                  )}
                 </span>
                 <span className="text-[11px] text-slate-400 mt-1 font-mono">
-                  {selectedFile ? `文件体量: ${(selectedFile.size / 1024).toFixed(1)} KB` : "独走超声分片不走老常态重车路"}
+                  {selectedFile ? `文件大小: ${(selectedFile.size / 1024).toFixed(1)} KB` : "将自动存入 uploads/bids/ 专属库"}
                 </span>
               </div>
 

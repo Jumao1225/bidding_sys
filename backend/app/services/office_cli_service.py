@@ -74,15 +74,16 @@ class OfficeCLIService:
             stderr_str = (completed_proc.stderr or "").strip()
 
             if completed_proc.returncode != 0:
-                logger.error(f"OfficeCLI 命令执行失败 (code={completed_proc.returncode}): {stderr_str}")
                 raise RuntimeError(f"OfficeCLI 执行失败: {stderr_str or stdout_str}")
 
             return stdout_str
         except FileNotFoundError:
             logger.exception("找不到 officecli 可执行文件，请检查系统 PATH 是否已配置。")
             raise RuntimeError("系统未安装 OfficeCLI 或无法在 PATH 中找到。")
+        except RuntimeError:
+            raise
         except Exception as e:
-            logger.exception(f"执行 OfficeCLI 子进程产生未预期异常: {str(e)}")
+            logger.warning(f"执行 OfficeCLI 子进程产生未预期异常: {str(e)}")
             raise
 
     async def check_available(self) -> bool:

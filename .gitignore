@@ -1,10 +1,9 @@
-# Python
+# Python & Bytecode
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -23,34 +22,79 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Environment Variables
+# Environment Variables & Virtual Envs
 .env
+.env.local
+.env.*.local
 .venv
 venv/
 ENV/
+env/
 env.bak/
 venv.bak/
 
-# Project Specific (Bidding System)
-backend/logs/
+# Node & Frontend (React / Vite)
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Database & SQLite Files
 backend/*.db
 backend/*.sqlite
 backend/*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+
+# AI Models & Heavy Artifacts
 models/
-backend/uploads/
-backend/storage/
+
+# Backend Uploads, Storage & Logs
+backend/logs/*
+!backend/logs/.gitkeep
+backend/storage/*
+!backend/storage/.gitkeep
+backend/uploads/*
+!backend/uploads/.gitkeep
+!backend/uploads/drafts/
+backend/uploads/drafts/*
+!backend/uploads/drafts/.gitkeep
+!backend/uploads/tenders/
+backend/uploads/tenders/*
+!backend/uploads/tenders/.gitkeep
+!backend/uploads/bids/
+backend/uploads/bids/*
+!backend/uploads/bids/.gitkeep
+!backend/uploads/qualifications/
+backend/uploads/qualifications/*
+!backend/uploads/qualifications/.gitkeep
+
+# Word & Office Temporary Lock Files
+~$*.docx
+~$*.doc
+~$*.xlsx
+~$*.xls
+~$*.pptx
 
 # Testing & Coverage
 .coverage
 htmlcov/
 .pytest_cache/
+.coverage.*
 
-# IDE / Editors
+# IDE / Editors / OS
 .vscode/
 .idea/
 *.swp
 *.swo
 .DS_Store
+Thumbs.db
 
-# AI Agents & Gemini
+# AI Agents & Gemini Tool Artifacts
 .gemini/

@@ -61,7 +61,7 @@ export const AgentAuditPage: React.FC = () => {
   // 拉取已上传的项目/招标文件列表
   const fetchDocList = async () => {
     try {
-      const res = await apiFetch(`${API_BASE_URL}/api/v1/bidding/documents-list`);
+      const res = await apiFetch(`${API_BASE_URL}/api/v1/bidding/documents-list?doc_type=tender`);
       if (res.ok) {
         const data = await res.json();
         const docs = data || [];
@@ -86,6 +86,31 @@ export const AgentAuditPage: React.FC = () => {
   }, []);
 
   const [isLivePolling, setIsLivePolling] = useState(false);
+
+  // 实时撰写计时器 State (支持 100ms 级别实时毫秒/秒级跳动计时)
+  const [liveTimerMs, setLiveTimerMs] = useState(0);
+  const timerStartRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    let intervalId: any = null;
+    if (isGenerating || isLivePolling) {
+      if (!timerStartRef.current) {
+        timerStartRef.current = Date.now();
+      }
+      intervalId = setInterval(() => {
+        if (timerStartRef.current) {
+          setLiveTimerMs(Date.now() - timerStartRef.current);
+        }
+      }, 100);
+    } else {
+      timerStartRef.current = null;
+      setLiveTimerMs(0);
+    }
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [isGenerating, isLivePolling]);
 
   const fetchWorkerLogs = async (docIdToFetch?: string, showLoadingSpinner: boolean = true) => {
     const targetId = typeof docIdToFetch === 'string' ? docIdToFetch : activeDocId;
@@ -272,6 +297,22 @@ export const AgentAuditPage: React.FC = () => {
 
   const totalTokens = workers.reduce((acc, w) => acc + (w.total_tokens || 0), 0);
   const totalTimeMs = workers.reduce((acc, w) => acc + (w.execution_time_ms || 0), 0);
+  
+  // 实时耗时计算：当 AI 团队全自主撰写运行中时使用 liveTimerMs 高频跳动计时，完成后精准呈现累计总耗时
+  const displayTimeSeconds = (isGenerating || isLivePolling)
+    ? (liveTimerMs / 1000).toFixed(1)
+    : (totalTimeMs / 1000).toFixed(1);
+
+  // 计算成功写盘且无失败的章节数 (包含 success, completed, skipped, master_completed)
+  const successfulWorkers = workers.filter((w) => {
+    const s = (w.status || '').toLowerCase();
+    return s === 'success' || s === 'completed' || s === 'skipped' || s === 'master_completed';
+  });
+  
+  // 按用户要求使用全量章节数 (workers.length) 作为固定分母计算真实成功率
+  const writeSuccessRateStr = workers.length > 0
+    ? `${Math.round((successfulWorkers.length / workers.length) * 100)}%`
+    : '100%';
 
   const currentDocObj = docList.find((d) => d.id === activeDocId);
 
@@ -436,8 +477,13 @@ export const AgentAuditPage: React.FC = () => {
               ⏱️
             </div>
             <div>
-              <div className="text-[11px] text-slate-400 font-medium">累计撰写耗时</div>
-              <div className="text-lg font-bold text-white font-mono">{(totalTimeMs / 1000).toFixed(1)} 秒</div>
+              <div className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5">
+                <span>累计撰写耗时</span>
+                {(isGenerating || isLivePolling) && (
+                  <span className="w-2 h-2 rounded-full bg-blue-400 animate-ping inline-block" />
+                )}
+              </div>
+              <div className="text-lg font-bold text-white font-mono">{displayTimeSeconds} 秒</div>
             </div>
           </div>
 
@@ -458,9 +504,7 @@ export const AgentAuditPage: React.FC = () => {
             <div>
               <div className="text-[11px] text-slate-400 font-medium">写盘验证成功率</div>
               <div className="text-lg font-bold text-amber-400 font-mono">
-                {workers.length > 0
-                  ? `${((workers.filter((w) => w.status === 'success').length / workers.length) * 100).toFixed(0)}%`
-                  : '100%'}
+                {writeSuccessRateStr}
               </div>
             </div>
           </div>

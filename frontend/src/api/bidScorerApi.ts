@@ -6,6 +6,9 @@ import { apiFetch, API_BASE_URL } from '../utils/api';
 export interface TenderDocumentRecord {
   id: string;
   filename: string;
+  doc_type?: string;
+  file_path?: string;
+  source_doc_id?: string;
   status: string;
   created_at: string | null;
 }
@@ -71,9 +74,11 @@ export interface ScoreResultDetail {
 
 /**
  * 1. 拉取所有状态完好的历史解析招标文件作为“评分尺度/裁判法典 (source_doc)”
+ * 默认仅查询 doc_type=tender 招标文件
  */
-export async function fetchTenderDocuments(): Promise<TenderDocumentRecord[]> {
-  const res = await apiFetch(`${API_BASE_URL}/api/v1/documents/`);
+export async function fetchTenderDocuments(docType: string = 'tender'): Promise<TenderDocumentRecord[]> {
+  const queryUrl = docType ? `${API_BASE_URL}/api/v1/documents/?doc_type=${docType}` : `${API_BASE_URL}/api/v1/documents/`;
+  const res = await apiFetch(queryUrl);
   if (!res.ok) throw new Error('无法加载历史招标文件列表');
   const json = await res.json();
   const list = Array.isArray(json?.data) ? json.data : (Array.isArray(json) ? json : []);

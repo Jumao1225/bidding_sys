@@ -88,6 +88,7 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "") -> List:
         officecli_batch_fill_sentence_tool,
         officecli_fill_table_rows_tool,
         officecli_add_table_row_tool,
+        officecli_insert_image_tool,
     )
     import asyncio
     import concurrent.futures
@@ -151,17 +152,37 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "") -> List:
             auto_index=auto_index
         )
 
+    @tool
+    def officecli_insert_image(target_path: str, image_path: str, width_inches: float = 5.5, caption: str = "") -> str:
+        """
+        [资质证明与图片嵌入工具] 在 Word 指定节点 Path (如 '/body/p[12]' 或 '/body/tbl[1]/row[2]/cell[1]') 插入资质证明/证书图片。
+        参数：
+        - target_path: Word 中的物理 DOM 节点 Path
+        - image_path: 资质证书图片的磁盘绝对路径 (可通过 query_company_qualification_tool 查库获取)
+        - width_inches: 图片宽度 (默认 5.5 英寸)
+        - caption: 图片说明图注 (可选，如 '营业执照')
+        """
+        logger.info(f"   🖼️ [Worker 图片写盘] 节点 {target_path} -> 嵌入图片 {image_path}")
+        return officecli_insert_image_tool.func(
+            file_path=docx_temp_path,
+            target_path=target_path,
+            image_path=image_path,
+            width_inches=width_inches,
+            caption=caption
+        )
+
     from app.agents.tools.style_extractor_tool import extract_text_by_style
     worker_tools = list(db_tools) + [
         officecli_query_structure,
         officecli_write_slot_value,
         officecli_batch_fill_sentence,
         officecli_fill_table_rows,
+        officecli_insert_image,
         get_full_chapter_text,
         search_bidding_document,
         extract_text_by_style,
     ]
-    logger.info(f"   🛠️ [Worker 工具包] 组装完成: {len(db_tools)} DB工具 + 4 Office CLI 工具 + 2 RAG/全章检索工具 + 1 样式定向提取工具")
+    logger.info(f"   🛠️ [Worker 工具包] 组装完成: {len(db_tools)} DB工具 + 5 Office CLI 工具 + 2 RAG/全章检索工具 + 1 样式定向提取工具")
     return worker_tools
 
 
@@ -199,6 +220,9 @@ def build_worker_prompt(
    - 🔀 **交叉章节检索强指引 (Cross-Chapter Retrieval)**：当填报任务涉及跨多个章节进行对比分析与交叉检索时（例如《商务条款偏离表》需要同时交叉检索“第三章 合同条款”、“第四章 项目需求商务条款”及“第六章 格式”），**必须分别多次调用 `get_full_chapter_text(document_id, chapter_name)` 获取相关各个章节的 100% 全量原文**，绝对严禁仅依靠单一章节或断章取义！
    - 🏢 **企业与报价 DB 直查与查无止步原则**：
      - 针对扫描到的具体字段，主动调用 DB 工具集（企业信息、资质库、人员库、业绩库、财务库等）检索真实数据。
+     - 🖼️ **资质证书与资格证明文件自主检索与图片嵌入法则**：
+       - 当处理【资格证明文件】、【资质证书】、【营业执照】或带有资质占位符（如 `[待手动补充资质证书: 营业执照]`）的章节与槽位时，**必须自主调用 `query_company_qualification_tool(cert_keyword)` 检索数据库中的匹配资质证书与磁盘图片绝对路径 (`local_image_path`)**。
+       - 查找到有效资质证书图片后，**必须自主调用 `officecli_insert_image(target_path, image_path, width_inches=5.5, caption=...)` 工具，将资质证书图像原位嵌入到 Word 目标节点中**！
      - 🛑 **查无结果立刻止步**：若 DB 工具返回 "未找到..."、"尚未录入" 或空记录，**严禁换用类似关键词重复循环调库**！应当立即将该槽位标记或写为 "[待补充: <字段名>]"，并直接完成该句/表单写盘。
      - 🚫 **杜绝伪造假数据**：绝对严禁捏造假数据或伪造日期！写盘完成后必须立即输出总结表格并终止工具调用，绝对不能死循环！
    - 🎨 **文档精细样式感知与定向提取规约**：

@@ -6,6 +6,8 @@ import { apiFetch } from '../utils/api';
 interface DocumentRecord {
   id: string;
   filename: string;
+  doc_type?: string;
+  file_path?: string;
   status: string;
   created_at: string | null;
 }
@@ -13,6 +15,7 @@ interface DocumentRecord {
 export function Home() {
   const navigate = useNavigate();
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
+  const [activeTab, setActiveTab] = useState<'all' | 'tender' | 'bid'>('all');
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
@@ -51,7 +54,6 @@ export function Home() {
         setDocuments(prev => prev.filter(d => d.id !== docId));
         // 清理本地聊天的缓存
         localStorage.removeItem(`chat_history_${docId}`);
-        // 如果当前正好在看这个文档，可能需要处理，但因为在首页，无所谓
       } else {
         alert('删除失败，请稍后重试');
       }
@@ -60,6 +62,12 @@ export function Home() {
       alert('删除出错');
     }
   };
+
+  const filteredDocs = documents.filter(doc => {
+    if (activeTab === 'all') return true;
+    const isBid = doc.doc_type === 'bid' || (doc.file_path && doc.file_path.includes('bids'));
+    return activeTab === 'bid' ? isBid : !isBid;
+  });
 
   return (
     <motion.div 
@@ -114,13 +122,35 @@ export function Home() {
         </motion.div>
       </div>
 
-      {/* 历史记录列表区 */}
+      {/* 历史记录与文件管理中心区 */}
       <div className="mt-16 bg-white/60 backdrop-blur-md rounded-3xl p-8 border border-slate-200/50 shadow-sm">
-        <div className="flex items-center justify-between mb-6">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 gap-4">
           <h3 className="text-xl font-bold text-slate-800 flex items-center">
             <svg className="w-6 h-6 mr-2 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-            最近解析记录
+            文档中台与文件管理中心
           </h3>
+
+          {/* 分类 Tab 切换 */}
+          <div className="flex items-center bg-slate-200/60 p-1 rounded-xl font-medium text-xs">
+            <button
+              onClick={() => setActiveTab('all')}
+              className={`px-3 py-1.5 rounded-lg transition-all ${activeTab === 'all' ? 'bg-white text-indigo-600 font-bold shadow-xs' : 'text-slate-600 hover:text-slate-900'}`}
+            >
+              全部文档 ({documents.length})
+            </button>
+            <button
+              onClick={() => setActiveTab('tender')}
+              className={`px-3 py-1.5 rounded-lg transition-all ${activeTab === 'tender' ? 'bg-white text-blue-600 font-bold shadow-xs' : 'text-slate-600 hover:text-slate-900'}`}
+            >
+              📑 招标文件库 ({documents.filter(d => d.doc_type !== 'bid' && (!d.file_path || !d.file_path.includes('bids'))).length})
+            </button>
+            <button
+              onClick={() => setActiveTab('bid')}
+              className={`px-3 py-1.5 rounded-lg transition-all ${activeTab === 'bid' ? 'bg-white text-emerald-600 font-bold shadow-xs' : 'text-slate-600 hover:text-slate-900'}`}
+            >
+              📝 投标文件库 ({documents.filter(d => d.doc_type === 'bid' || (d.file_path && d.file_path.includes('bids'))).length})
+            </button>
+          </div>
         </div>
         
         {isLoading ? (
@@ -128,71 +158,61 @@ export function Home() {
             <svg className="animate-spin h-6 w-6 mr-3" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
             加载中...
           </div>
-        ) : documents.length === 0 ? (
+        ) : filteredDocs.length === 0 ? (
           <div className="text-center py-10 text-slate-500">
-            暂无解析记录，快去上传您的第一份标书吧！
+            {activeTab === 'bid' ? '暂无投标文件，可去智能评标页面上传。' : '暂无招标文件，快去上传您的第一份标书吧！'}
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {documents.map(doc => (
-              <motion.div 
-                key={doc.id}
-                onClick={() => navigate(`/analysis/${doc.id}`)}
-                whileHover={{ y: -5, scale: 1.01 }}
-                className="group p-4 bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md hover:border-indigo-100 cursor-pointer transition-colors"
-              >
-                <div className="flex items-start justify-between">
-                  <div className="flex items-center space-x-3 overflow-hidden">
-                    <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-50 to-indigo-50 flex items-center justify-center flex-shrink-0 text-xl group-hover:scale-110 transition-transform">
-                      {doc.filename.endsWith('.pdf') ? '📄' : '📝'}
+            {filteredDocs.map(doc => {
+              const isBidDoc = doc.doc_type === 'bid' || (doc.file_path && doc.file_path.includes('bids'));
+              return (
+                <motion.div 
+                  key={doc.id}
+                  onClick={() => navigate(isBidDoc ? '/bid-scorer' : `/analysis/${doc.id}`)}
+                  whileHover={{ y: -5, scale: 1.01 }}
+                  className={`group p-4 bg-white rounded-2xl border ${isBidDoc ? 'border-emerald-100 hover:border-emerald-300' : 'border-slate-100 hover:border-indigo-200'} shadow-sm hover:shadow-md cursor-pointer transition-colors relative overflow-hidden`}
+                >
+                  <div className="flex items-start justify-between">
+                    <div className="flex items-center space-x-3 overflow-hidden">
+                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 text-xl group-hover:scale-110 transition-transform ${isBidDoc ? 'bg-emerald-50 text-emerald-600' : 'bg-blue-50 text-blue-600'}`}>
+                        {isBidDoc ? '📝' : (doc.filename.endsWith('.pdf') ? '📄' : '📑')}
+                      </div>
+                      <div className="overflow-hidden">
+                        <div className="flex items-center gap-1.5 mb-0.5">
+                          <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded border ${isBidDoc ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-blue-50 text-blue-700 border-blue-200'}`}>
+                            {isBidDoc ? '投标文件 (bids)' : '招标文件 (tenders)'}
+                          </span>
+                        </div>
+                        <p className="font-semibold text-slate-700 truncate text-sm" title={doc.filename}>
+                          {doc.filename}
+                        </p>
+                        <p className="text-[11px] text-slate-400 mt-0.5 font-mono truncate">
+                          {doc.created_at ? new Date(doc.created_at).toLocaleString() : '未知时间'}
+                        </p>
+                      </div>
                     </div>
-                    <div className="overflow-hidden">
-                      <p className="font-semibold text-slate-700 truncate text-sm" title={doc.filename}>
-                        {doc.filename}
-                      </p>
-                      <p className="text-[11px] text-slate-400 mt-0.5">
-                        {doc.created_at ? new Date(doc.created_at).toLocaleString() : '未知时间'}
-                      </p>
-                    </div>
-                  </div>
-                  {/* 删除按钮 */}
-                  <button
-                    onClick={(e) => handleDelete(e, doc.id)}
-                    className="p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100 flex-shrink-0"
-                    title="删除记录"
-                  >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                  </button>
-                </div>
-                <div className="mt-4 flex items-center justify-between">
-                  <span className={`text-[10px] font-bold px-2 py-1 rounded-full ${
-                    doc.status === 'completed' ? 'bg-emerald-50 text-emerald-600' :
-                    doc.status === 'pending' ? 'bg-amber-50 text-amber-600' :
-                    'bg-rose-50 text-rose-600'
-                  }`}>
-                    {doc.status === 'completed' ? '解析完成' : doc.status === 'pending' ? '排队中/解析中' : '解析失败'}
-                  </span>
-                  <div className="flex items-center gap-2">
+                    {/* 删除按钮 */}
                     <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        localStorage.setItem('bidding_document_id', doc.id);
-                        navigate(`/agent-audit/${doc.id}`);
-                      }}
-                      className="px-2 py-1 text-[11px] font-bold bg-purple-50 hover:bg-purple-100 text-purple-700 rounded-lg transition-all border border-purple-200/60 flex items-center gap-1 shadow-xs hover:scale-105"
-                      title="选定该招标文件并自动撰写标书"
+                      onClick={(e) => handleDelete(e, doc.id)}
+                      className="p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100 flex-shrink-0"
+                      title="删除记录"
                     >
-                      <span>✨ 生成标书</span>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                     </button>
-                    <span className="text-indigo-500 text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity flex items-center">
-                      查看看板
-                      <svg className="w-3 h-3 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7"></path></svg>
+                  </div>
+                  <div className="mt-4 flex items-center justify-between pt-2 border-t border-slate-100">
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                      doc.status === 'completed' ? 'bg-emerald-50 text-emerald-600' :
+                      doc.status === 'pending' ? 'bg-amber-50 text-amber-600' :
+                      'bg-rose-50 text-rose-600'
+                    }`}>
+                      {doc.status === 'completed' ? '已解析入库' : doc.status === 'pending' ? '解析中' : '解析失败'}
                     </span>
                   </div>
-                </div>
-              </motion.div>
-            ))}
+                </motion.div>
+              );
+            })}
           </div>
         )}
       </div>

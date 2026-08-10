@@ -169,7 +169,7 @@ export const AgentOrchestrator: React.FC<AgentOrchestratorProps> = ({
         <div className="p-6">
           <div className="flex items-center justify-between mb-3 text-xs font-bold text-slate-500">
             <span>全网 Worker 节点调度图</span>
-            <span>已完成项: {workerStatuses.filter(w => w.status === 'success').length} / {workerStatuses.length}</span>
+            <span>已完成项: {workerStatuses.filter(w => w.status === 'success' || w.status === 'skipped').length} / {workerStatuses.length}</span>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
             {workerStatuses.map((worker) => {

@@ -826,7 +826,8 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
             check_and_rollback_single_node(p_elem, real_text, path)
 
         if success_count > 0:
-            doc.save(docx_path)
+            from app.agents.tools.bid_db_tools import _safe_save_doc
+            _safe_save_doc(doc, docx_path)
             logger.info(f"   🛡️ [DOM 原位填报与美化] 成功原位写入并修饰 {success_count} 条提案（表格外保留下划线, 表格内取消下划线）")
         return success_count
     except Exception as exc:
@@ -1170,6 +1171,8 @@ def write_docx_node(state: BidFillerState) -> Dict[str, Any]:
 
     if docx_temp_path and os.path.exists(docx_temp_path):
         try:
+            from app.agents.tools.bid_db_tools import auto_embed_qualification_images_in_docx
+            auto_embed_qualification_images_in_docx(docx_temp_path)
             with open(docx_temp_path, "rb") as f_temp:
                 filled_bytes = f_temp.read()
             used_temp_file = True
@@ -1370,6 +1373,11 @@ def bid_filler_orchestrator_node(state: dict) -> dict:
         if filled_bytes:
             with open(draft_path, "wb") as f:
                 f.write(filled_bytes)
+            try:
+                from app.agents.tools.bid_db_tools import auto_embed_qualification_images_in_docx
+                auto_embed_qualification_images_in_docx(draft_path)
+            except Exception as e_embed:
+                logger.warning(f"草稿落盘自动嵌入资质图片异常: {e_embed}")
 
         doc_obj = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
         if doc_obj:

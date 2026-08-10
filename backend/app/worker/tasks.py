@@ -115,7 +115,7 @@ def analyze_bidding_doc(task_id: str, file_path: str, filename: str, company_qua
                 filename=filename,
                 file_path=file_path,
                 parse_status="pending",
-                parsed_metadata={"file_hash": file_hash}
+                parsed_metadata={"doc_type": "tender", "file_hash": file_hash}
             )
             db.add(doc)
             db.commit()

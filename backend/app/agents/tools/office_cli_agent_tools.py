@@ -260,6 +260,95 @@ async def officecli_fill_table_rows_tool(
 
 
 
+@tool
+def officecli_insert_image_tool(
+    file_path: str,
+    target_path: str,
+    image_path: str,
+    width_inches: float = 5.5,
+    caption: str = ""
+) -> str:
+    """
+    [Office CLI Tool] 在 Word 文档 (.docx) 的指定节点 Path (如 '/body/p[12]' 或 '/body/tbl[1]/row[2]/cell[1]') 原位插入资质证明图片。
+    用于在标书资质文件章节或单元格自动清除占位符并精确嵌入证书图像。
+
+    :param file_path: 待修改 Word 文档绝对路径
+    :param target_path: 目标的物理 Path 节点 (如 '/body/p[12]' 或 '/body/tbl[1]/row[2]/cell[1]')
+    :param image_path: 资质证书图片的磁盘绝对路径 (需存在于 uploads/qualifications)
+    :param width_inches: 图片渲染宽度 (单位: 英寸, 默认 5.5)
+    :param caption: 可选，图片下方的说明图注 (如 '营业执照 (统一社会信用代码: xxx)')
+    :return: 执行结果描述
+    """
+    logger.info(f"🖼️ [OfficeCLI Tool] officecli_insert_image_tool 被调用, file: '{file_path}', target: '{target_path}', img: '{image_path}'")
+    if not file_path or not os.path.exists(file_path):
+        return f"[错误: 目标 Word 文件不存在 {file_path}]"
+    if not image_path or not os.path.exists(image_path):
+        return f"[错误: 资质证书图片文件不存在 {image_path}]"
+
+    try:
+        from docx import Document
+        from docx.shared import Inches, Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        import re
+
+        doc = Document(file_path)
+        target_p = None
+
+        p_match = re.search(r'/body/p\[(\d+)\]$', target_path)
+        tc_match = re.search(r'/body/tbl\[(\d+)\]/(?:row|tr)\[(\d+)\]/(?:cell|tc)\[(\d+)\]$', target_path)
+
+        if p_match:
+            p_idx = int(p_match.group(1)) - 1
+            if 0 <= p_idx < len(doc.paragraphs):
+                target_p = doc.paragraphs[p_idx]
+        elif tc_match:
+            tbl_idx = int(tc_match.group(1)) - 1
+            row_idx = int(tc_match.group(2)) - 1
+            col_idx = int(tc_match.group(3)) - 1
+            if 0 <= tbl_idx < len(doc.tables):
+                table = doc.tables[tbl_idx]
+                if 0 <= row_idx < len(table.rows):
+                    row = table.rows[row_idx]
+                    if 0 <= col_idx < len(row.cells):
+                        cell = row.cells[col_idx]
+                        target_p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+
+        # 后备查找：若物理 Path 未能精确定位，正则匹配占位符文本
+        if not target_p:
+            for p in doc.paragraphs:
+                if target_path in p.text or "[待" in p.text or "资质" in p.text:
+                    target_p = p
+                    break
+
+        if not target_p and doc.paragraphs:
+            target_p = doc.add_paragraph()
+
+        if target_p:
+            target_p.text = ""
+            target_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            img_run = target_p.add_run()
+            img_run.add_picture(image_path, width=Inches(width_inches))
+
+            if caption:
+                cap_run = target_p.add_run(f"\n图：{caption}")
+                cap_run.font.size = Pt(10.5)
+                cap_run.font.bold = True
+
+            from app.agents.tools.bid_db_tools import _safe_save_doc
+            if _safe_save_doc(doc, file_path):
+                logger.info(f"🖼️ [OfficeCLI Tool] 成功在 Word 节点 {target_path} 插入资质图片: {os.path.basename(image_path)}")
+                return f"成功在 Word 节点 {target_path} 原位插入资质图片 ({os.path.basename(image_path)})"
+            else:
+                return f"[错误: 保存 Word 文件被占用，无法写入 {file_path}]"
+
+        return f"[错误: 无法定位到 Word 节点 {target_path}]"
+
+    except Exception as e:
+        logger.exception(f"🖼️ [OfficeCLI Tool] 插入图片产生异常: {str(e)}")
+        return f"[插入资质图片异常: {str(e)}]"
+
+
 def get_all_office_cli_agent_tools() -> List[Any]:
     """获取由 Office CLI 包装供 Agent 调用的完整 Tool 列表"""
     return [
@@ -268,5 +357,7 @@ def get_all_office_cli_agent_tools() -> List[Any]:
         officecli_add_table_row_tool,
         officecli_batch_fill_sentence_tool,
         officecli_fill_table_rows_tool,
+        officecli_insert_image_tool,
     ]
+
 

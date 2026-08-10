@@ -84,8 +84,9 @@ async def upload_bid_document(
         raise HTTPException(status_code=400, detail="缺少关联的招标文件 ID (source_doc_id)")
 
     try:
-        # 保存临时文件
-        upload_dir = os.path.join("storage", "temp_uploads")
+        # 保存投标文件到专属物理目录 (uploads/bids)
+        base_dir = Path(__file__).resolve().parent.parent.parent.parent
+        upload_dir = os.path.join(base_dir, "uploads", "bids")
         os.makedirs(upload_dir, exist_ok=True)
 
         file_id = str(uuid.uuid4())[:8]

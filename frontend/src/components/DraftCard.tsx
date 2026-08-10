@@ -576,7 +576,7 @@ export const DraftCard: React.FC<DraftCardProps> = ({
                                       <div className="flex items-center gap-2 flex-wrap">
                                         <h4 className="font-bold text-slate-900 text-sm">{worker.chapter_title || worker.node_name}</h4>
                                         <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-bold">
-                                          {worker.status === 'success' ? '✅ 执行成功' : worker.status}
+                                          {worker.status !== 'failed' && worker.status !== 'in_progress' ? '✅ 执行成功' : worker.status}
                                         </span>
                                         <span className="px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 text-[10px] font-semibold border border-blue-100">
                                           写盘提案: {worker.proposals_count || 0} 项

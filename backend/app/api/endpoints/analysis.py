@@ -43,9 +43,9 @@ async def upload_and_analyze(
         # 生成唯一 Task ID
         task_id = str(uuid.uuid4())
         
-        # 保存文件到临时目录
+        # 保存文件到招标文件专属目录 (uploads/tenders)
         base_dir = Path(__file__).resolve().parent.parent.parent.parent
-        upload_dir = os.path.join(base_dir, "uploads")
+        upload_dir = os.path.join(base_dir, "uploads", "tenders")
         os.makedirs(upload_dir, exist_ok=True)
         file_path = os.path.join(upload_dir, f"{task_id}_{file.filename}")
         
@@ -414,14 +414,18 @@ async def download_bidding_draft(
         except Exception as gen_err:
             logger.exception(f"动态生成草稿失败: {gen_err}")
             raise HTTPException(status_code=500, detail=f"投标书草稿实时生成失败: {str(gen_err)}")
-    else:
-        logger.info(f"秒级命中磁盘缓存草稿，直接返回文件: {target_file_path}")
+    if target_file_path and os.path.exists(target_file_path):
+        try:
+            from app.agents.tools.bid_db_tools import auto_embed_qualification_images_in_docx
+            auto_embed_qualification_images_in_docx(target_file_path)
+        except Exception as e_embed:
+            logger.warning(f"下载前自动嵌入资质图片提示: {e_embed}")
             
     clean_filename = doc.filename.rsplit('.', 1)[0]
     filename = f"投标书草稿_{clean_filename}.docx"
     
     return FileResponse(
-        path=draft_path,
+        path=target_file_path or draft_path,
         filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         content_disposition_type="attachment"

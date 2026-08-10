@@ -5,14 +5,27 @@ from fastapi import HTTPException
 from app.db.crud.document import document_crud
 
 class DocumentService:
-    def get_documents_list(self, db: Session, user_id: str, tenant_id: str):
-        """处理获取所有历史记录的业务逻辑"""
-        docs = document_crud.get_all_documents(db, user_id, tenant_id)
+    def get_documents_list(self, db: Session, user_id: str, tenant_id: str, doc_type: str = None):
+        """处理获取所有历史记录的业务逻辑，支持按 doc_type 过滤"""
+        docs = document_crud.get_all_documents(db, user_id, tenant_id, doc_type=doc_type)
         docs_list = []
         for d in docs:
+            pm = d.parsed_metadata or {}
+            path_str = str(d.file_path or "").replace("\\", "/")
+            is_bid = (
+                pm.get("doc_type") == "bid" 
+                or "/bids/" in path_str 
+                or "temp_uploads" in path_str 
+                or "bid_docs" in path_str
+            )
+            inferred_type = "bid" if is_bid else "tender"
+            
             docs_list.append({
                 "id": d.id,
                 "filename": d.filename,
+                "file_path": d.file_path,
+                "doc_type": pm.get("doc_type") or inferred_type,
+                "source_doc_id": pm.get("source_doc_id"),
                 "status": d.parse_status,
                 "created_at": d.created_at.isoformat() if hasattr(d, "created_at") and d.created_at else None
             })
