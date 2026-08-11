@@ -19,11 +19,13 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             # Log response
             log_msg = f"👈 请求结束 | {request.method} | {request.url.path} | Status: {response.status_code} | Time: {process_time:.4f}s"
             
-            # Highlight slow queries
+            # Highlight slow queries and differentiate HTTP log levels (5xx as ERROR, 4xx as WARNING)
             if process_time > 1.0:
                 logger.warning(f"{log_msg} 🐌 (慢请求)")
-            elif response.status_code >= 400:
+            elif response.status_code >= 500:
                 logger.error(log_msg)
+            elif response.status_code >= 400:
+                logger.warning(log_msg)
             else:
                 logger.info(log_msg)
                 
