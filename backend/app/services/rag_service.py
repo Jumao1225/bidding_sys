@@ -68,8 +68,12 @@ class RAGService:
                 chunk_list = [c for c in all_chunks]
                 chunk_id_to_idx = {c.id: idx for idx, c in enumerate(chunk_list)}
                 
-                # 构建基准数据库 Query Filter，支持按 section_title 条件限定
-                base_query = db.query(DocChunk).filter(DocChunk.document_id == document_id)
+                # 构建基准数据库 Query Filter，支持按 section_title 条件限定（剔除 0 号目录页与 toc_block）
+                base_query = db.query(DocChunk).filter(
+                    DocChunk.document_id == document_id,
+                    DocChunk.chunk_index > 0,
+                    DocChunk.content_type != "toc_block"
+                )
                 if section_title:
                     if isinstance(section_title, str) and section_title.strip():
                         clean_sec = section_title.strip()
@@ -154,21 +158,22 @@ class RAGService:
                 # 7. 提取结果并拼接 trace_info，合并连续 Chunk 以消除重叠文本
                 results = []
                 current_merged_content = ""
-                current_heading = "未知章节"
+                current_heading = "正文"
                 current_page_num = "未知"
                 last_idx = -2
                 
                 for i, chunk in enumerate(sorted_results):
                     idx = chunk_id_to_idx.get(chunk.id, -1)
                     
-                    heading = "未知章节"
-                    page_num = chunk.page_num if chunk.page_num else "未知"
+                    heading = chunk.section_title or "正文"
+                    page_num = chunk.page_num if chunk.page_num is not None else "未知"
                     
-                    if chunk.trace_info:
-                        if isinstance(chunk.trace_info, dict):
-                            headings = chunk.trace_info.get("headings", [])
-                            if headings:
-                                heading = " > ".join(headings)
+                    if chunk.trace_info and isinstance(chunk.trace_info, dict):
+                        headings = chunk.trace_info.get("headings") or chunk.trace_info.get("hierarchy")
+                        if headings:
+                            heading = " > ".join(headings)
+                        elif chunk.trace_info.get("section_path"):
+                            heading = chunk.trace_info.get("section_path")
                     
                     if idx == last_idx + 1 and heading == current_heading:
                         # 连续的 chunk 且同属一个章节，进行去重叠合并

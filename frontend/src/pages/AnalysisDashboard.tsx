@@ -19,7 +19,7 @@ export function AnalysisDashboard() {
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [retryingDomain, setRetryingDomain] = useState<string | null>(null);
   const hasAutoDownloadedRef = useRef(false);
-  
+
   const [result, setResult] = useState<any>(null);
 
   const initialWorkerStatuses: WorkerStatus[] = [
@@ -128,7 +128,7 @@ export function AnalysisDashboard() {
   const handleSupervisorUpdate = (decision: any) => {
     setSupervisorDecision(decision);
     if (decision.nextWorker && decision.nextWorker !== 'FINISH') {
-      setWorkerStatuses(prev => prev.map(w => 
+      setWorkerStatuses(prev => prev.map(w =>
         w.name === decision.nextWorker ? { ...w, status: 'waiting', retryCount: decision.retryCounts?.[w.name] || 0 } : w
       ));
     }
@@ -150,7 +150,7 @@ export function AnalysisDashboard() {
   };
 
   const handleWorkerStatusChange = (workerName: string, status: string, summary?: string, docId?: string) => {
-    setWorkerStatuses(prev => prev.map(w => 
+    setWorkerStatuses(prev => prev.map(w =>
       w.name === workerName ? { ...w, status: status as any, summary: summary || w.summary } : w
     ));
     if (status === 'success') {
@@ -234,7 +234,7 @@ export function AnalysisDashboard() {
 
   const risks = result?.risks_analysis || [];
   const highRiskCount = risks.filter((r: any) => r.severity === '高').length;
-  
+
   const qualItems = result?.qualifications_analysis?.items || [];
   let matchScore = 100;
   if (qualItems.length > 0) {
@@ -254,9 +254,9 @@ export function AnalysisDashboard() {
 
   return (
     <div className="w-full space-y-10 animate-fade-in-up delay-100 pb-20">
-      
+
       {/* 文本阅读与履约盘点/风险提示区域 */}
-      <UploadBox 
+      <UploadBox
         onTerminalMessage={handleTerminalMessage}
         onAnalysisSuccess={handleAnalysisSuccess}
         onAnalyzingChange={handleAnalyzingChange}
@@ -265,21 +265,21 @@ export function AnalysisDashboard() {
         onSupervisorUpdate={handleSupervisorUpdate}
         onWorkerStatusChange={handleWorkerStatusChange}
       />
-      
+
       {isLoadingHistory && (
         <div className="bg-white/80 backdrop-blur-md p-10 rounded-3xl shadow-sm border border-slate-100 flex flex-col items-center justify-center min-h-[300px]">
           <svg className="animate-spin h-10 w-10 text-indigo-500 mb-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
           <p className="text-slate-600 font-medium">正在从数据库恢复历史解析结果...</p>
         </div>
       )}
-      
-      <AgentOrchestrator 
+
+      <AgentOrchestrator
         isActive={isAnalyzing}
         supervisorDecision={supervisorDecision}
         workerStatuses={workerStatuses}
         terminalMessages={terminalMessages}
       />
-        
+
       {/* KPI Cards */}
       <div className="grid grid-cols-2 gap-8">
         <div className="bg-white/80 backdrop-blur-sm p-8 rounded-3xl shadow-sm border border-rose-100 relative overflow-hidden group hover:shadow-md transition-all">
@@ -304,21 +304,21 @@ export function AnalysisDashboard() {
           </div>
         </div>
       </div>
-      
+
       {/* 专项提取维度面板矩阵 - 5 大维度 Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
         {/* 核心财务防线卡片 */}
         <FinancialCard financial={fin} onReextract={() => handleReextract('financial')} isRetrying={retryingDomain === 'financial'} />
-        
+
         {/* 资质综合准入卡片 */}
         <QualificationCard qualification={qual} onReextract={() => handleReextract('qualification')} isRetrying={retryingDomain === 'qualification'} />
-        
+
         {/* 商务时限排期卡片 */}
         <TimelineCard timeline={tl} onReextract={() => handleReextract('timeline')} isRetrying={retryingDomain === 'timeline'} />
-        
+
         {/* 施工技术防线卡片 */}
         <EngineeringCard engineering={eng} onReextract={() => handleReextract('engineering')} isRetrying={retryingDomain === 'engineering'} />
-        
+
         {/* 评标办法与售后硬性约束 - 全宽横幅强化展示 */}
         <div className="md:col-span-2">
           <EvaluationCard evaluation={ev} onReextract={() => handleReextract('evaluation')} isRetrying={retryingDomain === 'evaluation'} />
@@ -327,10 +327,10 @@ export function AnalysisDashboard() {
 
       {/* BOM 成本核算表 */}
       <div className="w-full">
-        <CostTable 
+        <CostTable
           documentId={activeDocId}
-          equipmentList={eng.main_equipment_list || []} 
-          costAnalysis={result?.cost_analysis || {}} 
+          equipmentList={eng.main_equipment_list || []}
+          costAnalysis={result?.cost_analysis || {}}
           onReextract={() => handleReextract('cost_estimation')}
           onCostUpdated={(updatedCost) => {
             if (result) {
@@ -346,7 +346,7 @@ export function AnalysisDashboard() {
 
       {/* 投标书草稿生成与终极交付 - 全宽横幅 */}
       <div className="w-full">
-        <DraftCard 
+        <DraftCard
           documentId={activeDocId}
           outline={outline}
           draftPath={draftPath}

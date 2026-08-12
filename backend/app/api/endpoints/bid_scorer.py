@@ -397,25 +397,35 @@ async def delete_bid_document(
     try:
         from app.db.models.project import Document, DocChunk
         from app.db.models.bid_score import BidScoreResult
+        from sqlalchemy import or_
         logger.info(f"🗑️ 收到删除标书解析与打分残留强拆指令: document_id={document_id}")
         
-        doc = db.query(Document).filter(
-            Document.id == document_id,
-            Document.tenant_id == current_user.tenant_id
-        ).first()
+        # 优先通过 ID 精确匹配 Document 记录
+        doc = db.query(Document).filter(Document.id == document_id).first()
         
         if not doc:
-            # 兼容处理：可能已经由数据库脚本手动清走，直接报成功即可
+            logger.info(f"ℹ️ 目标文件记录不存在或已被提前清除: document_id={document_id}")
             return success_response(data={"deleted": True}, message="文件记录不在或已被安全清除")
             
-        # 联动删除切片
-        db.query(DocChunk).filter(DocChunk.document_id == document_id).delete()
-        # 联动删除以往报告
-        db.query(BidScoreResult).filter(BidScoreResult.document_id == document_id).delete()
+        # 1. 联动删除数据库中的 Chunk 切片
+        chunk_del_cnt = db.query(DocChunk).filter(DocChunk.document_id == document_id).delete()
         
+        # 2. 联动删除打分结果报告 (兼顾作为投标文件 document_id 与作为招标文件 source_doc_id)
+        score_del_cnt = db.query(BidScoreResult).filter(
+            or_(BidScoreResult.document_id == document_id, BidScoreResult.source_doc_id == document_id)
+        ).delete()
+        
+        # 3. 物理磁盘文件擦除
+        if doc.file_path and os.path.exists(doc.file_path):
+            try:
+                os.remove(doc.file_path)
+                logger.info(f"🗑️ 物理磁盘文件已擦除: {doc.file_path}")
+            except Exception as fe:
+                logger.warning(f"⚠️ 清理物理磁盘文件时发生非致命异常: {fe}")
+
         db.delete(doc)
         db.commit()
-        logger.info(f"✅ 文件完全解雇回收成功: {document_id}")
+        logger.info(f"✅ 文件完全解雇回收成功: {document_id} (已擦除 Chunk {chunk_del_cnt} 个, 打分报告 {score_del_cnt} 份)")
         return success_response(data={"deleted": True, "document_id": document_id}, message="成功洗涤该文件全部痕迹与历史")
     except Exception as e:
         db.rollback()

@@ -1,7 +1,7 @@
 import os
 import re
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from langchain_core.documents import Document
 try:
     import fitz  # PyMuPDF
@@ -204,7 +204,7 @@ class ExtractorService:
 
     def _clean_toc_title(self, text: str) -> str:
         """清理目录与标题中的引导线、页码、Markdown 符号等干扰字符"""
-        clean = text.lstrip("#*-. ").strip()
+        clean = text.replace('\ufffd', '').replace('\ufeff', '').lstrip("#*-. ").strip()
         # 移除末端引导点与页码，例如 ".... 12", "--- 105", ". . . 4"
         clean = re.sub(r'[\s.·…\-_]+\d*\s*$', '', clean).strip()
         clean = clean.rstrip("。，；,;")
@@ -213,20 +213,24 @@ class ExtractorService:
     def _normalize_title_for_matching(self, text: str) -> str:
         """归一化标题名称用于匹配，剔除标点、多余空白及常用编号前缀"""
         s = self._clean_toc_title(text)
-        s = re.sub(r'^[#*\s]+', '', s)
+        s = re.sub(r'^[\ufffd\ufeff#*\s]+', '', s)
         # 去除首部常见序号：如 "1. ", "1.1 ", "第一章 ", "一、", "（一）"
         s = re.sub(r'^(?:第[一二三四五六七八九十百零\d]+[章部分篇节]|附[件录表图][一二三四五六七八九十\dA-Za-z]*|[一二三四五六七八九十]+[、.]|\(?[\d一二三四五六七八九十]+\)?[\s.、]|\d+(?:\.\d+)*[\s.、])', '', s).strip()
         return s
 
-    def _extract_toc_chapters(self, markdown_text: str, doc_type: str = "general") -> List[str]:
+    def _extract_toc_chapters(self, markdown_text: str, doc_type: str = "general") -> Tuple[List[str], Dict[str, List[str]]]:
         """
-        全量提取 Markdown 中【目录】(TOC) 区域的所有章节标题白名单。
-        全面兼容汉字序号（一、二、三）、数字序号（1.、1.1）、第X章、附件X等所有格式。
+        全量提取 Markdown 中【目录】(TOC) 区域的所有章节标题白名单，
+        并按目录包含关系自动构建每个章节的完整父子层级映射 (toc_hierarchy_map)。
         """
         toc_chapters: List[str] = []
+        toc_hierarchy_map: Dict[str, List[str]] = {}
         lines = markdown_text.splitlines()
         in_toc = False
         empty_line_count = 0
+        toc_stack: List[str] = []
+
+        TOC_KEYWORDS = ["目录", "目录TOC", "CONTENTS", "目次", "目录概览", "投标文件目录", "标书目录", "投标目录"]
 
         for line in lines:
             stripped = line.strip()
@@ -240,8 +244,8 @@ class ExtractorService:
 
             # 探测目录起始标记
             if not in_toc:
-                clean_heading = stripped.replace('#', '').replace(' ', '').replace('　', '')
-                if clean_heading in ["目录", "目录TOC", "CONTENTS", "目次", "目录概览"]:
+                clean_heading = re.sub(r'[#\s　【】:：]', '', stripped)
+                if clean_heading in TOC_KEYWORDS:
                     in_toc = True
                 continue
 
@@ -257,8 +261,9 @@ class ExtractorService:
             if not title_candidate or len(title_candidate) > 70:
                 continue
 
-            # 过滤陈述句与非标题行
-            if re.search(r'[，。！？；,;!?]', title_candidate):
+            # 过滤包含中途标点的陈述句，允许结尾句号
+            clean_candidate = title_candidate.rstrip("。，；,;!?！？")
+            if re.search(r'[，！？；,;!?]', clean_candidate):
                 continue
             if re.search(r'(详见|参见|遵循|依据|见)\s*第', title_candidate):
                 continue
@@ -266,12 +271,175 @@ class ExtractorService:
             if title_candidate not in toc_chapters:
                 toc_chapters.append(title_candidate)
 
+                # 判定当前目录项的固有结构层级 lvl
+                if re.match(r'^\s*([一二三四五六七八九十百]+[、.])', title_candidate):
+                    lvl = 1
+                elif re.match(r'^\s*(第[一二三四五六七八九十\d]+[章部分篇]|附[件录表图])', title_candidate):
+                    lvl = 2
+                elif re.match(r'^\s*(第[一二三四五六七八九十\d]+节)', title_candidate):
+                    lvl = 3
+                elif re.match(r'^\s*[\(（][一二三四五六七八九十\d]+[\)）]', title_candidate):
+                    lvl = 4
+                else:
+                    # 对于无特定序号前缀的非标标题项（如 "投标人自有设施设备情况"）：
+                    if len(toc_stack) == 1:
+                        lvl = 2  # 挂在 L1 下作为 L2 同级/子级项
+                    elif len(toc_stack) >= 2:
+                        lvl = len(toc_stack)  # 保持当前深度，平级替换末位项
+                    else:
+                        lvl = 1
+
+                # 根据 lvl 维护目录堆栈 toc_stack
+                if lvl == 1:
+                    toc_stack = [title_candidate]
+                elif lvl == 2:
+                    toc_stack = [toc_stack[0], title_candidate] if toc_stack else [title_candidate]
+                elif lvl == 3:
+                    if len(toc_stack) >= 2:
+                        toc_stack = [toc_stack[0], toc_stack[1], title_candidate]
+                    elif len(toc_stack) == 1:
+                        toc_stack = [toc_stack[0], title_candidate]
+                    else:
+                        toc_stack = [title_candidate]
+                elif lvl == 4:
+                    if len(toc_stack) >= 3:
+                        toc_stack = [toc_stack[0], toc_stack[1], toc_stack[2], title_candidate]
+                    elif len(toc_stack) >= 1:
+                        toc_stack = list(toc_stack[:3]) + [title_candidate]
+                    else:
+                        toc_stack = [title_candidate]
+
+                # 保存映射，包括原名、去除结尾标点的版本和归一化名称（强制最深只挂到 2 层树干，如 "七、设计方案、服务方案 > 第六章 培训方案"）
+                capped_stack = toc_stack[:2]
+                toc_hierarchy_map[title_candidate] = list(capped_stack)
+                if clean_candidate and clean_candidate != title_candidate:
+                    toc_hierarchy_map[clean_candidate] = list(capped_stack)
+                norm_title = self._normalize_title_for_matching(title_candidate)
+                if norm_title:
+                    toc_hierarchy_map[norm_title] = list(capped_stack)
+
             if len(toc_chapters) > 200:
                 break
 
         if toc_chapters:
-            logger.info(f"📑 目录提取成功！捕获 {len(toc_chapters)} 个目录结构字段: {toc_chapters[:5]}...")
-        return toc_chapters
+            formatted_toc = "\n".join([f"  {idx+1:02d}. {chap} -> {' > '.join(toc_hierarchy_map.get(chap, [chap]))}" for idx, chap in enumerate(toc_chapters)])
+            logger.info(f"📑 目录提取成功！共捕获 {len(toc_chapters)} 个目录结构大纲字段:\n{formatted_toc}")
+        return toc_chapters, toc_hierarchy_map
+
+    def _detect_heading_level(
+        self,
+        line: str,
+        doc_type: str = "general",
+        toc_chapters: Optional[List[str]] = None,
+        stack: Optional[List[str]] = None,
+    ) -> Optional[tuple[int, str]]:
+        """
+        探测单行文本的标题层级 (Level 1, 2, 3) 与清洗后的标题字符串。
+        L1: 根大项 (如 一、投标函格式, 八、设计方案、施工方案, 十三、其他材料)
+        L2: 大章 (如 第一章 设计方案, 第二章 施工方案, 附件一)
+        L3: 子节 (如 第一节 项目可行性评估分析)
+        """
+        raw_strip = line.strip()
+        if not raw_strip:
+            return None
+
+        clean = raw_strip.replace('*', '').replace('#', '').strip()
+        if not clean or len(clean) > 70:
+            return None
+
+        # 排除“目录/CONTENTS/目次”关键字，防止审计报告等附件内部的“目录”行重置顶级堆栈
+        if clean in ["目录", "目录TOC", "CONTENTS", "目次", "目录概览", "投标文件目录", "标书目录", "投标目录"]:
+            return None
+
+        # 排除包含标点长段描述、结尾引导点符、引用陈述
+        if re.search(r'[，。！？；,;!?]', clean):
+            return None
+        if re.search(r'[\.·…\-_]{2,}', raw_strip):
+            return None
+        if re.search(r'(详见|参见|遵循|依据|见)\s*第[一二三四五六七八九十\d]+[章部分篇节]', clean):
+            return None
+
+        # 0. 带括号的序号（如 （一）、（二）、(1)）属于正文细节分块，绝不应升级为 Level 1 根标题
+        if re.match(r'^\s*[*#]*\s*[\(（][一二三四五六七八九十\d]+[\)）]', raw_strip):
+            return (3, clean)
+
+        # 1. 校验 TOC 目录白名单 (最高权威：只要匹配目录白名单中的项，统统按 TOC 标准层级与规范名称精确对齐返回)
+        if doc_type != "general" and toc_chapters:
+            clean_norm = self._normalize_title_for_matching(clean)
+            for tc in toc_chapters:
+                tc_norm = self._normalize_title_for_matching(tc)
+                if clean == tc or (clean_norm and clean_norm == tc_norm):
+                    canonical_title = tc
+                    if re.match(r'^[一二三四五六七八九十]+[、.]', tc):
+                        return (1, canonical_title)
+                    elif re.match(r'^第[一二三四五六七八九十\d]+[章部分篇]', tc) or re.match(r'^附[件录表图]', tc):
+                        return (2, canonical_title)
+                    else:
+                        return (3, canonical_title)
+
+        # 2. L1: 汉字序号顶级大项 (如 一、投标函格式 ... 三、资格证明文件 ... 十三、其他材料)
+        # 无论 PDF 解析引擎输出几个 #，只要是“一~十三、”标准大项或核心模块，统统优先提升为 Level 1 根节点
+        l1_match = re.match(r'^\s*[*#]*\s*([一二三四五六七八九十百]+[、.][^。，！？；\n]*)$', raw_strip)
+        if l1_match:
+            title = l1_match.group(1).strip()
+            title_norm = self._normalize_title_for_matching(title)
+            in_main_toc = bool(toc_chapters and any(title_norm == self._normalize_title_for_matching(tc) for tc in toc_chapters))
+            
+            # 如果当前 stack[0] 是目录中的合法顶级根大项（如 三、资格证明文件），且新出现的序号标题不在主目录中（如附件内部的 "一、审计意见"），
+            # 绝对禁止其重置根节点，统统下沉为 L3 子节点，确保所有资质附件 100% 包裹在所属大章树下！
+            stack_root_in_toc = bool(stack and toc_chapters and any(self._normalize_title_for_matching(stack[0]) == self._normalize_title_for_matching(tc) for tc in toc_chapters))
+            if stack_root_in_toc and not in_main_toc:
+                return (3, title)
+
+            is_std_num = bool(re.match(r'^[一二三四五六七八九十]+\s*[、.]', title))
+            is_root_module = bool(re.search(CORE_ROOT_BID_MODULES, title)) or any(kw in title for kw in ['投标', '报价', '资格', '方案', '偏离', '介绍', '材料', '声明', '承诺', '文件', '对照表', '响应'])
+            is_non_toc_cert = any(kw in title for kw in ['证书', '证明', '合同', '身份证', '执照', '报告']) if not is_std_num else False
+            if not is_non_toc_cert and (not stack or is_root_module or is_std_num or in_main_toc):
+                return (1, title)
+            else:
+                return (3, title)
+
+        # 3. 原生 Markdown 标记（处理一般 Heading）
+        if raw_strip.startswith('# '):
+            title_norm = self._normalize_title_for_matching(clean)
+            in_main_toc = bool(toc_chapters and any(title_norm == self._normalize_title_for_matching(tc) for tc in toc_chapters))
+            
+            # 关键拦截：如果一个 # 单井号标题包含 证书/证明/合同/身份证/执照/报告 且不在 TOC 目录白名单中，
+            # 绝对禁止其升级为 Level 1 根节点霸占 stack[0]！
+            is_non_toc_cert = any(kw in clean for kw in ['证书', '证明', '合同', '身份证', '执照', '报告']) if not in_main_toc else False
+            if is_non_toc_cert:
+                return (2, clean)
+
+            stack_root_in_toc = bool(stack and toc_chapters and any(self._normalize_title_for_matching(stack[0]) == self._normalize_title_for_matching(tc) for tc in toc_chapters))
+            if stack_root_in_toc and not in_main_toc:
+                return (2, clean)
+            return (1, clean)
+        elif raw_strip.startswith('## '):
+            return (2, clean)
+        elif raw_strip.startswith('### '):
+            return (3, clean)
+
+        # 4. L2: 第一章/附件X
+        l2_match = re.match(r'^\s*[*#]*\s*(第[一二三四五六七八九十百零\d]+[章部分篇]\s*.*|附[件录表图][一二三四五六七八九十\dA-Za-z]+.*)$', raw_strip)
+        if l2_match:
+            return (2, l2_match.group(1).strip())
+
+        # 5. L3: 第一节
+        l3_match = re.match(r'^\s*[*#]*\s*(第[一二三四五六七八九十百零\d]+节\s*.*)$', raw_strip)
+        if l3_match:
+            return (3, l3_match.group(1).strip())
+
+        # 6. 降级到常规判定（仅当文本包含于 TOC 或堆栈为空时允许升为 L1，防止非 TOC 证书标题霸占 L1 根节点）
+        line_chap = self._detect_major_chapter_in_line(line, doc_type=doc_type, toc_chapters=toc_chapters)
+        if line_chap:
+            is_cert_or_contract = any(kw in line_chap for kw in ['证书', '证明', '合同', '身份证', '执照', '报告'])
+            in_toc = bool(not toc_chapters or any(self._normalize_title_for_matching(line_chap) == self._normalize_title_for_matching(tc) for tc in toc_chapters))
+            if not is_cert_or_contract and (in_toc or not stack):
+                return (1, line_chap)
+            else:
+                return (3, line_chap)
+
+        return None
 
     def _detect_major_chapter_in_line(
         self,
@@ -300,16 +468,12 @@ class ExtractorService:
             return None
 
         # 1. 只有当 doc_type != "general" (如投标文件 "bid") 时才校验 TOC 目录白名单；
-        # 对于招标文件 (doc_type == "general")，复刻上一版 (c307c34) 逻辑：仅按 MAJOR_CHAPTER_PATTERNS (第X章/附件X) 划分顶级大章，防止目录过细导致文档被切成几百个小碎片
         if doc_type != "general" and toc_chapters:
             clean_norm = self._normalize_title_for_matching(clean)
             for tc in toc_chapters:
                 tc_norm = self._normalize_title_for_matching(tc)
                 if clean == tc or (clean_norm and clean_norm == tc_norm):
                     return clean
-                if len(clean) >= 4 and len(tc) >= 4:
-                    if clean.startswith(tc) or tc.startswith(clean):
-                        return clean
 
         # 2. 匹配标书与常规章节正则 (一、二、三 / 第X章 / 附件X / Markdown # / ##)
         patterns = BID_CHAPTER_PATTERNS if doc_type == "bid" else MAJOR_CHAPTER_PATTERNS
@@ -344,7 +508,7 @@ class ExtractorService:
     def _group_markdown_text_by_chapter(self, markdown_text: str, doc_type: str = "general", pdf_path: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         将纯 Markdown 文本按大章或独立表格层级进行全局归置与拼接。
-        结合 PyMuPDF 物理页码映射引擎，为每一个章节块精准注入物理页码 (page_start)。
+        结合 TOC 目录页隔离算法与动态层级栈 (section_stack)，确保每个正文段落与表格都获得完整的 section_path。
         """
         page_texts: Dict[int, str] = {}
         if pdf_path and os.path.exists(pdf_path) and pdf_path.lower().endswith(".pdf") and fitz:
@@ -357,13 +521,19 @@ class ExtractorService:
             except Exception as e:
                 logger.warning(f"无法读取 PDF 物理页码索引: {e}")
 
-        # 仅在处理投标文件 (doc_type == "bid") 时提取 TOC 目录白名单；
-        # 招标文件 (doc_type == "general") 完全跳过 TOC 目录提取，防止误搜目录碎块
-        toc_chapters = self._extract_toc_chapters(markdown_text, doc_type=doc_type) if doc_type == "bid" else []
-        grouped_chapters: Dict[str, Dict[str, Any]] = {}
-        chapter_order: List[str] = []
-        current_chapter: str = "无章节/正文"
+        # 仅在处理投标文件 (doc_type == "bid") 时提取 TOC 目录白名单与结构树映射；
+        if doc_type == "bid":
+            toc_chapters, toc_hierarchy_map = self._extract_toc_chapters(markdown_text, doc_type=doc_type)
+        else:
+            toc_chapters, toc_hierarchy_map = [], {}
+
+        result_chapters: List[Dict[str, Any]] = []
+        current_block: Optional[Dict[str, Any]] = None
+        stack: List[str] = []
         current_page: int = 1
+        in_toc = False
+        toc_passed = False
+        TOC_KEYWORDS = ["目录", "目录TOC", "CONTENTS", "目次", "目录概览", "投标文件目录", "标书目录", "投标目录"]
 
         lines = markdown_text.split('\n')
         for line in lines:
@@ -374,39 +544,135 @@ class ExtractorService:
             if page_texts:
                 current_page = self._find_page_for_text(line_str, page_texts, current_page)
 
-            line_chap = self._detect_major_chapter_in_line(line_str, doc_type=doc_type, toc_chapters=toc_chapters)
-            if line_chap:
-                current_chapter = line_chap
+            # 探测/处理目录页 (TOC Page Isolation)
+            clean_heading = re.sub(r'[#\s　【】:：]', '', line_str)
+            if doc_type == "bid" and not toc_passed and clean_heading in TOC_KEYWORDS:
+                in_toc = True
+                if current_block and current_block["text"].strip():
+                    result_chapters.append(current_block)
+                current_block = {
+                    "title": "目录",
+                    "section_path": "目录",
+                    "text": line_str,
+                    "page_start": current_page,
+                    "content_type": "toc_block",
+                    "trace_info": {"chapter": "目录", "section_path": "目录", "hierarchy": ["目录"]}
+                }
+                continue
 
-            if current_chapter not in grouped_chapters:
-                chapter_order.append(current_chapter)
-                grouped_chapters[current_chapter] = {
-                    "title": current_chapter,
+            if in_toc:
+                # 检查目录页是否结束（当行无引导点符，且匹配 TOC 白名单或正文标准标题正则）
+                is_dots = bool(re.search(r'[\d\.\-·…]{2,}', line_str))
+                clean_norm = self._normalize_title_for_matching(line_str)
+                is_toc_match = bool(toc_chapters and any(clean_norm == self._normalize_title_for_matching(tc) for tc in toc_chapters))
+                is_body_h1 = bool(re.match(r'^\s*[*#]*\s*(?:[一二三四五六七八九十百]+[、.]|第[一二三四五六七八九十\d]+[章部分篇]|附[件录表图])', line_str))
+                if not is_dots and (is_toc_match or is_body_h1):
+                    in_toc = False
+                    toc_passed = True
+                    if current_block and current_block["text"].strip():
+                        result_chapters.append(current_block)
+                        current_block = None
+                else:
+                    if current_block:
+                        current_block["text"] += "\n" + line_str
+                    continue
+
+            # 探测正文标题层级
+            # 1. 优先校验 TOC 目录白名单与结构树映射 (最高权威)
+            matched_toc_chain = None
+            if doc_type == "bid" and toc_hierarchy_map:
+                clean_line = line_str.lstrip('#*-. ').strip()
+                clean_norm = self._normalize_title_for_matching(clean_line)
+                if clean_line in toc_hierarchy_map:
+                    matched_toc_chain = toc_hierarchy_map[clean_line]
+                elif clean_norm in toc_hierarchy_map:
+                    matched_toc_chain = toc_hierarchy_map[clean_norm]
+
+            if matched_toc_chain:
+                stack = list(matched_toc_chain[:2])
+                title = stack[-1]
+                section_path = " > ".join(stack)
+
+                if current_block and current_block["text"].strip():
+                    block_body = "\n".join([l for l in current_block["text"].split('\n') if l.strip() and not l.strip().startswith('#')])
+                    if len(block_body.strip()) > 5 or current_block.get("content_type") == "toc_block":
+                        result_chapters.append(current_block)
+
+                current_block = {
+                    "title": title,
+                    "section_path": section_path,
                     "text": line_str,
                     "page_start": current_page,
                     "content_type": "chapter_block",
                     "trace_info": {
-                        "chapter": current_chapter,
-                        "headings": [current_chapter],
-                        "element_label": "text"
+                        "chapter": title,
+                        "section_path": section_path,
+                        "hierarchy": list(stack),
+                        "depth": len(stack),
+                        "level": f"L{len(stack)}" if stack else "L0"
                     }
                 }
             else:
-                grouped_chapters[current_chapter]["text"] += "\n" + line_str
+                heading_res = self._detect_heading_level(line_str, doc_type=doc_type, toc_chapters=toc_chapters, stack=stack)
+                if heading_res:
+                    level, title = heading_res
+                    
+                    # 保护 TOC 树干节点：非 TOC 目录中的局部子标题（如 (一)、### 细节小节）绝对不能打破父级 TOC 树干，且限定层级最多两层！
+                    if doc_type == "bid" and toc_chapters and stack:
+                        stack = stack[:2]
+                    else:
+                        if level == 1:
+                            stack = [title]
+                        elif level >= 2:
+                            stack = [stack[0], title] if stack else [title]
+                        stack = stack[:2]
 
-        result_chapters: List[Dict[str, Any]] = []
-        for title in chapter_order:
-            block = grouped_chapters[title]
-            if block["text"].strip():
-                result_chapters.append(block)
+                    section_path = " > ".join(stack)
+
+                    if current_block and current_block["text"].strip():
+                        block_body = "\n".join([l for l in current_block["text"].split('\n') if l.strip() and not l.strip().startswith('#')])
+                        if len(block_body.strip()) > 5 or current_block.get("content_type") == "toc_block":
+                            result_chapters.append(current_block)
+
+                    current_block = {
+                        "title": title,
+                        "section_path": section_path,
+                        "text": line_str,
+                        "page_start": current_page,
+                        "content_type": "chapter_block",
+                        "trace_info": {
+                            "chapter": title,
+                            "section_path": section_path,
+                            "hierarchy": list(stack),
+                            "depth": len(stack),
+                            "level": f"L{len(stack)}" if stack else "L0"
+                        }
+                    }
+                else:
+                    if not current_block:
+                        section_path = " > ".join(stack) if stack else "正文/未分类"
+                        current_block = {
+                            "title": stack[-1] if stack else "无章节/正文",
+                            "section_path": section_path,
+                            "text": line_str,
+                            "page_start": current_page,
+                            "content_type": "chapter_block",
+                            "trace_info": {
+                                "chapter": stack[-1] if stack else "无章节/正文",
+                                "section_path": section_path,
+                                "hierarchy": list(stack),
+                                "depth": len(stack),
+                                "level": f"L{len(stack)}" if stack else "L0"
+                            }
+                        }
+                    else:
+                        current_block["text"] += "\n" + line_str
+
+        if current_block and current_block["text"].strip():
+            result_chapters.append(current_block)
 
         return result_chapters
 
-    def _extract_text_and_table_blocks(self, text: str) -> List[Dict[str, Any]]:
-        """
-        将章节文本精准拆解为【普通文本段落块】与【完整的 Markdown 表格原子块】。
-        表格块 (以 '|' 开头的连贯表格行) 将被赋予最高优先级保护，保证分块时不跨行、不跨表截断。
-        """
     def _extract_text_and_table_blocks(self, text: str) -> List[Dict[str, Any]]:
         """
         将章节文本精准拆解为【普通文本段落块】与【完整的表格原子块】（兼容 Markdown 与 HTML 表格）。
@@ -521,7 +787,7 @@ class ExtractorService:
         """
         对单个大章进行自适应分块：
         - 若 doc_type == "general" (招标文件)：复刻上一版 (c307c34) 策略，保留完整的大章/段落结构，表格随文本平滑切割；
-        - 若 doc_type == "bid" (投标文件)：维持最新的专属策略，表格 100% 独立成块，超长表格拼接原始表头说明并注入 chunk_level 溯源属性。
+        - 若 doc_type == "bid" (投标文件)：维持最新的专属策略，表格 100% 独立成块，超长表格拼接原始表头说明并注入 chunk_level 溯源属性与 section_path 上下文。
         """
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         
@@ -532,6 +798,10 @@ class ExtractorService:
             return docs
         
         chapter_title = chapter["title"]
+        section_path = chapter.get("section_path") or chapter_title
+        parent_chapter = chapter_title
+        if isinstance(chapter.get("trace_info"), dict) and chapter.get("trace_info").get("hierarchy"):
+            parent_chapter = chapter["trace_info"]["hierarchy"][0]
 
         # ========== 模式 1: 招标文件 (doc_type == "general") 复刻上一版切块逻辑 ==========
         if doc_type == "general":
@@ -540,10 +810,11 @@ class ExtractorService:
                     page_content=chapter_text,
                     metadata={
                         "section_title": chapter_title,
+                        "section_path": section_path,
                         "chunk_index": start_index,
                         "page_num": chapter["page_start"],
                         "content_type": chapter["content_type"],
-                        "trace_info": chapter["trace_info"],
+                        "trace_info": {**chapter["trace_info"], "section_path": section_path},
                         "source": "",
                     }
                 ))
@@ -625,23 +896,31 @@ class ExtractorService:
                         page_content=sub_text,
                         metadata={
                             "section_title": chapter_title,
+                            "section_path": section_path,
                             "chunk_index": start_index + j,
                             "page_num": chapter["page_start"],
                             "content_type": chapter["content_type"],
-                            "trace_info": chapter["trace_info"],
+                            "trace_info": {**chapter["trace_info"], "section_path": section_path},
                             "source": "",
                         }
                     ))
             return docs
 
-        # ========== 模式 2: 投标文件 (doc_type == "bid") 维持现行精细化分块逻辑 ==========
+        # ========== 模式 2: 投标文件 (doc_type == "bid") 维持精细化分块 + 结构上下文注入 ==========
+        def _format_bid_content(raw_txt: str) -> str:
+            if section_path and section_path != "目录" and not raw_txt.startswith("[所属章节:"):
+                return f"[所属章节: {section_path}]\n\n{raw_txt}"
+            return raw_txt
+
         if len(chapter_text) <= MAX_CHUNK_SIZE:
             has_tbl = self._check_has_table(chapter_text)
+            content_formatted = _format_bid_content(chapter_text)
             docs.append(Document(
-                page_content=chapter_text,
+                page_content=content_formatted,
                 metadata={
-                    "section_title": chapter_title,
-                    "parent_chapter": chapter_title,
+                    "section_title": section_path[:250],
+                    "section_path": section_path,
+                    "parent_chapter": parent_chapter,
                     "chunk_level": "L3" if has_tbl else "L1",
                     "chunk_index": start_index,
                     "page_num": chapter["page_start"],
@@ -649,7 +928,8 @@ class ExtractorService:
                     "has_table": has_tbl,
                     "trace_info": {
                         **chapter["trace_info"],
-                        "parent_chapter": chapter_title,
+                        "section_path": section_path,
+                        "parent_chapter": parent_chapter,
                         "chunk_level": "L3" if has_tbl else "L1",
                         "has_table": has_tbl
                     },
@@ -658,7 +938,7 @@ class ExtractorService:
             ))
         else:
             logger.info(
-                f"投标文件章节 [{chapter_title}] 文本长度 {len(chapter_text)} 字 > {MAX_CHUNK_SIZE}，"
+                f"投标文件章节 [{section_path}] 文本长度 {len(chapter_text)} 字 > {MAX_CHUNK_SIZE}，"
                 f"启动表格隔离及表头自动补全拆分逻辑。"
             )
             splitter = RecursiveCharacterTextSplitter(
@@ -740,11 +1020,13 @@ class ExtractorService:
             for j, sub_text in enumerate(sub_texts):
                 has_tbl = self._check_has_table(sub_text)
                 chunk_lvl = "L3" if has_tbl else "L2"
+                content_formatted = _format_bid_content(sub_text)
                 docs.append(Document(
-                    page_content=sub_text,
+                    page_content=content_formatted,
                     metadata={
-                        "section_title": chapter_title,
-                        "parent_chapter": chapter_title,
+                        "section_title": section_path[:250],
+                        "section_path": section_path,
+                        "parent_chapter": parent_chapter,
                         "chunk_level": chunk_lvl,
                         "chunk_index": start_index + j,
                         "page_num": chapter["page_start"],
@@ -752,7 +1034,8 @@ class ExtractorService:
                         "has_table": has_tbl,
                         "trace_info": {
                             **chapter["trace_info"],
-                            "parent_chapter": chapter_title,
+                            "section_path": section_path,
+                            "parent_chapter": parent_chapter,
                             "chunk_level": chunk_lvl,
                             "has_table": has_tbl
                         },
@@ -789,9 +1072,11 @@ class ExtractorService:
             if mineru.check_availability().get("is_installed"):
                 logger.info(f"✅ 路由到 MinerUParser (主引擎): {file_name}")
                 try:
-                    parse_result = mineru.parse(file_path)
+                    parse_result = mineru.parse(file_path, max_retries=2)
                 except Exception as e:
-                    logger.warning(f"⚠️ MinerU 主引擎调用异常或轮询终极超时 ({str(e)})，自动激发灾备保险开关 —— 即时切换致 DoclingParser (备用极强引擎) 完成通览解析！")
+                    logger.warning(
+                        f"⚠️ MinerU 主引擎在重试 2 次后依然异常 ({str(e)})，自动激发灾备保险开关 —— 即时切换至 DoclingParser (备用极强引擎) 完成通览解析！"
+                    )
                     parser = self._get_docling_parser()
                     parse_result = parser.parse(file_path)
             else:

@@ -130,10 +130,10 @@ class BidScorerService:
         logger.info(f"✅ 解析完成, 共 {len(chunks)} 个切片")
 
         # 6. 生成 Embedding（复用 llm_service）
-        logger.info("🧮 开始生成 Embedding 向量...")
         texts_to_embed = [chunk.page_content for chunk in chunks]
-        embeddings = llm_service.generate_embeddings(texts_to_embed)
-        logger.info("✅ Embedding 生成完成")
+        logger.info(f"🧮 开始生成 Embedding 向量，共 {len(texts_to_embed)} 个切片...")
+        embeddings = llm_service.generate_embeddings(texts_to_embed, batch_size=32)
+        logger.info(f"✅ Embedding 向量生成完成 (共 {len(embeddings)} 条)")
 
         # 7. 批量写入 doc_chunks 表
         db_chunks = []
@@ -144,7 +144,7 @@ class BidScorerService:
                 content=chunk.page_content,
                 chunk_index=chunk.metadata.get("chunk_index", i),
                 page_num=chunk.metadata.get("page_num"),
-                section_title=chunk.metadata.get("section_title"),
+                section_title=chunk.metadata.get("section_path") or chunk.metadata.get("section_title"),
                 content_type=chunk.metadata.get("content_type"),
                 trace_info=chunk.metadata.get("trace_info"),
                 embedding=embedding,
@@ -326,6 +326,8 @@ class BidScorerService:
             retrieve_bid_content_for_category,
             llm_score_batch,
             compute_consensus,
+            extract_missing_keywords_from_round,
+            active_refine_context_with_keywords,
         )
 
         score_result = db.query(BidScoreResult).filter(
@@ -334,7 +336,7 @@ class BidScorerService:
         ).first()
 
         if not score_result:
-            raise ValueError(f"打分记录不存在或无权限访问 (result_id={result_id})")
+            raise ValueError(f"打分结果未找到 (result_id={result_id})")
 
         document_id = score_result.document_id
         source_doc_id = score_result.source_doc_id
@@ -377,9 +379,29 @@ class BidScorerService:
         # 1. 执行多级 RAG 检索
         bid_content = retrieve_bid_content_for_category(document_id, items_to_score)
 
-        # 2. 执行 LLM 评分（注入 user_instruction）
+        # 2. Agentic Active RAG：第 1 轮初审 + 缺项反思二次提问追问
         round_results = []
-        for r_idx in range(scoring_rounds):
+        r1_result = llm_score_batch(
+            items=items_to_score,
+            bid_content=bid_content,
+            round_idx=0,
+            category=category,
+            user_instruction=user_instruction,
+        )
+        round_results.append(r1_result)
+
+        # 检查第 1 轮扣分项中是否有“缺少/未包含某些细节”
+        missing_kws = extract_missing_keywords_from_round(r1_result)
+        if missing_kws and document_id:
+            logger.info(f"💡 [Rescore Active RAG] 微调第 1 轮初审发现缺项反思关键词: {missing_kws}，启动 Agentic 动态补全...")
+            bid_content = active_refine_context_with_keywords(
+                document_id=document_id,
+                bid_content=bid_content,
+                missing_keywords=missing_kws,
+            )
+
+        # 第 2~N 轮：基于（可能已扩充）的最新上下文执行终审评估
+        for r_idx in range(1, scoring_rounds):
             batch_result = llm_score_batch(
                 items=items_to_score,
                 bid_content=bid_content,

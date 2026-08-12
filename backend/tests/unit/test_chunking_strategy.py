@@ -123,6 +123,79 @@ class TestGroupMarkdownTextByChapter:
         assert "一、报价清单明细" == chapters[0]["title"]
         assert "二、技术架构体系说明" == chapters[1]["title"]
 
+    def test_toc_hierarchy_extraction_and_stem_protection(self, extractor):
+        """核心硬核单测：校验带有【目录】的投标文件，能够精准建立父子树干，且正文子序号（如（一）短路响应）绝不打断TOC树干！"""
+        md_text = (
+            "# 投标文件目录\n\n"
+            "七、设计方案、服务方案 ............................................ 8\n"
+            "    第二章 施工方案说明 ............................................ 12\n"
+            "        第一节 施工进度计划安排 ................................... 12\n"
+            "        第二节 光伏系统施工工艺流程 ............................. 20\n"
+            "八、项目负责人及其他人介绍 ......................................... 35\n\n"
+            "# 七、设计方案、服务方案\n\n"
+            "## 第二章 施工方案说明\n\n"
+            "### 第一节 施工进度计划安排\n\n"
+            "## （一）短路响应机制制定\n\n"
+            "这里是短路响应机制正文说明……\n\n"
+            "## （二）严格遵循短路流程\n\n"
+            "这里是严格遵循短路流程正文说明……\n\n"
+            "### 第二节 光伏系统施工工艺流程\n\n"
+            "#### 一、屋面承载力评估与加固\n\n"
+            "这里是屋面承载力评估说明……\n\n"
+            "# 八、项目负责人及其他人介绍\n\n"
+            "负责人简历如下……"
+        )
+        chapters = extractor._group_markdown_text_by_chapter(md_text, doc_type="bid")
+        
+        # 寻找包含（一）短路响应机制制定的块
+        chunk_1 = next(c for c in chapters if "（一）短路响应机制制定" in c["title"] or "短路响应" in c["text"])
+        assert "七、设计方案、服务方案 > 第二章 施工方案说明" in chunk_1["section_path"]
+
+        # 寻找包含（二）严格遵循短路流程的块
+        chunk_2 = next(c for c in chapters if "（二）严格遵循短路流程" in c["title"] or "严格遵循短路流程" in c["text"])
+        assert "七、设计方案、服务方案 > 第二章 施工方案说明" in chunk_2["section_path"]
+
+        # 寻找第二节 光伏系统施工工艺流程下面的 一、屋面承载力评估与加固
+        chunk_3 = next(c for c in chapters if "屋面承载力" in c["text"])
+        assert "七、设计方案、服务方案 > 第二章 施工方案说明" in chunk_3["section_path"]
+        assert not chunk_3["section_path"].startswith("（二）")
+
+    def test_user_real_bid_toc_extraction(self, extractor):
+        """用户真实目录结构提取测试：确保多层“章/节”已被严格约束为最多两层树干"""
+        toc_md = (
+            "## 目录\n\n"
+            "一、投标函格式....4\n"
+            "七、设计方案、服务方案....44\n"
+            "第一章 技术参数符合性情况....44\n"
+            "第一节 项目概括....44\n"
+            "第二节 编制原则....44\n"
+            "第二章 根据平面布置等进行评审....56\n"
+            "第一节 屋顶平面布置方案....56\n"
+            "九、投标人情况介绍....122\n"
+            "投标人自有设施设备情况....122\n"
+            "投标人获得的相关证书及奖项。....124\n"
+            "投标人2023年1月1日以来类似业绩介绍等。....129\n"
+            "十、技术要求响应及偏离表....153\n"
+        )
+        chaps, hierarchy_map = extractor._extract_toc_chapters(toc_md, doc_type="bid")
+        
+        # 1. 验证常规 1/2 级（最深封顶 2 层）
+        assert "一、投标函格式" in chaps
+        assert hierarchy_map["第一节 项目概括"] == ["七、设计方案、服务方案", "第一章 技术参数符合性情况"]
+        assert hierarchy_map["第一节 屋顶平面布置方案"] == ["七、设计方案、服务方案", "第二章 根据平面布置等进行评审"]
+
+        # 2. 验证“九、投标人情况介绍”下的无序号条目平级替换
+        assert hierarchy_map.get("投标人自有设施设备情况") == ["九、投标人情况介绍", "投标人自有设施设备情况"]
+        cert_chain = hierarchy_map.get("投标人获得的相关证书及奖项") or hierarchy_map.get("投标人获得的相关证书及奖项。")
+        assert cert_chain and cert_chain[0] == "九、投标人情况介绍"
+        perf_chain = hierarchy_map.get("投标人2023年1月1日以来类似业绩介绍等") or hierarchy_map.get("投标人2023年1月1日以来类似业绩介绍等。")
+        assert perf_chain and perf_chain[0] == "九、投标人情况介绍"
+
+        # 3. 验证回归“十、技术要求响应及偏离表”重置为 L1 顶级
+        assert hierarchy_map["十、技术要求响应及偏离表"] == ["十、技术要求响应及偏离表"]
+
+
+
 
 # ========== 测试 _split_table_preserving_headers ==========
 

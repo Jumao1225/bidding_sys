@@ -49,9 +49,15 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
         # 2. 解析和切片（先解析，成功后再清理旧数据，避免解析失败导致数据全丢）
         import os
         filename = os.path.basename(file_path)
-        emit_agent_log("info", f"正在调用底层智能解析引擎对 {filename} 进行物理层深度提取与多模态切割，过程可能需要 1-3 分钟，请耐心等待...")
-        chunks = extractor_service.parse_and_chunk(file_path)
-        logger.info(f"文档解析完成，共获得 {len(chunks)} 个切片。")
+        pm = document.parsed_metadata or {}
+        fname = (document.filename or "").lower()
+        m_path = str(document.file_path or "").lower()
+        is_bid = (pm.get("doc_type") == "bid" or "bid" in m_path or "和烁" in fname or "窑厂" in fname or "投标文件" in fname or "投标" in fname)
+        target_doc_type = "bid" if is_bid else "general"
+
+        emit_agent_log("info", f"正在调用底层智能解析引擎对 {filename} 进行物理层深度提取与多模态切割 (策略: {target_doc_type})，过程可能需要 1-3 分钟，请耐心等待...")
+        chunks = extractor_service.parse_and_chunk(file_path, doc_type=target_doc_type)
+        logger.info(f"文档解析完成 (doc_type={target_doc_type})，共获得 {len(chunks)} 个切片。")
         emit_agent_log("success", f"文件解析完成！共切割出 {len(chunks)} 个高质量标准文本块。")
 
         if not chunks:
@@ -106,7 +112,7 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
                 content=chunk.page_content,
                 chunk_index=chunk.metadata.get("chunk_index", i),
                 page_num=chunk.metadata.get("page_num"),
-                section_title=chunk.metadata.get("section_title"),
+                section_title=chunk.metadata.get("section_path") or chunk.metadata.get("section_title"),
                 content_type=chunk.metadata.get("content_type"),
                 trace_info=chunk.metadata.get("trace_info"),
                 embedding=embedding,

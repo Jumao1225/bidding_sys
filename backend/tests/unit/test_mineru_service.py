@@ -46,3 +46,49 @@ def test_parse_file_with_docx_fixture():
     with open(result["md_file_path"], "r", encoding="utf-8") as f:
         saved_md = f.read()
     assert saved_md == result["markdown_content"]
+
+
+def test_mineru_parse_retry_success():
+    """
+    测试 MinerU 前两次解析失败、第 3 次重试成功的情况
+    """
+    from unittest.mock import patch
+    base_dir = Path(__file__).resolve().parent.parent
+    word_fixture_path = base_dir / "fixtures" / "test_bidding.docx"
+    service = MinerUParser()
+
+    call_count = 0
+
+    def mock_cloud_api(file_path, task_id, model_version="vlm", max_poll_seconds=600):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            return None
+        return "# 重试解析成功标题\n这是第 3 次尝试成功解析的内容。"
+
+    with patch.object(service, "_parse_via_cloud_api", side_effect=mock_cloud_api), \
+         patch("time.sleep", return_value=None):
+        result = service.parse(file_path=str(word_fixture_path), task_id="test_retry_task", max_retries=2)
+
+    assert call_count == 3
+    assert result["markdown_content"] == "# 重试解析成功标题\n这是第 3 次尝试成功解析的内容。"
+    assert "test_retry_task_retry_2" in result["task_id"]
+
+
+def test_mineru_parse_retry_exhausted_raises():
+    """
+    测试 MinerU 解析连续失败超过 max_retries (2次) 后抛出 RuntimeError 异常
+    """
+    from unittest.mock import patch
+    base_dir = Path(__file__).resolve().parent.parent
+    word_fixture_path = base_dir / "fixtures" / "test_bidding.docx"
+    service = MinerUParser()
+
+    with patch.object(service, "_parse_via_cloud_api", return_value=None), \
+         patch("time.sleep", return_value=None):
+        with pytest.raises(RuntimeError) as exc_info:
+            service.parse(file_path=str(word_fixture_path), task_id="test_fail_task", max_retries=2)
+
+    assert "MinerU 解析失败" in str(exc_info.value)
+    assert "重试 2 次" in str(exc_info.value)
+

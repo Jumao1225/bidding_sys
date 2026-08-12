@@ -23,36 +23,144 @@ from app.services.llm_service import llm_service
 
 def _extract_dynamic_keywords(items: List[Dict[str, Any]]) -> List[str]:
     """
-    从评分项列表中动态提取关键搜索词，避免在代码中硬编码固定业务名词。
+    使用大模型 (LLM) 智能分析评分维度，预测并重写出在【投标文件】中可能出现的
+    核心章节标题、服务专有名词及高精准度检索关键词，彻底替代规则抽取。
     
     :param items: 评分项列表
-    :return: 动态抓取的关键词列表
+    :return: LLM 生成的精准检索关键词与预测章节列表
     """
-    keywords = set()
+    if not items:
+        return []
+
+    # 汇总评分维度上下文
+    items_desc = []
+    for idx, item in enumerate(items, 1):
+        title = item.get("title", "")
+        sub_cat = item.get("sub_category", "")
+        criteria = item.get("scoring_criteria", "")
+        items_desc.append(f"评分项 {idx}:\n- 标题: {title}\n- 子分类: {sub_cat}\n- 评分细则: {criteria[:200]}")
+
+    joined_desc = "\n\n".join(items_desc)
+
+    prompt = f"""你是一位招投标领域的检索与评测专家。请分析以下【招标文件】的评分维度项，预测并重写出在【投标文件】中最可能对应的核心章节标题、技术/服务专有名词以及精准检索关键词。
+
+{joined_desc}
+
+【要求】
+1. 预测投标文件中的可能章节路径或标题（如: "第四章 服务响应方案情况", "服务团队配置", "售后服务响应时间保障", "现场到达时间"）。
+2. 提取最具有业务针对性的专有名词实体（5 ~ 12 个）。
+3. 严格禁止输出“评分、标准、要求、满足、符合”等通用废词。
+4. 必须输出合法 JSON 对象，包含 "keywords" 字段，格式如：
+{{"keywords": ["第四章 服务响应方案情况", "服务团队配置", "售后服务响应时间保障", "现场问题解决", "到达现场承诺"]}}
+"""
+
+    try:
+        from app.services.llm_service import llm_service
+        res_json = llm_service.generate_structured_json(prompt, temperature=0.2)
+        if isinstance(res_json, dict) and "keywords" in res_json and isinstance(res_json["keywords"], list):
+            llm_keywords = [str(k).strip() for k in res_json["keywords"] if str(k).strip() and len(str(k).strip()) >= 2]
+            if llm_keywords:
+                logger.info(f"🤖 [LLM 智能检索词扩展] 成功生成 {len(llm_keywords)} 个专业检索词: {llm_keywords}")
+                return llm_keywords[:15]
+    except Exception as e:
+        logger.warning(f"⚠️ [LLM 智能检索词生成失败，启动降级]: {e}")
+
+    # 降级兜底保护（保证 API 异常时不卡死系统）
+    fallback_words = set()
     for item in items:
-        title = str(item.get("title") or "").strip()
-        sub_cat = str(item.get("sub_category") or "").strip()
-        criteria = str(item.get("scoring_criteria") or "").strip()
-        
-        # 抓取标题与子类目核心名词
-        for text in [title, sub_cat]:
-            if text:
-                # 去除普通连字符与停用词，提取 2~8 字的核心实体名
+        t = item.get("title", "")
+        sc = item.get("sub_category", "")
+        for term in [t, sc]:
+            if term:
                 import re
-                clean_terms = re.findall(r'[\u4e00-\u9fa5A-Za-z0-9]{2,8}', text)
-                for term in clean_terms:
-                    if term not in ["评分", "标准", "要求", "分值", "得分", "得分点"]:
-                        keywords.add(term)
+                for m in re.findall(r'[\u4e00-\u9fa5A-Za-z0-9]{2,8}', term):
+                    if m not in ["评分", "标准", "要求", "分值"]:
+                        fallback_words.add(m)
+    return list(fallback_words)[:10]
 
-        # 抓取评分标准中的关键专有名词
-        if criteria:
-            import re
-            terms = re.findall(r'[\u4e00-\u9fa5]{3,8}', criteria[:150])
-            for t in terms[:5]:
-                if not any(stop in t for stop in ["满意", "较好", "满足", "符合", "提供", "具备", "根据"]):
-                    keywords.add(t)
 
-    return [k for k in keywords if len(k) >= 2][:12]
+def get_bid_document_outline(document_id: str) -> List[str]:
+    """获取投标文件的所有真实章节大纲路径列表 (例如: '七、设计方案、服务方案 > 第四章 服务响应方案情况')"""
+    if not document_id:
+        return []
+    try:
+        from app.db.session import SessionLocal
+        from app.db.models.project import DocChunk
+
+        with SessionLocal() as db:
+            chunks = db.query(DocChunk.section_title).filter(
+                DocChunk.document_id == document_id,
+                DocChunk.chunk_index > 0
+            ).distinct().all()
+
+            titles = []
+            for (st,) in chunks:
+                if st and st != "无章节/正文" and st != "正文" and st not in titles:
+                    titles.append(st)
+            return titles
+    except Exception as e:
+        logger.warning(f"⚠️ [目录大纲提取] 异常: {e}")
+        return []
+
+
+def subagent_select_target_chapters(
+    category: str,
+    subagent_type: str,
+    items: List[Dict[str, Any]],
+    document_outline: List[str]
+) -> List[str]:
+    """
+    专项子 Agent 自主决策：对比自身负责的评分标准与投标文件的实际目录树，
+    从目录大纲中自主挑选最可能包含证据正文的目标章节。
+    """
+    if not document_outline or not items:
+        return []
+
+    outline_str = "\n".join([f"- {t}" for t in document_outline])
+    items_str = "\n".join([
+        f"评分项 {idx+1}: {i.get('title')}\n  分类: {i.get('sub_category')}\n  细则: {i.get('scoring_criteria')[:150]}"
+        for idx, i in enumerate(items)
+    ])
+
+    prompt = f"""你是一位专业招投标评估子 Agent [{subagent_type}]，负责评估维度【{category}】。
+
+【投标文件的实际目录大纲 (TOC Outline)】:
+{outline_str}
+
+【你负责评估的评分标准项】:
+{items_str}
+
+请根据你的评估评分标准，对照投标文件的实际目录大纲，自主挑选并决策：上述目录中哪些章节最可能包含本分类评分所需的具体方案正文？
+
+【决策规则】
+1. 从【投标文件的实际目录大纲】中挑选完全一致或最相关的章节名称。
+2. 可以挑选 1 ~ 6 个最相关的章节。
+3. 必须输出合法 JSON，格式为：
+{{"selected_chapters": ["挑选的章节1", "挑选的章节2"]}}
+"""
+
+    try:
+        from app.services.llm_service import llm_service
+        res = llm_service.generate_structured_json(prompt, temperature=0.1)
+        if isinstance(res, dict) and "selected_chapters" in res and isinstance(res["selected_chapters"], list):
+            selected = []
+            for c in res["selected_chapters"]:
+                c_str = str(c).strip()
+                # 寻找目录中的准确匹配或包含项
+                matched = [t for t in document_outline if c_str in t or t in c_str]
+                if matched:
+                    selected.extend(matched)
+                elif c_str in document_outline:
+                    selected.append(c_str)
+            # 去重
+            dedup_selected = list(dict.fromkeys(selected))
+            if dedup_selected:
+                logger.info(f"🧠 [{subagent_type}] 子 Agent 针对 category=[{category}] 自主决策锁定目标章节: {dedup_selected}")
+                return dedup_selected
+    except Exception as e:
+        logger.warning(f"⚠️ [{subagent_type}] 自主决策挑选目标章节失败，启动降级: {e}")
+
+    return []
 
 
 def _clean_markdown_images(text: str) -> str:
@@ -60,7 +168,6 @@ def _clean_markdown_images(text: str) -> str:
     if not text:
         return ""
     import re
-    # 将重复的图片 Markdown ![Images/xxx](Images/xxx) 压缩为简短标识
     cleaned = re.sub(r'!\[Images/([^\]]+)\]\(Images/[^)]+\)', r'[图片占位]', text)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned
@@ -71,20 +178,26 @@ def retrieve_bid_content_for_category(
     items: List[Dict[str, Any]],
     top_k: int = 50,
     max_context_chars: int = 500000,
+    category: str = "通用分类",
+    subagent_type: str = "general_subagent",
 ) -> str:
     """
-    多级索引检索 (Multi-Level Index Retrieval)：
-    - 一级：章节结构索引 (Chapter Index) — 动态提取关键词，探查 DB 中匹配的大章正文切片
-    - 二级：语义切片索引 (Semantic Index) — 基于向量相似度全局搜寻 top_k 切片
-    - 上下文预算管理 (Context Budgeting) — 自动去重并控制总字符长度
-
-    :param document_id: 投标文件 Document ID
-    :param items: 该 category 下的评分项列表
-    :param top_k: 向量检索切片数
-    :param max_context_chars: 最大允许输出字符上限
-    :return: 格式化后的上下文参考文本
+    子 Agent 自主目录探查 + 多级索引 RAG 检索：
+    1. 提取投标文件的真实 TOC 目录树大纲 (doc_outline)
+    2. 子 Agent 结合自身负责的评分标准，从 TOC 大纲中自主挑选定位目标章节
+    3. 在 PostgreSQL 中对子 Agent 选定的目标章节执行【全章闭环盲拉】
+    4. 融合【语义向量索引】辅助召回全局零星条款
     """
-    # 1. 动态生成检索关键词与查询文本
+    # 1. 提取投标文件的实际目录大纲并由子 Agent 自主决策目标章节
+    doc_outline = get_bid_document_outline(document_id)
+    subagent_selected_chapters = subagent_select_target_chapters(
+        category=category,
+        subagent_type=subagent_type,
+        items=items,
+        document_outline=doc_outline,
+    )
+
+    # 2. 动态生成补充关键词与向量查询文本
     dynamic_keywords = _extract_dynamic_keywords(items)
     search_queries = []
     for item in items:
@@ -96,8 +209,8 @@ def retrieve_bid_content_for_category(
 
     combined_query = " ".join(search_queries)
     logger.info(
-        f"🔍 [多级检索] document_id={document_id}, 评分项={len(items)}, "
-        f"动态关键词={dynamic_keywords}"
+        f"🔍 [子Agent自主检索] category=[{category}], document_id={document_id}, "
+        f"目录大纲数={len(doc_outline)}, 自主锁定章节={subagent_selected_chapters}"
     )
 
     # 2. 二级检索：语义切片索引 (Semantic Index)
@@ -123,22 +236,59 @@ def retrieve_bid_content_for_category(
             with SessionLocal() as db:
                 conditions = []
                 for kw in dynamic_keywords:
-                    conditions.append(DocChunk.section_title.ilike(f"%{kw}%"))
+                    k_str = kw.strip()
+                    if len(k_str) >= 2:
+                        conditions.append(DocChunk.section_title.ilike(f"%{k_str}%"))
+                        conditions.append(DocChunk.content.ilike(f"%{k_str}%"))
 
                 if conditions:
-                    matched_chunks = (
+                    # 1. 查找初步命中的种子切片
+                    seed_chunks = (
                         db.query(DocChunk)
                         .filter(DocChunk.document_id == document_id)
                         .filter(DocChunk.chunk_index > 0)  # 剔除 0 号目录页
                         .filter(or_(*conditions))
                         .order_by(DocChunk.chunk_index)
-                        .limit(30)
+                        .limit(20)
                         .all()
                     )
+
+                    # 2. 从种子切片与子 Agent 自主选定的目标章节提取“章节前缀家族”
+                    family_prefixes = set(subagent_selected_chapters or [])
+                    for c in seed_chunks:
+                        st = c.section_title or ""
+                        parts = [p.strip() for p in st.split(">") if p.strip()]
+                        if len(parts) >= 2:
+                            family_prefixes.add(" > ".join(parts[:2]))
+                        elif len(parts) == 1:
+                            family_prefixes.add(parts[0])
+
+                    # 3. 针对章节前缀家族，执行【全章闭环盲拉】，拉取该大章下的全量连续子节点切片！
+                    matched_chunks = []
+                    if family_prefixes:
+                        family_conditions = [DocChunk.section_title.ilike(f"{pref}%") for pref in family_prefixes]
+                        family_chunks = (
+                            db.query(DocChunk)
+                            .filter(DocChunk.document_id == document_id)
+                            .filter(DocChunk.chunk_index > 0)
+                            .filter(or_(*family_conditions))
+                            .order_by(DocChunk.chunk_index)
+                            .limit(100)
+                            .all()
+                        )
+                        matched_chunks.extend(family_chunks)
+
+                    # 兜底补充种子切片
+                    seen_ids = {c.id for c in matched_chunks}
+                    for c in seed_chunks:
+                        if c.id not in seen_ids:
+                            matched_chunks.append(c)
 
                     for c in matched_chunks:
                         c_text = c.content.strip() if c.content else ""
                         c_clean = _clean_markdown_images(c_text)
+                        if len(c_clean.strip()) < 5:
+                            continue
                         if c_clean and c_clean not in seen_contents and c_clean not in vector_content:
                             seen_contents.add(c_clean)
                             if c.section_title:
@@ -172,8 +322,10 @@ def retrieve_bid_content_for_category(
         final_content = final_content[:max_context_chars] + "\n\n...[由于长度预算限制，后续参考内容已自动截断]"
 
     logger.info(
-        f"✅ [多级检索] 完成, 最终上下文长度={len(final_content)} 字 | "
-        f"预览片段: {repr(final_content[:120])}"
+        f"✅ [多级检索] 完成, 最终上下文长度={len(final_content)} 字\n"
+        f"==================== [RAG 检索给 LLM 的上下文详情 BEGIN] ====================\n"
+        f"{final_content}\n"
+        f"==================== [RAG 检索给 LLM 的上下文详情 END] ===================="
     )
     return final_content
 
@@ -506,4 +658,94 @@ def compute_consensus(
         f"有效项={len(consensus)}/{len(items)}"
     )
     return consensus
+
+
+# ============================================================
+# Agentic Active RAG 自主反思追问与动态上下文补齐逻辑
+# ============================================================
+
+def extract_missing_keywords_from_round(round_result: List[Dict[str, Any]]) -> List[str]:
+    """
+    从第 1 轮评估结果的 deduction_reason / suggestion 中提取出形如
+    “缺少日常运行管理”、“未提供施工工艺流程”、“未包含故障应急处置” 等动态缺失关键词。
+    """
+    missing_keywords = []
+    import re
+    patterns = [
+        r"(?:缺少|未包含|未提供|未找到|未查到|未见|未列出|部分缺失|不包含)\s*([“「『]?[\u4e00-\u9fa5A-Za-z0-9\s、，和及与]{2,30}[”」』]?)",
+        r"(?:针对|补充)\s*([“「『]?[\u4e00-\u9fa5A-Za-z0-9\s、，和及与]{2,30}[”」』]?)",
+    ]
+    for item in round_result:
+        ai_score = item.get("ai_score", 0.0)
+        max_score = item.get("max_score", 0.0)
+        if max_score > 0 and ai_score < max_score:
+            text = (str(item.get("deduction_reason") or "") + " " + str(item.get("suggestion") or "")).strip()
+            for pat in patterns:
+                matches = re.findall(pat, text)
+                for m in matches:
+                    clean_str = m.strip("“「『”」』 ").strip()
+                    sub_kws = re.split(r'[、，,\s和及与]+', clean_str)
+                    for kw in sub_kws:
+                        kw_clean = kw.strip()
+                        if len(kw_clean) >= 2 and kw_clean not in missing_keywords and kw_clean not in ["内容", "细节", "方案", "条款", "要求", "具体", "判定", "部分", "缺失"]:
+                            missing_keywords.append(kw_clean)
+    return missing_keywords
+
+
+def active_refine_context_with_keywords(
+    document_id: str,
+    bid_content: str,
+    missing_keywords: List[str],
+) -> str:
+    """
+    拿着 Agentic 追问提取出的 missing_keywords，去数据库中执行二次定向反查，
+    并将新抓取的文本动态去重合并入 bid_content。
+    """
+    if not document_id or not missing_keywords:
+        return bid_content
+
+    logger.info(f"🕵️‍♂️ [Agentic Active RAG] 触发自主二次反查, 缺失追问词={missing_keywords}")
+    
+    try:
+        from app.db.session import SessionLocal
+        from app.db.models.project import DocChunk
+        from sqlalchemy import or_
+
+        with SessionLocal() as db:
+            conditions = []
+            for kw in missing_keywords:
+                k_str = kw.strip()
+                if len(k_str) >= 2:
+                    conditions.append(DocChunk.section_title.ilike(f"%{k_str}%"))
+                    conditions.append(DocChunk.content.ilike(f"%{k_str}%"))
+
+            if not conditions:
+                return bid_content
+
+            extra_chunks = (
+                db.query(DocChunk)
+                .filter(DocChunk.document_id == document_id)
+                .filter(DocChunk.chunk_index > 0)
+                .filter(or_(*conditions))
+                .order_by(DocChunk.chunk_index)
+                .limit(20)
+                .all()
+            )
+
+            new_blocks = []
+            for c in extra_chunks:
+                c_text = c.content.strip() if c.content else ""
+                c_clean = _clean_markdown_images(c_text)
+                if c_clean and c_clean not in bid_content:
+                    header = f"### 【Agentic 自主追问二次补全: {c.section_title or '正文'} | 切片 #{c.chunk_index}】\n"
+                    new_blocks.append(header + c_clean)
+
+            if new_blocks:
+                logger.info(f"⚡ [Agentic Active RAG] 自主反查成功补充 {len(new_blocks)} 个缺失正文切片!")
+                appended_text = "\n\n## 📌 Agentic 智能体自主追问补全上下文\n" + "\n\n".join(new_blocks)
+                return bid_content + "\n\n" + appended_text
+    except Exception as e:
+        logger.warning(f"⚠️ [Agentic Active RAG] 二次反查出现非致命异常: {e}")
+
+    return bid_content
 

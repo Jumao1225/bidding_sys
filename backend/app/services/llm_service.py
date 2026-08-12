@@ -422,15 +422,69 @@ class LLMService:
             logger.error(f"流式聊天异常: {str(e)}")
             raise e
 
-    def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
-
+    def generate_embeddings(
+        self,
+        texts: list[str],
+        batch_size: int = 32,
+        show_progress: bool = True
+    ) -> list[list[float]]:
         """
         为给定的文本列表生成嵌入向量 (Embeddings)。
         返回 1024 维的 BGE-M3 向量列表。
+        支持针对多切片自动按 batch_size 分批生成并实时打印进度日志。
         """
+        if not texts:
+            return []
+
         try:
             embeddings_model = self._get_embeddings_model()
-            return embeddings_model.embed_documents(texts)
+            total_texts = len(texts)
+
+            # 少量文本无需分批输出进度
+            if total_texts <= batch_size:
+                return embeddings_model.embed_documents(texts)
+
+            total_batches = (total_texts + batch_size - 1) // batch_size
+            if show_progress:
+                logger.info(
+                    f"🧮 开始分批生成 {total_texts} 个切片的 Embedding 向量 (批次大小: {batch_size}, 共 {total_batches} 批)..."
+                )
+
+            all_embeddings: list[list[float]] = []
+            
+            # 使用 tqdm 生成终端动态进度条 (配合 defensive import 容错)
+            try:
+                from tqdm import tqdm
+                use_tqdm = show_progress
+            except ImportError:
+                use_tqdm = False
+
+            batch_iterable = range(total_batches)
+            if use_tqdm:
+                batch_iterable = tqdm(
+                    batch_iterable,
+                    desc="🧮 [Embedding 向量计算]",
+                    unit="批",
+                    total=total_batches,
+                    ncols=100
+                )
+
+            for i in batch_iterable:
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, total_texts)
+                batch_texts = texts[start_idx:end_idx]
+
+                batch_result = embeddings_model.embed_documents(batch_texts)
+                all_embeddings.extend(batch_result)
+
+                if show_progress:
+                    processed_count = len(all_embeddings)
+                    percent = (processed_count / total_texts) * 100
+                    logger.info(
+                        f"📊 [Embedding 进度] 已完成 {processed_count}/{total_texts} ({percent:.1f}%) | 批次 {i + 1}/{total_batches}"
+                    )
+
+            return all_embeddings
         except Exception as e:
             logger.error(f"Embedding 生成失败: {str(e)}")
             raise e

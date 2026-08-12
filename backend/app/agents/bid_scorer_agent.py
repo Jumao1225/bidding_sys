@@ -25,6 +25,8 @@ from app.agents.tools.bid_scorer_tools import (
     retrieve_bid_content_for_category,
     llm_score_batch,
     compute_consensus,
+    extract_missing_keywords_from_round,
+    active_refine_context_with_keywords,
 )
 
 
@@ -208,15 +210,38 @@ def specialist_score_node(state: BidScorerState) -> dict:
         f"   📋 [{subagent_type}] 负责 {len(items)} 个评分项, 共识轮数={scoring_rounds}"
     )
 
-    # 1. 多级索引 RAG 检索
+    # 1. 多级索引与子 Agent 自主目录探查 RAG 检索
     bid_content = retrieve_bid_content_for_category(
         document_id=document_id,
         items=items,
+        category=category,
+        subagent_type=subagent_type,
     )
 
-    # 2. 多轮结构化打分
+    # 2. Agentic Active RAG 多轮结构化打分与自主反思追问
     all_rounds = []
-    for round_idx in range(scoring_rounds):
+    
+    # 第 1 轮：初审评估
+    r1_result = llm_score_batch(
+        items=items,
+        bid_content=bid_content,
+        round_idx=0,
+        category=category,
+    )
+    all_rounds.append(r1_result)
+
+    # 自主反思护栏：检查第 1 轮扣分项中是否有“缺少/未包含某些细节”
+    missing_kws = extract_missing_keywords_from_round(r1_result)
+    if missing_kws and document_id:
+        logger.info(f"💡 [{subagent_type}] 第 1 轮初审发现缺项反思关键词: {missing_kws}，启动 Agentic 动态上下文补全...")
+        bid_content = active_refine_context_with_keywords(
+            document_id=document_id,
+            bid_content=bid_content,
+            missing_keywords=missing_kws,
+        )
+
+    # 第 2~N 轮：基于（可能已扩充）的最新上下文执行终审评估
+    for round_idx in range(1, scoring_rounds):
         round_result = llm_score_batch(
             items=items,
             bid_content=bid_content,

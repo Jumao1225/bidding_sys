@@ -40,36 +40,39 @@ export const BidScorerLab: React.FC = () => {
   const [scoreResult, setScoreResult] = useState<ScoreResultDetail | null>(null);
   const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
 
-  // 4. 微调重算交互 Modal 状态
-  const [rescoreCategoryName, setRescoreCategoryName] = useState<string | null>(null);
-  const [rescoreItemCode, setRescoreItemCode] = useState<string | null>(null);
-  const [rescoreInstruction, setRescoreInstruction] = useState<string>('');
-  const [rescoring, setRescoring] = useState<boolean>(false);
+  // 4. 微调重算交互（无遮罩内嵌面板）状态
+  const [activeRescoreKey, setActiveRescoreKey] = useState<string | null>(null); // 当前展开微调面板的 key ('cat:XXX' 或 'item:YYY')
+  const [rescoreInstructionMap, setRescoreInstructionMap] = useState<Record<string, string>>({}); // 存储各个 key 对应的指令草稿
+  const [rescoringKey, setRescoringKey] = useState<string | null>(null); // 当前正在重算加载的 key
 
-  const handleRescoreCategory = async () => {
-    if (!scoreResult || !rescoreCategoryName || !rescoreInstruction.trim()) return;
+  const handleApplyRescore = async (
+    key: string,
+    categoryName: string,
+    itemCode?: string,
+    targetTitle?: string
+  ) => {
+    const instruction = rescoreInstructionMap[key];
+    if (!scoreResult || !categoryName || !instruction?.trim()) return;
     try {
-      setRescoring(true);
+      setRescoringKey(key);
       setErrorMessage('');
-      const targetName = rescoreItemCode ? `评分项 ${rescoreItemCode}` : `大类 [${rescoreCategoryName}]`;
+      const targetName = itemCode ? `评分项 [${targetTitle || itemCode}]` : `大类 [${categoryName}]`;
       setStatusMessage(`正在应用微调规则，重新评估 ${targetName}...`);
       const targetResultId = scoreResult.id || scoreResult.result_id;
       const updatedDetail = await rescoreCategory(
         targetResultId!,
-        rescoreCategoryName,
-        rescoreInstruction.trim(),
+        categoryName,
+        instruction.trim(),
         1,
-        rescoreItemCode || undefined
+        itemCode || undefined
       );
       setScoreResult(updatedDetail);
       setStatusMessage(`✅ ${targetName} 得分微调成功，总分已更新。`);
-      setRescoreCategoryName(null);
-      setRescoreItemCode(null);
-      setRescoreInstruction('');
+      setActiveRescoreKey(null);
     } catch (err: any) {
       setErrorMessage(err.message || '微调重算发生错误');
     } finally {
-      setRescoring(false);
+      setRescoringKey(null);
     }
   };
 
@@ -569,31 +572,145 @@ export const BidScorerLab: React.FC = () => {
                 )}
               </div>
 
-              <div className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between text-xs text-slate-400 gap-2">
-                {Object.entries(scoreResult.category_scores || {}).map(([cName, info]) => (
-                  <div key={cName} className="flex items-center space-x-2 px-3 py-1.5 rounded-xl bg-slate-950/60 border border-slate-800 font-mono hover:border-cyan-500/40 transition-colors">
-                    <span className="w-2 h-2 rounded-full bg-cyan-400" />
-                    <span className="font-bold text-slate-200">{cName}:</span>
-                    <span className="text-emerald-400 font-extrabold">{info.score} <span className="text-slate-500 font-normal">/ {info.max_total}</span></span>
+              <div className="pt-3 border-t border-slate-800/80 space-y-3 font-sans">
+                <div className="flex flex-wrap items-center justify-between text-xs text-slate-400 gap-2">
+                  {Object.entries(scoreResult.category_scores || {}).map(([cName, info]) => {
+                    const catKey = `cat:${cName}`;
+                    const isCatActive = activeRescoreKey === catKey;
+                    const defaultInst = cName === '价格分' 
+                      ? '针对单标书评估，默认其投标总价为有效最低报价，按满分计算。' 
+                      : `针对【${cName}】大类，凡提供了响应承诺与相关情况说明的，均按满分计算。`;
 
-                    <button
-                      onClick={() => {
-                        setRescoreCategoryName(cName);
-                        setRescoreItemCode(null);
-                        if (cName === '价格分') {
-                          setRescoreInstruction('针对单标书评估，默认其投标总价为有效最低报价，按满分计算。');
-                        } else {
-                          setRescoreInstruction(`针对【${cName}】大类，凡提供了响应承诺与相关情况说明的，均按满分计算。`);
-                        }
-                      }}
-                      className="ml-1.5 px-2 py-0.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/30 text-[11px] font-sans font-bold flex items-center gap-1 transition-all active:scale-95"
-                      title={`微调 [${cName}] 得分`}
+                    return (
+                      <div key={cName} className={`flex items-center space-x-2 px-3 py-1.5 rounded-xl bg-slate-950/60 border font-mono transition-colors ${isCatActive ? 'border-cyan-500 bg-cyan-950/20' : 'border-slate-800 hover:border-cyan-500/40'}`}>
+                        <span className="w-2 h-2 rounded-full bg-cyan-400" />
+                        <span className="font-bold text-slate-200">{cName}:</span>
+                        <span className="text-emerald-400 font-extrabold">{info.score} <span className="text-slate-500 font-normal">/ {info.max_total}</span></span>
+
+                        <button
+                          onClick={() => {
+                            if (isCatActive) {
+                              setActiveRescoreKey(null);
+                            } else {
+                              setActiveRescoreKey(catKey);
+                              if (!rescoreInstructionMap[catKey]) {
+                                setRescoreInstructionMap(prev => ({ ...prev, [catKey]: defaultInst }));
+                              }
+                            }
+                          }}
+                          className={`ml-1.5 px-2 py-0.5 rounded-lg border text-[11px] font-sans font-bold flex items-center gap-1 transition-all active:scale-95 ${
+                            isCatActive 
+                              ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-extrabold' 
+                              : 'bg-cyan-500/15 hover:bg-cyan-500/30 text-cyan-300 border-cyan-500/30'
+                          }`}
+                          title={`微调 [${cName}] 得分`}
+                        >
+                          <MessageSquare className="w-3 h-3" />
+                          <span>{isCatActive ? '收起' : '微调'}</span>
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* 大类内嵌微调展开区 */}
+                <AnimatePresence>
+                  {activeRescoreKey && activeRescoreKey.startsWith('cat:') && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="p-4 rounded-2xl bg-slate-950/90 border border-cyan-500/40 shadow-xl space-y-3"
                     >
-                      <MessageSquare className="w-3 h-3 text-cyan-400" />
-                      <span>微调</span>
-                    </button>
-                  </div>
-                ))}
+                      {(() => {
+                        const cName = activeRescoreKey.replace('cat:', '');
+                        const catKey = activeRescoreKey;
+                        const isCatRescoring = rescoringKey === catKey;
+
+                        return (
+                          <>
+                            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                              <div className="flex items-center space-x-2">
+                                <Sparkles className="w-4 h-4 text-cyan-400 animate-pulse" />
+                                <span className="text-xs font-bold text-cyan-300">
+                                  大类微调规则 — <span className="text-white">[{cName}]</span>
+                                </span>
+                              </div>
+                              <button
+                                onClick={() => setActiveRescoreKey(null)}
+                                className="text-slate-400 hover:text-white p-1 rounded-lg transition-colors"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
+                            </div>
+
+                            <div className="space-y-1">
+                              <label className="text-[11px] font-bold text-slate-300">
+                                请输入大类微调评估规则:
+                              </label>
+                              <textarea
+                                value={rescoreInstructionMap[catKey] || ''}
+                                onChange={(e) => setRescoreInstructionMap({ ...rescoreInstructionMap, [catKey]: e.target.value })}
+                                rows={3}
+                                placeholder="例如：针对单标书评估，默认其投标总价为有效最低报价，价格分按满分计算。"
+                                className="w-full bg-slate-900 border border-slate-700 focus:border-cyan-500 rounded-xl p-2.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none transition-colors custom-scrollbar"
+                              />
+                            </div>
+
+                            {/* 快捷指令模板 */}
+                            <div className="flex flex-wrap gap-1.5 text-[11px]">
+                              <button
+                                onClick={() => setRescoreInstructionMap({ ...rescoreInstructionMap, [catKey]: '针对单标书评估，默认其投标总价为有效最低报价，按满分计算。' })}
+                                className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-cyan-950/60 hover:text-cyan-300 border border-slate-700 text-slate-300 transition-colors"
+                              >
+                                💰 价格默认满分
+                              </button>
+                              <button
+                                onClick={() => setRescoreInstructionMap({ ...rescoreInstructionMap, [catKey]: `针对【${cName}】大类，凡提供了响应承诺与相关情况说明的，均按满分计算。` })}
+                                className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-cyan-950/60 hover:text-cyan-300 border border-slate-700 text-slate-300 transition-colors"
+                              >
+                                📜 承诺书视同满足响应
+                              </button>
+                              <button
+                                onClick={() => setRescoreInstructionMap({ ...rescoreInstructionMap, [catKey]: '按招标文件已满足项进行正常梯次打分，宽松认定相关佐证材料。' })}
+                                className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-cyan-950/60 hover:text-cyan-300 border border-slate-700 text-slate-300 transition-colors"
+                              >
+                                ⚖️ 宽松认定佐证材料
+                              </button>
+                            </div>
+
+                            <div className="pt-2 border-t border-slate-800 flex items-center justify-end space-x-2">
+                              <button
+                                onClick={() => setActiveRescoreKey(null)}
+                                disabled={isCatRescoring}
+                                className="px-3 py-1 text-xs text-slate-400 hover:text-white transition-colors"
+                              >
+                                收起
+                              </button>
+                              <button
+                                onClick={() => handleApplyRescore(catKey, cName)}
+                                disabled={isCatRescoring || !(rescoreInstructionMap[catKey] || '').trim()}
+                                className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 text-slate-950 font-black text-xs hover:brightness-110 disabled:opacity-50 transition-all flex items-center space-x-1.5 shadow-md shadow-cyan-500/20"
+                              >
+                                {isCatRescoring ? (
+                                  <>
+                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                    <span>正在微调重算...</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Sparkles className="w-3.5 h-3.5" />
+                                    <span>应用规则重算大类得分</span>
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
             </div>
           </div>
@@ -729,10 +846,35 @@ export const BidScorerLab: React.FC = () => {
                   const ratio = (item.ai_score / (item.max_score || 1)) * 100;
                   const isPerfect = ratio >= 99;
 
+                  const itemKey = `item:${item.id || item.item_code || item.title}`;
+                  const isItemActive = activeRescoreKey === itemKey;
+                  const isItemRescoring = rescoringKey === itemKey;
+                  const defaultInst = item.category === '价格分' 
+                    ? '针对单标书评估，默认其投标总价为有效最低报价，按满分计算。' 
+                    : `针对[${item.title}]，凡提供了响应承诺与说明的，按满分计算。`;
+
+                  const handleToggleItemRescore = (e?: React.MouseEvent) => {
+                    if (e) e.stopPropagation();
+                    if (isItemActive) {
+                      setActiveRescoreKey(null);
+                    } else {
+                      setActiveRescoreKey(itemKey);
+                      if (!rescoreInstructionMap[itemKey]) {
+                        setRescoreInstructionMap(prev => ({ ...prev, [itemKey]: defaultInst }));
+                      }
+                    }
+                  };
+
                   return (
                     <div
                       key={item.id}
-                      className={`transition-all duration-300 rounded-2xl border ${isExpanded ? 'bg-slate-900/95 border-cyan-500/50 shadow-xl shadow-cyan-500/5' : 'bg-slate-950/60 border-slate-800 hover:border-slate-700/90'}`}
+                      className={`transition-all duration-300 rounded-2xl border ${
+                        isItemActive 
+                          ? 'bg-slate-900/95 border-cyan-500 shadow-xl shadow-cyan-500/10' 
+                          : isExpanded 
+                          ? 'bg-slate-900/95 border-cyan-500/50 shadow-xl shadow-cyan-500/5' 
+                          : 'bg-slate-950/60 border-slate-800 hover:border-slate-700/90'
+                      }`}
                     >
                       {/* 表行头部触感栏 */}
                       <div
@@ -782,21 +924,16 @@ export const BidScorerLab: React.FC = () => {
 
                           {/* 交互微调按钮 */}
                           <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setRescoreCategoryName(item.category);
-                              setRescoreItemCode(item.item_code || item.title);
-                              if (item.category === '价格分') {
-                                setRescoreInstruction('针对单标书评估，默认其投标总价为有效最低报价，按满分计算。');
-                              } else {
-                                setRescoreInstruction(`针对[${item.title}]，凡提供了响应承诺与说明的，按满分计算。`);
-                              }
-                            }}
-                            className="px-2.5 py-1 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 text-xs font-sans font-bold flex items-center gap-1.5 transition-all shadow-sm active:scale-95 flex-shrink-0"
+                            onClick={handleToggleItemRescore}
+                            className={`px-2.5 py-1 rounded-xl border text-xs font-sans font-bold flex items-center gap-1.5 transition-all shadow-sm active:scale-95 flex-shrink-0 ${
+                              isItemActive 
+                                ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-extrabold' 
+                                : 'bg-cyan-500/15 hover:bg-cyan-500/30 text-cyan-300 border-cyan-500/40'
+                            }`}
                             title={`精细微调 [${item.title}] 指令重算`}
                           >
-                            <MessageSquare className="w-3.5 h-3.5 text-cyan-400" />
-                            <span>微调</span>
+                            <MessageSquare className="w-3.5 h-3.5" />
+                            <span>{isItemActive ? '收起微调' : '微调'}</span>
                           </button>
 
                           <button className="text-slate-400 hover:text-white p-1.5 rounded-lg transition-colors text-sm font-black font-mono">
@@ -804,6 +941,98 @@ export const BidScorerLab: React.FC = () => {
                           </button>
                         </div>
                       </div>
+
+                      {/* 卡片内嵌微调控制台 (不遮挡页面) */}
+                      <AnimatePresence>
+                        {isItemActive && (
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            exit={{ opacity: 0, height: 0 }}
+                            className="px-5 py-4 border-t border-cyan-500/30 bg-slate-900/90 rounded-b-2xl space-y-3 font-sans"
+                          >
+                            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                              <div className="flex items-center space-x-2">
+                                <Sparkles className="w-4 h-4 text-cyan-400 animate-pulse" />
+                                <span className="text-xs font-bold text-cyan-300">
+                                  自定义微调评分规则 — <span className="text-white">[{item.title}]</span>
+                                </span>
+                              </div>
+                              <button
+                                onClick={() => setActiveRescoreKey(null)}
+                                className="text-slate-400 hover:text-white p-1 rounded-lg transition-colors"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
+                            </div>
+
+                            <div className="space-y-1">
+                              <label className="text-[11px] font-bold text-slate-300">
+                                请输入微调评分规则:
+                              </label>
+                              <textarea
+                                value={rescoreInstructionMap[itemKey] || ''}
+                                onChange={(e) => setRescoreInstructionMap({ ...rescoreInstructionMap, [itemKey]: e.target.value })}
+                                rows={3}
+                                placeholder="例如：针对单标书评估，默认其投标总价为有效最低报价，按满分计算。"
+                                className="w-full bg-slate-950 border border-slate-700 focus:border-cyan-500 rounded-xl p-2.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none transition-colors custom-scrollbar"
+                              />
+                            </div>
+
+                            {/* 快捷模板推荐 */}
+                            <div className="space-y-1">
+                              <span className="text-[10px] font-bold text-slate-400 font-mono">💡 常用快捷指令模板 (点击一键填入):</span>
+                              <div className="flex flex-wrap gap-1.5 text-[11px]">
+                                <button
+                                  onClick={() => setRescoreInstructionMap({ ...rescoreInstructionMap, [itemKey]: '针对单标书评估，默认其投标总价为有效最低报价，按满分计算。' })}
+                                  className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-cyan-950/60 hover:text-cyan-300 border border-slate-700 text-slate-300 transition-colors"
+                                >
+                                  💰 价格默认满分
+                                </button>
+                                <button
+                                  onClick={() => setRescoreInstructionMap({ ...rescoreInstructionMap, [itemKey]: `针对[${item.title}]，凡提供了响应承诺与说明的，按满分计算。` })}
+                                  className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-cyan-950/60 hover:text-cyan-300 border border-slate-700 text-slate-300 transition-colors"
+                                >
+                                  📜 承诺书视同满足响应
+                                </button>
+                                <button
+                                  onClick={() => setRescoreInstructionMap({ ...rescoreInstructionMap, [itemKey]: '按招标文件已满足项进行正常梯次打分，宽松认定相关佐证材料。' })}
+                                  className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-cyan-950/60 hover:text-cyan-300 border border-slate-700 text-slate-300 transition-colors"
+                                >
+                                  ⚖️ 宽松认定佐证材料
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="pt-2 border-t border-slate-800 flex items-center justify-end space-x-2">
+                              <button
+                                onClick={() => setActiveRescoreKey(null)}
+                                disabled={isItemRescoring}
+                                className="px-3 py-1 text-xs text-slate-400 hover:text-white transition-colors"
+                              >
+                                收起
+                              </button>
+                              <button
+                                onClick={() => handleApplyRescore(itemKey, item.category, item.item_code || item.title, item.title)}
+                                disabled={isItemRescoring || !(rescoreInstructionMap[itemKey] || '').trim()}
+                                className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 text-slate-950 font-black text-xs hover:brightness-110 disabled:opacity-50 transition-all flex items-center space-x-1.5 shadow-md shadow-cyan-500/20"
+                              >
+                                {isItemRescoring ? (
+                                  <>
+                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                    <span>正在微调重算...</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Sparkles className="w-3.5 h-3.5" />
+                                    <span>应用规则并重新打分</span>
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
 
                       {/* 打开手风琴内部: 原文依据与原因 */}
                       {isExpanded && (
@@ -846,19 +1075,11 @@ export const BidScorerLab: React.FC = () => {
 
                               <div className="pt-2 border-t border-slate-800/80">
                                 <button
-                                  onClick={() => {
-                                    setRescoreCategoryName(item.category);
-                                    setRescoreItemCode(item.item_code || item.title);
-                                    if (item.category === '价格分') {
-                                      setRescoreInstruction('针对单标书评估，默认其投标总价为有效最低报价，按满分计算。');
-                                    } else {
-                                      setRescoreInstruction(`针对[${item.title}]，凡提供了响应承诺与说明的，按满分计算。`);
-                                    }
-                                  }}
+                                  onClick={handleToggleItemRescore}
                                   className="w-full py-2.5 rounded-xl bg-gradient-to-r from-cyan-500/20 to-emerald-500/20 hover:from-cyan-500/30 hover:to-emerald-500/30 text-cyan-300 border border-cyan-500/40 text-xs font-extrabold flex items-center justify-center gap-2 transition-all shadow-md active:scale-98"
                                 >
                                   <Sparkles className="w-4 h-4 text-cyan-400 animate-pulse" />
-                                  <span>微调本项得分</span>
+                                  <span>{isItemActive ? '收起微调面板' : '微调本项得分'}</span>
                                 </button>
                               </div>
                             </div>
@@ -874,106 +1095,6 @@ export const BidScorerLab: React.FC = () => {
           </div>
         </motion.div>
       )}
-
-      {/* ===================== 6. 人工微调指令 Modal 弹窗 ===================== */}
-      <AnimatePresence>
-        {rescoreCategoryName && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              className="bg-slate-900 border border-cyan-500/40 rounded-3xl p-6 max-w-xl w-full shadow-2xl shadow-cyan-500/10 space-y-4"
-            >
-              <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-                <div className="flex items-center space-x-2.5">
-                  <div className="p-2 rounded-xl bg-cyan-500/15 text-cyan-400 border border-cyan-500/30">
-                    <Sparkles className="w-5 h-5 animate-pulse" />
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-black text-white">
-                      自定义微调评分规则 — <span className="text-cyan-400">[{rescoreCategoryName}]</span>
-                    </h3>
-                    <p className="text-xs text-slate-400 font-mono">Custom Rule Guidance for Score Re-evaluation</p>
-                  </div>
-                </div>
-                <button
-                  onClick={() => setRescoreCategoryName(null)}
-                  className="text-slate-400 hover:text-white p-1 rounded-lg transition-colors"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-xs font-bold text-slate-300">
-                  请输入微调评分规则:
-                </label>
-                <textarea
-                  value={rescoreInstruction}
-                  onChange={(e) => setRescoreInstruction(e.target.value)}
-                  rows={4}
-                  placeholder="例如：针对单标书评估，默认其投标总报价为最低有效报价，价格分按满分计算。"
-                  className="w-full bg-slate-950 border border-slate-700 focus:border-cyan-500 rounded-2xl p-3.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none transition-colors custom-scrollbar"
-                />
-              </div>
-
-              {/* 快捷模板推荐 */}
-              <div className="space-y-1.5">
-                <span className="text-[11px] font-bold text-slate-400 font-mono">💡 常用快捷指令模板 (点击一键填入):</span>
-                <div className="flex flex-wrap gap-2 text-xs">
-                  <button
-                    onClick={() => setRescoreInstruction('针对单标书评估，默认其投标总价为有效最低报价，按满分计算。')}
-                    className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-cyan-950/60 hover:text-cyan-300 border border-slate-700 text-slate-300 transition-colors"
-                  >
-                    💰 单标书价格默认满分
-                  </button>
-                  <button
-                    onClick={() => setRescoreInstruction('若投标文件中提供了项目承诺书或服务总结说明，直接给予满分。')}
-                    className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-cyan-950/60 hover:text-cyan-300 border border-slate-700 text-slate-300 transition-colors"
-                  >
-                    📜 承诺书视同满足响应
-                  </button>
-                  <button
-                    onClick={() => setRescoreInstruction('按招标文件已满足项进行正常梯次打分，宽松认定相关佐证材料。')}
-                    className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-cyan-950/60 hover:text-cyan-300 border border-slate-700 text-slate-300 transition-colors"
-                  >
-                    ⚖️ 宽松认定佐证材料
-                  </button>
-                </div>
-              </div>
-
-              <div className="pt-3 border-t border-slate-800 flex items-center justify-end space-x-3">
-                <button
-                  onClick={() => setRescoreCategoryName(null)}
-                  disabled={rescoring}
-                  className="px-4 py-2 rounded-xl text-sm text-slate-400 hover:text-white transition-colors"
-                >
-                  取消
-                </button>
-                <button
-                  onClick={handleRescoreCategory}
-                  disabled={rescoring || !rescoreInstruction.trim()}
-                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 text-slate-950 font-black text-sm hover:brightness-110 disabled:opacity-50 transition-all flex items-center space-x-2 shadow-lg shadow-cyan-500/20"
-                >
-                  {rescoring ? (
-                    <>
-                      <RefreshCw className="w-4 h-4 animate-spin" />
-                      <span>正在微调重算...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="w-4 h-4" />
-                      <span>应用规则并重新打分</span>
-                    </>
-                  )}
-                </button>
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
     </div>
   );
 };

@@ -2,11 +2,30 @@ import os
 import pytest
 import httpx
 from pathlib import Path
+from unittest.mock import MagicMock
 from app.main import app
+from app.api import deps
+
+
+@pytest.fixture
+def override_auth():
+    """
+    重载 FastAPI current_user 鉴权依赖，生成虚拟测试用户进行 API 测试
+    """
+    mock_user = MagicMock()
+    mock_user.id = "user-mineru-tester-101"
+    mock_user.tenant_id = "tenant-mineru-unit-999"
+    mock_user.is_active = True
+    app.dependency_overrides[deps.get_current_active_user] = lambda: mock_user
+    app.dependency_overrides[deps.get_current_user] = lambda: mock_user
+    yield mock_user
+    app.dependency_overrides.pop(deps.get_current_active_user, None)
+    app.dependency_overrides.pop(deps.get_current_user, None)
+
 
 
 @pytest.mark.asyncio
-async def test_mineru_status_api_should_return_200():
+async def test_mineru_status_api_should_return_200(override_auth):
     """
     测试 GET /api/v1/mineru/status 健康诊断接口
     """
@@ -22,7 +41,7 @@ async def test_mineru_status_api_should_return_200():
 
 
 @pytest.mark.asyncio
-async def test_mineru_parse_and_preview_api_should_succeed():
+async def test_mineru_parse_and_preview_api_should_succeed(override_auth):
     """
     测试上传 test_bidding.docx 到 POST /api/v1/mineru/parse 并通过 GET /preview-md/{task_id} 在线预览 Markdown 内容
     """
@@ -50,3 +69,4 @@ async def test_mineru_parse_and_preview_api_should_succeed():
         preview_resp = await ac.get(f"/api/v1/mineru/preview-md/{task_id}")
         assert preview_resp.status_code == 200
         assert preview_resp.text == markdown_content
+
