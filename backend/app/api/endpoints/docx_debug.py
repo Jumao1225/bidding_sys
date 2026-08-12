@@ -16,6 +16,7 @@ import re
 from typing import Dict, Any, Optional
 from loguru import logger
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 from app.services.docx_test_filler_service import docx_test_filler_service
@@ -120,8 +121,9 @@ async def debug_modify_docx(
                 "row_1": ["1", fill_data.get("项目名称", "智能填报响应模块"), price_val]
             }
 
-        # 3. 调用基于 docx 技能的修改服务
-        modified_bytes = docx_test_filler_service.fill_and_modify_docx(
+        # 3. 调用基于 docx 技能的修改服务（线程池异步化）
+        modified_bytes = await run_in_threadpool(
+            docx_test_filler_service.fill_and_modify_docx,
             docx_bytes=docx_bytes,
             fill_data=fill_data,
             table_updates=table_updates
@@ -183,7 +185,7 @@ async def accept_tracked_changes_api(file: UploadFile = File(...)):
 
     try:
         docx_bytes = await file.read()
-        res_bytes = docx_skill_service.accept_tracked_changes(docx_bytes)
+        res_bytes = await run_in_threadpool(docx_skill_service.accept_tracked_changes, docx_bytes)
         from urllib.parse import quote
         filename_encode = quote(f"accepted_{file.filename}")
         return Response(
@@ -206,7 +208,7 @@ async def insert_toc_api(file: UploadFile = File(...)):
 
     try:
         docx_bytes = await file.read()
-        res_bytes = docx_skill_service.insert_table_of_contents(docx_bytes)
+        res_bytes = await run_in_threadpool(docx_skill_service.insert_table_of_contents, docx_bytes)
         from urllib.parse import quote
         filename_encode = quote(f"toc_{file.filename}")
         return Response(
@@ -229,7 +231,7 @@ async def scrub_privacy_api(file: UploadFile = File(...)):
 
     try:
         docx_bytes = await file.read()
-        res_bytes = docx_skill_service.scrub_privacy_metadata(docx_bytes)
+        res_bytes = await run_in_threadpool(docx_skill_service.scrub_privacy_metadata, docx_bytes)
         from urllib.parse import quote
         filename_encode = quote(f"scrubbed_{file.filename}")
         return Response(
@@ -252,7 +254,7 @@ async def extract_comments_api(file: UploadFile = File(...)):
 
     try:
         docx_bytes = await file.read()
-        comments = docx_skill_service.extract_comments(docx_bytes)
+        comments = await run_in_threadpool(docx_skill_service.extract_comments, docx_bytes)
         return {"code": 200, "message": "成功提取批注", "data": comments}
     except Exception as e:
         logger.exception("提取批注失败")
@@ -269,7 +271,7 @@ async def strip_comments_api(file: UploadFile = File(...)):
 
     try:
         docx_bytes = await file.read()
-        res_bytes = docx_skill_service.strip_comments(docx_bytes)
+        res_bytes = await run_in_threadpool(docx_skill_service.strip_comments, docx_bytes)
         from urllib.parse import quote
         filename_encode = quote(f"no_comments_{file.filename}")
         return Response(

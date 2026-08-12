@@ -122,6 +122,8 @@ async def reextract_domain(
         token_user = current_user_id.set(current_user.id)
         token_tenant = current_tenant_id.set(current_user.tenant_id)
         
+        from fastapi.concurrency import run_in_threadpool
+
         try:
             if domain in ("opening_summary", "opening_summary_agent"):
                 from app.agents.nodes.opening_summary_agent import generate_opening_summary_node
@@ -130,7 +132,7 @@ async def reextract_domain(
                     "user_id": current_user.id,
                     "tenant_id": current_user.tenant_id
                 }
-                summary_res = generate_opening_summary_node(state)
+                summary_res = await run_in_threadpool(generate_opening_summary_node, state)
                 doc_fresh = document_crud.get_document_by_id(db, document_id, current_user.id, current_user.tenant_id)
                 fresh_meta = doc_fresh.parsed_metadata if doc_fresh else {}
                 return success_response(
@@ -151,7 +153,7 @@ async def reextract_domain(
                     "user_id": current_user.id,
                     "tenant_id": current_user.tenant_id
                 }
-                cost_result = cost_node(state)
+                cost_result = await run_in_threadpool(cost_node, state)
                 cost_data = cost_result.get("cost_analysis", {})
                 
                 # 持久化更新至数据库 parsed_metadata
@@ -173,7 +175,7 @@ async def reextract_domain(
                     "tenant_id": current_user.tenant_id,
                     "company_quals": (doc.parsed_metadata or {}).get("company_quals", "")
                 }
-                qual_result = analyze_qualifications_node(state)
+                qual_result = await run_in_threadpool(analyze_qualifications_node, state)
                 qual_data = qual_result.get("qualifications_analysis", {})
 
                 parsed_metadata = dict(doc.parsed_metadata or {})
@@ -192,7 +194,7 @@ async def reextract_domain(
                     "tenant_id": current_user.tenant_id,
                     "company_quals": (doc.parsed_metadata or {}).get("company_quals", "")
                 }
-                writer_result = writer_agent_node(state)
+                writer_result = await run_in_threadpool(writer_agent_node, state)
                 
                 # 重新刷新从数据库读取最新 parsed_metadata 包含的 bid_doc_outline
                 doc_fresh = document_crud.get_document_by_id(db, document_id, current_user.id, current_user.tenant_id)
@@ -208,8 +210,8 @@ async def reextract_domain(
                 )
             
             tool_func = domain_map[domain]
-            # 调用工具提取（其内部已包含落盘逻辑）
-            res_str = tool_func.invoke({"document_id": document_id})
+            # 调用工具提取（异步线程池避让主事件循环）
+            res_str = await run_in_threadpool(tool_func.invoke, {"document_id": document_id})
             
             import json
             if res_str and res_str.startswith("{"):

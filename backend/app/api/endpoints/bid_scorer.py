@@ -15,6 +15,7 @@ from typing import List
 from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from loguru import logger
 
@@ -102,8 +103,9 @@ async def upload_bid_document(
 
         logger.info(f"📤 投标文件已保存: {file_path}")
 
-        # 调用 Service 层执行轻量解析
-        result = bid_scorer_service.upload_and_parse_bid(
+        # 调用 Service 层执行轻量解析（使用 run_in_threadpool 避让主事件循环）
+        result = await run_in_threadpool(
+            bid_scorer_service.upload_and_parse_bid,
             db=db,
             file_path=file_path,
             filename=file.filename,
@@ -139,7 +141,8 @@ async def get_document_chunks(
     供前端界面渲染原文及人工章节标注面板。
     """
     try:
-        chunks = bid_scorer_service.get_document_chunks_for_annotation(
+        chunks = await run_in_threadpool(
+            bid_scorer_service.get_document_chunks_for_annotation,
             db=db,
             document_id=document_id,
             user_id=current_user.id,
@@ -165,7 +168,8 @@ async def update_document_chunks(
     后端将批量更新向量 Embedding，确保后续 AI 打分 100% 依据人工确认后的章节维度进行检索。
     """
     try:
-        result = bid_scorer_service.save_human_annotated_chunks(
+        result = await run_in_threadpool(
+            bid_scorer_service.save_human_annotated_chunks,
             db=db,
             document_id=document_id,
             chunk_updates=body.chunks,
@@ -202,7 +206,8 @@ async def score_bid(
             f"rounds={request.scoring_rounds}"
         )
 
-        result = bid_scorer_service.score_bid(
+        result = await run_in_threadpool(
+            bid_scorer_service.score_bid,
             document_id=request.document_id,
             source_doc_id=request.source_doc_id,
             user_id=current_user.id,
@@ -450,7 +455,7 @@ async def evaluate_ragas_for_result(
     try:
         from app.services.ragas_eval_service import ragas_eval_service
         logger.info(f"📊 [API] 触发 Ragas 开源评估: result_id={result_id}")
-        eval_summary = ragas_eval_service.evaluate_score_result(db=db, score_result_id=result_id)
+        eval_summary = await run_in_threadpool(ragas_eval_service.evaluate_score_result, db=db, score_result_id=result_id)
         return success_response(data=eval_summary, message="Ragas 开源指标评估计算完成")
     except ValueError as e:
         raise HTTPException(status_code=44, detail=str(e))
@@ -479,7 +484,8 @@ async def rescore_category(
             f"category={body.category}, 指令='{body.user_instruction[:30]}'"
         )
 
-        updated_result = bid_scorer_service.rescore_category_with_instruction(
+        updated_result = await run_in_threadpool(
+            bid_scorer_service.rescore_category_with_instruction,
             db=db,
             result_id=body.result_id,
             category=body.category,

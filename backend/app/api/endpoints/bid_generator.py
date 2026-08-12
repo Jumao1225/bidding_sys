@@ -20,6 +20,7 @@ import uuid
 import urllib.parse
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from loguru import logger
@@ -496,7 +497,8 @@ async def extract_and_download_bid_format(
     logger.info(f"收到投标文件格式提取请求: doc_id={document_id}, user_id={current_user.id}")
 
     try:
-        docx_bytes, filename, mode = bid_format_extractor_service.extract_and_export_bid_format(
+        docx_bytes, filename, mode = await run_in_threadpool(
+            bid_format_extractor_service.extract_and_export_bid_format,
             db=db,
             doc_id=document_id,
             user_id=current_user.id if hasattr(current_user, 'id') else None,
@@ -547,7 +549,8 @@ async def fill_and_download_bid_format(
     logger.info(f"收到投标文件格式纯净导出请求: doc_id={document_id}")
 
     try:
-        template_bytes, filename, mode = bid_format_extractor_service.extract_and_export_bid_format(
+        template_bytes, filename, mode = await run_in_threadpool(
+            bid_format_extractor_service.extract_and_export_bid_format,
             db=db,
             doc_id=document_id,
             user_id=current_user.id if hasattr(current_user, 'id') else None,
@@ -596,7 +599,8 @@ async def trigger_human_like_bid_filling(
 
     logger.info(f"收到标书自动填报请求（→ 内部委托方案 C BidFillerAgent）: doc_id={document_id}")
 
-    template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
+    template_bytes, filename, _ = await run_in_threadpool(
+        bid_format_extractor_service.extract_and_export_bid_format,
         db=db,
         doc_id=document_id,
         user_id=current_user.id if hasattr(current_user, 'id') else None,
@@ -623,7 +627,8 @@ async def trigger_human_like_bid_filling(
         except PermissionError:
             pass
 
-    _, audit_report, filled_bytes = bid_filler_agent.process_filling_tasks(
+    _, audit_report, filled_bytes = await run_in_threadpool(
+        bid_filler_agent.process_filling_tasks,
         db=db,
         document_id=document_id,
         profile=CompanyProfile(),

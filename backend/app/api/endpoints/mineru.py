@@ -62,8 +62,11 @@ async def parse_document(
 
         logger.info(f"上传文件已暂存: {file_path}，开始提交 MinerUService 解析...")
 
-        # 3. 调用 Service 执行解析
-        result = mineru_service.parse(
+        from fastapi.concurrency import run_in_threadpool
+
+        # 3. 调用 Service 执行解析（异步线程池避让主事件循环）
+        result = await run_in_threadpool(
+            mineru_service.parse,
             file_path=str(file_path),
             task_id=task_id,
             parse_mode=parse_mode
