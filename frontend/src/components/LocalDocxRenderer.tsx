@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import type { DocRenderer } from "@cyntler/react-doc-viewer";
 import { renderAsync } from 'docx-preview';
 
-export const LocalDocxRenderer: DocRenderer = ({ mainState: { currentDocument } }) => {
+export const LocalDocxRenderer: DocRenderer = ({ mainState: { currentDocument, requestHeaders } }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -15,9 +15,18 @@ export const LocalDocxRenderer: DocRenderer = ({ mainState: { currentDocument } 
     setError(null);
 
     // 获取文件流
-    fetch(currentDocument.uri)
-      .then(res => {
-        if (!res.ok) throw new Error("获取文件失败");
+    fetch(currentDocument.uri, { headers: requestHeaders as HeadersInit })
+      .then(async res => {
+        if (!res.ok) {
+          console.error("Fetch failed with status:", res.status);
+          throw new Error("获取文件失败: HTTP " + res.status);
+        }
+        const contentType = res.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+          const json = await res.json().catch(() => ({}));
+          console.error("Expected binary file but got JSON:", json);
+          throw new Error("获取文件失败: " + (json.message || json.detail || "后端返回了JSON"));
+        }
         return res.blob();
       })
       .then(blob => {

@@ -440,9 +440,27 @@ class LLMService:
             embeddings_model = self._get_embeddings_model()
             total_texts = len(texts)
 
-            # 少量文本无需分批输出进度
+            # 少量文本直接生成并推送 100% 进度
             if total_texts <= batch_size:
-                return embeddings_model.embed_documents(texts)
+                res = embeddings_model.embed_documents(texts)
+                if show_progress:
+                    try:
+                        from app.worker.tasks import emit_agent_log
+                        emit_agent_log(
+                            log_type="info",
+                            content=f"🧮 [BGE-M3 向量化计算] 已完成 {total_texts}/{total_texts} (100%) | 单批计算完成",
+                            extra={
+                                "type": "embedding_progress",
+                                "processed_count": total_texts,
+                                "total_texts": total_texts,
+                                "percent": 100.0,
+                                "current_batch": 1,
+                                "total_batches": 1
+                            }
+                        )
+                    except Exception:
+                        pass
+                return res
 
             total_batches = (total_texts + batch_size - 1) // batch_size
             if show_progress:
@@ -483,6 +501,22 @@ class LLMService:
                     logger.info(
                         f"📊 [Embedding 进度] 已完成 {processed_count}/{total_texts} ({percent:.1f}%) | 批次 {i + 1}/{total_batches}"
                     )
+                    try:
+                        from app.worker.tasks import emit_agent_log
+                        emit_agent_log(
+                            log_type="info",
+                            content=f"🧮 [BGE-M3 向量化计算] 已生成 {processed_count}/{total_texts} ({percent:.0f}%) | 批次 {i + 1}/{total_batches}",
+                            extra={
+                                "type": "embedding_progress",
+                                "processed_count": processed_count,
+                                "total_texts": total_texts,
+                                "percent": round(percent, 1),
+                                "current_batch": i + 1,
+                                "total_batches": total_batches
+                            }
+                        )
+                    except Exception:
+                        pass
 
             return all_embeddings
         except Exception as e:

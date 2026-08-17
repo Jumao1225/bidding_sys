@@ -249,3 +249,20 @@ def get_llm_cost_stats(
         }
     }
 
+
+@router.post("/clean-office-processes")
+def clean_office_processes(
+    current_admin: UserModel = Depends(deps.get_current_admin_user),
+) -> Any:
+    """
+    运维管理 API：强制清理 Windows/Linux 系统中残留悬挂的 OfficeCLI / LibreOffice 孤儿进程，强行释放文件独占锁
+    """
+    from app.services.office_cli_service import office_cli_service
+
+    killed_count = office_cli_service.kill_lingering_processes()
+    return {
+        "code": 200,
+        "message": f"成功解封句柄锁并强杀 {killed_count} 个悬挂的 Office 孤儿进程",
+        "data": {"killed_count": killed_count}
+    }
+

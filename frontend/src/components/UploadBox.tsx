@@ -122,6 +122,13 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
   };
   const [progress, setProgress] = useState(0);
   const [statusText, setStatusText] = useState("");
+  const [embeddingInfo, setEmbeddingInfo] = useState<{
+    percent: number;
+    processed_count: number;
+    total_texts: number;
+    current_batch: number;
+    total_batches: number;
+  } | null>(null);
   
   const [result, setResult] = useState<any>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
@@ -310,6 +317,10 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
         setTaskId(taskId);
         setFileName(file.name);
         setStatusText("任务已提交，排队中...");
+
+        // 立刻持久化最新解析的 document_id，保证切换页面再切回时能恢复解析状态与结果
+        localStorage.setItem('bidding_document_id', taskId);
+        window.dispatchEvent(new Event('bidding_document_changed'));
         
         // 开启 SSE 监听
         const eventSource = new EventSource(`${baseUrl}/api/v1/sse/progress/${taskId}`);
@@ -325,6 +336,17 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
               if (log.document_id) {
                 localStorage.setItem('bidding_document_id', log.document_id);
               }
+              if (log.type === 'embedding_progress') {
+                setEmbeddingInfo({
+                  percent: log.percent,
+                  processed_count: log.processed_count,
+                  total_texts: log.total_texts,
+                  current_batch: log.current_batch,
+                  total_batches: log.total_batches
+                });
+                setStatusText(`🧮 BGE-M3 向量化计算中 (${log.percent}%)`);
+              }
+
               if (onTerminalMessage) {
                 onTerminalMessage({
                   id: Date.now().toString() + Math.random().toString(),
@@ -425,6 +447,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     }
 
     return [{ 
+      id: activeDocOrTaskId,
       uri: `${import.meta.env.VITE_API_BASE_URL || ""}/api/v1/analysis/download/${activeDocOrTaskId}`,
       fileName: actualFileName,
       fileType: fileType
@@ -596,6 +619,29 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
               </div>
               <p className="text-slate-700 font-bold text-lg animate-pulse">{statusText}</p>
               <p className="text-slate-400 text-sm">正在调度多智能体网络进行深度分析...</p>
+
+              {/* Embedding 专属生成进度卡片 */}
+              {embeddingInfo && (
+                <div className="w-full max-w-md bg-white border border-indigo-100 rounded-xl p-4 shadow-sm mt-3 animate-fade-in-up">
+                  <div className="flex items-center justify-between text-xs font-bold mb-2">
+                    <span className="text-indigo-600 flex items-center gap-1.5">
+                      <span className="animate-spin text-sm">🧮</span>
+                      <span>BGE-M3 向量化矩阵生成进度</span>
+                    </span>
+                    <span className="text-indigo-600 font-mono font-extrabold">{embeddingInfo.percent}%</span>
+                  </div>
+                  <div className="w-full bg-indigo-50 h-2.5 rounded-full overflow-hidden mb-2 border border-indigo-100/60">
+                    <div 
+                      className="bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500 h-full transition-all duration-500 ease-out shadow-sm"
+                      style={{ width: `${embeddingInfo.percent}%` }}
+                    ></div>
+                  </div>
+                  <div className="flex justify-between text-[11px] text-slate-500 font-mono">
+                    <span>切片已向量化: {embeddingInfo.processed_count} / {embeddingInfo.total_texts}</span>
+                    <span>批次: {embeddingInfo.current_batch} / {embeddingInfo.total_batches}</span>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}

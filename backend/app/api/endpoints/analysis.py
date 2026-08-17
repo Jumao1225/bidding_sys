@@ -58,16 +58,25 @@ async def upload_and_analyze(
             
         logger.info(f"文件已保存: {file_path}，即将触发 Celery 任务: {task_id}")
         
-        # 触发后台异步任务
-        background_tasks.add_task(
-            analyze_bidding_doc,
-            task_id, 
-            file_path, 
-            file.filename, 
-            company_quals,
-            current_user.id,
-            current_user.tenant_id
+        # 触发后台异步独立线程任务（绑定 ContextVar 确保 emit_agent_log 能正常将进度推送到 Redis 频道）
+        import threading
+        def _run_analyze_thread_with_context(t_id, f_path, f_name, c_quals, u_id, ten_id):
+            from app.core.context import current_task_id
+            token = current_task_id.set(t_id)
+            try:
+                analyze_bidding_doc(t_id, f_path, f_name, c_quals, u_id, ten_id)
+            finally:
+                try:
+                    current_task_id.reset(token)
+                except Exception:
+                    pass
+
+        parse_thread = threading.Thread(
+            target=_run_analyze_thread_with_context,
+            args=(task_id, file_path, file.filename, company_quals, current_user.id, current_user.tenant_id),
+            daemon=True
         )
+        parse_thread.start()
         
         # 返回 task_id，前端根据这个 task_id 建立 SSE 连接
         return success_response(data={"task_id": task_id}, message="任务已提交，请通过 SSE 获取进度")
@@ -356,6 +365,7 @@ async def update_cost_analysis(
         for item in calculated_items:
             est = CostEstimate(
                 tenant_id=current_user.tenant_id,
+                user_id=current_user.id,
                 document_id=document_id,
                 project_id=valid_project_id,
                 item_name=item.get("name", "未命名项"),
@@ -400,22 +410,8 @@ async def download_bidding_draft(
     target_file_path = draft_path if (draft_path and os.path.exists(draft_path)) else (expected_path if os.path.exists(expected_path) else None)
     
     if not target_file_path:
-        logger.info(f"磁盘未搜寻到草稿，触发在线动态生成草稿，文档ID: {document_id}")
-        try:
-            from app.agents.bid_filler_agent import bid_filler_orchestrator_node as writer_agent_node
-            state = {
-                "document_id": document_id,
-                "user_id": current_user.id,
-                "tenant_id": current_user.tenant_id,
-                "company_quals": parsed_meta.get("company_quals", "")
-            }
-            writer_res = writer_agent_node(state)
-            target_file_path = writer_res.get("draft_path")
-            if not target_file_path or not os.path.exists(target_file_path):
-                raise HTTPException(status_code=404, detail="投标书草稿生成失败")
-        except Exception as gen_err:
-            logger.exception(f"动态生成草稿失败: {gen_err}")
-            raise HTTPException(status_code=500, detail=f"投标书草稿实时生成失败: {str(gen_err)}")
+        logger.info(f"未在磁盘搜寻到现成草稿，提示用户手动点击起草，文档ID: {document_id}")
+        raise HTTPException(status_code=404, detail="投标书草稿尚未生成，请在页面中点击【生成/起草标书】按钮手动触发。")
     if target_file_path and os.path.exists(target_file_path):
         try:
             from app.agents.tools.bid_db_tools import auto_embed_qualification_images_in_docx

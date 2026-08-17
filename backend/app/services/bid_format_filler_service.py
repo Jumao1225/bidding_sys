@@ -304,8 +304,8 @@ class BidFormatFillerService:
 
             # 原位精确拆分替换
             new_text = date_re.sub(r'[\s_]{2,}年', f"{y_str}年", text)
-            new_text = date_re.sub(r'[\s_]*月', f"{m_str}月", new_text)
-            new_text = date_re.sub(r'[\s_]*日', f"{d_str}日", new_text)
+            new_text = date_re.sub(r'(?<=年)[\s_]*月', f"{m_str}月", new_text)
+            new_text = date_re.sub(r'(?<=月)[\s_]*日', f"{d_str}日", new_text)
 
             p._element.clear_content()
             r = p.add_run(new_text)
@@ -320,11 +320,11 @@ class BidFormatFillerService:
             not txt_stripped.startswith(('1', '2', '3', '4', '5', '6', '7', '8', '9', '一', '二', '三', '四', '五', '致', '据此', '根据'))
         )
 
-        # 查找匹配的占位符模式
+        # 查找匹配的占位符模式（严禁匹配冒号前、汉字中间的对齐空格）
         if is_label_line:
-            placeholder_regex = re.compile(r'(_{2,}|\[[^\]]+\]|［[^］]+］|\s{2,}|(?<=[:：])\s*$)')
+            placeholder_regex = re.compile(r'(_{2,}|\[[^\]]+\]|［[^］]+］|(?<=[:：])\s{2,}|\s{2,}$)')
         else:
-            placeholder_regex = re.compile(r'(_{2,}|\[[^\]]+\]|［[^］]+］|\s{3,})')
+            placeholder_regex = re.compile(r'(_{2,}|\[[^\]]+\]|［[^］]+］|(?<=[:：])\s{2,}|\s{3,}$)')
 
         matches = list(placeholder_regex.finditer(text))
         if not matches:

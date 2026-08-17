@@ -140,6 +140,7 @@ class BidScorerService:
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             db_chunk = DocChunk(
                 tenant_id=tenant_id,
+                user_id=user_id or doc.user_id,
                 document_id=doc.id,
                 content=chunk.page_content,
                 chunk_index=chunk.metadata.get("chunk_index", i),

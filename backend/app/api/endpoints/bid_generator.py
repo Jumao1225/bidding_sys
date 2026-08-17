@@ -19,9 +19,10 @@ import tempfile
 import uuid
 import urllib.parse
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from loguru import logger
 
@@ -110,14 +111,19 @@ async def get_bid_fill_worker_logs(
         try:
             logs = (
                 db.query(AgentAuditLog)
-                .filter(cast(AgentAuditLog.inputs, String).like(f"%{document_id}%"))
+                .filter(
+                    or_(
+                        AgentAuditLog.task_id == document_id,
+                        cast(AgentAuditLog.inputs, String).like(f"%{document_id}%")
+                    )
+                )
                 .order_by(desc(AgentAuditLog.created_at))
                 .all()
             )
         except Exception as filter_err:
-            logger.warning(f"基于 SQL LIKE 过滤 AgentAuditLog 异常, 降级全量过滤: {filter_err}")
+            logger.warning(f"基于 SQL 过滤 AgentAuditLog 异常, 降级全量过滤: {filter_err}")
             all_logs = db.query(AgentAuditLog).order_by(desc(AgentAuditLog.created_at)).limit(200).all()
-            logs = [l for l in all_logs if document_id in str(l.inputs or {})]
+            logs = [l for l in all_logs if l.task_id == document_id or document_id in str(l.inputs or {})]
 
         worker_items = []
         seen_chapters = set()
@@ -192,17 +198,21 @@ async def stream_bid_fill_worker_logs(
                 try:
                     logs = (
                         session.query(AgentAuditLog)
-                        .filter(cast(AgentAuditLog.inputs, String).like(f"%{document_id}%"))
+                        .filter(
+                            or_(
+                                AgentAuditLog.task_id == document_id,
+                                cast(AgentAuditLog.inputs, String).like(f"%{document_id}%")
+                            )
+                        )
                         .order_by(desc(AgentAuditLog.created_at))
                         .all()
                     )
                 except Exception:
                     all_logs = session.query(AgentAuditLog).order_by(desc(AgentAuditLog.created_at)).limit(200).all()
-                    logs = [l for l in all_logs if document_id in str(l.inputs or {})]
+                    logs = [l for l in all_logs if l.task_id == document_id or document_id in str(l.inputs or {})]
 
                 worker_items = []
                 seen_chapters = set()
-                all_completed = True if logs else False
 
                 for log in logs:
                     if log.action_type in ("llm_call_worker", "llm_call_supervisor", "chapter_execution") or (log.node_name and (log.node_name.startswith("BidFillerWorker") or "Supervisor" in log.node_name)):
@@ -215,8 +225,6 @@ async def stream_bid_fill_worker_logs(
                         seen_chapters.add(ch_title)
 
                         status_val = log.status or "success"
-                        if status_val == "in_progress":
-                            all_completed = False
 
                         worker_items.append({
                             "id": str(log.id),
@@ -236,10 +244,21 @@ async def stream_bid_fill_worker_logs(
                             "created_at": log.created_at.strftime("%Y-%m-%d %H:%M:%S") if log.created_at else None
                         })
 
+                # 判断所有最新状态的节点中是否还有正在进行中的任务
+                has_in_progress = any(w.get("status") in ("in_progress", "running") for w in worker_items)
+
+                # 只有当日志非空、没有任何在途进行中的 Worker、且至少有一个成功节点时才判定为全量完成
+                all_completed = (
+                    bool(logs) and 
+                    not has_in_progress and 
+                    len(worker_items) > 0 and 
+                    any(w.get("status") == "success" for w in worker_items)
+                )
+
                 payload = {
                     "document_id": document_id,
                     "worker_items": worker_items,
-                    "is_completed": all_completed and len(worker_items) > 0,
+                    "is_completed": all_completed,
                     "timestamp": time.time()
                 }
                 payload_str = json.dumps(payload, ensure_ascii=False)
@@ -658,27 +677,137 @@ async def trigger_human_like_bid_filling(
     }
 
 
-@router.post("/agent-fill-bid-format/{document_id}")
-def trigger_agent_bid_filling(
+def _run_agent_bid_filling_in_background(
     document_id: str,
+    u_id: str,
+    t_id: str,
+    custom_instructions: Optional[str] = None,
+    category_hints: Optional[dict] = None,
+):
+    """后台工作线程：执行长耗时的 BidFillerAgent 多 Agent 标书撰写与落盘"""
+    from app.core.context import current_user_id, current_tenant_id, current_task_id
+    from app.db.session import SessionLocal
+    from app.schemas.bid_filler_schema import CompanyProfile
+    from app.agents.bid_filler_agent import bid_filler_agent
+    from app.services.bid_format_extractor_service import bid_format_extractor_service
+
+    token_task = current_task_id.set(document_id)
+    token_u = current_user_id.set(u_id)
+    token_t = current_tenant_id.set(t_id)
+    db: Session = SessionLocal()
+    try:
+        template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
+            db=db, doc_id=document_id, user_id=None, tenant_id=None
+        )
+        if not template_bytes:
+            logger.error(f"后台任务提取《投标文件格式》模板失败: doc_id={document_id}")
+            from app.db.models.audit import AgentAuditLog
+            err_log = AgentAuditLog(
+                task_id=document_id,
+                tenant_id=t_id,
+                user_id=u_id,
+                node_name="Supervisor-总控调度",
+                action_type="llm_call_supervisor",
+                status="failed",
+                inputs={"chapter_title": "Supervisor-总控调度"},
+                outputs={"summary": "❌ 后台提取《投标文件格式》模板失败"}
+            )
+            db.add(err_log)
+            db.commit()
+            return
+
+        replacement_map, audit_report, filled_bytes = bid_filler_agent.process_filling_tasks(
+            db=db,
+            document_id=document_id,
+            profile=CompanyProfile(),
+            detected_placeholders=[],
+            original_docx=template_bytes,
+            custom_instructions=custom_instructions,
+            category_hints=category_hints,
+        )
+
+        if not filled_bytes:
+            from app.services.bid_format_filler_service import bid_format_filler_service as filler_svc
+            filled_bytes = filler_svc.fill_docx_with_audit_trail(
+                docx_bytes=template_bytes,
+                replacement_map=replacement_map,
+                audit_items=audit_report.audit_items if audit_report else []
+            )
+
+        if filled_bytes:
+            drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
+            os.makedirs(drafts_dir, exist_ok=True)
+            result_path = os.path.join(drafts_dir, f"agent_fill_result_{document_id[:8]}.docx")
+            draft_path = os.path.join(drafts_dir, f"draft_{document_id}.docx")
+            for p in [result_path, draft_path]:
+                with open(p, "wb") as f:
+                    f.write(filled_bytes)
+            logger.info(f"✅ 后台标书撰写完成并已保存至: {result_path}")
+
+            # 写入 Supervisor 最终完成日志，确保前端 SSE 和控制台能够侦测到全量收官
+            try:
+                from app.db.models.audit import AgentAuditLog
+                final_sup_log = AgentAuditLog(
+                    task_id=document_id,
+                    tenant_id=t_id,
+                    user_id=u_id,
+                    node_name="Supervisor-总控调度",
+                    action_type="llm_call_supervisor",
+                    status="master_completed",
+                    inputs={"document_id": document_id, "chapter_title": "Supervisor-总控调度"},
+                    outputs={"summary": "✨ AI 团队自主撰写与原位写盘已全量收官！所有章节卡片均已更新。"}
+                )
+                db.add(final_sup_log)
+                db.commit()
+            except Exception as final_log_err:
+                logger.warning(f"写入最终 Supervisor 完结日志异常: {final_log_err}")
+    except Exception as e:
+        logger.exception(f"❌ 后台标书撰写任务异常: {e}")
+        try:
+            from app.db.models.audit import AgentAuditLog
+            err_log = AgentAuditLog(
+                task_id=document_id,
+                tenant_id=t_id,
+                user_id=u_id,
+                node_name="Supervisor-总控调度",
+                action_type="llm_call_supervisor",
+                status="failed",
+                inputs={"chapter_title": "Supervisor-总控调度"},
+                outputs={"summary": f"❌ 后台标书撰写任务异常中断: {str(e)}"}
+            )
+            db.add(err_log)
+            db.commit()
+        except Exception:
+            pass
+    finally:
+        try:
+            current_task_id.reset(token_task)
+            current_user_id.reset(token_u)
+            current_tenant_id.reset(token_t)
+        except Exception:
+            pass
+        db.close()
+
+
+@router.post("/agent-fill-bid-format/{document_id}")
+async def trigger_agent_bid_filling(
+    document_id: str,
+    background_tasks: BackgroundTasks,
     request_body: Optional[BidFillRequest] = None,
     db: Session = Depends(deps.get_db),
     current_user: Optional[User] = Depends(deps.get_current_user_optional)
 ):
     """
     触发 BidFillerAgent (LangGraph + ReAct Agent) 自动填报。
+    使用 BackgroundTasks 进行后台解耦，瞬间返回响应，配合 SSE (stream-logs) 获得 0 延迟卡片实时弹增体验。
     """
     if not document_id:
         raise HTTPException(status_code=400, detail="未提供有效的 document_id 参数")
 
     logger.info(f"🤖 收到 BidFillerAgent ReAct 自动填报请求: doc_id={document_id}")
 
-    # 建立多租户与用户安全上下文，全链路透传至 ContextVar 及多线程 Worker
-    from app.core.context import current_user_id, current_tenant_id
     u_id = current_user.id if (current_user and hasattr(current_user, 'id')) else "default-user"
     t_id = current_user.tenant_id if (current_user and hasattr(current_user, 'tenant_id')) else "default-tenant"
-    token_u = current_user_id.set(u_id)
-    token_t = current_tenant_id.set(t_id)
 
     custom_instructions = None
     category_hints = None
@@ -686,12 +815,15 @@ def trigger_agent_bid_filling(
         custom_instructions = request_body.custom_instructions
         category_hints = request_body.category_hints
 
-    # 清理该文档上一次的填报审计日志，并立即注入全局起始 in_progress 记录，为全新一轮运行提供实时卡片弹增与追溯空间
+    # 清理该文档上一次的填报审计日志，并立即注入全局起始 in_progress 记录
     try:
         from app.db.models.audit import AgentAuditLog
         from sqlalchemy import cast, String
         db.query(AgentAuditLog).filter(
-            cast(AgentAuditLog.inputs, String).like(f"%{document_id}%")
+            or_(
+                AgentAuditLog.task_id == document_id,
+                cast(AgentAuditLog.inputs, String).like(f"%{document_id}%")
+            )
         ).delete(synchronize_session=False)
 
         init_log = AgentAuditLog(
@@ -711,45 +843,22 @@ def trigger_agent_bid_filling(
         logger.warning(f"清理旧 AuditLog 异常: {del_err}")
         db.rollback()
 
-    template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
-        db=db,
-        doc_id=document_id,
-        user_id=current_user.id if hasattr(current_user, 'id') else None,
-        tenant_id=current_user.tenant_id if hasattr(current_user, 'tenant_id') else None
+    import threading
+    filling_thread = threading.Thread(
+        target=_run_agent_bid_filling_in_background,
+        kwargs={
+            "document_id": document_id,
+            "u_id": u_id,
+            "t_id": t_id,
+            "custom_instructions": custom_instructions,
+            "category_hints": category_hints
+        },
+        daemon=True
     )
-    if not template_bytes:
-        raise HTTPException(status_code=500, detail="未提取到《投标文件格式》模板，无法触发 Agent 填报")
-
-    from app.schemas.bid_filler_schema import CompanyProfile
-    from app.agents.bid_filler_agent import bid_filler_agent
-
-    replacement_map, audit_report, filled_bytes = bid_filler_agent.process_filling_tasks(
-        db=db,
-        document_id=document_id,
-        profile=CompanyProfile(),
-        detected_placeholders=[],
-        original_docx=template_bytes,
-        custom_instructions=custom_instructions,
-        category_hints=category_hints,
-    )
-
-    if not filled_bytes:
-        from app.services.bid_format_filler_service import bid_format_filler_service as filler_svc
-        filled_bytes = filler_svc.fill_docx_with_audit_trail(
-            docx_bytes=template_bytes,
-            replacement_map=replacement_map,
-            audit_items=audit_report.audit_items if audit_report else []
-        )
-
-    if filled_bytes:
-        drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
-        os.makedirs(drafts_dir, exist_ok=True)
-        result_path = os.path.join(drafts_dir, f"agent_fill_result_{document_id[:8]}.docx")
-        with open(result_path, "wb") as f:
-            f.write(filled_bytes)
+    filling_thread.start()
 
     return {
         "document_id": document_id,
-        "audit_report": audit_report.model_dump() if audit_report else None,
-        "summary": "BidFillerAgent (全自主标书撰写 Agent) 已完成《投标文件格式》的撰写",
+        "status": "processing",
+        "message": "已成功启动 Agent 团队后台全自主撰写流程，请通过 SSE 实时监听进度"
     }

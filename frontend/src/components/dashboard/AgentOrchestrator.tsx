@@ -171,7 +171,7 @@ export const AgentOrchestrator: React.FC<AgentOrchestratorProps> = ({
             <span>全网 Worker 节点调度图</span>
             <span>已完成项: {workerStatuses.filter(w => w.status === 'success' || w.status === 'skipped').length} / {workerStatuses.length}</span>
           </div>
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {workerStatuses.map((worker) => {
               const style = statusConfig[worker.status];
               const isError = worker.status === 'failed';

@@ -18,9 +18,9 @@ class EquipmentItem(BaseModel):
 
 class TechValidationRequirement(BaseModel):
     """技术验证、样品与演示要求（一票否决/高分项）"""
-    sample_required: bool = Field(False, description="开标现场是否需要提供物理样品/样机")
+    sample_required: Optional[bool] = Field(False, description="开标现场是否需要提供物理样品/样机")
     sample_description: Optional[str] = Field(None, description="样品/样机送达与封样要求")
-    poc_demo_required: bool = Field(False, description="是否需要现场 POC 演示或软件系统功能答辩")
+    poc_demo_required: Optional[bool] = Field(False, description="是否需要现场 POC 演示或软件系统功能答辩")
     test_report_requirements: Optional[list[str]] = Field(
         default_factory=list, 
         description="要求的第三方检测/测试报告明细（如：['须具备某种第三方认证机构出具的检测报告']）"

@@ -9,7 +9,7 @@ from loguru import logger
 class SupervisorDecision(BaseModel):
     next: List[Literal[
         "master_agent", "strategy_qual", "strategy_risk",
-        "cost_estimation", "writer_agent", "FINISH", "WAIT"
+        "cost_estimation", "FINISH", "WAIT"
     ]] = Field(description="The next worker(s) to execute. Output multiple for parallel execution. Output ['WAIT'] to yield control.")
     reasoning: str = Field(description="The reasoning behind this decision. This will be shown to the user, so keep it concise and professional.")
 
@@ -17,14 +17,13 @@ MAX_RETRIES = 2
 
 def build_supervisor_prompt(completed: List[str], running: List[str], retry_counts: Dict[str, int], summaries: List[Dict], state: BiddingState) -> str:
     return f"""
-你是一位高级项目总控 Agent (Supervisor)，负责指挥以下 5 个专项 Worker 完成复杂的招标文件分析任务。
+你是一位高级项目总控 Agent (Supervisor)，负责指挥以下 4 个专项 Worker 完成复杂的招标文件分析与解析任务。
 
 【Worker 清单与职责】：
 1. master_agent：提取项目的5大基础元数据（如时间、财务、工程等）。【前置条件】：必须最先执行。
 2. strategy_qual：资质评估专家，评估本公司资质是否满足标书要求。【前置条件】：依赖 master_agent。
 3. strategy_risk：法务风控专家，扫描标书中的各种风险条款和暗坑。【前置条件】：依赖 master_agent。
-4. cost_estimation：成本核算专家，计算物料成本底价。【前置条件】：依赖 master_agent。
-5. writer_agent：标书文案专家，负责生成最终的偏离表和标书初稿。【前置条件】：依赖前三者（strategy_qual, strategy_risk, cost_estimation）全部完成。
+4. cost_estimation：成本核算专家，计算物料成本底价与 BOM 清单匹配。【前置条件】：依赖 master_agent。
 
 【当前执行状态】：
 - ✅ 已成功完成的 Worker：{json.dumps(completed, ensure_ascii=False)}
@@ -34,8 +33,8 @@ def build_supervisor_prompt(completed: List[str], running: List[str], retry_coun
 【决策规则 (Autonomous Orchestration)】：
 1. 请根据前置条件，决定下一步的动作。绝不能重复调度已经在【已成功完成】或【正在运行中】的 Worker。
 2. 【自主并发】：如果你发现有多个未开始的任务，它们的前置条件都已满足，请你自主决定将它们作为一个数组同时返回（例如：`["strategy_qual", "strategy_risk", "cost_estimation"]`），开启并发执行。
-3. 【自主等待】：如果某些任务（如 writer_agent）的前置条件还未满足，且你需要等待【正在运行中】的 Worker 跑完，请你自主决定返回 `["WAIT"]`，什么都不做，等待下一回合。
-4. 只有当 5 个 Worker 全部【已成功完成】（或因重试超限被跳过）时，才能返回 `["FINISH"]`。
+3. 【自主等待】：如果某些任务的前置条件还未满足，且你需要等待【正在运行中】的 Worker 跑完，请你自主决定返回 `["WAIT"]`，什么都不做，等待下一回合。
+4. 只有当上述 4 个 Worker 全部【已成功完成】（或因重试超限被跳过）时，才能返回 `["FINISH"]`。
 
 请提供你的决策理由和下一步要调度的 Worker 数组。
 """

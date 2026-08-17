@@ -27,7 +27,7 @@ class TenderMilestone(BaseModel):
     """筹备期关键流程节点（红线控制）"""
     name: str = Field(..., description="节点名称（如：标书发售截止、现场踏勘、答疑提问截止、保证金到账截止）")
     deadline: str = Field(..., description="截止时间（标准格式：YYYY-MM-DD HH:MM）")
-    is_mandatory: bool = Field(True, description="是否为硬性废标节点（如保证金未按时到账直接废标）")
+    is_mandatory: Optional[bool] = Field(True, description="是否为硬性废标节点（如保证金未按时到账直接废标）")
     description: Optional[str] = Field(None, description="特殊说明（如：现场踏勘需带授权委托书及身份证原件）")
 
 class DocumentRequirement(BaseModel):

@@ -59,6 +59,7 @@ def reparse_every_single_document():
                 sec_title = chunk.metadata.get("section_title") or chunk.metadata.get("chapter", "正文")
                 db_chunk = DocChunk(
                     tenant_id=tenant_id,
+                    user_id=doc.user_id,
                     document_id=doc.id,
                     chunk_index=i,
                     content=chunk.page_content,

@@ -210,13 +210,28 @@ async def officecli_fill_table_rows_tool(
         except Exception as err:
             logger.warning(f"📊 [OfficeCLI Tool] 查询表格结构统计行数异常: {err}")
 
+        # 智能判断第一列是否为序号列：查询表头单元格文本
+        should_auto_index = auto_index
+        if should_auto_index:
+            try:
+                hdr_struct = await office_cli_service.query_structure(file_path, "all")
+                hdr_match = re.search(re.escape(table_path) + r'/(?:row|tr)\[1\]/(?:cell|tc)\[1\].*?text=["\'](.*?)["\']', str(hdr_struct))
+                if hdr_match:
+                    cell1_text = hdr_match.group(1).strip()
+                    index_keywords = ["序号", "No", "NO", "no", "#", "项号", "NUM", "num"]
+                    if cell1_text and not any(kw in cell1_text for kw in index_keywords):
+                        should_auto_index = False
+                        logger.info(f"📊 [OfficeCLI Tool] 识别到表格 '{table_path}' 表头第1列为 '{cell1_text}' 非序号列，智能停用 auto_index")
+            except Exception as hdr_err:
+                logger.debug(f"📊 [OfficeCLI Tool] 检测表头序号列提示: {hdr_err}")
+
         cmds = []
         added_count = 0
         for i, row in enumerate(raw_rows):
             if not isinstance(row, list):
                 continue
             row_data = list(row)
-            if auto_index:
+            if should_auto_index:
                 # 检查第一列是否已是纯数字序号，若不是则注入递增序号
                 if not (row_data and str(row_data[0]).isdigit() and int(row_data[0]) == i + 1):
                     row_data.insert(0, str(i + 1))
@@ -269,11 +284,11 @@ def officecli_insert_image_tool(
     caption: str = ""
 ) -> str:
     """
-    [Office CLI Tool] 在 Word 文档 (.docx) 的指定节点 Path (如 '/body/p[12]' 或 '/body/tbl[1]/row[2]/cell[1]') 原位插入资质证明图片。
+    [Office CLI Tool] 在 Word 文档 (.docx) 的指定节点 Path (如 '/body/p[12]' 或 '/body/tbl[1]/tr[2]/tc[1]') 原位插入资质证明图片。
     用于在标书资质文件章节或单元格自动清除占位符并精确嵌入证书图像。
 
     :param file_path: 待修改 Word 文档绝对路径
-    :param target_path: 目标的物理 Path 节点 (如 '/body/p[12]' 或 '/body/tbl[1]/row[2]/cell[1]')
+    :param target_path: 目标的物理 Path 节点 (如 '/body/p[12]' 或 '/body/tbl[1]/tr[2]/tc[1]')
     :param image_path: 资质证书图片的磁盘绝对路径 (需存在于 uploads/qualifications)
     :param width_inches: 图片渲染宽度 (单位: 英寸, 默认 5.5)
     :param caption: 可选，图片下方的说明图注 (如 '营业执照 (统一社会信用代码: xxx)')

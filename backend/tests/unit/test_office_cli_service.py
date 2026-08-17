@@ -126,3 +126,36 @@ async def test_agent_officecli_tools_should_succeed():
         await office_cli_service.save_and_close(test_file)
 
 
+def test_kill_lingering_processes_should_return_integer():
+    """ 测试强杀清理孤儿进程函数能够安全执行并返回处理数量 """
+    killed = office_cli_service.kill_lingering_processes()
+    assert isinstance(killed, int)
+    assert killed >= 0
+
+
+@pytest.mark.asyncio
+async def test_office_cli_auto_retry_on_file_lock(monkeypatch):
+    """ 测试 OfficeCLIService._run_command 遇到文件锁定错误时能够自动救援并重试 """
+    attempts = 0
+
+    def mock_exec_sync():
+        nonlocal attempts
+        attempts += 1
+        class MockCompletedProc:
+            def __init__(self, ret_code, stdout_val, stderr_val):
+                self.returncode = ret_code
+                self.stdout = stdout_val
+                self.stderr = stderr_val
+
+        if attempts == 1:
+            return MockCompletedProc(1, "", "Error: The process cannot access the file because it is being used by another process.")
+        return MockCompletedProc(0, "Success", "")
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: mock_exec_sync())
+
+    res = await office_cli_service._run_command(["version"], timeout=5, max_retries=2)
+    assert res == "Success"
+    assert attempts >= 2
+
+

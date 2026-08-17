@@ -34,18 +34,17 @@ def route_from_supervisor(state: BiddingState) -> List[str]:
 
 def build_bidding_graph():
     """
-    构建总控编排图 (Hub-and-Spoke 拓扑)
+    构建总控编排图 (Hub-and-Spoke 拓扑)，专注招标文件解析与 AI 规则/数据提取。
     """
     builder = StateGraph(BiddingState)
     
-    # 注册所有节点
+    # 注册所有解析与分析节点
     builder.add_node("parser_worker", parser_worker_node)
     builder.add_node("supervisor", supervisor_node)
     builder.add_node("master_agent", master_agent_node)
     builder.add_node("strategy_qual", analyze_qualifications_node)
     builder.add_node("strategy_risk", identify_risks_node)
     builder.add_node("cost_estimation", cost_node)
-    builder.add_node("writer_agent", bid_filler_orchestrator_node)
     
     # 构建边 (入口)
     builder.set_entry_point("parser_worker")
@@ -57,7 +56,6 @@ def build_bidding_graph():
         "strategy_qual": "strategy_qual",
         "strategy_risk": "strategy_risk",
         "cost_estimation": "cost_estimation",
-        "writer_agent": "writer_agent",
         END: END
     })
     
@@ -66,7 +64,6 @@ def build_bidding_graph():
     builder.add_edge("strategy_qual", "supervisor")
     builder.add_edge("strategy_risk", "supervisor")
     builder.add_edge("cost_estimation", "supervisor")
-    builder.add_edge("writer_agent", "supervisor")
     
     # 编译成可执行的图
     return builder.compile()

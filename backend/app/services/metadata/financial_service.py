@@ -28,9 +28,9 @@ class BondInfo(BaseModel):
 class PaymentMilestone(BaseModel):
     """付款节点与现金流结构"""
     stage: str = Field(..., description="付款阶段名称（如：预付款、进度款、初验收款、终验收款、质保金）")
-    percentage: float = Field(..., description="付款百分比数值（如：30.0 表示 30%）")
-    condition: str = Field(..., description="付款触发条件原文（如：合同签订并收到预付款保函后7个工作日内）")
-    invoice_required: bool = Field(True, description="付款前是否需要先开具等额发票")
+    percentage: Optional[float] = Field(None, description="付款百分比数值（如：30.0 表示 30%）")
+    condition: Optional[str] = Field(None, description="付款触发条件原文（如：合同签订并收到预付款保函后7个工作日内）")
+    invoice_required: Optional[bool] = Field(True, description="付款前是否需要先开具等额发票")
 
 class FinancialSchema(BaseModel):
     # --- 1. 预算与控制价红线 (Cost Agent 报价防爆核心) ---

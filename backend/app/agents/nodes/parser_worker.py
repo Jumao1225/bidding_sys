@@ -50,10 +50,9 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
         import os
         filename = os.path.basename(file_path)
         pm = document.parsed_metadata or {}
-        fname = (document.filename or "").lower()
-        m_path = str(document.file_path or "").lower()
-        is_bid = (pm.get("doc_type") == "bid" or "bid" in m_path or "和烁" in fname or "窑厂" in fname or "投标文件" in fname or "投标" in fname)
-        target_doc_type = "bid" if is_bid else "general"
+        # 严格基于数据库记录的元数据 parsed_metadata 中的 doc_type 进行确定，绝不通过文件名或路径包含关键字去模糊推断
+        doc_type_meta = str(pm.get("doc_type", "")).lower()
+        target_doc_type = "bid" if doc_type_meta == "bid" else "general"
 
         emit_agent_log("info", f"正在调用底层智能解析引擎对 {filename} 进行物理层深度提取与多模态切割 (策略: {target_doc_type})，过程可能需要 1-3 分钟，请耐心等待...")
         chunks = extractor_service.parse_and_chunk(file_path, doc_type=target_doc_type)
@@ -76,7 +75,9 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
                 toc_set.append(st)
         
         toc_str = "\n".join([f"- {t}" for t in toc_set])
-        logger.info(f"生成目录树 (TOC)，共 {len(toc_set)} 个顶级章节。")
+        logger.info(f"生成目录树 (TOC)，共 {len(toc_set)} 个顶级章节:")
+        for idx, t in enumerate(toc_set, 1):
+            logger.info(f"  [{idx:02d}] {t}")
         emit_agent_log("info", f"文档拓扑分析：目录树 (TOC) 提取成功，侦测到 {len(toc_set)} 个顶级章节导航。")
         
         if document.parsed_metadata is None:
@@ -108,6 +109,7 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             db_chunk = DocChunk(
                 tenant_id=document.tenant_id,
+                user_id=document.user_id,
                 document_id=document.id,
                 content=chunk.page_content,
                 chunk_index=chunk.metadata.get("chunk_index", i),

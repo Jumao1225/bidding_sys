@@ -16,6 +16,7 @@ evaluation_metadata, cost_estimates, risk_items, qualification_matches, document
 """
 
 import os
+import re
 import json
 from typing import Dict, Any, List, Optional, Tuple, Set
 from loguru import logger
@@ -83,6 +84,17 @@ ALIAS_MAP = {
 
     # 6. 评审标准与办法 (evaluation_metadata)
     "evaluation_method": ["evaluation_method", "评标方法", "评标办法", "评审标准", "评标标准"],
+
+    # 7. BOM 成本与分项报价模型字段 (CostEstimate)
+    "item_name": ["item_name", "标的物名称", "标的物", "设备名称", "货物名称", "品名", "产品名称", "材料名称", "名称"],
+    "spec": ["spec", "规格型号", "规格", "型号", "技术参数", "参数要求", "技术规格"],
+    "brand": ["brand", "品牌", "制造品牌", "商标"],
+    "manufacturer": ["manufacturer", "生产厂家", "制造厂家", "生产企业", "制造商", "厂家", "产地"],
+    "unit": ["unit", "单位", "计量单位"],
+    "quantity": ["quantity", "数量", "工程量", "规模"],
+    "unit_price": ["unit_price", "单价", "综合单价", "单价(元)", "单价（元）", "投标单价"],
+    "calculated_total": ["calculated_total", "合价", "总价", "小计", "合价(元)", "合价（元）", "总价(元)", "总价（元）", "金额"],
+    "remark": ["remark", "备注", "说明", "备注说明"],
 }
 
 
@@ -249,11 +261,18 @@ def _safe_save_doc(doc, docx_path: str, max_retries: int = 10) -> bool:
             doc.save(docx_path)
             return True
         except PermissionError:
-            logger.warning(f"⚠️ [File Lock] 保存文件 {os.path.basename(docx_path)} 被占用 (PermissionError)，使用临时文件中转与长退避重试...")
+            logger.warning(f"⚠️ [File Lock] 保存文件 {os.path.basename(docx_path)} 被占用 (PermissionError)，主动触发孤儿进程清理与长退避重试...")
             import tempfile
             import shutil
             import time
             import random
+            from app.services.office_cli_service import office_cli_service
+
+            # 尝试强 kill 残留的 officecli / soffice 孤儿进程以释放文件独占锁
+            try:
+                office_cli_service.kill_lingering_processes()
+            except Exception as kill_err:
+                logger.debug(f"尝试清理孤儿进程提示: {kill_err}")
 
             with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
                 temp_out = tf.name
@@ -266,6 +285,11 @@ def _safe_save_doc(doc, docx_path: str, max_retries: int = 10) -> bool:
                         logger.info(f"✅ 成功通过临时文件中转写入目标 Word: {os.path.basename(docx_path)} (第 {attempt} 次重试成功)")
                         return True
                     except PermissionError:
+                        if attempt % 3 == 0:
+                            try:
+                                office_cli_service.kill_lingering_processes()
+                            except Exception:
+                                pass
                         sleep_time = 0.4 * attempt + random.uniform(0.1, 0.3)
                         time.sleep(sleep_time)
                 logger.error(f"❌ 重试 {max_retries} 次仍无法覆盖目标文件 {docx_path} (文件正被 OfficeCLI/系统进程锁定)")
@@ -327,175 +351,195 @@ def auto_embed_qualification_images_in_docx(docx_path: str, tenant_id: Optional[
 
         db: Session = SessionLocal()
         try:
-            quals = []
-            if tenant_id and tenant_id != "default-tenant":
-                quals = db.query(CompanyQualification).filter(
-                    CompanyQualification.tenant_id == tenant_id
-                ).order_by(CompanyQualification.created_at.desc()).all()
-
-            if not quals:
-                quals = db.query(CompanyQualification).order_by(CompanyQualification.created_at.desc()).all()
-
-            if not quals:
-                logger.warning("🖼️ [Auto Image Embedder] 数据库中没有任何 CompanyQualification 记录")
-                return 0
+            query = db.query(CompanyQualification)
+            if tenant_id:
+                query = query.filter(CompanyQualification.tenant_id == tenant_id)
+            quals = query.all()
 
             valid_quals = []
             for q in quals:
-                img_path, exists = resolve_qualification_image_path(q.file_url)
-                if exists and img_path:
+                img_path = None
+                file_url_val = getattr(q, 'file_url', None) or getattr(q, 'file_path', None)
+                if file_url_val:
+                    p_res, exists = resolve_qualification_image_path(file_url_val)
+                    if exists:
+                        img_path = p_res
+
+                if img_path:
                     valid_quals.append({
-                        "name": q.name or "资质证书",
-                        "level": q.level or "通用",
-                        "company_name": q.company_name or "",
+                        "name": getattr(q, 'name', '') or "企业资质证书",
+                        "code": getattr(q, 'code', '') or "",
+                        "level": getattr(q, 'level', '') or "通用",
                         "image_path": img_path,
-                        "used": False,
-                        "used_paragraphs": set()
+                        "used_paragraphs": set(),
+                        "used": False
                     })
+        finally:
+            db.close()
 
-            if not valid_quals:
-                logger.warning("🖼️ [Auto Image Embedder] 未能在 backend/uploads/qualifications 找到任何可用的物理资质图片")
-                return 0
+        if not valid_quals:
+            logger.info("数据库中未查询到物理磁盘存在的有效企业资质证书图片，跳过自动图嵌入")
+            return 0
 
-            doc = Document(docx_path)
-            embedded_count = 0
-            embedded_image_paths_in_doc: Set[str] = set()
+        doc = Document(docx_path)
+        embedded_count = 0
+        embedded_image_paths_in_doc = set()
 
-            # 预扫描文档中已经存在的资质图注文本，预判并标记已插入的物理图片
-            for p_item in doc.paragraphs:
-                p_item_text = p_item.text.strip() if p_item.text else ""
-                if p_item_text.startswith("图："):
-                    for item in valid_quals:
-                        name_core = item["name"].replace("证书", "").strip()
-                        if name_core and name_core in p_item_text:
-                            embedded_image_paths_in_doc.add(item["image_path"])
+        # 预扫描文档中已经存在的资质图注文本，预判并标记已插入的物理图片
+        for p_item in doc.paragraphs:
+            p_item_text = p_item.text.strip() if p_item.text else ""
+            if p_item_text.startswith("图："):
+                for item in valid_quals:
+                    name_core = item["name"].replace("证书", "").strip()
+                    if name_core and name_core in p_item_text:
+                        embedded_image_paths_in_doc.add(item["image_path"])
 
-            def paragraph_or_next_has_inserted_qual_image(p) -> bool:
-                """检查指定段落 p 或其下方紧跟的段落中，是否已经插入了资质证书图片或图注"""
-                if not p:
-                    return False
-                try:
-                    curr = p
-                    for _ in range(3):
-                        next_elem = curr._element.getnext()
-                        if next_elem is None or not next_elem.tag.endswith('p'):
-                            break
-                        from docx.text.paragraph import Paragraph
-                        next_p = Paragraph(next_elem, p._parent)
-                        next_text = (next_p.text or "").strip()
-
-                        if next_text.startswith("图：") and any(k in next_text for k in ["资质", "证书", "执照", "许可证"]):
-                            return True
-                        if next_p._element.xpath('.//w:drawing | .//w:pict'):
-                            return True
-                        curr = next_p
-                except Exception:
-                    pass
+        def paragraph_or_next_has_inserted_qual_image(p) -> bool:
+            if not p:
                 return False
+            try:
+                curr = p
+                for _ in range(3):
+                    next_elem = curr._element.getnext()
+                    if next_elem is None or not next_elem.tag.endswith('p'):
+                        break
+                    from docx.text.paragraph import Paragraph
+                    next_p = Paragraph(next_elem, p._parent)
+                    next_text = (next_p.text or "").strip()
+                    if next_text.startswith("图：") and any(k in next_text for k in ["资质", "证书", "执照", "许可证"]):
+                        return True
+                    if next_p._element.xpath('.//w:drawing | .//w:pict'):
+                        return True
+                    curr = next_p
+            except Exception:
+                pass
+            return False
 
-            def find_best_qual(text_snippet: str) -> Optional[Dict[str, Any]]:
-                for item in valid_quals:
-                    name_clean = item["name"].replace("公司", "").replace("证书", "").strip()
-                    if name_clean and (name_clean in text_snippet or text_snippet in item["name"]):
-                        return item
-                if "营业" in text_snippet or "执照" in text_snippet:
-                    for item in valid_quals:
-                        if "营业" in item["name"] or "执照" in item["name"]:
-                            return item
-                if "安全" in text_snippet or "安" in text_snippet:
-                    for item in valid_quals:
-                        if "安全" in item["name"]:
-                            return item
-                for item in valid_quals:
-                    if not item["used"]:
-                        item["used"] = True
-                        return item
-                return valid_quals[0]
+        def find_best_qual(target_text: str) -> Optional[Dict[str, Any]]:
+            best_item = None
+            max_score = 0
+            for item in valid_quals:
+                score = 0
+                q_name = item["name"]
+                if q_name in target_text:
+                    score += 10
+                elif check_qual_matches_paragraph(q_name, target_text):
+                    score += 5
+                if score > max_score:
+                    max_score = score
+                    best_item = item
+            return best_item
 
-            def replace_paragraph_with_image(p, qual_item: Dict[str, Any]):
-                p.text = ""
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        def insert_paragraph_after(paragraph, doc_obj):
+            new_p = doc_obj.add_paragraph()
+            paragraph._p.addnext(new_p._p)
+            return new_p
 
-                run = p.add_run()
-                run.add_picture(qual_item["image_path"], width=Inches(5.5))
+        def replace_paragraph_with_image(p, qual_item: Dict[str, Any]):
+            p.text = ""
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run()
+            run.add_picture(qual_item["image_path"], width=Inches(5.5))
+            cap_run = p.add_run(f"\n图：{qual_item['name']}（等级/范围: {qual_item['level']}）")
+            cap_run.font.size = Pt(10.5)
+            cap_run.font.bold = True
 
-                cap_run = p.add_run(f"\n图：{qual_item['name']}（等级/范围: {qual_item['level']}）")
-                cap_run.font.size = Pt(10.5)
-                cap_run.font.bold = True
+        # 1. 扫描正文段落（增加目录识别与过滤，严禁在目录列表中插入图片）
+        in_toc = False
+        toc_item_count = 0
+        in_qual_section = False
+        for i, p in enumerate(doc.paragraphs):
+            text = p.text.strip()
+            if not text:
+                continue
 
-            # 1. 扫描正文段落
-            in_qual_section = False
-            for p in doc.paragraphs:
-                text = p.text.strip()
-                if not text:
+            # 目录区域判定
+            if any(k in text for k in ["目录", "目 录", "文件目录"]):
+                in_toc = True
+                continue
+            if in_toc:
+                # 当在目录后再次遇到正文第一章（如 一、封面 / 第一章 / 【一】）时，目录结束
+                if bool(re.match(r'^\s*(?:[一1][、\.．\s]|第一[章节部分篇]|【[一1]】)', text)) and toc_item_count > 3:
+                    in_toc = False
+                else:
+                    toc_item_count += 1
                     continue
 
-                if any(h in text for h in ["资格证明文件", "投标人资质文件", "营业执照及资质证书"]):
-                    in_qual_section = True
+            # 离开资质章节判定：遇到后续大章标题且非资质相关时重置 in_qual_section
+            is_new_chapter_title = bool(re.match(r'^\s*(?:[一二三四五六七八九十百\d]+[、\.．\s]|第[一二三四五六七八九十\d]+[章节部分篇]|【[一二三四五六七八九十\d]+】)', text)) or (p.style and p.style.name and p.style.name.startswith("Heading"))
+            if is_new_chapter_title and not any(h in text for h in ["资格证明", "资质文件", "营业执照", "证书"]):
+                in_qual_section = False
 
-                # 场景 A: 包含显式占位符 [待手动补充资质证书: xxx] 或 [待...]
-                if "[待" in text and ("资质" in text or "证书" in text or "执照" in text or "证明" in text):
-                    matched_q = find_best_qual(text)
-                    if matched_q and matched_q["image_path"] not in embedded_image_paths_in_doc:
-                        replace_paragraph_with_image(p, matched_q)
-                        embedded_image_paths_in_doc.add(matched_q["image_path"])
-                        embedded_count += 1
-                        logger.info(f"   🖼️ 已原位替换段落占位符 '{text[:30]}' -> 资质图片 {matched_q['name']}")
+            if any(h in text for h in ["资格证明", "资质文件", "营业执照"]):
+                in_qual_section = True
+
+            # 场景 A: 包含显式占位符 [待手动补充资质证书: xxx] 或 [待...]
+            if "[待" in text and ("资质" in text or "证书" in text or "执照" in text or "证明" in text):
+                matched_q = find_best_qual(text)
+                if matched_q and matched_q["image_path"] not in embedded_image_paths_in_doc:
+                    replace_paragraph_with_image(p, matched_q)
+                    embedded_image_paths_in_doc.add(matched_q["image_path"])
+                    embedded_count += 1
+                    logger.info(f"   🖼️ 已原位替换段落占位符 '{text[:30]}' -> 资质图片 {matched_q['name']}")
+                continue
+
+            # 场景 B: 纯文本资质要求条款（仅限定在资质章节内部，或显式包含通用资质类型词组）
+            if in_qual_section or any(k in text for k in ["执照", "资质", "证书", "许可证", "体系认证"]):
+                # 若该条款下方已存在插入好的资质图片或图注，坚决跳过，防重复插入
+                if paragraph_or_next_has_inserted_qual_image(p):
+                    logger.info(f"   ⏩ [跳过已存图片] 条款 '{text[:30]}' 下方已存在资质图片或图注")
                     continue
 
-                # 场景 B: 纯文本资质要求条款（如“1. 营业执照等证明文件”、“8. 电力工程施工总承包...安全生产许可证”）
-                if in_qual_section or any(k in text for k in ["营业执照", "施工总承包", "电力设施", "安全生产", "资质证书"]):
-                    # 若该条款下方已存在插入好的资质图片或图注，坚决跳过，防重复插入
-                    if paragraph_or_next_has_inserted_qual_image(p):
-                        logger.info(f"   ⏩ [跳过已存图片] 条款 '{text[:30]}' 下方已存在资质图片或图注")
-                        continue
+                matched_quals_for_p = [item for item in valid_quals if check_qual_matches_paragraph(item["name"], text)]
+                if not matched_quals_for_p:
+                    continue
 
-                    matched_quals_for_p = [item for item in valid_quals if check_qual_matches_paragraph(item["name"], text)]
+                # 按物理图片路径进行去重与合并组装（支持一证多资质共享图片）
+                grouped_by_img = {}
+                for item in matched_quals_for_p:
+                    img_p_key = item["image_path"]
+                    if img_p_key not in grouped_by_img:
+                        grouped_by_img[img_p_key] = []
+                    grouped_by_img[img_p_key].append(item)
 
-                    # 按物理图片路径进行去重与合并组装（支持一证多资质共享图片）
-                    grouped_by_img = {}
-                    for item in matched_quals_for_p:
-                        img_p_key = item["image_path"]
-                        if img_p_key not in grouped_by_img:
-                            grouped_by_img[img_p_key] = []
-                        grouped_by_img[img_p_key].append(item)
+                # 限制单个段落下方最多只挑选 1 个最匹配的图片组落盘，防止连续砸入多张独立大图
+                available_img_groups = [
+                    (img_key, items) for img_key, items in grouped_by_img.items()
+                    if img_key not in embedded_image_paths_in_doc
+                ]
+                if not available_img_groups:
+                    continue
 
-                    last_p = p
-                    for img_p_key, items in grouped_by_img.items():
-                        # 全局物理图片路径去重：若该图片文件已经在文档中插入过，绝不再重复插入！
-                        if img_p_key in embedded_image_paths_in_doc:
-                            logger.info(f"   ⏩ [图片去重] 跳过已插入过的物理证书图片: {os.path.basename(img_p_key)}")
-                            continue
+                img_p_key, items = available_img_groups[0]
+                last_p = p
 
-                        # 若同一条款匹配到了同一张证书上的多个资质，合并渲染一张图片与综合图注
-                        if len(items) > 1:
-                            merged_names = " / ".join(list(dict.fromkeys([it["name"] for it in items])))
-                            merged_levels = " / ".join(list(dict.fromkeys([it["level"] for it in items if it["level"] and it["level"] != "通用"]))) or "通用"
-                            composite_item = {
-                                "name": f"综合资质证书（涵盖: {merged_names}）",
-                                "level": merged_levels,
-                                "image_path": img_p_key,
-                                "used_paragraphs": set()
-                            }
-                            img_p = insert_paragraph_after(last_p, doc)
-                            replace_paragraph_with_image(img_p, composite_item)
-                            embedded_image_paths_in_doc.add(img_p_key)
-                            for it in items:
-                                it["used_paragraphs"].add(p)
-                                it["used"] = True
-                            last_p = img_p
-                            embedded_count += 1
-                            logger.info(f"   🖼️ 已在条款 '{text[:30]}' 下方插入一证多资质证书图片: {composite_item['name']}")
-                        else:
-                            q_item = items[0]
-                            img_p = insert_paragraph_after(last_p, doc)
-                            replace_paragraph_with_image(img_p, q_item)
-                            embedded_image_paths_in_doc.add(img_p_key)
-                            q_item["used_paragraphs"].add(p)
-                            q_item["used"] = True
-                            last_p = img_p
-                            embedded_count += 1
-                            logger.info(f"   🖼️ 已在条款 '{text[:30]}' 下方自动附带插入资质图片: {q_item['name']}")
+                # 若同一条款匹配到了同一张证书上的多个资质，合并渲染一张图片与综合图注
+                if len(items) > 1:
+                    merged_names = " / ".join(list(dict.fromkeys([it["name"] for it in items])))
+                    merged_levels = " / ".join(list(dict.fromkeys([it["level"] for it in items if it["level"] and it["level"] != "通用"]))) or "通用"
+                    composite_item = {
+                        "name": f"综合资质证书（涵盖: {merged_names}）",
+                        "level": merged_levels,
+                        "image_path": img_p_key,
+                        "used_paragraphs": set()
+                    }
+                    img_p = insert_paragraph_after(last_p, doc)
+                    replace_paragraph_with_image(img_p, composite_item)
+                    embedded_image_paths_in_doc.add(img_p_key)
+                    for it in items:
+                        it["used_paragraphs"].add(p)
+                        it["used"] = True
+                    embedded_count += 1
+                    logger.info(f"   🖼️ 已在条款 '{text[:30]}' 下方插入一证多资质证书图片: {composite_item['name']}")
+                else:
+                    q_item = items[0]
+                    img_p = insert_paragraph_after(last_p, doc)
+                    replace_paragraph_with_image(img_p, q_item)
+                    embedded_image_paths_in_doc.add(img_p_key)
+                    q_item["used_paragraphs"].add(p)
+                    q_item["used"] = True
+                    embedded_count += 1
+                    logger.info(f"   🖼️ 已在条款 '{text[:30]}' 下方自动附带插入资质图片: {q_item['name']}")
 
             # 2. 扫描表格单元格
             for tbl in doc.tables:
@@ -515,15 +559,30 @@ def auto_embed_qualification_images_in_docx(docx_path: str, tenant_id: Optional[
             if embedded_count == 0 and len(embedded_image_paths_in_doc) == 0:
                 qual_p_list = []
                 in_section = False
+                in_toc_fb = False
+                toc_count_fb = 0
                 for p in doc.paragraphs:
                     p_text = p.text.strip()
-                    if any(h in p_text for h in ["资格证明文件", "投标人资质文件", "营业执照及资质证书"]):
+                    if not p_text:
+                        continue
+                    if any(k in p_text for k in ["目录", "目 录", "文件目录"]):
+                        in_toc_fb = True
+                        continue
+                    if in_toc_fb:
+                        if bool(re.match(r'^\s*(?:[一1][、\.．\s]|第一[章节部分篇]|【[一1]】)', p_text)) and toc_count_fb > 3:
+                            in_toc_fb = False
+                        else:
+                            toc_count_fb += 1
+                            continue
+                    if any(h in p_text for h in ["资格证明", "资质文件", "营业执照"]):
                         in_section = True
                         qual_p_list.append(p)
                         continue
                     if in_section:
-                        if p.style and p.style.name.startswith("Heading 1"):
+                        is_next_chap = bool(re.match(r'^\s*(?:[一二三四五六七八九十百\d]+[、\.．\s]|第[一二三四五六七八九十\d]+[章节部分篇]|【[一二三四五六七八九十\d]+】)', p_text)) or (p.style and p.style.name and p.style.name.startswith("Heading"))
+                        if is_next_chap and not any(h in p_text for h in ["资格证明", "资质文件", "营业执照", "证书"]):
                             in_section = False
+                            break
                         else:
                             qual_p_list.append(p)
 
@@ -544,9 +603,7 @@ def auto_embed_qualification_images_in_docx(docx_path: str, tenant_id: Optional[
                 _safe_save_doc(doc, docx_path)
                 logger.info(f"✅ [Auto Image Embedder] 成功完成 {embedded_count} 张资质证明图片的落盘嵌入！文档: {docx_path}")
 
-            return embedded_count
-        finally:
-            db.close()
+        return embedded_count
     except Exception as e:
         logger.exception(f"❌ [Auto Image Embedder] 自动嵌入资质图片产生异常: {e}")
         return 0
@@ -659,14 +716,86 @@ def query_project_metadata_tool(document_id: str, field_key: str) -> str:
         db.close()
 
 
-@tool
-def query_financial_quotation_tool(document_id: str, field_key: str) -> str:
+def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optional[List[str]] = None) -> List[List[str]]:
     """
-    [数据库直查工具] 全量查询财务报价、BOM 清单、分项造价、保证金及付款条款数据 (financial_metadata / cost_estimates / market_price_references 表)。
-    支持查询【分项报价清单 (cost_estimates/bom)】并输出各分项名称、品牌、数量、单价与小计，也可输出阿拉伯数字总价、标准【汉字大写金额】、投标保证金、履约保证金及付款节点要求。
+    【纯 ORM 字段名直映射引擎 — 语义映射由 Worker LLM 负责】
+    接收 Worker LLM 预推理好的 ORM 物理字段名列表 (header_columns)，
+    直接按列名顺序从 CostEstimate 实体中提取数据生成二维矩阵。
+    
+    支持的特殊标记列：
+      - "__INDEX__"      → 自动填充 1..N 递增序号
+      - "__BRAND_SPEC__" → 将 brand 和 spec 字段合并为一列
+    
+    此函数不包含任何中文关键字映射逻辑，所有中文表头→ORM字段名的
+    语义推理全部由上游 Worker LLM Agent 在调用前完成。
+    """
+    if not cost_items:
+        return []
+
+    # 1. 动态获取 ORM 模型物理字段列表（排除系统字段）
+    from app.db.models.ai_analysis import CostEstimate
+    model_columns = [col.key for col in CostEstimate.__table__.columns
+                     if not col.primary_key and col.key not in (
+                         'document_id', 'project_id', 'reference_price_id',
+                         'created_at', 'updated_at', 'tenant_id'
+                     )]
+
+    # 2. 若未提供映射后的字段列表，反射模型所有业务字段
+    if not header_columns:
+        sample = cost_items[0]
+        header_columns = [col for col in model_columns
+                          if hasattr(sample, col) and getattr(sample, col) is not None]
+        if not header_columns:
+            header_columns = model_columns
+
+    # 3. 按字段名顺序生成二维矩阵（纯 ORM 直查）
+    matrix = []
+    for idx, item in enumerate(cost_items, start=1):
+        row = []
+        for col_name in header_columns:
+            col_key = str(col_name).strip()
+            if col_key == "__INDEX__":
+                # 自动递增序号列
+                row.append(str(idx))
+            elif col_key == "__BRAND_SPEC__":
+                # 品牌+规格合并列
+                brand = str(getattr(item, 'brand', '') or '')
+                spec = str(getattr(item, 'spec', '') or '')
+                row.append(f"{brand} {spec}".strip())
+            elif hasattr(item, col_key):
+                # 直接获取 ORM 实体字段属性
+                val = getattr(item, col_key, None)
+                row.append(str(val) if val is not None else "")
+            else:
+                # 未知列名填空
+                logger.warning(f"⚠️ [Matrix] 未识别的 ORM 字段名 '{col_key}'，填空。可用模型字段: {model_columns}")
+                row.append("")
+        matrix.append(row)
+    return matrix
+
+
+@tool
+def query_financial_quotation_tool(document_id: str, field_key: str, header_columns_json: Optional[str] = None) -> str:
+    """
+    [数据库直查工具] 全量查询财务报价、BOM 清单、分项造价、保证金及付款条款数据。
 
     :param document_id: 招标文件 ID
-    :param field_key: 查询类型 ('cost_estimates', 'bom_list', 'total_price_numeric', 'total_price_chinese', 'bid_price_chinese', 'bid_bond', 'performance_bond', 'payment_milestones')
+    :param field_key: 查询类型 ('cost_estimates', 'bom_list', 'cost_estimates_json_matrix', 'total_price_numeric', 'total_price_chinese', 'bid_bond', 'performance_bond', 'payment_milestones')
+    :param header_columns_json: 【重要 - 获取 matrix 时强烈建议传入】JSON 字符串数组，包含你根据 Word 表格实际表头推理映射后的 ORM 字段名列表。
+        可用的 ORM 字段名（按实际需要选用、排列）：
+          - "__INDEX__"       → 自动生成 1..N 递增序号
+          - "item_name"       → 名称/标的物/设备/货物/品名
+          - "brand"           → 品牌
+          - "spec"            → 规格/型号/技术参数
+          - "__BRAND_SPEC__"  → 品牌+规格合并为一列 (当表头为"品牌、规格、型号"时使用)
+          - "unit"            → 单位/计量单位
+          - "quantity"        → 数量/工程量
+          - "unit_price"      → 单价/综合单价
+          - "calculated_total"→ 总价/合价/小计/金额
+          - "remark"          → 备注/说明
+        示例：表头为 [序号, 标的物名称, 品牌规格型号, 生产厂家, 单位, 数量, 单价, 总价, 备注]
+              → header_columns_json = '["__INDEX__", "item_name", "__BRAND_SPEC__", "remark", "unit", "quantity", "unit_price", "calculated_total", "remark"]'
+        注意：不在上述列表中的表头列（如"生产厂家"在数据库中无对应字段），可映射为最接近的字段或 "remark"。
     :return: 分项报价明细列表、价格、保证金或付款条款字符串
     """
     logger.info(f"🛠️ [DB Tool] query_financial_quotation_tool 被调用, doc_id: '{document_id}', 字段: '{field_key}'")
@@ -691,6 +820,20 @@ def query_financial_quotation_tool(document_id: str, field_key: str) -> str:
         if any(k in key_lower for k in ["cost", "bom", "item", "清单", "明细", "分项", "配置", "设备", "sub", "quote", "报价"]):
             if not cost_items:
                 return "[待补充: 成本测算与 BOM 分项清单数据库尚未录入]"
+            
+            # 如果请求 JSON 二维矩阵格式（供 officecli_fill_table_rows 直接填充表格）
+            if any(k in key_lower for k in ["matrix", "json", "grid", "table", "矩阵", "二维"]):
+                hdr_cols = None
+                if header_columns_json:
+                    try:
+                        hdr_cols = json.loads(header_columns_json)
+                    except Exception:
+                        pass
+                
+                rows_matrix = build_dynamic_matrix_for_header(cost_items, hdr_cols)
+                logger.info(f"🛠️ [DB Tool] 成功生成 {len(rows_matrix)} 行 BOM 自适应表格 JSON 矩阵 (列数: {len(rows_matrix[0]) if rows_matrix else 0})")
+                return json.dumps(rows_matrix, ensure_ascii=False)
+
             res_items = []
             for item in cost_items:
                 brand_str = f" [品牌: {item.brand}]" if getattr(item, 'brand', None) else ""
@@ -699,7 +842,7 @@ def query_financial_quotation_tool(document_id: str, field_key: str) -> str:
                     f"- {item.item_name}{brand_str}{spec_str} | 数量: {item.quantity}{item.unit} | 参考单价: {item.unit_price}元 | 测算合计合价(总价): {item.calculated_total}元 | 备注: {getattr(item, 'remark', '')}"
                 )
             logger.info(f"🛠️ [DB Tool] 成功查得并回传 {len(res_items)} 条 BOM 分项成本报价明细")
-            return "\n".join(res_items)
+            return "\n".join(res_items) + f"\n\n【表格填充提示】可直接调用 query_financial_quotation_tool(document_id, 'cost_estimates_json_matrix') 获取可直接用于 officecli_fill_table_rows 写盘的 2D JSON 矩阵。"
 
         if not cost_items:
             return "[待补充: 财务总报价与分项测算数据尚未录入]"

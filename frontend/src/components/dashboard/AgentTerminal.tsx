@@ -1,10 +1,15 @@
 import React, { useEffect, useRef } from 'react';
-import { Terminal, Settings, CheckCircle2, XCircle, ChevronRight, Activity } from 'lucide-react';
+import { Terminal, Settings, CheckCircle2, XCircle, ChevronRight, Activity, Cpu } from 'lucide-react';
 
 export interface TerminalMessage {
   id: string;
-  type: 'info' | 'tool_call' | 'success' | 'error' | 'supervisor_decision' | 'worker_start' | 'worker_complete' | 'chapter_execution' | 'planner_tasks' | string;
+  type: 'info' | 'tool_call' | 'success' | 'error' | 'supervisor_decision' | 'worker_start' | 'worker_complete' | 'chapter_execution' | 'planner_tasks' | 'embedding_progress' | string;
   content: string;
+  percent?: number;
+  processed_count?: number;
+  total_texts?: number;
+  current_batch?: number;
+  total_batches?: number;
   extra?: Record<string, any>;
 }
 
@@ -96,6 +101,30 @@ export function AgentTerminal({ isAnalyzing, messages }: AgentTerminalProps) {
         ) : (
           messages.map((msg, index) => (
             <div key={msg.id} className="animate-fade-in-up flex items-start gap-2.5 group">
+              {msg.type === 'embedding_progress' && (
+                <>
+                  <Cpu size={14} className="text-purple-400 mt-0.5 shrink-0 animate-pulse" />
+                  <div className="flex-1 bg-purple-950/40 border border-purple-800/40 rounded-xl p-2.5 my-0.5">
+                    <div className="flex items-center justify-between text-xs text-purple-300 font-bold mb-1">
+                      <span className="flex items-center gap-1.5">
+                        <span>🧮</span>
+                        <span>BGE-M3 向量矩阵生成中</span>
+                      </span>
+                      <span className="font-mono text-purple-200">{msg.percent ?? msg.extra?.percent ?? 100}%</span>
+                    </div>
+                    <div className="w-full bg-slate-900 h-2 rounded-full overflow-hidden mb-1.5 border border-purple-900/40">
+                      <div 
+                        className="bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 h-full transition-all duration-300"
+                        style={{ width: `${msg.percent ?? msg.extra?.percent ?? 100}%` }}
+                      ></div>
+                    </div>
+                    <div className="flex justify-between text-[10px] text-purple-400/80 font-mono">
+                      <span>切片: {msg.processed_count ?? msg.extra?.processed_count ?? 0} / {msg.total_texts ?? msg.extra?.total_texts ?? 0}</span>
+                      <span>批次: {msg.current_batch ?? msg.extra?.current_batch ?? 1} / {msg.total_batches ?? msg.extra?.total_batches ?? 1}</span>
+                    </div>
+                  </div>
+                </>
+              )}
               {msg.type === 'tool_call' && (
                 <>
                   <Settings size={14} className="text-amber-400 mt-0.5 shrink-0 animate-[spin_4s_linear_infinite] opacity-90" />

@@ -10,7 +10,6 @@ import type { WorkerStatus, SupervisorDecision, TerminalMessage } from '../compo
 import { EvaluationCard } from '../components/dashboard/EvaluationCard';
 import { QualificationCard } from '../components/dashboard/QualificationCard';
 import { FinancialCard } from '../components/dashboard/FinancialCard';
-import { DraftCard } from '../components/DraftCard';
 
 export function AnalysisDashboard() {
   const { id } = useParams<{ id: string }>();
@@ -27,7 +26,6 @@ export function AnalysisDashboard() {
     { name: 'strategy_qual', label: '资质盘点', status: 'locked', retryCount: 0 },
     { name: 'strategy_risk', label: '风险排查', status: 'locked', retryCount: 0 },
     { name: 'cost_estimation', label: '成本核算', status: 'locked', retryCount: 0 },
-    { name: 'writer_agent', label: '标书起草', status: 'locked', retryCount: 0 },
   ];
   const [supervisorDecision, setSupervisorDecision] = useState<SupervisorDecision | undefined>(undefined);
   const [workerStatuses, setWorkerStatuses] = useState<WorkerStatus[]>(initialWorkerStatuses);
@@ -341,17 +339,6 @@ export function AnalysisDashboard() {
             }
           }}
           isRetrying={retryingDomain === 'cost_estimation'}
-        />
-      </div>
-
-      {/* 投标书草稿生成与终极交付 - 全宽横幅 */}
-      <div className="w-full">
-        <DraftCard
-          documentId={activeDocId}
-          outline={outline}
-          draftPath={draftPath}
-          onReextract={() => handleReextract('writer')}
-          isRetrying={retryingDomain === 'writer'}
         />
       </div>
     </div>

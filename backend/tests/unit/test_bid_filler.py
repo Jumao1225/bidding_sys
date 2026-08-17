@@ -290,18 +290,23 @@ def test_fill_docx_proposals_underline_policy_outside_vs_inside_table():
         assert count == 2
 
         res_doc = Document(temp_path)
-        # 1. 验证表格外正文段落：数据值带有下划线
+        from docx.shared import Pt
+        # 1. 验证表格外正文段落：数据值带有下划线，且为【宋体 小四 (12pt)】
         p_body = res_doc.paragraphs[0]
         assert len(p_body.runs) == 2
         assert p_body.runs[1].text == "北京某某科技有限公司"
         assert p_body.runs[1].underline is True
         assert "w:u" in p_body.runs[1]._element.xml
+        assert p_body.runs[1].font.name == "宋体"
+        assert p_body.runs[1].font.size == Pt(12)
 
-        # 2. 验证表格内单元格：数据值没有下划线
+        # 2. 验证表格内单元格：数据值没有下划线，且为【宋体 小五 (9pt)】
         p_cell = res_doc.tables[0].rows[0].cells[1].paragraphs[0]
         assert p_cell.runs[0].text == "15.00万元"
         assert p_cell.runs[0].underline is False or p_cell.runs[0].underline is None
         assert "w:u" not in p_cell.runs[0]._element.xml
+        assert p_cell.runs[0].font.name == "宋体"
+        assert p_cell.runs[0].font.size == Pt(9)
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -383,4 +388,294 @@ def test_parse_proposals_unescaped_quotes_and_object_recovery():
     assert proposals[0]["path"] == "/body/p[1]"
     assert "招标编号" in proposals[0]["reasoning"]
     assert proposals[1]["proposed_text"] == "1"
+
+
+def test_auto_repair_officecli_commands_should_correct_parent_and_paths():
+    """测试 Office CLI 指令前置自愈器能自动修复 add row 的 parent 与 set cell 的嵌套路径"""
+    from app.agents.bid_filler_agent import auto_repair_officecli_commands
+
+    bad_commands = [
+        {"command": "add", "parent": "/body/tbl[3]/tr[2]", "type": "row"},
+        {"command": "set", "path": "/body/tbl[3]/tr[2]/tr[last()]/tc[1]", "props": {"text": "测试数据"}},
+        {"command": "set", "path": "/body/tbl[1]/tr[2]/tc[3]", "props": {"text": "数值"}}
+    ]
+
+    repaired = auto_repair_officecli_commands(bad_commands)
+    assert len(repaired) == 3
+    # 断言 1: add row 的 parent 被剥离还原为 /body/tbl[3]
+    assert repaired[0]["parent"] == "/body/tbl[3]"
+    # 断言 2: tr[last()] 嵌套错路径被自愈为 /body/tbl[3]/row[last()]/cell[1]
+    assert repaired[1]["path"] == "/body/tbl[3]/row[last()]/cell[1]"
+    # 断言 3: 合法规范路径无感放行
+    assert repaired[2]["path"] == "/body/tbl[1]/tr[2]/tc[3]"
+
+
+def test_proposals_to_commands_table_cell_no_prefix():
+    """测试 proposals_to_commands 对表格单元格禁止强加标签前缀，并自动纯化单元格文本"""
+    from app.agents.bid_filler_agent import proposals_to_commands
+
+    proposals = [
+        {
+            "path": "/body/p[1]",
+            "original_context": "投标人名称：______",
+            "proposed_text": "四川某某建设工程有限公司"
+        },
+        {
+            "path": "/body/tbl[1]/tr[2]/tc[1]",
+            "original_context": "投标人名称：______",
+            "proposed_text": "投标人名称：四川某某建设工程有限公司"
+        }
+    ]
+
+    cmds, approved, rejected = proposals_to_commands(proposals)
+    assert len(cmds) == 2
+    # 断言 1: 正文段落保留补全前缀
+    assert cmds[0]["props"]["text"] == "投标人名称：四川某某建设工程有限公司"
+    # 断言 2: 表格单元格强行剥离纯化，绝无重复前缀
+    assert cmds[1]["props"]["text"] == "四川某某建设工程有限公司"
+
+
+def test_build_dynamic_matrix_for_header_custom_columns():
+    """测试 build_dynamic_matrix_for_header 可配置语义映射 + ORM Schema 反射自适应"""
+    from app.agents.tools.bid_db_tools import build_dynamic_matrix_for_header
+    from unittest.mock import MagicMock
+
+    mock_item = MagicMock()
+    mock_item.item_name = "XXX设备"
+    mock_item.brand = "XXX品牌"
+    mock_item.spec = "XXX规格"
+    mock_item.manufacturer = "XXX厂商"
+    mock_item.unit = "套"
+    mock_item.quantity = 10
+    mock_item.unit_price = 100.0
+    mock_item.calculated_total = 1000.0
+    mock_item.remark = "XXX备注"
+
+    cost_items = [mock_item]
+
+    # 测试场景1: 直接按 ORM 物理字段名提取列矩阵
+    hdr_orm = ["item_name", "quantity", "unit_price", "calculated_total"]
+    mat_orm = build_dynamic_matrix_for_header(cost_items, hdr_orm)
+    assert len(mat_orm[0]) == 4
+    assert mat_orm[0] == ["XXX设备", "10", "100.0", "1000.0"]
+
+    # 测试场景2: 5 列包含 __INDEX__ 的动态 ORM 字段提取
+    hdr_5col = ["__INDEX__", "item_name", "spec", "quantity", "calculated_total"]
+    mat_5col = build_dynamic_matrix_for_header(cost_items, hdr_5col)
+    assert len(mat_5col[0]) == 5
+    assert mat_5col[0][0] == "1"          # 序号自动递增
+    assert mat_5col[0][1] == "XXX设备"    # item_name
+    assert mat_5col[0][2] == "XXX规格"    # spec
+    assert mat_5col[0][3] == "10"         # quantity
+    assert mat_5col[0][4] == "1000.0"     # calculated_total
+
+    # 测试场景3: 9 列传统表头 (含 __BRAND_SPEC__ 品牌+规格合并列)
+    hdr_9col = ["__INDEX__", "item_name", "__BRAND_SPEC__", "manufacturer", "unit", "quantity", "unit_price", "calculated_total", "remark"]
+    mat_9col = build_dynamic_matrix_for_header(cost_items, hdr_9col)
+    assert len(mat_9col[0]) == 9
+    assert mat_9col[0][0] == "1"
+    assert mat_9col[0][1] == "XXX设备"
+    assert mat_9col[0][2] == "XXX品牌 XXX规格"  # 品牌+规格合并
+    assert mat_9col[0][3] == "XXX厂商"
+    assert mat_9col[0][6] == "100.0"  # 单价
+    assert mat_9col[0][7] == "1000.0"  # 总价
+
+
+def test_auto_repair_officecli_nested_path():
+    """测试 auto_repair_officecli_commands 修复嵌套路径 /tbl[N]/tr[M]/tr[last()]/tc[C]"""
+    from app.agents.bid_filler_agent import auto_repair_officecli_commands
+
+    # 模式A: /body/tbl[3]/tr[6]/tr[last()]/tc[1] → /body/tbl[3]/row[last()]/cell[1]
+    cmds = [
+        {"command": "set", "path": "/body/tbl[3]/tr[6]/tr[last()]/tc[1]", "props": {"text": "XXX值"}},
+        {"command": "add", "parent": "/body/tbl[3]/tr[6]", "type": "row"},
+        {"command": "set", "path": "/body/tbl[3]/row[last()]/cell[1]", "props": {"text": "XXX正常值"}},
+    ]
+    repaired = auto_repair_officecli_commands(cmds)
+
+    # 嵌套路径被修复
+    assert repaired[0]["path"] == "/body/tbl[3]/row[last()]/cell[1]"
+    # add row 的 parent 被剥离为表格根路径
+    assert repaired[1]["parent"] == "/body/tbl[3]"
+    # 已正确的路径保持不变
+    assert repaired[2]["path"] == "/body/tbl[3]/row[last()]/cell[1]"
+
+
+def test_table_pipe_concatenation_auto_split_across_cells():
+    """测试自愈引擎：当大模型错误将整行数据用 '｜' 拼接填入首单元格时，自动横向跨列分发"""
+    import tempfile, os
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    tbl = doc.add_table(rows=2, cols=8)
+    # 表头
+    headers = ["序号", "标的物名称", "规格型号", "生产厂家", "单位", "数量", "单价", "总价"]
+    for i, h in enumerate(headers):
+        tbl.rows[0].cells[i].text = h
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+        proposals = [{
+            "path": "/body/tbl[1]/tr[2]/tc[1]",
+            "original_context": "表格第 1 个表，第 2 行，第 1 列",
+            "proposed_text": "1 ｜ 光伏组件 ｜ 550W ｜ 某某光伏有限公司 ｜ 块 ｜ 1155 ｜ 550.00 ｜ 635250.00"
+        }]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count == 1
+
+        res_doc = Document(temp_path)
+        row2 = res_doc.tables[0].rows[1]
+        assert row2.cells[0].text.strip() == "1"
+        assert row2.cells[1].text.strip() == "光伏组件"
+        assert row2.cells[2].text.strip() == "550W"
+        assert row2.cells[3].text.strip() == "某某光伏有限公司"
+        assert row2.cells[4].text.strip() == "块"
+        assert row2.cells[5].text.strip() == "1155"
+        assert row2.cells[6].text.strip() == "550.00"
+        assert row2.cells[7].text.strip() == "635250.00"
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_technical_specs_with_slashes_should_not_split_or_overwrite_index_column():
+    """测试偏离表防误切分：技术条款中包含多个 '/'（如 IEC61215/IEC61730/CQC/TUV/耐寒/防腐/防火）绝不误触发跨列切分，且绝不覆盖序号列"""
+    import tempfile, os
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    tbl = doc.add_table(rows=2, cols=5)
+    headers = ["序号", "招标文件技术要求", "投标文件服务承诺", "有无偏离", "偏离说明"]
+    for i, h in enumerate(headers):
+        tbl.rows[0].cells[i].text = h
+
+    # 模版预设序号 1
+    tbl.rows[1].cells[0].text = "1"
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+        long_spec_text = "光伏组件≥630Wp、IEC61215/IEC61730、CQC/TUV认证、耐高温/耐寒/耐紫外线/阻燃、NB/T 32004-2018"
+        proposals = [
+            {
+                "path": "/body/tbl[1]/tr[2]/tc[2]",
+                "value": long_spec_text,
+            },
+            {
+                "path": "/body/tbl[1]/tr[2]/tc[3]",
+                "value": "拟投天合光能635Wp单晶组件，完全满足全部指标要求。",
+            },
+            {
+                "path": "/body/tbl[1]/tr[2]/tc[4]",
+                "value": "无",
+            },
+            {
+                "path": "/body/tbl[1]/tr[2]/tc[5]",
+                "value": "完全响应招标文件技术要求，无偏离。",
+            }
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count >= 4
+
+        res_doc = Document(temp_path)
+        row = res_doc.tables[0].rows[1]
+        # 断言 1: 序号列保持为 1，绝对没有被技术条款覆盖！
+        assert row.cells[0].text.strip() == "1"
+        # 断言 2: 第 2 列完整保留包含所有斜杠的技术要求全量文字，没有被切碎！
+        assert row.cells[1].text.strip() == long_spec_text
+        # 断言 3: 第 3 列为服务承诺
+        assert "天合光能" in row.cells[2].text.strip()
+        # 断言 4: 第 4 列为无偏离
+        assert row.cells[3].text.strip() == "无"
+        # 断言 5: 第 5 列为无偏离说明
+        assert "无偏离" in row.cells[4].text.strip()
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_value_key_normalization_and_open_bid_table_filling():
+    """测试 Worker 提案解析与写盘引擎双向兼容 'value' 键名，确保《开标一览表》等表格完整填入"""
+    import tempfile, os
+    from docx import Document
+    from app.agents.bid_filler_workers import _parse_proposals
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    # 1. 验证 _parse_proposals 对纯 value 键名的 JSON 代码块自动归一化
+    raw_worker_json = """```json
+[
+  {"path": "/body/tbl[1]/tr[2]/tc[3]", "value": "1017934.21"},
+  {"path": "/body/tbl[1]/tr[2]/tc[4]", "value": "接到采购人进场通知后60日内完工"},
+  {"path": "/body/tbl[1]/tr[3]/tc[2]", "value": "壹佰零壹万柒仟玖佰叁拾肆元贰角壹分"}
+]
+```"""
+    parsed = _parse_proposals(raw_worker_json)
+    assert len(parsed) == 3
+    assert parsed[0]["proposed_text"] == "1017934.21"
+    assert parsed[0]["value"] == "1017934.21"
+    assert parsed[2]["proposed_text"] == "壹佰零壹万柒仟玖佰叁拾肆元贰角壹分"
+
+    # 2. 验证 fill_docx_proposals_in_dom 将纯 value 键名提案成功写入 Word 表格
+    doc = Document()
+    tbl = doc.add_table(rows=3, cols=4)
+    tbl.rows[0].cells[0].text = "项目名称"
+    tbl.rows[0].cells[1].text = "技术要求"
+    tbl.rows[0].cells[2].text = "总价(元)"
+    tbl.rows[0].cells[3].text = "备注"
+
+    tbl.rows[1].cells[0].text = "某光伏项目"
+    tbl.rows[1].cells[1].text = "详见第四章"
+    # cells[2] 和 cells[3] 留空待填
+
+    tbl.rows[2].cells[0].text = "投标总报价(大写)"
+    # cells[1] 留空待填
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+        count = fill_docx_proposals_in_dom(temp_path, parsed)
+        assert count == 3
+
+        res_doc = Document(temp_path)
+        table = res_doc.tables[0]
+        # 验证总价数字与备注承诺已成功写入
+        assert table.rows[1].cells[2].text.strip() == "1017934.21"
+        assert "60日内完工" in table.rows[1].cells[3].text.strip()
+        # 验证大写总价已成功写入
+        assert table.rows[2].cells[1].text.strip() == "壹佰零壹万柒仟玖佰叁拾肆元贰角壹分"
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_ellipsis_cleanup_in_review_engine():
+    """测试质量审核引擎：自动清理省略号截断与残缺标点"""
+    from app.agents.review_engine import clean_cell_text_value
+
+    # 场景1: 句子以 ... 结尾，自动补齐为句号
+    res1 = clean_cell_text_value("我公司完全响应并承诺，严格按要求提供相关服务及技术支持...")
+    assert res1 == "我公司完全响应并承诺，严格按要求提供相关服务及技术支持。"
+
+    # 场景2: 句子以 …… 结尾
+    res2 = clean_cell_text_value("由我公司负责相关技术支持……")
+    assert res2 == "由我公司负责相关技术支持。"
+
+    # 场景3: 纯省略号残缺行
+    res3 = clean_cell_text_value("..")
+    assert res3 == ""
+
+
+
+
 

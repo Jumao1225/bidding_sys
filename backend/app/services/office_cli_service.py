@@ -49,9 +49,9 @@ class OfficeCLIService:
         # 默认回退
         return "officecli"
 
-    async def _run_command(self, args: List[str]) -> str:
+    async def _run_command(self, args: List[str], timeout: int = 30, max_retries: int = 2) -> str:
         """
-        异步执行底层 officecli 子进程命令并捕获输出 (兼容 Windows Uvicorn 各种 EventLoop 策略)
+        异步执行底层 officecli 子进程命令并捕获输出 (具备 Timeout 强拦截保护、文件占用锁自动解封与防挂起重试)
         """
         import subprocess
 
@@ -64,27 +64,78 @@ class OfficeCLIService:
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                errors="ignore"
+                errors="ignore",
+                timeout=timeout
             )
 
-        try:
-            completed_proc = await asyncio.to_thread(_exec_sync)
+        for attempt in range(max_retries + 1):
+            try:
+                completed_proc = await asyncio.to_thread(_exec_sync)
 
-            stdout_str = (completed_proc.stdout or "").strip()
-            stderr_str = (completed_proc.stderr or "").strip()
+                stdout_str = (completed_proc.stdout or "").strip()
+                stderr_str = (completed_proc.stderr or "").strip()
 
-            if completed_proc.returncode != 0:
-                raise RuntimeError(f"OfficeCLI 执行失败: {stderr_str or stdout_str}")
+                if completed_proc.returncode != 0:
+                    err_msg = stderr_str or stdout_str
+                    # 检查是否由于文件句柄被孤儿进程锁定导致 (PermissionError / being used by another process)
+                    if any(k in err_msg.lower() for k in ["used by another process", "permissionerror", "accessdenied", "winerror 32"]) and attempt < max_retries:
+                        logger.warning(f"⚠️ OfficeCLI 遇到文件锁占用异常 ({err_msg[:60]}...)，正在强杀悬挂进程并自动重试 (第 {attempt+1}/{max_retries} 次)...")
+                        self.kill_lingering_processes()
+                        await asyncio.sleep(0.6 * (attempt + 1))
+                        continue
+                    raise RuntimeError(f"OfficeCLI 执行失败: {err_msg}")
 
-            return stdout_str
-        except FileNotFoundError:
-            logger.exception("找不到 officecli 可执行文件，请检查系统 PATH 是否已配置。")
-            raise RuntimeError("系统未安装 OfficeCLI 或无法在 PATH 中找到。")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            logger.warning(f"执行 OfficeCLI 子进程产生未预期异常: {str(e)}")
-            raise
+                return stdout_str
+            except subprocess.TimeoutExpired:
+                logger.error(f"❌ OfficeCLI 命令执行超时 ({timeout}s)，已触发强制中断，命令: {' '.join(cmd)}")
+                self.kill_lingering_processes()
+                if attempt < max_retries:
+                    await asyncio.sleep(0.5)
+                    continue
+                raise TimeoutError(f"OfficeCLI 命令执行超时 ({timeout}s)")
+            except FileNotFoundError:
+                logger.exception("找不到 officecli 可执行文件，请检查系统 PATH 是否已配置。")
+                raise RuntimeError("系统未安装 OfficeCLI 或无法在 PATH 中找到。")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                logger.warning(f"执行 OfficeCLI 子进程产生未预期异常: {str(e)}")
+                raise
+
+    def kill_lingering_processes(self) -> int:
+        """
+        清理 Windows/Linux 系统中残留悬挂的 officecli 及 LibreOffice/soffice 孤儿进程，强行释放文件锁
+        """
+        import sys
+        import subprocess
+
+        killed_count = 0
+        if sys.platform == "win32":
+            # Windows 环境使用 taskkill 强杀悬挂的 officecli.exe 和 soffice.exe
+            targets = ["officecli.exe", "soffice.exe", "soffice.bin"]
+            for target in targets:
+                try:
+                    res = subprocess.run(
+                        ["taskkill", "/F", "/IM", target],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="ignore"
+                    )
+                    if res.returncode == 0:
+                        logger.info(f"🧹 已成功清理悬挂的 Office 孤儿进程: {target}")
+                        killed_count += 1
+                except Exception as kill_err:
+                    logger.debug(f"清理进程 {target} 提示: {kill_err}")
+        else:
+            # Linux/macOS 环境使用 pkill
+            for target in ["officecli", "soffice"]:
+                try:
+                    subprocess.run(["pkill", "-9", target], capture_output=True)
+                except Exception:
+                    pass
+
+        return killed_count
 
     async def check_available(self) -> bool:
         """
@@ -129,6 +180,13 @@ class OfficeCLIService:
             logger.warning("批处理指令列表为空，忽略执行")
             return ""
 
+        # 尝试使用指令前置自愈器校正语法与路径
+        try:
+            from app.agents.bid_filler_agent import auto_repair_officecli_commands
+            commands = auto_repair_officecli_commands(commands)
+        except Exception as e:
+            logger.debug(f"前置自愈器校验提示: {e}")
+
         # 使用临时文件传递 JSON 数组
         with tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=False, encoding="utf-8") as tf:
             json.dump(commands, tf, ensure_ascii=False, indent=2)
@@ -154,6 +212,23 @@ class OfficeCLIService:
                 # 递归重试剔除后的有效指令列表
                 return await self.apply_batch(file_path, filtered_commands)
             else:
+                # 尝试使用 python-docx DOM 原生引擎自愈执行批量修改
+                try:
+                    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+                    proposals = []
+                    for cmd in commands:
+                        if cmd.get("command") == "set":
+                            proposals.append({
+                                "path": cmd.get("path", ""),
+                                "proposed_text": cmd.get("props", {}).get("text", ""),
+                                "type": "text"
+                            })
+                    if proposals:
+                        count = fill_docx_proposals_in_dom(file_path, proposals)
+                        logger.info(f"🛡️ [OfficeCLI 自愈回退] 使用 DOM 原生引擎成功执行 {count} 条指令写入: {file_path}")
+                        return f"DOM 引擎成功执行 {count} 条修改"
+                except Exception as fallback_err:
+                    logger.warning(f"DOM 引擎回退执行失败: {fallback_err}")
                 # 若无法排除则向上抛出
                 raise
         finally:

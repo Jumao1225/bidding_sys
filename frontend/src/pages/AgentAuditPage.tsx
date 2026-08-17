@@ -39,6 +39,7 @@ export const AgentAuditPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [isDownloadingRaw, setIsDownloadingRaw] = useState(false);
   const [customInstruction, setCustomInstruction] = useState('');
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -168,13 +169,15 @@ export const AgentAuditPage: React.FC = () => {
         const data = JSON.parse(event.data);
         if (data.worker_items && Array.isArray(data.worker_items)) {
           setWorkers(data.worker_items);
+          setLoading(false);
           if (data.worker_items.length > 0) {
             setSelectedWorkerId(prev => (prev && data.worker_items.some((i: any) => i.id === prev)) ? prev : data.worker_items[0].id);
           }
         }
-        if (data.is_completed) {
+        if (data.is_completed && data.worker_items && data.worker_items.length > 0 && data.worker_items.some((w: any) => w.status === 'success')) {
           setIsLivePolling(false);
           setIsGenerating(false);
+          setLoading(false);
           setNotice('✨ AI 团队自主撰写与原位写盘已全量收官！所有章节卡片均已更新。');
           es.close();
         }
@@ -192,6 +195,7 @@ export const AgentAuditPage: React.FC = () => {
   useEffect(() => {
     if (activeDocId) {
       fetchWorkerLogs(activeDocId);
+      setupSSELogStream(activeDocId);
     } else {
       setLoading(false);
     }
@@ -215,6 +219,7 @@ export const AgentAuditPage: React.FC = () => {
     // 清空历史旧履历，重置呈现最新一轮 Agent 思考与原位落盘弹增过程
     setWorkers([]);
     setSelectedWorkerId(null);
+    setLoading(false);
 
     try {
       // 先发起 POST 请求，触发后端瞬间清理旧日志并写入初始 in_progress 记录
@@ -238,11 +243,11 @@ export const AgentAuditPage: React.FC = () => {
         throw new Error(errData.detail || '标书全自主撰写失败');
       }
 
-      setNotice('🎉 标书全自主智能撰写完成！数据与偏离表已原位刷盘，支持点击【下载标书 Word】查看。');
-      await fetchWorkerLogs(activeDocId, false);
+      // POST 成功仅表示后台线程已启动，非撰写完成；SSE onmessage 中的 is_completed 逻辑会自动控制生命周期
+      setNotice('⚡ Agent 团队后台全自主撰写已启动，正在通过 SSE 实时推流监听进度...');
     } catch (err: any) {
       setError(`撰写生成失败: ${err.message}`);
-    } finally {
+      // 仅在请求失败时才关闭 SSE 连接并重置状态，正常情况交由 SSE is_completed 回调自动关闭
       setIsGenerating(false);
       setIsLivePolling(false);
       if (eventSourceRef.current) {
@@ -284,6 +289,42 @@ export const AgentAuditPage: React.FC = () => {
       setError(`下载失败: ${err.message}`);
     } finally {
       setIsDownloading(false);
+    }
+  };
+
+  // 下载原格式标书文件 (投标文件格式原始模板 .docx)
+  const handleDownloadRawTemplate = async () => {
+    if (!activeDocId || isDownloadingRaw) return;
+
+    setIsDownloadingRaw(true);
+    setNotice('📥 正在从服务器提取《投标文件格式》原格式标书模板，准备下载...');
+
+    try {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/bidding/extract-bid-format/${activeDocId}`);
+      if (!response.ok) throw new Error('提取原格式标书文件失败');
+
+      const blob = await response.blob();
+      const contentDisposition = response.headers.get('Content-Disposition') || '';
+      let filename = '【原格式】投标文件格式模板.docx';
+      const match = contentDisposition.match(/filename\*=UTF-8''(.+)/);
+      if (match && match[1]) {
+        filename = decodeURIComponent(match[1]);
+      }
+
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+
+      setNotice('✅ 《投标文件格式》原格式标书文件已成功下载！');
+    } catch (err: any) {
+      setError(`下载原格式标书失败: ${err.message}`);
+    } finally {
+      setIsDownloadingRaw(false);
     }
   };
 
@@ -373,6 +414,25 @@ export const AgentAuditPage: React.FC = () => {
 
         {/* 顶部右侧核心触发操作 */}
         <div className="flex items-center gap-3">
+
+          <button
+            type="button"
+            onClick={handleDownloadRawTemplate}
+            disabled={isDownloadingRaw || !activeDocId}
+            className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-200 hover:text-white text-xs font-bold shadow-md border border-slate-700/80 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            title="提取并下载未经过 AI 扩写的原格式《投标文件格式》Word 模板"
+          >
+            {isDownloadingRaw ? (
+              <>
+                <span className="animate-spin w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full"></span>
+                <span>正在提取原格式...</span>
+              </>
+            ) : (
+              <>
+                <span>📄 下载原格式标书文件</span>
+              </>
+            )}
+          </button>
 
           <button
             type="button"
@@ -556,11 +616,13 @@ export const AgentAuditPage: React.FC = () => {
                       <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
                         w.status === 'in_progress'
                           ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse'
-                          : isSupervisor
-                            ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono'
-                            : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                          : w.status === 'failed'
+                            ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                            : isSupervisor
+                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono'
+                              : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                       }`}>
-                        {w.status === 'in_progress' ? '🤖 思考撰写中' : isSupervisor ? '👑 总控决策' : '✅ 已填报'}
+                        {w.status === 'in_progress' ? '🤖 思考撰写中' : w.status === 'failed' ? '❌ 执行失败' : isSupervisor ? '👑 总控决策' : '✅ 已填报'}
                       </span>
                     </div>
 
@@ -962,11 +1024,30 @@ export const AgentAuditPage: React.FC = () => {
 
                   <button
                     type="button"
+                    onClick={handleDownloadRawTemplate}
+                    disabled={isDownloadingRaw || !activeDocId}
+                    className="px-4 py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 text-sm font-bold border border-slate-700 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    title="提取并下载未经过 AI 扩写的原格式《投标文件格式》Word 模板"
+                  >
+                    {isDownloadingRaw ? (
+                      <>
+                        <span className="animate-spin w-4 h-4 border-2 border-slate-300 border-t-transparent rounded-full"></span>
+                        <span>正在提取原格式...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>📄 下载原格式标书文件</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={handleDownloadWord}
                     disabled={isDownloading || !activeDocId}
-                    className="px-5 py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 text-sm font-bold border border-slate-700 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    className="px-5 py-3 rounded-2xl bg-emerald-700 hover:bg-emerald-600 active:bg-emerald-800 text-white text-sm font-bold shadow-md shadow-emerald-950/40 border border-emerald-500/30 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
                   >
-                    <span>📥 下载 Word (.docx)</span>
+                    <span>📥 下载已撰写标书 Word</span>
                   </button>
                 </div>
               </div>

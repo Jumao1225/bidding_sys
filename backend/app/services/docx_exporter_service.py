@@ -267,11 +267,11 @@ class DocxExporterService:
                     p.paragraph_format.space_after = Pt(2)
 
                     run = p.add_run(cell_text)
-                    run.font.name = '黑体' if is_header else '宋体'
-                    run.font.size = Pt(10.5)  # 五号
+                    run.font.name = '宋体'
+                    run.font.size = Pt(9)  # 小五 (9磅)
                     run.font.bold = is_header
                     run.font.color.rgb = self.black_color
-                    run._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体' if is_header else '宋体')
+                    run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
 
 
 # 单例初始化

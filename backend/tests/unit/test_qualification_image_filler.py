@@ -23,7 +23,7 @@ from app.agents.tools.writer_tools import get_company_qualifications_tool
 
 @pytest.fixture
 def temp_qualification_image():
-    """创建一个临时测试用资质证书图片文件"""
+    """创建一个临时测试用资质证书图片文件并写入 DB 记录"""
     backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     qual_dir = os.path.join(backend_dir, "uploads", "qualifications")
     os.makedirs(qual_dir, exist_ok=True)
@@ -32,7 +32,35 @@ def temp_qualification_image():
     img = Image.new("RGB", (300, 200), color=(73, 109, 137))
     img.save(img_path)
 
+    # 写入测试 DB 记录
+    from app.db.session import SessionLocal
+    from app.db.models.business import CompanyQualification
+    db = SessionLocal()
+    mock_quals = []
+    try:
+        for name in ["营业执照", "电力工程施工总承包", "安全生产许可证", "机电工程施工总承包"]:
+            q = CompanyQualification(
+                name=name,
+                level="二级",
+                company_name="测试工程有限公司",
+                file_url="/uploads/qualifications/test_cert_mock.png"
+            )
+            db.add(q)
+            mock_quals.append(q)
+        db.commit()
+    except Exception:
+        db.rollback()
+
     yield img_path
+
+    try:
+        for q in mock_quals:
+            db.delete(q)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
     if os.path.exists(img_path):
         os.remove(img_path)

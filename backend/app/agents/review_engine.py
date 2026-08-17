@@ -119,11 +119,12 @@ def check_unfilled_slots(
                 ))
                 break  # 每个段落只报一次
 
-    # 扫描表格单元格
+    # 扫描表格单元格 (按 XML <w:tc> 物理节点遍历，防止合并单元格产生错位)
     for tbl_idx, table in enumerate(doc.tables, start=1):
         for row_idx, row in enumerate(table.rows, start=1):
-            for col_idx, cell in enumerate(row.cells, start=1):
-                cell_text = cell.text.strip()
+            tc_elements = [c for c in row._tr.iterchildren() if c.tag.endswith('tc')]
+            for col_idx, tc_elem in enumerate(tc_elements, start=1):
+                cell_text = "".join(tc_elem.itertext()).strip()
                 xpath = f"/body/tbl[{tbl_idx}]/tr[{row_idx}]/tc[{col_idx}]"
 
                 # 检查空白单元格（跳过表头行，即第一行）
@@ -680,6 +681,36 @@ _CELL_POLLUTION_PATTERNS = [
 ]
 
 
+def clean_all_ellipsis(text: str) -> str:
+    """
+    全方位清除与智能自愈文本中的所有省略号（包括首尾截断、句中偷懒连接符及伪装标记）。
+    将句中的 `…` / `……` / `...` 自愈为中文逗号，确保语义连贯完整。
+    """
+    if not text:
+        return text
+    had_trailing_ellipsis = bool(re.search(r'[\.。\s…]{2,}$', text) or text.endswith("..."))
+    # 1. 移除伪装标记如 （完整技术要求）
+    text = re.sub(r'[\(（]完整技术要求[\)）]', '', text)
+    # 2. 清理首尾省略号与孤立点号
+    text = re.sub(r'^[…\.。]+', '', text)
+    text = re.sub(r'[…\.。]+$', '', text)
+    # 3. 将句中的省略号（…、……、...、..）智能转换为中文标点
+    # 若省略号紧挨着标点，直接规整
+    text = re.sub(r'[，,；;、]\s*[…\.]+', '，', text)
+    text = re.sub(r'[…\.]+\s*[，,；;、]', '，', text)
+    # 若位于文字之间，转换为逗号
+    text = re.sub(r'([^\s，,；;、])\s*[…\.]{2,}\s*([^\s，,；;、])', r'\1，\2', text)
+    text = re.sub(r'([^\s，,；;、])\s*…\s*([^\s，,；;、])', r'\1，\2', text)
+    # 去除多余连续逗号
+    text = re.sub(r'，{2,}', '，', text)
+    text = text.strip()
+    if had_trailing_ellipsis and text and not text.endswith(("。", "！", "？", "；", ")", "）")):
+        text += "。"
+    if text and re.match(r'^\s*\.{1,6}\s*$', text):
+        return ""
+    return text
+
+
 def clean_cell_text_value(text: str, ctx: str = "") -> str:
     """
     程序化清理表格单元格文本中的污染前缀与多余指示词。
@@ -702,6 +733,9 @@ def clean_cell_text_value(text: str, ctx: str = "") -> str:
         elif "有" in cleaned or "偏离" in cleaned:
             if len(cleaned) <= 15:
                 return "有"
+
+    # 全方位智能清洗句中与尾部省略号
+    cleaned = clean_all_ellipsis(cleaned)
 
     return cleaned
 

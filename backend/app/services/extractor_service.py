@@ -359,9 +359,18 @@ class ExtractorService:
         if re.search(r'(详见|参见|遵循|依据|见)\s*第[一二三四五六七八九十\d]+[章部分篇节]', clean):
             return None
 
-        # 0. 带括号的序号（如 （一）、（二）、(1)）属于正文细节分块，绝不应升级为 Level 1 根标题
-        if re.match(r'^\s*[*#]*\s*[\(（][一二三四五六七八九十\d]+[\)）]', raw_strip):
-            return (3, clean)
+        # ========== 模式 A: 招标文件 (doc_type == "general") 严格仅抓取一级顶级大章 ==========
+        if doc_type == "general":
+            # 剥离 Markdown (#, * 等) 与 HTML 标签 (如 <u>/</u>)
+            clean_title = re.sub(r'<[^>]+>', '', raw_strip)
+            clean_title = re.sub(r'[*#_`~]', '', clean_title).strip()
+            # 严格匹配一级大章 (如：第一章 招标公告、第二部分 投标人须知、附件一 格式等)
+            m_general = re.match(r'^\s*(第[一二三四五六七八九十百零\d]+[章部分篇]\s*.*|附[件录表图][一二三四五六七八九十\dA-Za-z]+.*)$', clean_title)
+            if m_general:
+                canonical_chap = m_general.group(1).strip()
+                canonical_chap = re.sub(r'\s+', ' ', canonical_chap)
+                return (1, canonical_chap)
+            return None
 
         # 1. 校验 TOC 目录白名单 (最高权威：只要匹配目录白名单中的项，统统按 TOC 标准层级与规范名称精确对齐返回)
         if doc_type != "general" and toc_chapters:
@@ -1092,6 +1101,9 @@ class ExtractorService:
 
         # 4. 执行大章或专题模块归组 (结合 PDF 物理页码定位引擎)
         chapters = self._group_markdown_text_by_chapter(md_text, doc_type=doc_type, pdf_path=file_path)
+        logger.info(f"📋 成功提取到 {len(chapters)} 个顶级大章:")
+        for idx, chap in enumerate(chapters, 1):
+            logger.info(f"  [{idx:02d}] {chap['title']}")
         
         # 5. 自适应再分块与元数据注入
         final_docs: List[Document] = []
