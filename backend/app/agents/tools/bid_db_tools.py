@@ -775,12 +775,12 @@ def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optio
 
 
 @tool
-def query_financial_quotation_tool(document_id: str, field_key: str, header_columns_json: Optional[str] = None) -> str:
+def query_financial_quotation_tool(document_id: str, field_key: str = "cost_estimates", header_columns_json: Optional[str] = None) -> str:
     """
     [数据库直查工具] 全量查询财务报价、BOM 清单、分项造价、保证金及付款条款数据。
 
     :param document_id: 招标文件 ID
-    :param field_key: 查询类型 ('cost_estimates', 'bom_list', 'cost_estimates_json_matrix', 'total_price_numeric', 'total_price_chinese', 'bid_bond', 'performance_bond', 'payment_milestones')
+    :param field_key: 查询类型 ('cost_estimates', 'bom_list', 'cost_estimates_json_matrix', 'total_price_numeric', 'total_price_chinese', 'bid_bond', 'performance_bond', 'payment_milestones')，默认值为 'cost_estimates'
     :param header_columns_json: 【重要 - 获取 matrix 时强烈建议传入】JSON 字符串数组，包含你根据 Word 表格实际表头推理映射后的 ORM 字段名列表。
         可用的 ORM 字段名（按实际需要选用、排列）：
           - "__INDEX__"       → 自动生成 1..N 递增序号
@@ -801,7 +801,7 @@ def query_financial_quotation_tool(document_id: str, field_key: str, header_colu
     logger.info(f"🛠️ [DB Tool] query_financial_quotation_tool 被调用, doc_id: '{document_id}', 字段: '{field_key}'")
     db: Session = SessionLocal()
     try:
-        key_lower = field_key.lower()
+        key_lower = str(field_key or "cost_estimates").lower()
 
         # 1. 查财务元数据中的保证金与付款节点
         fin_meta = db.query(FinancialMetadata).filter(FinancialMetadata.document_id == document_id).first()
@@ -842,7 +842,7 @@ def query_financial_quotation_tool(document_id: str, field_key: str, header_colu
                     f"- {item.item_name}{brand_str}{spec_str} | 数量: {item.quantity}{item.unit} | 参考单价: {item.unit_price}元 | 测算合计合价(总价): {item.calculated_total}元 | 备注: {getattr(item, 'remark', '')}"
                 )
             logger.info(f"🛠️ [DB Tool] 成功查得并回传 {len(res_items)} 条 BOM 分项成本报价明细")
-            return "\n".join(res_items) + f"\n\n【表格填充提示】可直接调用 query_financial_quotation_tool(document_id, 'cost_estimates_json_matrix') 获取可直接用于 officecli_fill_table_rows 写盘的 2D JSON 矩阵。"
+            return "\n".join(res_items) + f"\n\n【分项展开提示】共检索到 {len(res_items)} 项具体分项清单。在分项报价表中，必须在建设费等汇总大类下方将全部具体细项逐行完整展开（按 2.1, 2.2... 2.K 编号），严禁只填大类总额。"
 
         if not cost_items:
             return "[待补充: 财务总报价与分项测算数据尚未录入]"

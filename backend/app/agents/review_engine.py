@@ -688,12 +688,13 @@ def clean_all_ellipsis(text: str) -> str:
     """
     if not text:
         return text
-    had_trailing_ellipsis = bool(re.search(r'[\.。\s…]{2,}$', text) or text.endswith("..."))
+    had_trailing_ellipsis = bool(re.search(r'(?:[…\.]{2,}|…+|\.{2,}|。{2,})\s*$', text) or text.endswith("..."))
     # 1. 移除伪装标记如 （完整技术要求）
     text = re.sub(r'[\(（]完整技术要求[\)）]', '', text)
-    # 2. 清理首尾省略号与孤立点号
-    text = re.sub(r'^[…\.。]+', '', text)
-    text = re.sub(r'[…\.。]+$', '', text)
+    # 2. 清理首部省略号与孤立点号
+    text = re.sub(r'^[…\.]+', '', text)
+    # 清理尾部省略号（连续点号、连续省略号、连续句号），保留单个合法句末标点
+    text = re.sub(r'(?:[…\.]{2,}|…+|\.{2,}|。{2,})\s*$', '', text)
     # 3. 将句中的省略号（…、……、...、..）智能转换为中文标点
     # 若省略号紧挨着标点，直接规整
     text = re.sub(r'[，,；;、]\s*[…\.]+', '，', text)
@@ -1123,6 +1124,89 @@ def auto_fix_proposals(
 
 
 # ============================================================
+# R11: 报价表格单价与分项总价列分离与防错列检测
+# ============================================================
+
+def check_pricing_table_column_alignment(
+    proposals: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    R11: 报价表格单价与分项总价列分离与防错列质检管线：
+    检测 2D 报价表格矩阵提案中是否存在将包干/工程总价重复填入单价列，或单价与分项总价错列的情况。
+    自动将包干/汇总项的单价纠偏为破折号 "——"，保留分项总价。
+
+    :param proposals: Worker 提案列表
+    :return: ReviewFinding 列表
+    """
+    logger.info("🔍 [R11] 启动报价表格单价与分项总价列分离质检管线...")
+    findings: List[Dict[str, Any]] = []
+
+    pkg_kws = ["费", "工程", "系统", "加固", "防水", "敷设", "安装", "调试", "服务", "培训", "大类", "购置", "总承包", "支架", "桥架", "辅材", "电缆", "柜"]
+
+    for p in proposals:
+        p_path = str(p.get("path", "")).strip()
+        raw_val = p.get("proposed_text") if p.get("proposed_text") is not None else p.get("value", "")
+        p_val = str(raw_val).strip() if raw_val is not None else ""
+
+        # 检查是否为 2D 矩阵提案
+        matrix = None
+        if isinstance(raw_val, list) and raw_val and isinstance(raw_val[0], list):
+            matrix = raw_val
+        elif p_val.startswith("[") and p_val.endswith("]"):
+            try:
+                parsed = json.loads(p_val)
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], list):
+                    matrix = parsed
+            except Exception:
+                pass
+
+        if not matrix:
+            continue
+
+        # 检查是否为 5 列的报价数据矩阵
+        has_duplicate_pricing = False
+        new_matrix = []
+        for row in matrix:
+            if not isinstance(row, list):
+                new_matrix.append(row)
+                continue
+            r_copy = list(row)
+            if len(r_copy) >= 4:
+                name_val = str(r_copy[1]).strip()
+                unit_val = str(r_copy[2]).strip()
+                total_val = str(r_copy[3]).strip()
+                # 检查单价与总价相同且非空且非破折号且非 0.00
+                if unit_val and total_val and unit_val == total_val and unit_val not in ("—", "——", "/", "-", "0", "0.00"):
+                    if any(kw in name_val for kw in pkg_kws):
+                        r_copy[2] = "——"
+                        has_duplicate_pricing = True
+            new_matrix.append(r_copy)
+
+        if has_duplicate_pricing:
+            new_json_str = json.dumps(new_matrix, ensure_ascii=False)
+            findings.append(make_finding(
+                rule_id="R11-PRICING-COL-DUPLICATE",
+                severity="warning",
+                path=p_path,
+                description=f"报价表格存在包干/工程项将总价重复填入单价列，已自动纯化单价列为破折号",
+                current_value=p_val[:100],
+                expected_value=new_json_str[:100],
+                auto_fixable=True,
+                fix_proposal={
+                    "path": p_path,
+                    "proposed_text": new_json_str,
+                    "value": new_json_str,
+                    "type": p.get("type", "table_rows"),
+                    "source_tool": "review_engine_r11_fix",
+                    "reasoning": "R11 自动纠偏: 修复报价表单价列与分项总价列重复填报，规范包干项单价为破折号",
+                }
+            ))
+
+    logger.info(f"🔍 [R11] 报价表列分离质检完成，发现并标记 {len(findings)} 处表格错列")
+    return findings
+
+
+# ============================================================
 # 总入口：执行全部审查管线
 # ============================================================
 
@@ -1132,7 +1216,7 @@ def run_all_review_pipelines(
     docx_path: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    执行全部 5 条规则审查管线，并调用 R6 自动修正管线。
+    执行全部规则审查管线，并调用 R6 自动修正管线。
 
     :param proposals: Worker 提案列表
     :param document_id: 文档 ID
@@ -1168,6 +1252,10 @@ def run_all_review_pipelines(
     # R8: 短字段长文本错填检测
     r8_findings = check_short_field_text_overflow(proposals)
     all_findings.extend(r8_findings)
+
+    # R11: 报价表格单价与分项总价列分离与防错列检测
+    r11_findings = check_pricing_table_column_alignment(proposals)
+    all_findings.extend(r11_findings)
 
     # 统计各级别数量
     errors = sum(1 for f in all_findings if f["severity"] == "error")

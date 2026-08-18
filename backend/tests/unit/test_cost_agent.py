@@ -110,6 +110,62 @@ def test_cost_node_execution_should_succeed(
     cost_data = result["cost_analysis"]
     assert cost_data["total_cost"] == 17000.0
     assert cost_data["budget_limit"] == "200000"
-    assert "预算可控" in cost_data["budget_status"]
+    assert "可控" in cost_data["budget_status"]
     assert len(cost_data["items"]) == 1
     assert cost_data["items"][0]["matched_brand"] == "华为"
+
+@patch("app.agents.nodes.cost_agent.SessionLocal")
+@patch("app.agents.nodes.cost_agent.document_crud")
+@patch("app.agents.nodes.cost_agent.business_crud")
+@patch("app.agents.nodes.cost_agent.rag_service")
+@patch("app.agents.nodes.cost_agent.llm_service")
+def test_cost_node_with_financial_metadata_max_limit_exceeded(
+    mock_llm, mock_rag, mock_business_crud, mock_document_crud, mock_session
+):
+    """测试当存在 FinancialMetadata 最高限价且测算成本超出时，cost_node 正确返回已超出最高投标限价"""
+    from app.db.models.metadata import FinancialMetadata
+    
+    mock_db = MagicMock()
+    mock_session.return_value = mock_db
+    
+    mock_fin = MagicMock(spec=FinancialMetadata)
+    mock_fin.max_price_limit = {"amount": 10000.0, "currency": "CNY"}
+    mock_fin.budget = {"amount": 20000.0, "currency": "CNY"}
+    
+    # 模拟 query(FinancialMetadata).filter().first() 返回 mock_fin
+    mock_db.query.return_value.filter.return_value.first.return_value = mock_fin
+    
+    mock_doc = MagicMock()
+    mock_doc.parsed_metadata = {}
+    mock_document_crud.get_document_by_id.return_value = mock_doc
+    mock_business_crud.get_all_price_references.return_value = []
+    mock_rag.search_bidding_document.return_value = "设备清单"
+    
+    mock_analysis_result = CostAnalysisResult(
+        items=[
+            CostItem(
+                name="高压开关柜",
+                qty=1.0,
+                unit="台",
+                ref_price=15000.0,
+                subtotal=15000.0,
+                match_quality="精准匹配"
+            )
+        ],
+        analysis_summary="核算完毕"
+    )
+    mock_llm.generate_structured_output.return_value = mock_analysis_result
+    
+    state = {
+        "document_id": "doc-fin-123",
+        "user_id": "user-123",
+        "tenant_id": "tenant-123"
+    }
+    
+    result = cost_node(state)
+    cost_data = result["cost_analysis"]
+    assert cost_data["total_cost"] == 15000.0
+    assert cost_data["budget_numeric"] == 10000.0
+    assert cost_data["limit_type"] == "max_price_limit"
+    assert "已超出最高投标限价" in cost_data["budget_status"]
+    assert "5,000.00" in cost_data["budget_status"] or "5000" in cost_data["budget_status"]

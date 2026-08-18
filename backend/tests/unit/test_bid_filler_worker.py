@@ -435,4 +435,496 @@ def test_dual_path_merge_substantive_table_cell_proposals_should_preserve_all_ce
             os.remove(temp_path)
 
 
+def test_fill_docx_proposals_in_dom_prefilled_items_table_should_overwrite_in_place_without_duplication():
+    """测试供货一览表等已预置货物名称/序号/斜杠的模板表，2D 矩阵写盘时 100% 原位覆盖填报，绝不重复生成多余行把原模板挤到末尾"""
+    import json
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    # 模拟供货一览表：1 行表头 + 14 行预置标的物数据行
+    tbl = doc.add_table(rows=15, cols=7)
+    headers = ["编号", "货物名称", "品牌、型号（或规格）", "数量", "产地", "制造厂商", "备注"]
+    for c_idx, h in enumerate(headers):
+        tbl.rows[0].cells[c_idx].text = h
+
+    item_names = [
+        "光伏组件", "逆变器 1", "逆变器 2", "并网柜", "直流电缆",
+        "交流电缆（逆变器）", "交流电缆（并网 1）", "交流电缆（并网 2）", "电缆桥架", "光伏支架",
+        "接地系统", "其他辅材", "防水", "加固"
+    ]
+    for idx, name in enumerate(item_names, 1):
+        tbl.rows[idx].cells[0].text = str(idx)
+        tbl.rows[idx].cells[1].text = name
+        tbl.rows[idx].cells[2].text = ""
+        tbl.rows[idx].cells[3].text = "/"  # 预置斜杠
+        tbl.rows[idx].cells[4].text = ""
+        tbl.rows[idx].cells[5].text = ""
+        tbl.rows[idx].cells[6].text = ""
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+
+        # 模拟 Worker 产出的 14 行 6 列（未含首列序号，底层自动补序号）的 2D 矩阵提案
+        matrix = []
+        for idx, name in enumerate(item_names, 1):
+            matrix.append([
+                name,
+                f"投报品牌型号_{idx}",
+                f"{idx * 100}台" if idx <= 3 else "1批",
+                "中国",
+                f"制造厂商_{idx}",
+                "满足技术要求"
+            ])
+
+        proposals = [
+            {
+                "path": "/body/tbl[1]",
+                "proposed_text": json.dumps(matrix, ensure_ascii=False),
+                "value": json.dumps(matrix, ensure_ascii=False),
+                "type": "table_rows",
+                "chapter_title": "供货一览表（主要标的物）"
+            }
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count == 14
+
+        res_doc = Document(temp_path)
+        res_tbl = res_doc.tables[0]
+
+        # 核心断言 1：总行数严格保持为 15 行（1 表头 + 14 数据行），严禁出现 29 行（14 行新增 + 14 行残留）！
+        assert len(res_tbl.rows) == 15
+
+        # 核心断言 2：每一行均在原有位置被精准更新填满，原标的物名称与新填入的品牌厂商完美对齐
+        for idx, name in enumerate(item_names, 1):
+            r_cells = [c.text.strip() for c in res_tbl.rows[idx].cells]
+            assert r_cells[0] == str(idx)
+            assert r_cells[1] == name
+            assert r_cells[2] == f"投报品牌型号_{idx}"
+            assert r_cells[4] == "中国"
+            assert r_cells[5] == f"制造厂商_{idx}"
+            assert r_cells[6] == "满足技术要求"
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_fill_docx_proposals_in_dom_hierarchical_sub_items_table_should_overwrite_and_expand_cleanly():
+    """测试投标配置及分项报价表：大类 1/2 与二级分项 2.1~2.14 展开，原位覆盖占位行并消除 ...... 占位符"""
+    import json
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    # 模拟模板：1 表头 + 5 模板行（设计费/建设费/空行/空行/......）+ 1 表尾合并合计行
+    tbl = doc.add_table(rows=7, cols=5)
+    headers = ["序号", "项目/费用名称", "单价（元）", "分项总价（元）", "备注"]
+    for c_idx, h in enumerate(headers):
+        tbl.rows[0].cells[c_idx].text = h
+
+    tbl.rows[1].cells[0].text = "1"
+    tbl.rows[1].cells[1].text = "设计费（含电力设计、建筑设计费用）"
+    tbl.rows[2].cells[0].text = "2"
+    tbl.rows[2].cells[1].text = "建设费（含设备购置费）"
+    tbl.rows[3].cells[0].text = ""
+    tbl.rows[4].cells[0].text = ""
+    tbl.rows[5].cells[0].text = "......"
+
+    # 表尾合并合计行
+    tbl.rows[6].cells[0].merge(tbl.rows[6].cells[4])
+    tbl.rows[6].cells[0].text = "合计总价（合计总价=设计费+建设费合计）：与开标一览表一致"
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+
+        # 模拟 Worker 提交的 16 行二维矩阵（1个设计费 + 1个建设费汇总 + 14个 2.1~2.14 二级细项）
+        matrix = [
+            ["1", "设计费（含电力设计、建筑设计费用）", "0.00", "0.00", "深化设计费用已包含于建设费报价内，不再单独计列"],
+            ["2", "建设费（含设备购置费）", "2,235,211.56", "2,235,211.56", "包含全部设备购置费、材料费、安装调试费及防水加固等费用，下含2.1~2.14分项明细"],
+            ["2.1", "光伏组件", "882.69", "1,167,798.87", "天合光能 635Wp 单晶硅组件 1323台"],
+            ["2.2", "逆变器 1", "11,555.00", "46,220.00", "华为 100kW 组串式逆变器 4台"],
+            ["2.3", "逆变器 2", "11,555.00", "46,220.00", "华为 110kW 组串式逆变器 4台"],
+            ["2.4", "并网柜", "9,180.35", "9,180.35", "诺电 200kW 室外并网柜 1台"],
+            ["2.5", "直流电缆", "25,720.56", "25,720.56", "江南 PV1-F 4mm² 光伏专用直流电缆 1批"],
+            ["2.6", "交流电缆（逆变器）", "17,859.45", "17,859.45", "江南 ZRC-YJLHV 3*120+1*70 1批"],
+            ["2.7", "交流电缆（并网 1）", "11,882.62", "11,882.62", "江南 ZRC-YJV 3*240+1*120 1批"],
+            ["2.8", "交流电缆（并网 2）", "33,600.00", "33,600.00", "江南 ZRC-YJV 3*150+1*70 1批"],
+            ["2.9", "电缆桥架", "9,233.06", "9,233.06", "热镀锌钢制梯式桥架 1批"],
+            ["2.10", "光伏支架", "117,600.00", "117,600.00", "彩钢瓦屋面专用铝合金支架 1套"],
+            ["2.11", "接地系统", "6,580.98", "6,580.98", "光伏专用接地防雷系统 1批"],
+            ["2.12", "其他辅材", "15,035.67", "15,035.67", "穿线管、接线盒、连接器等 1批"],
+            ["2.13", "防水", "176,400.00", "176,400.00", "屋面全面防水处理及渗漏排查 1项"],
+            ["2.14", "加固", "551,880.00", "551,880.00", "屋面加固处理及承载力验算 1项"]
+        ]
+
+        proposals = [
+            {
+                "path": "/body/tbl[1]",
+                "proposed_text": json.dumps(matrix, ensure_ascii=False),
+                "value": json.dumps(matrix, ensure_ascii=False),
+                "type": "table_rows",
+                "chapter_title": "投标配置及分项报价表"
+            }
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count == 16
+
+        res_doc = Document(temp_path)
+        res_tbl = res_doc.tables[0]
+
+        # 核心断言 1：总行数严格为 18 行（1 表头 + 16 细项数据行 + 1 表尾合并合计行）
+        assert len(res_tbl.rows) == 18
+
+        # 核心断言 2：前 5 行模板行（包含原来的 ......）已被 100% 干净覆盖，没有任何 ...... 残留
+        row_texts = ["".join([c.text.strip() for c in r.cells]) for r in res_tbl.rows]
+        assert not any("......" in t for t in row_texts)
+
+        # 核心断言 3：各行序号与二级编号精准对齐
+        assert res_tbl.rows[1].cells[0].text.strip() == "1"
+        assert res_tbl.rows[2].cells[0].text.strip() == "2"
+        assert res_tbl.rows[3].cells[0].text.strip() == "2.1"
+        assert "光伏组件" in res_tbl.rows[3].cells[1].text
+        assert res_tbl.rows[4].cells[0].text.strip() == "2.2"
+        assert "逆变器 1" in res_tbl.rows[4].cells[1].text
+        assert res_tbl.rows[16].cells[0].text.strip() == "2.14"
+        assert "加固" in res_tbl.rows[16].cells[1].text
+
+        # 核心断言 4：表尾合计行仍完好保留在最后一行
+        assert "合计总价" in res_tbl.rows[17].cells[0].text
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_fill_docx_proposals_in_dom_auto_split_and_deduplicate_hierarchical_prefix():
+    """测试 4 列数据传入时自动将 '2.1 光伏组件' 拆分为序号 '2.1' 与名称 '光伏组件'，以及 5 列数据重复前缀去重"""
+    import json
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    # 模拟模板：1 表头 + 2 模板行 + 1 合并合计行
+    tbl = doc.add_table(rows=4, cols=5)
+    headers = ["序号", "项目/费用名称", "单价（元）", "分项总价（元）", "备注"]
+    for c_idx, h in enumerate(headers):
+        tbl.rows[0].cells[c_idx].text = h
+
+    # 表尾合并合计行
+    tbl.rows[3].cells[0].merge(tbl.rows[3].cells[4])
+    tbl.rows[3].cells[0].text = "合计总价：2235211.56"
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+
+        # 4 列数据测试（首项包含层级编号 1、2、2.1、2.2）
+        matrix_4cols = [
+            ["1 设计费（含电力设计、建筑设计费用）", "0.00", "0.00", ""],
+            ["2 建设费（含设备购置费）", "2235211.56", "2235211.56", ""],
+            ["2.1 光伏组件", "882.69", "1167798.87", ""],
+            ["2.2、逆变器 1", "11555.00", "46220.00", ""],
+            ["合计总价（合计总价=设计费+建设费合计）", "", "2235211.56", ""]
+        ]
+
+        proposals = [
+            {
+                "path": "/body/tbl[1]",
+                "proposed_text": json.dumps(matrix_4cols, ensure_ascii=False),
+                "value": json.dumps(matrix_4cols, ensure_ascii=False),
+                "type": "table_rows",
+                "chapter_title": "投标配置及分项报价表"
+            }
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count == 5
+
+        res_doc = Document(temp_path)
+        res_tbl = res_doc.tables[0]
+
+        # 核心断言 1：第 1 列为纯层级序号，第 2 列为纯名称（无序号混入）
+        assert res_tbl.rows[1].cells[0].text.strip() == "1"
+        assert res_tbl.rows[1].cells[1].text.strip() == "设计费（含电力设计、建筑设计费用）"
+
+        assert res_tbl.rows[2].cells[0].text.strip() == "2"
+        assert res_tbl.rows[2].cells[1].text.strip() == "建设费（含设备购置费）"
+
+        assert res_tbl.rows[3].cells[0].text.strip() == "2.1"
+        assert res_tbl.rows[3].cells[1].text.strip() == "光伏组件"
+
+        assert res_tbl.rows[4].cells[0].text.strip() == "2.2"
+        # 核心断言 2：合计行包含合计总价或合计金额
+        assert "合计总价" in res_tbl.rows[5].cells[0].text or "2235211.56" in res_tbl.rows[5].cells[0].text
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_fill_docx_proposals_in_dom_full_paragraph_should_not_duplicate_text():
+    """
+    测试针对包含多个空白/下划线占位符的段落（如《投标函》主句），
+    当 Worker 提交完整覆盖句子时，写盘引擎能够智能识别整段替换并生成精确的 Diff Run，
+    彻底消除文本重复与未填占位符残留，并为填入的数据自动添加下划线。
+    """
+    from docx import Document
+    from docx.oxml.ns import qn
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    orig_para_text = "根据贵方的                   号招标文件，正式授权下述签字人       代表我方                           （投标人的名称），全权处理本次项目投标的有关事宜。"
+    p = doc.add_paragraph(orig_para_text)
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+
+        proposed_full_text = "根据贵方的RXCG2026-G003号招标文件，正式授权下述签字人李四（授权代表）代表我方四川石楠建设工程有限公司，全权处理本次项目投标的有关事宜。"
+
+        proposals = [
+            {
+                "path": "/body/p[1]",
+                "original_context": orig_para_text,
+                "proposed_text": proposed_full_text,
+                "value": proposed_full_text,
+                "type": "text",  # 模拟大模型在 JSON 中写了普通 text 类型
+                "chapter_title": "投标函格式"
+            }
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count >= 1
+
+        res_doc = Document(temp_path)
+        res_p = res_doc.paragraphs[0]
+        res_text = res_p.text.strip()
+
+        # 核心断言 1：绝不能出现重复前缀或重复后缀
+        assert res_text.count("根据贵方") == 1
+        assert res_text.count("全权处理本次项目投标的有关事宜") == 1
+        assert res_text.count("正式授权下述签字人") == 1
+        assert res_text.count("代表我方") == 1
+
+        # 核心断言 2：结果文本完整且无残留空格/下划线占位符
+        assert res_text == proposed_full_text
+        assert "                   " not in res_text
+        assert "（投标人的名称）" not in res_text
+
+        # 核心断言 3：验证填入的数据携带下划线，模板固定文字不带下划线
+        underlined_texts = []
+        normal_texts = []
+        for r in res_p.runs:
+            rPr = r._element.find(qn('w:rPr'))
+            has_u = (rPr is not None and rPr.find(qn('w:u')) is not None)
+            if has_u:
+                underlined_texts.append(r.text)
+            else:
+                normal_texts.append(r.text)
+
+        # 验证填入的核心业务数据有下划线
+        full_underlined = "".join(underlined_texts)
+        assert "RXCG2026-G003" in full_underlined
+        assert "李四" in full_underlined
+        assert "四川石楠建设工程有限公司" in full_underlined
+
+        # 验证固定模板引导词无下划线
+        full_normal = "".join(normal_texts)
+        assert "根据贵方的" in full_normal
+        assert "号招标文件" in full_normal
+        assert "全权处理本次项目投标的有关事宜" in full_normal
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_is_full_paragraph_replacement_detection():
+    """测试 _is_full_paragraph_replacement 智能判定器的多维准确性"""
+    from app.agents.bid_filler_agent import _is_full_paragraph_replacement
+
+    # 1. 显式类型
+    assert _is_full_paragraph_replacement("某段落原文", "某段落修改后文本", prop_type="sentence_batch") is True
+    assert _is_full_paragraph_replacement("某段落原文", "某段落修改后文本", prop_type="paragraph") is True
+
+    # 2. 投标函主句：首尾双锚点匹配
+    orig_bid = "根据贵方的                   号招标文件，正式授权下述签字人       代表我方                           （投标人的名称），全权处理本次项目投标的有关事宜。"
+    prop_bid = "根据贵方的RXCG2026-G003号招标文件，正式授权下述签字人李四（授权代表）代表我方四川石楠建设工程有限公司，全权处理本次项目投标的有关事宜。"
+    assert _is_full_paragraph_replacement(orig_bid, prop_bid, prop_type="text") is True
+
+    # 3. 授权委托书：首尾双锚点与骨架重合
+    orig_auth = "兹委托受托人______合法地代表我单位参加______组织的______项目的采购活动，受托人有权在该投标活动中，以我单位的名义签署投标书和投标文件，与采购人协商、澄清、解释，签订合同书并执行一切与此有关的事项。"
+    prop_auth = "兹委托受托人李四合法地代表我单位参加张家港润信项目咨询有限公司组织的窑厂工业区840KW分布式光伏发电项目的采购活动，受托人有权在该投标活动中，以我单位的名义签署投标书和投标文件，与采购人协商、澄清、解释，签订合同书并执行一切与此有关的事项。"
+    assert _is_full_paragraph_replacement(orig_auth, prop_auth, prop_type="text") is True
+
+    # 4. 普通单槽位填空值：必须判定为 False
+    assert _is_full_paragraph_replacement("地    址：________________________", "四川省成都市高新区天府大道北段128号", prop_type="text") is False
+    assert _is_full_paragraph_replacement("投标单位代表姓名（签字）：______", "李四", prop_type="text") is False
+
+
+def test_parse_proposals_fusion_should_preserve_specific_type_from_markdown():
+    """测试 _parse_proposals 在 JSON 中 type 为 text 时，能从 Markdown 表格中继承 sentence_batch 类型"""
+    from app.agents.bid_filler_workers import _parse_proposals
+
+    raw_text = """
+### 操作总结
+| 序号 | DOM 节点路径 | 替换前模板原文 | 实际填入/扩写结果 | 提议类型 | 写盘状态 |
+|---|---|---|---|---|---|
+| 1 | /body/p[@paraId=32595626] | 根据贵方的______号招标文件... | 根据贵方的RXCG2026-G003号招标文件，正式授权下述签字人李四代表我方四川石楠建设工程有限公司，全权处理本次项目投标的有关事宜。 | sentence_batch | 已提交刷盘队列 |
+
+```json
+[
+  {
+    "path": "/body/p[@paraId=32595626]",
+    "proposed_text": "根据贵方的RXCG2026-G003号招标文件，正式授权下述签字人李四代表我方四川石楠建设工程有限公司，全权处理本次项目投标的有关事宜。",
+    "value": "根据贵方的RXCG2026-G003号招标文件，正式授权下述签字人李四代表我方四川石楠建设工程有限公司，全权处理本次项目投标的有关事宜。",
+    "type": "text",
+    "status": "success"
+  }
+]
+```
+"""
+    proposals = _parse_proposals(raw_text)
+    assert len(proposals) == 1
+    assert proposals[0]["path"] == "/body/p[@paraId=32595626]"
+    # 验证提议类型已成功提升为更精确的 sentence_batch
+    assert proposals[0]["type"] == "sentence_batch"
+
+
+def test_fill_docx_proposals_in_dom_hierarchical_pricing_table_exact_alignment_and_footer_reuse():
+    """
+    测试《投标配置及分项报价表》全流程原位写入：
+    1. 验证 4 列数据（省略空备注）能够 100% 精准对齐 5 列表格，杜绝名称重复占用单价列与向右错位；
+    2. 验证原模板预置的 1 设计费、2 建设费、空白行及 ...... 占位行 100% 被二级细项原位覆盖；
+    3. 验证原模板最后一行的合计总价行被原位复用刷新总金额，绝不在下方残留旧行或产生重复合计行。
+    """
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    tbl = doc.add_table(rows=7, cols=5)
+
+    # Row 0: 表头
+    headers = ["序号", "项目/费用名称", "单价（元）", "分项总价（元）", "备注"]
+    for c_idx, h in enumerate(headers):
+        tbl.rows[0].cells[c_idx].text = h
+
+    # Row 1: 1 设计费（模拟原模板中的单元格合并）
+    tbl.rows[1].cells[1].merge(tbl.rows[1].cells[2])
+    tbl.rows[1].cells[0].text = "1"
+    tbl.rows[1].cells[1].text = "设计费（含电力设计、建筑设计费用）"
+
+    # Row 2: 2 建设费（模拟原模板中的单元格合并）
+    tbl.rows[2].cells[1].merge(tbl.rows[2].cells[2])
+    tbl.rows[2].cells[0].text = "2"
+    tbl.rows[2].cells[1].text = "建设费（含设备购置费）"
+
+    # Row 3 & 4: 空白数据行
+    # Row 5: ...... 占位行（整行合并）
+    tbl.rows[5].cells[0].merge(tbl.rows[5].cells[4])
+    tbl.rows[5].cells[0].text = "......"
+
+    # Row 6: 原模板表尾合计总价行（前两列合并）
+    tbl.rows[6].cells[0].merge(tbl.rows[6].cells[1])
+    tbl.rows[6].cells[0].text = "合计总价（合计总价=设计费+建设费合计）"
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+
+        # 模拟大模型输出的 17 行 4 列数据矩阵（包含明细与合计，省略了末尾空的备注列）
+        pricing_matrix = [
+            ["1", "设计费（含电力设计、建筑设计费用）", "0.00", "0.00"],
+            ["2", "建设费（含设备购置费）", "", "2235211.56"],
+            ["2.1", "光伏组件", "882.69", "1167798.87"],
+            ["2.2", "逆变器 1", "11555.00", "46220.00"],
+            ["2.3", "逆变器 2", "11555.00", "46220.00"],
+            ["2.4", "并网柜", "9180.35", "9180.35"],
+            ["2.5", "直流电缆", "25720.56", "25720.56"],
+            ["2.6", "交流电缆（逆变器）", "17859.45", "17859.45"],
+            ["2.7", "交流电缆（并网1）", "11882.62", "11882.62"],
+            ["2.8", "交流电缆（并网2）", "33600.00", "33600.00"],
+            ["2.9", "电缆桥架", "9233.06", "9233.06"],
+            ["2.10", "光伏支架", "117600.00", "117600.00"],
+            ["2.11", "接地系统", "6580.98", "6580.98"],
+            ["2.12", "其他辅材", "15035.67", "15035.67"],
+            ["2.13", "防水", "176400.00", "176400.00"],
+            ["2.14", "加固", "551880.00", "551880.00"],
+            ["合计总价（合计总价=设计费+建设费合计）", "", "2235211.56", ""]
+        ]
+
+        proposals = [
+            {
+                "path": "/body/tbl[1]",
+                "proposed_text": json.dumps(pricing_matrix, ensure_ascii=False),
+                "value": json.dumps(pricing_matrix, ensure_ascii=False),
+                "type": "table_rows",
+                "chapter_title": "投标配置及分项报价表"
+            }
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count >= 16
+
+        res_doc = Document(temp_path)
+        res_tbl = res_doc.tables[0]
+
+        # 核心断言 1：总行数严格为 18 行（1 行表头 + 16 行明细 + 1 行合计），绝无任何多余旧行残留
+        assert len(res_tbl.rows) == 18
+
+        # 核心断言 2：Row 1 为大类设计费，单价为 0.00，分项总价为 0.00，备注为空
+        assert res_tbl.rows[1].cells[0].text.strip() == "1"
+        assert res_tbl.rows[1].cells[1].text.strip() == "设计费（含电力设计、建筑设计费用）"
+        assert res_tbl.rows[1].cells[2].text.strip() == "0.00"
+        assert res_tbl.rows[1].cells[3].text.strip() == "0.00"
+        assert res_tbl.rows[1].cells[4].text.strip() == ""
+
+        # 核心断言 3：Row 2 为大类建设费
+        assert res_tbl.rows[2].cells[0].text.strip() == "2"
+        assert res_tbl.rows[2].cells[1].text.strip() == "建设费（含设备购置费）"
+        assert res_tbl.rows[2].cells[3].text.strip() == "2235211.56"
+
+        # 核心断言 4：Row 3 为 2.1 光伏组件，列数据 100% 精准对齐（绝不发生名称写进单价列！）
+        assert res_tbl.rows[3].cells[0].text.strip() == "2.1"
+        assert res_tbl.rows[3].cells[1].text.strip() == "光伏组件"
+        assert res_tbl.rows[3].cells[2].text.strip() == "882.69"  # 单价必须在第 2 列
+        assert res_tbl.rows[3].cells[3].text.strip() == "1167798.87"  # 分项总价必须在第 3 列
+        assert res_tbl.rows[3].cells[4].text.strip() == ""  # 备注必须在第 4 列
+
+        # 核心断言 5：Row 4 为 2.2 逆变器 1
+        assert res_tbl.rows[4].cells[0].text.strip() == "2.2"
+        assert res_tbl.rows[4].cells[1].text.strip() == "逆变器 1"
+        assert res_tbl.rows[4].cells[2].text.strip() == "11555.00"
+        assert res_tbl.rows[4].cells[3].text.strip() == "46220.00"
+
+        # 核心断言 6：最后一行合计总价行已原位刷新，且表格仅有唯一个合计总价行
+        last_row = res_tbl.rows[-1]
+        assert "合计总价" in last_row.cells[0].text
+        assert "2235211.56" in "".join(c.text for c in last_row.cells)
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+
+
+
+
+
 

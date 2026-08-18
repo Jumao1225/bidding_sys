@@ -69,7 +69,7 @@ class LLMService:
                     api_key=settings.OPENAI_API_KEY,
                     base_url=settings.OPENAI_API_BASE if settings.OPENAI_API_BASE else None,
                     temperature=temperature,
-                    request_timeout=60.0,  # 显式配置 60 秒请求超时，防止网络卡死
+                    request_timeout=180.0,  # 扩展至 180 秒请求超时，确保大章节推理与并发生成不被误杀
                 )
                 if json_mode:
                     llm = llm.bind(response_format={"type": "json_object"})

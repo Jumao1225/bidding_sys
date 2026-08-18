@@ -68,7 +68,7 @@ class MinerUParser(BaseParser):
         file_path: str,
         task_id: str,
         model_version: str = "vlm",
-        max_poll_seconds: int = 600
+        max_poll_seconds: int = 180
     ) -> Optional[str]:
         if not self.api_token:
             logger.warning("未配置 MINERU_API_TOKEN，无法发起云端 HTTP 接口调用。")

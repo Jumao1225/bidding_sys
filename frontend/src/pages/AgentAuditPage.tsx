@@ -51,6 +51,11 @@ export const AgentAuditPage: React.FC = () => {
   const [showDocModal, setShowDocModal] = useState(false);
   const [docFilterText, setDocFilterText] = useState('');
 
+  // 单章节重新生成与 Prompt 微调 State
+  const [showRefineModal, setShowRefineModal] = useState(false);
+  const [refinePrompt, setRefinePrompt] = useState('');
+  const [isRefining, setIsRefining] = useState(false);
+
   // 同步 URL 参数变更
   useEffect(() => {
     if (paramDocId && paramDocId !== activeDocId) {
@@ -325,6 +330,46 @@ export const AgentAuditPage: React.FC = () => {
       setError(`下载原格式标书失败: ${err.message}`);
     } finally {
       setIsDownloadingRaw(false);
+    }
+  };
+
+  // 单章节重新生成与 Prompt 微调处理
+  const handleRegenerateChapter = async () => {
+    if (!activeDocId || !selectedWorker || isRefining) return;
+    setIsRefining(true);
+    setNotice(`🔄 正在针对章节【${selectedWorker.chapter_title}】根据您的微调提示词重新生成与写盘...`);
+
+    try {
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/bidding/fill-bid-format/${activeDocId}/regenerate-chapter`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chapter_title: selectedWorker.chapter_title,
+          custom_prompt: refinePrompt,
+          category: selectedWorker.category,
+        })
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail || '单章节重新生成失败');
+      }
+
+      const data = await response.json();
+      setNotice(`✅ 章节【${selectedWorker.chapter_title}】微调重新生成成功！已原位更新 Word 文档。`);
+      setShowRefineModal(false);
+      setRefinePrompt('');
+
+      // 更新本地 workers 列表并刷新履历
+      if (data.worker_item) {
+        setWorkers(prev => prev.map(w => w.chapter_title === data.chapter_title ? { ...w, ...data.worker_item } : w));
+      } else {
+        fetchWorkerLogs(activeDocId, false);
+      }
+    } catch (err: any) {
+      setError(`单章节微调失败: ${err.message}`);
+    } finally {
+      setIsRefining(false);
     }
   };
 
@@ -667,35 +712,59 @@ export const AgentAuditPage: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Tab Switcher */}
-                <div className="flex bg-slate-900 p-1 rounded-xl border border-slate-800">
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('details')}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                      activeTab === 'details' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    📌 结构化写盘与工具履历
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('thought')}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                      activeTab === 'thought' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    🧠 完整思维链推导 (CoT)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('raw')}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                      activeTab === 'raw' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    📄 原始 JSON 履历
-                  </button>
+                <div className="flex items-center gap-3">
+                  {/* 单章节微调按钮 */}
+                  {!selectedWorker.category?.includes('supervisor') && !selectedWorker.node_name.includes('Supervisor') && (
+                    <button
+                      type="button"
+                      onClick={() => setShowRefineModal(true)}
+                      disabled={isRefining || isGenerating}
+                      className="px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-purple-700/90 to-indigo-700/90 hover:from-purple-600 hover:to-indigo-600 active:scale-95 text-white text-xs font-bold shadow-md border border-purple-500/40 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                      title="针对当前章节输入自定义提示词重新生成与微调"
+                    >
+                      {isRefining ? (
+                        <>
+                          <span className="animate-spin w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full"></span>
+                          <span>单章微调中...</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>✨ 针对该章节重新生成 / Prompt 微调</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+
+                  {/* Tab Switcher */}
+                  <div className="flex bg-slate-900 p-1 rounded-xl border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('details')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        activeTab === 'details' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      📌 结构化写盘与工具履历
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('thought')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        activeTab === 'thought' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      🧠 完整思维链推导 (CoT)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('raw')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                        activeTab === 'raw' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      📄 原始 JSON 履历
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -1147,6 +1216,114 @@ export const AgentAuditPage: React.FC = () => {
                   未查找到匹配的招标文件，请尝试其他关键词。
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 单章节 Prompt 微调与重新生成 Modal */}
+      {showRefineModal && selectedWorker && (
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-md z-50 flex items-center justify-center p-4 animate-fade-in">
+          <div className="bg-slate-900 border border-purple-500/40 rounded-3xl w-full max-w-2xl overflow-hidden shadow-2xl flex flex-col">
+            {/* 弹窗 Header */}
+            <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
+              <div className="flex items-center gap-3">
+                <span className="w-10 h-10 rounded-2xl bg-purple-600/20 text-purple-300 border border-purple-500/30 flex items-center justify-center text-lg font-bold shadow-inner">
+                  ✨
+                </span>
+                <div>
+                  <h3 className="font-bold text-base text-white">针对章节【{selectedWorker.chapter_title}】微调重新生成</h3>
+                  <p className="text-xs text-purple-300/80 mt-0.5">专属 Worker Agent 将根据您的提示词，重新检索上下文、重写内容并原位刷入 Word 文档</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowRefineModal(false)}
+                disabled={isRefining}
+                className="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer disabled:opacity-50"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* 弹窗 Body */}
+            <div className="p-6 space-y-4 bg-slate-950/40">
+              {/* 推荐常用提示词快捷标签 */}
+              <div>
+                <label className="block text-xs font-bold text-slate-300 mb-2 flex items-center gap-1.5">
+                  <span>💡 常用微调提示词推荐（点击快速填入）：</span>
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    "商务条款与技术要求全部严格填报无偏离",
+                    "强调售后服务团队2小时内到达现场响应",
+                    "根据企业资质中心调取最新资质证书与业绩证明图片",
+                    "所有单价按含13%增值税计算，总价大写金额严格对齐",
+                    "指定项目负责人为张三，具备一级建造师资格与高级工程师职称",
+                    "原位覆盖所有占位符下划线，保持表格排版工整美观",
+                  ].map((tag, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => setRefinePrompt(prev => prev ? `${prev}；${tag}` : tag)}
+                      className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-purple-900/60 border border-slate-800 hover:border-purple-600/60 text-[11px] text-purple-200 transition-all cursor-pointer text-left active:scale-95"
+                    >
+                      + {tag}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* 用户提示词输入区域 */}
+              <div>
+                <label className="block text-xs font-bold text-slate-300 mb-2 flex items-center justify-between">
+                  <span>✍️ 自定义微调指令 / 提示词 (Prompt)：</span>
+                  <span className="text-[11px] text-slate-500 font-normal">支持输入任意具体的修正、补全或格式要求</span>
+                </label>
+                <textarea
+                  rows={5}
+                  value={refinePrompt}
+                  onChange={(e) => setRefinePrompt(e.target.value)}
+                  placeholder="例如：“将商务偏离全部设为无偏离；增加对项目工期20天的特别保证承诺；更新企业法定代表人身份信息为最新工商档案...”"
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-purple-500 rounded-2xl p-3.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none transition-colors resize-none leading-relaxed shadow-inner"
+                  autoFocus
+                />
+              </div>
+
+              {/* 提示信息 */}
+              <div className="p-3 rounded-xl bg-purple-950/30 border border-purple-800/30 text-[11px] text-purple-300 flex items-start gap-2">
+                <span className="text-sm shrink-0">ℹ️</span>
+                <span>重新生成仅会重新调度该章节的专属 Worker Agent 进行推理与写盘，不会影响其他已生成章节的内容，写盘后可直接下载最新 Word 文档。</span>
+              </div>
+            </div>
+
+            {/* 弹窗 Footer */}
+            <div className="p-4 border-t border-slate-800 bg-slate-950/80 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setShowRefineModal(false)}
+                disabled={isRefining}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition-all cursor-pointer disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={handleRegenerateChapter}
+                disabled={isRefining}
+                className="px-5 py-2 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 active:scale-98 text-white text-xs font-bold transition-all shadow-lg shadow-purple-900/40 border border-purple-400/30 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+              >
+                {isRefining ? (
+                  <>
+                    <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
+                    <span>正在针对性重新生成中...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>🚀 确认微调并重新生成</span>
+                  </>
+                )}
+              </button>
             </div>
           </div>
         </div>

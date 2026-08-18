@@ -225,6 +225,21 @@ async def officecli_fill_table_rows_tool(
             except Exception as hdr_err:
                 logger.debug(f"📊 [OfficeCLI Tool] 检测表头序号列提示: {hdr_err}")
 
+        # 判定表头行数（支持多行复合表头）
+        header_row_count = 1
+        try:
+            from docx import Document
+            from app.utils.table_utils import detect_table_header_rows
+            doc_peek = Document(file_path)
+            m_t_idx = re.search(r'/tbl\[(\d+)\]', table_path)
+            if m_t_idx:
+                t_idx = int(m_t_idx.group(1)) - 1
+                if 0 <= t_idx < len(doc_peek.tables):
+                    header_row_count = detect_table_header_rows(doc_peek.tables[t_idx])
+                    logger.info(f"📊 [OfficeCLI Tool] 识别到表格 '{table_path}' 表头包含 {header_row_count} 行")
+        except Exception as e_hdr:
+            logger.debug(f"📊 [OfficeCLI Tool] 探测多行表头提示: {e_hdr}")
+
         cmds = []
         added_count = 0
         for i, row in enumerate(raw_rows):
@@ -236,10 +251,10 @@ async def officecli_fill_table_rows_tool(
                 if not (row_data and str(row_data[0]).isdigit() and int(row_data[0]) == i + 1):
                     row_data.insert(0, str(i + 1))
             
-            # Row 1 为表头；数据行目标行号为 target_row_idx = i + 2
-            target_row_idx = i + 2
+            # 数据行目标行号为 target_row_idx = header_row_count + i + 1 (1-based index)
+            target_row_idx = header_row_count + i + 1
             if target_row_idx <= existing_row_count:
-                # 优先原位覆盖模板中表头下方已有的空白行 (Row 2, Row 3...)
+                # 优先原位覆盖模板中表头下方已有的空白行
                 target_row_path = f"{table_path}/row[{target_row_idx}]"
                 for col_idx, val in enumerate(row_data):
                     cmds.append({
@@ -258,8 +273,8 @@ async def officecli_fill_table_rows_tool(
                     })
             added_count += 1
 
-        # 2. 自动清理模板中余下的未用预设空行（从底部向上倒序删除，防止留白与多余空行）
-        last_filled_row_idx = added_count + 1
+        # 2. 自动清理模板中余下的未用预设空行（从底部向上倒序删除，确保不删除表头行）
+        last_filled_row_idx = header_row_count + added_count
         if last_filled_row_idx < existing_row_count:
             for r in range(existing_row_count, last_filled_row_idx, -1):
                 cmds.append({"command": "remove", "path": f"{table_path}/row[{r}]"})
@@ -267,8 +282,8 @@ async def officecli_fill_table_rows_tool(
         if cmds:
             await office_cli_service.apply_batch(file_path, cmds)
 
-        logger.info(f"📊 [OfficeCLI Tool] 成功为表格 '{table_path}' 填充 {added_count} 行数据（已防留白）")
-        return f"成功为表格 {table_path} 从第二行开始填充 {added_count} 行数据（表头完好，已有空行原位覆盖对齐）"
+        logger.info(f"📊 [OfficeCLI Tool] 成功为表格 '{table_path}' 填充 {added_count} 行数据（表头 {header_row_count} 行已保护，已防留白）")
+        return f"成功为表格 {table_path} 从第 {header_row_count + 1} 行开始填充 {added_count} 行数据（表头 {header_row_count} 行完好，已有空行原位覆盖对齐）"
     except Exception as e:
         logger.exception(f"📊 [OfficeCLI Tool] 批量填充表格行异常: {str(e)}")
         return f"[批量填充表格行异常: {str(e)}]"

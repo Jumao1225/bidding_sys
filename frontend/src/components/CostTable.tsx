@@ -4,6 +4,7 @@ import { apiFetch, API_BASE_URL } from '../utils/api';
 interface CostTableProps {
   documentId?: string;
   equipmentList?: any[];
+  financial?: any;
   costAnalysis?: any;
   onReextract?: () => void;
   onCostUpdated?: (updatedData: any) => void;
@@ -13,6 +14,7 @@ interface CostTableProps {
 export function CostTable({
   documentId,
   equipmentList = [],
+  financial = {},
   costAnalysis = {},
   onReextract,
   onCostUpdated,
@@ -54,9 +56,53 @@ export function CostTable({
     return sum + q * p;
   }, 0);
 
-  const budgetStatus = costAnalysis.budget_status || '';
-  const isBudgetExceeded = budgetStatus.includes('已超出');
-  const isBudgetWarning = budgetStatus.includes('接近');
+  // 严格优先级提取限价：1. 最高投标限价 (max_price_limit) > 2. 采购总预算 (budget) > 3. costAnalysis.budget_numeric / costAnalysis.budget_limit
+  const maxPriceLimitAmount = financial?.max_price_limit?.amount ? Number(financial.max_price_limit.amount) : null;
+  const budgetAmount = financial?.budget?.amount ? Number(financial.budget.amount) : null;
+
+  let effectiveLimitAmount: number | null = null;
+  let limitTypeLabel = '';
+
+  if (maxPriceLimitAmount && maxPriceLimitAmount > 0) {
+    effectiveLimitAmount = maxPriceLimitAmount;
+    limitTypeLabel = '最高投标限价';
+  } else if (budgetAmount && budgetAmount > 0) {
+    effectiveLimitAmount = budgetAmount;
+    limitTypeLabel = '采购总预算';
+  } else if (costAnalysis?.budget_numeric && Number(costAnalysis.budget_numeric) > 0) {
+    effectiveLimitAmount = Number(costAnalysis.budget_numeric);
+    limitTypeLabel = costAnalysis.limit_type === 'max_price_limit' ? '最高投标限价' : (costAnalysis.limit_type === 'budget' ? '采购总预算' : '预算上限');
+  } else if (costAnalysis?.budget_limit) {
+    const cleaned = String(costAnalysis.budget_limit).replace(/[^\d.]/g, '');
+    if (cleaned && Number(cleaned) > 0) {
+      effectiveLimitAmount = Number(cleaned);
+      limitTypeLabel = '预算限额';
+    }
+  }
+
+  // 实时计算预算与超额状态
+  let isRealTimeExceeded = false;
+  let isRealTimeWarning = false;
+  let dynamicStatusText = costAnalysis.budget_status || '';
+  let overrunAmount = 0;
+  let usageRatio = 0;
+
+  if (effectiveLimitAmount && effectiveLimitAmount > 0 && realTimeTotalCost > 0) {
+    usageRatio = Number(((realTimeTotalCost / effectiveLimitAmount) * 100).toFixed(1));
+    if (realTimeTotalCost > effectiveLimitAmount) {
+      isRealTimeExceeded = true;
+      overrunAmount = Number((realTimeTotalCost - effectiveLimitAmount).toFixed(2));
+      dynamicStatusText = `已超出${limitTypeLabel} (使用率 ${usageRatio}%, 超额 ¥${overrunAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })})`;
+    } else if (usageRatio >= 90) {
+      isRealTimeWarning = true;
+      dynamicStatusText = `接近${limitTypeLabel} (使用率 ${usageRatio}%)`;
+    } else {
+      dynamicStatusText = `在${limitTypeLabel}内可控 (使用率 ${usageRatio}%)`;
+    }
+  } else if (dynamicStatusText) {
+    isRealTimeExceeded = dynamicStatusText.includes('已超出');
+    isRealTimeWarning = dynamicStatusText.includes('接近');
+  }
 
   // 开启行内编辑模式
   const handleStartEdit = (index: number, item: any) => {
@@ -223,35 +269,70 @@ export function CostTable({
         </div>
 
         <div className="flex items-center gap-3">
-          {budgetStatus && budgetStatus !== '预算未设置' && (
-            <div className={`px-4 py-2 rounded-2xl text-xs font-bold border ${
-              isBudgetExceeded 
-                ? 'bg-rose-50 text-rose-600 border-rose-200' 
-                : isBudgetWarning 
-                  ? 'bg-amber-50 text-amber-600 border-amber-200' 
-                  : 'bg-emerald-50 text-emerald-600 border-emerald-200'
+          {dynamicStatusText && dynamicStatusText !== '预算未设置' && (
+            <div className={`px-4 py-2 rounded-2xl text-xs font-bold border transition-all ${
+              isRealTimeExceeded 
+                ? 'bg-rose-50 text-rose-600 border-rose-300 shadow-sm animate-pulse' 
+                : isRealTimeWarning 
+                  ? 'bg-amber-50 text-amber-600 border-amber-300' 
+                  : 'bg-emerald-50 text-emerald-600 border-emerald-300'
             }`}>
-              {isBudgetExceeded && '🚨 '}
-              {isBudgetWarning && '⚠️ '}
-              {!isBudgetExceeded && !isBudgetWarning && '✓ '}
-              {budgetStatus}
+              {isRealTimeExceeded && '🚨 '}
+              {isRealTimeWarning && '⚠️ '}
+              {!isRealTimeExceeded && !isRealTimeWarning && '✓ '}
+              {dynamicStatusText}
             </div>
           )}
 
           {/* 实时预估总成本卡片 */}
-          <div className="text-right bg-slate-50 p-3.5 px-5 rounded-2xl border border-slate-100 shadow-inner">
+          <div className={`text-right p-3.5 px-5 rounded-2xl border shadow-inner transition-all ${
+            isRealTimeExceeded 
+              ? 'bg-rose-50/70 border-rose-200 shadow-rose-100' 
+              : isRealTimeWarning 
+                ? 'bg-amber-50/70 border-amber-200' 
+                : 'bg-slate-50 border-slate-100'
+          }`}>
             <div className="text-xs font-bold text-slate-500 mb-0.5 tracking-wider uppercase">预估总成本 (实时)</div>
-            <div className={`text-2xl font-black ${hasCostData ? 'text-blue-600' : 'text-slate-300'}`}>
-              {hasCostData ? `¥${realTimeTotalCost.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '暂未测算'}
+            <div className={`text-2xl font-black ${
+              hasCostData 
+                ? (isRealTimeExceeded ? 'text-rose-600' : (isRealTimeWarning ? 'text-amber-600' : 'text-blue-600')) 
+                : 'text-slate-300'
+            }`}>
+              {hasCostData ? `¥${realTimeTotalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '暂未测算'}
             </div>
-            {costAnalysis.budget_limit && (
-              <div className="text-xs text-slate-400 font-medium">
+            {effectiveLimitAmount ? (
+              <div className="text-xs text-slate-500 font-medium mt-0.5">
+                基准{limitTypeLabel}: <span className="font-bold text-slate-700">¥{effectiveLimitAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                {maxPriceLimitAmount && budgetAmount && maxPriceLimitAmount !== budgetAmount && (
+                  <span className="text-[10px] text-slate-400 block">
+                    (采购总预算: ¥{budgetAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                  </span>
+                )}
+              </div>
+            ) : (costAnalysis.budget_limit && (
+              <div className="text-xs text-slate-400 font-medium mt-0.5">
                 预算限额: {costAnalysis.budget_limit}
               </div>
-            )}
+            ))}
           </div>
         </div>
       </div>
+
+      {/* 强视觉熔断警报横幅（当实时总价超出最高限价/预算时立即触发） */}
+      {isRealTimeExceeded && (
+        <div className="mb-5 p-4 bg-rose-50/90 rounded-2xl border-2 border-rose-200 text-rose-800 flex items-start gap-3 shadow-sm animate-pulse">
+          <span className="text-2xl p-1 bg-rose-100 rounded-xl">🚨</span>
+          <div className="flex-1">
+            <div className="font-extrabold text-sm text-rose-900 flex items-center gap-2">
+              <span>【强视觉熔断警报】当前预估总成本已超出{limitTypeLabel}！</span>
+              <span className="bg-rose-600 text-white text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">废标风险红线</span>
+            </div>
+            <div className="text-xs text-rose-700 mt-1 leading-relaxed">
+              当前实时测算总价为 <span className="font-bold underline font-mono">¥{realTimeTotalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>，已超出基准{limitTypeLabel}（<span className="font-mono font-bold">¥{effectiveLimitAmount?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>）共 <span className="font-extrabold text-rose-900 font-mono">¥{overrunAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>（超出幅度 {(usageRatio - 100).toFixed(1)}%）。根据招投标法，若以当前价格起草投标书，将直接触发废标风险，请及时在下方表格中调整指导单价或数量。
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 专家评估总结 */}
       {costAnalysis.analysis_summary && (

@@ -28,7 +28,7 @@ from loguru import logger
 
 from app.api import deps
 from app.db.models.user import User
-from app.schemas.bid_filler_schema import BidFillRequest
+from app.schemas.bid_filler_schema import BidFillRequest, RegenerateChapterRequest, RegenerateChapterResponse
 from app.services.bid_format_extractor_service import bid_format_extractor_service
 
 router = APIRouter()
@@ -291,6 +291,213 @@ async def stream_bid_fill_worker_logs(
             "Connection": "keep-alive"
         }
     )
+
+
+@router.post("/fill-bid-format/{document_id}/regenerate-chapter", response_model=RegenerateChapterResponse)
+async def regenerate_single_chapter(
+    document_id: str,
+    request_body: RegenerateChapterRequest,
+    db: Session = Depends(deps.get_db),
+    current_user: Optional[User] = Depends(deps.get_current_user_optional)
+):
+    """
+    针对具体指定章节重新启动 Worker Agent 进行针对性起草与 Prompt 微调，并原位写回 Word 文档。
+    """
+    if not document_id:
+        raise HTTPException(status_code=400, detail="未提供有效的 document_id 参数")
+    if not request_body.chapter_title:
+        raise HTTPException(status_code=400, detail="未提供目标章节名称 chapter_title")
+
+    chapter_title = request_body.chapter_title.strip()
+    custom_prompt = (request_body.custom_prompt or "").strip()
+    category = (request_body.category or "needs_fill").strip()
+    mapping_hint = (request_body.mapping_hint or "").strip()
+
+    logger.info(f"🔄 收到单章节重新生成/微调请求: doc_id={document_id}, chapter={chapter_title}, prompt='{custom_prompt[:60]}'")
+
+    # 1. 准备 Word 工作副本
+    drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
+    os.makedirs(drafts_dir, exist_ok=True)
+    working_docx_path = os.path.join(drafts_dir, f"bid_fill_{document_id[:8]}.docx")
+    result_docx_path = os.path.join(drafts_dir, f"agent_fill_result_{document_id[:8]}.docx")
+
+    if not os.path.exists(working_docx_path):
+        if os.path.exists(result_docx_path):
+            import shutil
+            shutil.copyfile(result_docx_path, working_docx_path)
+        else:
+            template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
+                db=db, doc_id=document_id, user_id=None, tenant_id=None
+            )
+            if not template_bytes:
+                raise HTTPException(status_code=404, detail="未找到该文档的标书模板")
+            with open(working_docx_path, "wb") as f:
+                f.write(template_bytes)
+
+    # 2. 注入上下文变量
+    from app.core.context import current_user_id, current_tenant_id, current_task_id
+    u_id = current_user.id if (current_user and hasattr(current_user, 'id')) else "default-user"
+    t_id = current_user.tenant_id if (current_user and hasattr(current_user, 'tenant_id')) else "default-tenant"
+    token_task = current_task_id.set(document_id)
+    token_u = current_user_id.set(u_id)
+    token_t = current_tenant_id.set(t_id)
+
+    # 3. 记录初始进行中状态
+    try:
+        from app.services.audit_service import audit_service
+        audit_service.log_event(
+            action_type="llm_call_worker",
+            node_name=f"BidFillerWorker-{chapter_title[:30]}",
+            inputs={"chapter_title": chapter_title, "category": category, "document_id": document_id, "custom_prompt": custom_prompt},
+            outputs={
+                "summary": f"🔄 正在根据用户提示词对章节 [{chapter_title}] 重新起草与微调...",
+                "proposals_count": 0,
+                "thought_steps": [
+                    {"step": 1, "type": "thought", "content": f"接收到用户微调指令: '{custom_prompt}'，正在启动专属 Worker Agent 重新调取数据并生成提案。"}
+                ]
+            },
+            status="in_progress"
+        )
+    except Exception as log_init_err:
+        logger.warning(f"写入微调初始状态日志异常: {log_init_err}")
+
+    try:
+        from app.agents.bid_filler_workers import run_chapter_worker
+        from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+        from app.utils.table_utils import extract_chapter_dom_structure
+
+        # 仅精准提取属于该章节专属的纯净表格表头与结构定义（消除半成品残缺行的诱导）
+        from app.agents.bid_filler_workers import extract_docx_tables_summary
+        from app.utils.table_utils import get_chapter_specific_table_indices
+        target_tbl_summary = extract_docx_tables_summary(working_docx_path, chapter_title)
+        
+        # 组装纯净模板提示（如为表格章节，突出表头定义与全量重写要求）
+        if target_tbl_summary:
+            chapter_pure_context = f"【本章节专属表格表头定义】\n{target_tbl_summary}\n（请根据招标文件原文及企业数据库全量检索数据，生成完整 2D 矩阵全量覆写）"
+        else:
+            chapter_pure_context = extract_chapter_dom_structure(working_docx_path, chapter_title)
+            if not chapter_pure_context:
+                chapter_pure_context = f"【目标章节】: {chapter_title}"
+
+        # 尝试从历史日志中继承该章节的分类 hint 与说明
+        effective_category = category
+        effective_mapping_hint = mapping_hint
+        try:
+            from app.db.models.audit import AgentAuditLog
+            from sqlalchemy import desc
+            hist_log = (
+                db.query(AgentAuditLog)
+                .filter(AgentAuditLog.task_id == document_id)
+                .filter(AgentAuditLog.node_name == f"BidFillerWorker-{chapter_title[:30]}")
+                .order_by(desc(AgentAuditLog.created_at))
+                .first()
+            )
+            if hist_log and hist_log.inputs:
+                if not effective_mapping_hint:
+                    effective_mapping_hint = hist_log.inputs.get("mapping_hint", "")
+                if not effective_category or effective_category == "needs_fill":
+                    effective_category = hist_log.inputs.get("category", effective_category)
+        except Exception:
+            pass
+
+        start_time = time.time()
+        worker_res = await run_in_threadpool(
+            run_chapter_worker,
+            chapter_title=chapter_title,
+            chapter_number="",
+            mapping_hint=effective_mapping_hint,
+            category=effective_category,
+            document_id=document_id,
+            docx_temp_path=working_docx_path,
+            template_text=chapter_pure_context,
+            content_hint="（请根据招标文件原文与企业数据库检索全量数据，按要求全量重新起草与覆写本章节）",
+            extra_instructions=custom_prompt or "请按照主流程标准，全量重新检索招标文件与数据库并完成全表覆写。",
+            repair_instructions="",
+        )
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        proposals = worker_res.get("proposals", [])
+        status = worker_res.get("status", "success")
+        summary = worker_res.get("summary", "单章节微调已完成。")
+
+        # 4. 原位刷盘
+        if proposals and os.path.exists(working_docx_path):
+            try:
+                write_count = fill_docx_proposals_in_dom(working_docx_path, proposals)
+                logger.info(f"✅ 单章节微调原位写盘完成，写入 {write_count} 处修改")
+                # 同步到 result 文件
+                import shutil
+                shutil.copyfile(working_docx_path, result_docx_path)
+                draft_path = os.path.join(drafts_dir, f"draft_{document_id}.docx")
+                shutil.copyfile(working_docx_path, draft_path)
+            except Exception as write_err:
+                logger.error(f"单章节微调写盘异常: {write_err}")
+
+        # 5. 查询最新的 audit log 条目
+        from app.db.models.audit import AgentAuditLog
+        from sqlalchemy import desc, cast, String
+        latest_log = (
+            db.query(AgentAuditLog)
+            .filter(
+                or_(
+                    AgentAuditLog.task_id == document_id,
+                    cast(AgentAuditLog.inputs, String).like(f"%{document_id}%")
+                )
+            )
+            .filter(
+                or_(
+                    AgentAuditLog.node_name == f"BidFillerWorker-{chapter_title[:30]}",
+                    cast(AgentAuditLog.inputs, String).like(f"%{chapter_title}%")
+                )
+            )
+            .order_by(desc(AgentAuditLog.created_at))
+            .first()
+        )
+
+        worker_item = None
+        if latest_log:
+            inp = latest_log.inputs or {}
+            out = latest_log.outputs or {}
+            worker_item = {
+                "id": str(latest_log.id),
+                "node_name": latest_log.node_name or f"BidFillerWorker-{chapter_title}",
+                "chapter_title": chapter_title,
+                "category": inp.get("category", category),
+                "status": latest_log.status or "success",
+                "execution_time_ms": latest_log.execution_time_ms or elapsed_ms,
+                "total_tokens": latest_log.total_tokens or 0,
+                "prompt_tokens": latest_log.prompt_tokens or 0,
+                "completion_tokens": latest_log.completion_tokens or 0,
+                "summary": out.get("summary", summary),
+                "proposals_count": out.get("proposals_count", len(proposals)),
+                "proposals": out.get("proposals", proposals),
+                "tools_used": out.get("tools_used", inp.get("tools_used", [])),
+                "thought_steps": out.get("thought_steps", []),
+                "created_at": latest_log.created_at.strftime("%Y-%m-%d %H:%M:%S") if latest_log.created_at else None
+            }
+
+        return RegenerateChapterResponse(
+            document_id=document_id,
+            chapter_title=chapter_title,
+            status=status,
+            summary=summary,
+            proposals_count=len(proposals),
+            execution_time_ms=elapsed_ms,
+            total_tokens=worker_item.get("total_tokens", 0) if worker_item else 0,
+            worker_item=worker_item
+        )
+
+    except Exception as exc:
+        logger.exception(f"❌ 单章节微调失败: {exc}")
+        raise HTTPException(status_code=500, detail=f"单章节重新生成失败: {str(exc)}")
+    finally:
+        try:
+            current_task_id.reset(token_task)
+            current_user_id.reset(token_u)
+            current_tenant_id.reset(token_t)
+        except Exception:
+            pass
+
 
 
 @router.get("/fill-bid-format/{document_id}/audit-report")

@@ -257,6 +257,7 @@ class RAGService:
         """
         获取指定文档中某个章节的 100% 连贯全文原文（无 Top-K 向量截断）。
         在数据库中按 section_title 匹配并按 DocChunk.chunk_index 顺序拼接所有相关切片。
+        支持 '第四章'、'（4）'、'项目需求' 等多别名智能模糊召回。
         """
         if not document_id or not chapter_name:
             return "错误：必须提供 document_id 和 chapter_name"
@@ -264,18 +265,43 @@ class RAGService:
         clean_name = chapter_name.strip()
         db: Session = SessionLocal()
         try:
+            # 通用抽象别名生成器（根据传入章节名称自动推导序号变体与主干词，零业务硬编码）
+            aliases = [clean_name]
+
+            # 1. 序号形态通用转换（如 '第一章' <-> '第1章' <-> '（1）' <-> '1、'）
+            import re
+            zh_num_pattern = re.search(r'[第（(]?([一二三四五六七八九十0-9]+)[章节部分、\.\)）]?', clean_name)
+            if zh_num_pattern:
+                raw_num = zh_num_pattern.group(1)
+                num_zh_to_ar = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}
+                num_ar_to_zh = {v: k for k, v in num_zh_to_ar.items()}
+                ar_num = num_zh_to_ar.get(raw_num, raw_num if raw_num.isdigit() else "")
+                zh_num = num_ar_to_zh.get(raw_num, raw_num if not raw_num.isdigit() else "")
+
+                for n_val in set(filter(None, [ar_num, zh_num])):
+                    aliases.extend([f"第{n_val}章", f"（{n_val}）", f"({n_val})", f"{n_val}、", f"{n_val}."])
+
+            # 2. 核心主干词通用提取（剔除前后缀如“格式”、“响应表”、“偏离表”等通用词汇）
+            pure_stem = re.sub(r'^[第（(]?[一二三四五六七八九十0-9]+[章节部分、\.\)）\s]*', '', clean_name)
+            pure_stem = re.sub(r'(?:格式|响应对照表|响应表|偏离表|汇总表|明细表|清单)$', '', pure_stem).strip()
+            if pure_stem and len(pure_stem) >= 2:
+                aliases.append(pure_stem)
+
+            from sqlalchemy import or_
+            filter_conditions = [DocChunk.section_title.ilike(f"%{a}%") for a in set(aliases) if a]
+
             chunks = (
                 db.query(DocChunk)
                 .filter(
                     DocChunk.document_id == document_id,
-                    DocChunk.section_title.ilike(f"%{clean_name}%")
+                    or_(*filter_conditions)
                 )
                 .order_by(DocChunk.chunk_index)
                 .all()
             )
 
             if not chunks:
-                logger.info(f"RAGService: 未能通过章节关键字 '%{clean_name}%' 找到任何切片 (文档ID: {document_id})")
+                logger.info(f"RAGService: 未能通过章节关键字 '{aliases}' 找到任何切片 (文档ID: {document_id})")
                 return f"未能在文档中检索到章节名称匹配 '{chapter_name}' 的任何段落。"
 
             matched_sections = list(dict.fromkeys([c.section_title for c in chunks if c.section_title]))

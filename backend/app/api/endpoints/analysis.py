@@ -315,34 +315,64 @@ async def update_cost_analysis(
 
     total_cost = round(total_cost, 2)
 
-    # 3. 评估预算状态
+    # 3. 评估预算与最高限价状态（严格优先级：最高投标限价 max_price_limit > 采购总预算 budget > parsed_metadata 兜底）
+    from app.db.models.metadata import FinancialMetadata
     parsed_metadata = dict(doc.parsed_metadata or {})
-    budget_limit = parsed_metadata.get("budget_limit")
+    
+    fin_md = db.query(FinancialMetadata).filter(FinancialMetadata.document_id == document_id).first()
+    
     budget_status = "预算未设置"
     budget_numeric = None
+    budget_limit_str = None
+    limit_type = "unspecified"
 
-    if budget_limit:
-        try:
-            cleaned_budget = re.sub(r'[^\d.]', '', str(budget_limit))
-            if cleaned_budget:
-                budget_numeric = float(cleaned_budget)
-        except Exception as e:
-            logger.warning(f"解析预算数字失败: {budget_limit}, error: {e}")
+    if fin_md:
+        if fin_md.max_price_limit and isinstance(fin_md.max_price_limit, dict) and fin_md.max_price_limit.get("amount"):
+            try:
+                budget_numeric = float(fin_md.max_price_limit["amount"])
+                budget_limit_str = f"最高投标限价 ¥{budget_numeric:,.2f}"
+                limit_type = "max_price_limit"
+            except (ValueError, TypeError) as e:
+                logger.warning(f"解析最高投标限价数字失败: {fin_md.max_price_limit}, error: {e}")
+        elif fin_md.budget and isinstance(fin_md.budget, dict) and fin_md.budget.get("amount"):
+            try:
+                budget_numeric = float(fin_md.budget["amount"])
+                budget_limit_str = f"采购总预算 ¥{budget_numeric:,.2f}"
+                limit_type = "budget"
+            except (ValueError, TypeError) as e:
+                logger.warning(f"解析采购总预算数字失败: {fin_md.budget}, error: {e}")
+
+    # 兜底旧逻辑：从 parsed_metadata 读取 budget_limit
+    if budget_numeric is None:
+        raw_budget_limit = parsed_metadata.get("budget_limit") or (parsed_metadata.get("cost_analysis") or {}).get("budget_limit")
+        if raw_budget_limit:
+            try:
+                cleaned_budget = re.sub(r'[^\d.]', '', str(raw_budget_limit))
+                if cleaned_budget:
+                    budget_numeric = float(cleaned_budget)
+                    budget_limit_str = str(raw_budget_limit)
+                    limit_type = "budget_limit"
+            except Exception as e:
+                logger.warning(f"解析预算数字失败: {raw_budget_limit}, error: {e}")
 
     if budget_numeric and budget_numeric > 0:
         ratio = round((total_cost / budget_numeric) * 100, 1)
+        overrun_amt = round(total_cost - budget_numeric, 2)
+        limit_name = "最高投标限价" if limit_type == "max_price_limit" else ("采购总预算" if limit_type == "budget" else "预算上限")
         if total_cost > budget_numeric:
-            budget_status = f"已超出预算上限 (预算使用率 {ratio}%, 超额 ¥{round(total_cost - budget_numeric, 2)})"
+            budget_status = f"已超出{limit_name} (使用率 {ratio}%, 超额 ¥{overrun_amt:,.2f})"
         elif ratio >= 90:
-            budget_status = f"接近预算上限 (预算使用率 {ratio}%)"
+            budget_status = f"接近{limit_name} (使用率 {ratio}%)"
         else:
-            budget_status = f"预算可控 (预算使用率 {ratio}%)"
+            budget_status = f"在{limit_name}内可控 (使用率 {ratio}%)"
 
     cost_data = {
         "items": calculated_items,
         "total_cost": total_cost,
         "unmatched_count": unmatched_count,
-        "budget_limit": budget_limit,
+        "budget_limit": budget_limit_str,
+        "budget_numeric": budget_numeric,
+        "limit_type": limit_type,
         "budget_status": budget_status,
         "analysis_summary": payload.analysis_summary or (parsed_metadata.get("cost_analysis") or {}).get("analysis_summary", "已完成手动调整与成本核算汇总。")
     }

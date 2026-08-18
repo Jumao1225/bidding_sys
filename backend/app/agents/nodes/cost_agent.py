@@ -48,13 +48,48 @@ def cost_node(state: BiddingState) -> dict:
     
     db: Session = SessionLocal()
     budget_limit = None
+    budget_numeric = None
+    limit_type = "unspecified"
     price_book = []
     equipment_list_from_db = []
     
     try:
         document = document_crud.get_document_by_id(db, document_id, user_id, tenant_id)
-        if document and document.parsed_metadata:
-            budget_limit = document.parsed_metadata.get("budget_limit")
+        
+        # 优先从 FinancialMetadata 查询最高投标限价 (max_price_limit) 与采购总预算 (budget)
+        from app.db.models.metadata import FinancialMetadata, EngineeringMetadata
+        fin_md = db.query(FinancialMetadata).filter(
+            FinancialMetadata.document_id == document_id,
+            FinancialMetadata.tenant_id == tenant_id
+        ).first()
+        if fin_md:
+            if fin_md.max_price_limit and isinstance(fin_md.max_price_limit, dict) and fin_md.max_price_limit.get("amount"):
+                try:
+                    budget_numeric = float(fin_md.max_price_limit["amount"])
+                    budget_limit = f"最高投标限价 ¥{budget_numeric:,.2f}"
+                    limit_type = "max_price_limit"
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"CostAgent 解析最高投标限价失败: {fin_md.max_price_limit}, error: {e}")
+            elif fin_md.budget and isinstance(fin_md.budget, dict) and fin_md.budget.get("amount"):
+                try:
+                    budget_numeric = float(fin_md.budget["amount"])
+                    budget_limit = f"采购总预算 ¥{budget_numeric:,.2f}"
+                    limit_type = "budget"
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"CostAgent 解析采购总预算失败: {fin_md.budget}, error: {e}")
+
+        if budget_numeric is None and document and document.parsed_metadata:
+            raw_budget_limit = document.parsed_metadata.get("budget_limit") or (document.parsed_metadata.get("cost_analysis") or {}).get("budget_limit")
+            if raw_budget_limit:
+                try:
+                    import re
+                    cleaned_budget = re.sub(r'[^\d.]', '', str(raw_budget_limit))
+                    if cleaned_budget:
+                        budget_numeric = float(cleaned_budget)
+                        budget_limit = str(raw_budget_limit)
+                        limit_type = "budget_limit"
+                except Exception as e:
+                    logger.warning(f"CostAgent 解析预算数字失败: {raw_budget_limit}, error: {e}")
             
         # 获取当前租户的全维度价格参考库
         price_refs = business_crud.get_all_price_references(db, tenant_id)
@@ -203,25 +238,17 @@ def cost_node(state: BiddingState) -> dict:
     
     # 预算对比与风险预警
     budget_status = "预算未设置"
-    budget_numeric = None
     
-    if budget_limit:
-        try:
-            import re
-            cleaned_budget = re.sub(r'[^\d.]', '', str(budget_limit))
-            if cleaned_budget:
-                budget_numeric = float(cleaned_budget)
-        except Exception as e:
-            logger.warning(f"解析预算数字失败: {budget_limit}, error: {e}")
-
     if budget_numeric and budget_numeric > 0:
         ratio = round((total_cost / budget_numeric) * 100, 1)
+        overrun_amt = round(total_cost - budget_numeric, 2)
+        limit_name = "最高投标限价" if limit_type == "max_price_limit" else ("采购总预算" if limit_type == "budget" else "预算上限")
         if total_cost > budget_numeric:
-            budget_status = f"已超出预算上限 (预算使用率 {ratio}%, 超额 ¥{round(total_cost - budget_numeric, 2)})"
+            budget_status = f"已超出{limit_name} (使用率 {ratio}%, 超额 ¥{overrun_amt:,.2f})"
         elif ratio >= 90:
-            budget_status = f"接近预算上限 (预算使用率 {ratio}%)"
+            budget_status = f"接近{limit_name} (使用率 {ratio}%)"
         else:
-            budget_status = f"预算可控 (预算使用率 {ratio}%)"
+            budget_status = f"在{limit_name}内可控 (使用率 {ratio}%)"
 
     logger.info(f"成本核算完成，总估算成本: {total_cost}，预算状态: {budget_status}，未匹配项: {unmatched_count}。")
 
@@ -262,6 +289,7 @@ def cost_node(state: BiddingState) -> dict:
             "total_cost": total_cost,
             "budget_limit": budget_limit,
             "budget_numeric": budget_numeric,
+            "limit_type": limit_type,
             "budget_status": budget_status,
             "unmatched_count": unmatched_count,
             "analysis_summary": response_obj.analysis_summary,

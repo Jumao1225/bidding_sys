@@ -792,9 +792,269 @@ def _apply_run_style_xml(run, enable_underline: bool = False, is_table: bool = F
         pass
 
 
-def _apply_run_underline_xml(run, enable: bool = True, is_table: bool = False) -> None:
-    """兼容旧接口"""
-    _apply_run_style_xml(run, enable_underline=enable, is_table=is_table)
+def align_table_row_cells(row_data: List[Any], total_cols: int, row_i: int) -> List[str]:
+    """
+    智能将行数据对齐为 total_cols 长度的标准单元格列表（纯结构化正则与几何映射，无具体业务数据）：
+    1. 智能剥离粘连金额：若名称末尾粘连了数字（如 '某费用名称 0.00'），自动剥离并顺延至单价/总价列；
+    2. 缺少 1 列数据自适应：
+       - 若首列为独立纯序号，末尾自动补齐空的【备注】列；
+       - 若首列包含复合序号与名称，拆分为第 0 列序号与第 1 列名称；
+       - 若首列为纯名称，在第 0 列自动补齐流水序号；
+    3. 合计行标准装配：第 0 列留空，第 1 列为合计标签，分项总价列填入总金额，末尾留空；
+    4. 防错列自愈：
+       - 若第 1 列与第 2 列名称相同，自动剔除重复项并纠正列偏移；
+       - 若 5 列报价表中【单价】与【分项总价】被重复填入相同的非零大额总金额，对于包干/工程/大类项智能纠偏将单价置为破折号 "——"；
+       - 若 5 列报价表中第 1 列名称重复包含序号，自动剥离前缀序号。
+    """
+    raw_vals = [str(c).strip() if c is not None else "" for c in row_data]
+    if not raw_vals:
+        return [""] * total_cols
+
+    # 0. 智能检测并剥离第 1 列（名称列）末尾粘连的小数点金额（如 '费用名称 0.00'，精确保护 '设备名 1' 等编号后缀）
+    if len(raw_vals) >= 2:
+        name_cand = raw_vals[1]
+        m_name_amount = re.match(r'^(.*?)\s+([0-9]+\.[0-9]{1,2})\s*$', name_cand)
+        if m_name_amount:
+            clean_n = m_name_amount.group(1).strip()
+            num_part = m_name_amount.group(2).strip()
+            if clean_n and len(raw_vals) < total_cols:
+                raw_vals[1] = clean_n
+                raw_vals.insert(2, num_part)
+
+    first_val = raw_vals[0]
+    is_summary_row = any(k in first_val for k in ["合计", "总计", "总价", "小计"]) or (len(raw_vals) > 1 and any(k in str(raw_vals[1]) for k in ["合计", "总计", "总价", "小计"]))
+
+    # 1. 合计总价汇总行
+    if is_summary_row:
+        sum_label = first_val if any(k in first_val for k in ["合计", "总计", "总价", "小计"]) else str(raw_vals[1])
+        sum_amount = ""
+        for v in raw_vals[1:]:
+            v_clean = re.sub(r'[,，\s元¥]', '', v)
+            if re.match(r'^\d+(\.\d+)?$', v_clean):
+                sum_amount = v_clean
+                break
+        if not sum_amount:
+            for v in raw_vals:
+                v_clean = re.sub(r'[,，\s元¥]', '', v)
+                if re.match(r'^\d+(\.\d+)?$', v_clean):
+                    sum_amount = v_clean
+                    break
+
+        res = [""] * total_cols
+        res[0] = ""
+        res[1] = sum_label
+        if total_cols >= 4:
+            res[total_cols - 2] = sum_amount
+        return res
+
+    # 2. 缺少 1 列数据时的自适应对齐 (len(raw_vals) == total_cols - 1)
+    if len(raw_vals) == total_cols - 1:
+        is_pure_seq = bool(re.match(r'^\d+(?:\.\d+)*[、.．]?$', first_val))
+        if is_pure_seq:
+            # 场景 A: 首列已是独立序号，少的是末尾备注列
+            res = list(raw_vals)
+            res[0] = re.sub(r'[、.．]$', '', first_val)
+            res.append("")
+        else:
+            m_idx = re.match(r'^(\d+(?:\.\d+)*)\s*[、.．\s\-]\s*([^\d].*)$', first_val)
+            if m_idx:
+                # 场景 B: 首列包含复合序号与名称，拆分为序号与名称
+                seq_num = m_idx.group(1).strip()
+                clean_name = m_idx.group(2).strip()
+                res = list(raw_vals)
+                res[0] = clean_name
+                res.insert(0, seq_num)
+                while len(res) < total_cols:
+                    res.append("")
+            else:
+                # 场景 C: 首列为纯名称，少的是首列序号，在第 0 列自动补齐流水序号
+                res = list(raw_vals)
+                res.insert(0, str(row_i + 1))
+                while len(res) < total_cols:
+                    res.append("")
+    else:
+        # 3. 列数完全匹配或更多列数据
+        res = list(raw_vals)
+
+    seq_val = res[0] if res else ""
+    name_val = res[1] if len(res) > 1 else ""
+
+    if seq_val and name_val:
+        m_dup = re.match(r'^' + re.escape(seq_val) + r'\s*[、.．\s\-]\s*(.+)$', name_val)
+        if not m_dup:
+            m_dup = re.match(r'^' + re.escape(seq_val) + r'(.+)$', name_val)
+        if m_dup:
+            res[1] = m_dup.group(1).strip()
+
+    if len(res) >= 3 and res[1] and res[1] == res[2]:
+        res.pop(2)
+        res.append("")
+
+    # 4. [5列报价表专项纠偏] 单价列与分项总价列重复/错列自愈
+    if total_cols == 5 and len(res) >= 4:
+        unit_p = str(res[2]).strip()
+        total_p = str(res[3]).strip()
+        name_p = str(res[1]).strip()
+
+        # 场景 A: 单价与总价完全相同，且为非零的大额总金额（非 0.00 / 0）
+        if unit_p and total_p and unit_p == total_p and unit_p not in ("—", "——", "/", "-", "0", "0.00"):
+            pkg_kws = ["费", "工程", "系统", "加固", "防水", "敷设", "安装", "调试", "服务", "培训", "大类", "购置", "总承包", "支架", "桥架", "辅材", "电缆", "柜"]
+            if any(k in name_p for k in pkg_kws):
+                res[2] = "——"
+                res[3] = total_p
+        # 场景 B: 单价列填了纯总价数字而总价列为空
+        elif unit_p and not total_p and unit_p not in ("—", "——", "/", "-"):
+            pkg_kws = ["费", "工程", "系统", "加固", "防水", "敷设", "安装", "调试", "服务", "培训", "大类", "购置", "总承包"]
+            if any(k in name_p for k in pkg_kws):
+                res[3] = unit_p
+                res[2] = "——"
+
+    while len(res) < total_cols:
+        res.append("")
+    return res[:total_cols]
+
+
+def _is_table_footer_row(row, total_cols: int) -> bool:
+    """
+    通用 DOM 结构化判定：识别表格行是否为标书表尾非数据落款/声明行。
+    特征：
+    1. 包含通用的落款、签章、总报价大写、期限或独立说明注等标书声明词汇；
+    2. 单元格发生跨列合并且包含标签说明（以冒号结尾或长声明）。
+    注意：纯占位符 '......' 或纯序号行属于普通数据区，可正常覆盖。
+    """
+    if row is None or not hasattr(row, '_tr') or row._tr is None:
+        return False
+    try:
+        row_text = "".join(c.text for c in row.cells).strip()
+        if not row_text or "..." in row_text or "…" in row_text:
+            return False
+
+        # 标书通用表尾落款与声明特征词（通用结构词，无任何具体业务数据）
+        footer_keywords = [
+            "签字", "签章", "盖章", "法定代表人", "授权代表", "投标人名称",
+            "总报价", "大写", "交货期", "工期", "质保", "服务期",
+            "注：", "注:", "说明：", "说明:"
+        ]
+        if any(k in row_text for k in footer_keywords):
+            return True
+
+        # 结构化跨列且带说明标签
+        from docx.oxml.ns import qn
+        tc_elements = [c for c in row._tr.iterchildren() if c.tag.endswith('tc')]
+        if len(tc_elements) < total_cols and ("：" in row_text or ":" in row_text):
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
+def _is_full_paragraph_replacement(real_text: str, proposed_val: str, prop_type: str = "") -> bool:
+    """
+    智能判定提案是否为整段/整句完整覆盖替换（Full Paragraph Replacement），而非单槽位插值填空。
+
+    判定维度：
+    1. 显式类型：prop_type 为 sentence_batch / paragraph / full_text / replace_all；
+    2. 双锚点首尾重合：real_text 与 proposed_val 去除标点空格后，开头（前4~6字）相同且结尾（后4~6字）相同，长度 >= 12；
+    3. 骨架重合度：计算 real_text（剥离占位符后）与 proposed_val 的字符重合率与公共子串；
+    4. 序列相似度：SequenceMatcher 相似度 > 0.4 且 proposed_val 长度 >= 20；
+    5. 单槽位切片防嵌套防重复：若 proposed_val 已经包含了段落开头和结尾的固定词（如“根据贵方”、“有关事宜”），严禁按单槽位切片。
+    """
+    if not real_text or not proposed_val:
+        return False
+
+    p_type_lower = str(prop_type or "").strip().lower()
+    if p_type_lower in ("sentence_batch", "paragraph", "full_text", "replace_all"):
+        return True
+
+    r_strip = real_text.strip()
+    p_strip = proposed_val.strip()
+
+    if len(p_strip) < 8:
+        return False
+
+    # 规范化去除空白与标点进行核心骨架比对
+    r_core = re.sub(r'[\s_＿\-\–\—\(\)（）\[\]［］【】:：\.\,，。；;、“”"\'`]', '', r_strip)
+    p_core = re.sub(r'[\s_＿\-\–\—\(\)（）\[\]［］【】:：\.\,，。；;、“”"\'`]', '', p_strip)
+
+    if len(r_core) >= 8 and len(p_core) >= 8:
+        # 1. 首尾双锚点匹配：首部 4 个字相同 且 尾部 4 个字相同
+        if len(r_core) >= 4 and len(p_core) >= 4:
+            head_match = (r_core[:4] == p_core[:4])
+            tail_match = (r_core[-4:] == p_core[-4:])
+            if head_match and tail_match:
+                return True
+
+        # 2. 首部 6 个字相同且 proposed_val 长度较长（整句覆盖）
+        if len(r_core) >= 6 and len(p_core) >= 6:
+            if r_core[:6] == p_core[:6] and len(p_core) >= 20 and len(p_core) >= len(r_core) * 0.4:
+                return True
+
+        # 3. 尾部 6 个字相同且 proposed_val 包含 r_core 前半段核心词
+        if len(r_core) >= 6 and len(p_core) >= 6:
+            if r_core[-6:] == p_core[-6:] and r_core[:4] in p_core and len(p_core) >= 20:
+                return True
+
+    # 4. 基于 SequenceMatcher 计算相似度
+    import difflib
+    ratio = difflib.SequenceMatcher(None, r_core, p_core).ratio()
+    if ratio > 0.45 and len(p_strip) >= 20:
+        return True
+
+    # 5. 原模板固定词段序列包含率检测
+    slot_pattern = r'(_{1,}|＿{1,}|\[[^\]]+\]|［[^］]+］|【[^】]+】|（(?:姓名和职务|投标人的名称|投标人名称|代表姓名|职务)[^）]*）|\([^\)]*(?:name and title|bidder name)[^\)]*|\d*\s*年\s*\d*\s*月\s*\d*\s*日|(?<=[:：])\s{2,}|\s{2,})'
+    static_segments = [s.strip() for s in re.split(slot_pattern, r_strip) if s and not re.search(slot_pattern, s)]
+    valid_static = [s for s in static_segments if len(s) >= 3 and not re.match(r'^[0-9\s:：、.．\-]+$', s)]
+    if len(valid_static) >= 2:
+        matched_count = sum(1 for s in valid_static if s in p_strip)
+        if matched_count >= 2 and matched_count >= len(valid_static) * 0.6:
+            return True
+
+    return False
+
+
+def _render_diff_paragraph_runs(
+    p_elem,
+    real_text: str,
+    proposed_val: str,
+    enable_underline_on_diff: bool = True,
+    is_table: bool = False,
+) -> None:
+    """
+    高保真 Diff 级段落 Run 分段重构与渲染引擎：
+    1. 基于 SequenceMatcher 精准识别模板原有固定文字与新填入的数据值；
+    2. 模板固定文字（equal 标签）：渲染为【宋体 小四 Pt(12) 无下划线】；
+    3. 新填入的业务数据（replace / insert 标签）：渲染为【宋体 小四 Pt(12) 原生下划线】（表格外）；
+    4. 彻底消除单槽位切片导致的重复前缀、重复后缀与未填占位符残留！
+    """
+    import difflib
+    p_elem._element.clear_content()
+
+    if not real_text or not proposed_val:
+        if proposed_val:
+            _apply_run_style_xml(p_elem.add_run(proposed_val), enable_underline=enable_underline_on_diff, is_table=is_table)
+        return
+
+    sm = difflib.SequenceMatcher(None, real_text, proposed_val)
+    opcodes = sm.get_opcodes()
+
+    # 如果相似度过低（例如全新重写的独立说明段落），直接整段写入
+    if sm.ratio() < 0.2:
+        _apply_run_style_xml(p_elem.add_run(proposed_val), enable_underline=enable_underline_on_diff, is_table=is_table)
+        return
+
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == 'equal':
+            fixed_text = proposed_val[j1:j2]
+            if fixed_text:
+                _apply_run_style_xml(p_elem.add_run(fixed_text), enable_underline=False, is_table=is_table)
+        elif tag in ('replace', 'insert'):
+            inserted_text = proposed_val[j1:j2]
+            if inserted_text:
+                _apply_run_style_xml(p_elem.add_run(inserted_text), enable_underline=(enable_underline_on_diff and not is_table), is_table=is_table)
+        elif tag == 'delete':
+            # real_text 中被替换/删除的占位符（如 "______" 或纯空格），不输出到目标文档
+            pass
 
 
 def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
@@ -813,6 +1073,94 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
         doc = Document(docx_path)
         success_count = 0
 
+        # 0. 跨章节表格路径冲突检测与智能重定向守卫 (Table Path Collision Guard)
+        from app.utils.table_utils import get_doc_chapter_tables_mapping, get_chapter_specific_table_indices, detect_table_header_rows
+        
+        doc_tbl_mapping = get_doc_chapter_tables_mapping(doc)
+        tbl_to_chapter = {}
+        for entry in doc_tbl_mapping:
+            for t_i in entry.get("table_indices", []):
+                tbl_to_chapter[t_i] = entry.get("chapter_title", "")
+
+        # 扫描所有表格提案进行冲突检测
+        tbl_proposals_by_target = defaultdict(list)
+        for p_idx, p in enumerate(proposals):
+            p_path = str(p.get("path", "")).strip()
+            raw_val = p.get("proposed_text") if p.get("proposed_text") is not None else p.get("value", "")
+            p_val = str(raw_val).strip() if raw_val is not None else ""
+            p_type = str(p.get("type", "")).strip()
+
+            is_cell_target = bool(re.search(r'/(?:tr|row|tc|cell)\[\d+\]', p_path))
+            if is_cell_target or not p_val:
+                continue
+
+            matrix = []
+            if isinstance(raw_val, list) and raw_val and isinstance(raw_val[0], list):
+                matrix = raw_val
+            elif p_val.startswith("[") and p_val.endswith("]"):
+                try:
+                    parsed = json.loads(p_val)
+                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], list):
+                        matrix = parsed
+                except Exception:
+                    pass
+
+            is_table_prop = bool(
+                p_type == "table_rows" or
+                (matrix and re.search(r'/tbl\[\d+\]', p_path)) or
+                (re.search(r'^/body/tbl\[\d+\]$', p_path) and p_val.startswith("["))
+            )
+            if is_table_prop:
+                m_tbl = re.search(r'/tbl\[(\d+)\]', p_path)
+                if m_tbl:
+                    t_idx = int(m_tbl.group(1)) - 1
+                    tbl_proposals_by_target[t_idx].append((p_idx, p, matrix))
+
+        # 对产生多重竞争的同一个 tbl_idx 执行仲裁与重定向
+        for t_idx, prop_list in tbl_proposals_by_target.items():
+            if len(prop_list) <= 1:
+                continue
+
+            real_ch = tbl_to_chapter.get(t_idx, "")
+            table_obj = doc.tables[t_idx] if 0 <= t_idx < len(doc.tables) else None
+            real_cols = len(table_obj.rows[0].cells) if table_obj and table_obj.rows else 0
+
+            scored_props = []
+            for p_idx, p, mat in prop_list:
+                p_ch = p.get("chapter_title", "")
+                mat_cols = len(mat[0]) if mat and isinstance(mat[0], list) else 0
+
+                score = 0.0
+                if p_ch and real_ch:
+                    if p_ch in real_ch or real_ch in p_ch:
+                        score += 20.0
+                    else:
+                        clean_pch = re.sub(r'^[一二三四五六七八九十百0-9\s、\.\(\)（）]+', '', p_ch).strip()
+                        clean_rch = re.sub(r'^[一二三四五六七八九十百0-9\s、\.\(\)（）]+', '', real_ch).strip()
+                        if clean_pch and clean_rch and (clean_pch in clean_rch or clean_rch in clean_pch):
+                            score += 15.0
+                if mat_cols == real_cols:
+                    score += 10.0
+                elif abs(mat_cols - real_cols) == 1:
+                    score += 5.0
+
+                scored_props.append((score, p_idx, p, mat))
+
+            scored_props.sort(key=lambda x: x[0], reverse=True)
+            winner = scored_props[0]
+            logger.info(f"🛡️ [Table Collision Guard] 表格 /body/tbl[{t_idx+1}] 发生跨章节竞争 (真实所属: '{real_ch}')。胜出提案: 章节 '{winner[2].get('chapter_title')}' (得分: {winner[0]})")
+
+            for score, p_idx, p, mat in scored_props[1:]:
+                loser_ch = p.get("chapter_title", "")
+                real_loser_tbls = get_chapter_specific_table_indices(doc, loser_ch)
+                if real_loser_tbls and real_loser_tbls[0] != t_idx:
+                    redirect_idx = real_loser_tbls[0]
+                    p["path"] = f"/body/tbl[{redirect_idx + 1}]"
+                    logger.info(f"   🔄 [Table Collision Guard] 异章提案 (章节: '{loser_ch}') 成功重定向到真实表格: /body/tbl[{redirect_idx + 1}]")
+                else:
+                    p["path"] = "/body/tbl_collision_blocked"
+                    logger.warning(f"   ⛔ [Table Collision Guard] 拦截并阻止异章提案 (章节: '{loser_ch}') 覆盖 /body/tbl[{t_idx+1}]")
+
         # 1. 优先处理表格批量插行/原位填报提案
         handled_tbl_proposals = set()
         for p_idx, p in enumerate(proposals):
@@ -822,7 +1170,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
             p_type = str(p.get("type", "")).strip()
 
             is_cell_target = bool(re.search(r'/(?:tr|row|tc|cell)\[\d+\]', p_path))
-            if is_cell_target or not p_val:
+            if is_cell_target or not p_val or "blocked" in p_path:
                 continue
 
             # 智能解析 2D 数据矩阵
@@ -861,52 +1209,182 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                 continue
 
             handled_tbl_proposals.add(p_idx)
+            
+            # 引入通用多行表头检测（支持 1~3 行复合表头），彻底防止子表头被数据覆盖
+            from app.utils.table_utils import (
+                detect_table_header_rows,
+                get_table_header_logical_spans,
+                align_row_to_header_grid_spans,
+                clean_row_vmerge,
+            )
+            hdr_count = detect_table_header_rows(table)
             header_row = table.rows[0] if table.rows else None
             if not header_row:
                 continue
 
             total_cols = len(header_row.cells)
+            header_spans = get_table_header_logical_spans(table, hdr_count)
+            logical_cols_count = len(header_spans) if header_spans else total_cols
+
+            # 找到【分项总价】在逻辑列中的索引
+            total_price_logical_idx = logical_cols_count - 2 if logical_cols_count >= 4 else logical_cols_count - 1
+            for l_i, (s_c, e_c) in enumerate(header_spans):
+                h_text = header_row.cells[s_c].text.strip()
+                if any(k in h_text for k in ["分项总价", "总价", "合价", "总金额", "金额（元）", "小计（元）"]):
+                    total_price_logical_idx = l_i
+                    break
+
+            # 1. 检查原表格最后一行是否是原模板自带的【合计总价】行（包含"合计"或"总计"）
+            template_summary_tr = None
+            if len(table.rows) > hdr_count:
+                last_row_text = "".join(c.text for c in table.rows[-1].cells).strip()
+                if any(k in last_row_text for k in ["合计", "总计", "总价", "小计"]):
+                    template_summary_tr = table.rows[-1]._tr
+
+            # 2. 检查原表格中是否有真正的表尾非数据落款行（签字盖章/独立说明注/期限报价等）
             footer_start_idx = len(table.rows)
-            for r_idx in range(len(table.rows) - 1, 0, -1):
-                cells_text = [c.text.strip() for c in table.rows[r_idx].cells]
-                is_blank_data_row = all(not t or t == "_" * len(t) for t in cells_text) or (
-                    cells_text[0].isdigit() and all(not t or t == "_" * len(t) for t in cells_text[1:])
-                )
-                if not is_blank_data_row and any(len(t) > 0 for t in cells_text):
+            footer_anchor_tr = None
+            for r_idx in range(len(table.rows) - 1, hdr_count - 1, -1):
+                if _is_table_footer_row(table.rows[r_idx], total_cols):
                     footer_start_idx = r_idx
                 else:
                     break
 
-            for row_i, row_data in enumerate(matrix):
+            if footer_start_idx < len(table.rows):
+                footer_anchor_tr = table.rows[footer_start_idx]._tr
+
+            # 3. 拆分 matrix: 将最后一行的合计行（如有）与前面的明细行拆分
+            detail_matrix = []
+            summary_row_data = None
+            for r_idx, r_data in enumerate(matrix):
+                r_str = " ".join(str(c) for c in r_data)
+                if r_idx == len(matrix) - 1 and any(k in r_str for k in ["合计", "总计", "总价", "小计"]):
+                    summary_row_data = r_data
+                else:
+                    detail_matrix.append(r_data)
+
+            # 4. 确定数据区的可用行范围
+            max_available_detail_idx = footer_start_idx
+            if template_summary_tr is not None and footer_start_idx == len(table.rows):
+                max_available_detail_idx = len(table.rows) - 1
+
+            # 5. 写入明细数据行 (detail_matrix) - 从真实数据行起始行 (hdr_count) 开始原位替换或追加
+            for row_i, row_data in enumerate(detail_matrix):
                 if not isinstance(row_data, list):
                     continue
-                row_vals = list(row_data)
-                if len(row_vals) == total_cols - 1:
-                    row_vals.insert(0, str(row_i + 1))
-                elif len(row_vals) < total_cols:
-                    while len(row_vals) < total_cols:
-                        row_vals.append("")
+                # row_vals 对齐到逻辑列数 (logical_cols_count)
+                row_vals = align_table_row_cells(row_data, logical_cols_count, row_i)
+                target_row_idx = hdr_count + row_i  # 绝对跳过所有表头行 (0 ~ hdr_count-1)
 
-                target_row_idx = row_i + 1
-                if target_row_idx < footer_start_idx:
-                    t_row = table.rows[target_row_idx]
+                if target_row_idx < max_available_detail_idx and target_row_idx < len(table.rows):
+                    old_row = table.rows[target_row_idx]
+                    unique_tcs = set(c._tc for c in old_row.cells)
+                    # 若旧行的独立单元格数量少于表头逻辑列数，说明旧行存在错误的合并污染，创建干净新行原位替换
+                    if len(unique_tcs) < len(header_spans):
+                        new_row = table.add_row()
+                        old_row._tr.addprevious(new_row._tr)
+                        old_row._tr.getparent().remove(old_row._tr)
+                        t_row = new_row
+                    else:
+                        t_row = old_row
                 else:
+                    # 超出原数据区行数：在合计行或落款行上方新增行
                     new_row = table.add_row()
-                    if footer_start_idx < len(table.rows) - 1:
-                        footer_tr = table.rows[footer_start_idx]._tr
-                        footer_tr.addprevious(new_row._tr)
+                    anchor = template_summary_tr if template_summary_tr is not None else footer_anchor_tr
+                    if anchor is not None and anchor.getparent() is not None:
+                        anchor.addprevious(new_row._tr)
                     t_row = new_row
+                    max_available_detail_idx += 1
                     footer_start_idx += 1
 
-                for col_idx, cell_val in enumerate(row_vals):
-                    if col_idx < len(t_row.cells):
-                        cell = t_row.cells[col_idx]
-                        cell.text = str(cell_val).strip()
-                        for p_in_cell in cell.paragraphs:
+                # 关键 1：彻底清洗当前行所有单元格的纵向合并 (vMerge) 标记，杜绝跨页断层拉伸
+                clean_row_vmerge(t_row)
+
+                # 关键 2：将 t_row 的单元格合并结构与表头的 header_spans 100% 对齐！
+                align_row_to_header_grid_spans(t_row, header_spans)
+
+                # 按逻辑列依次写入单元格
+                for l_idx, cell_val in enumerate(row_vals):
+                    if l_idx < len(header_spans):
+                        p_col = header_spans[l_idx][0]
+                        if p_col < len(t_row.cells):
+                            cell = t_row.cells[p_col]
+                            cell.text = str(cell_val).strip()
+                            for p_in_cell in cell.paragraphs:
+                                for r_in_cell in p_in_cell.runs:
+                                    _apply_run_style_xml(r_in_cell, enable_underline=False, is_table=True)
+                success_count += 1
+
+            # 6. 写入合计总价行 (summary_row_data)
+            if summary_row_data is not None:
+                sum_vals = align_table_row_cells(summary_row_data, logical_cols_count, len(detail_matrix))
+                sum_label = sum_vals[1] if len(sum_vals) > 1 and sum_vals[1] else (summary_row_data[0] if summary_row_data else "合计总价")
+                sum_amount = sum_vals[total_price_logical_idx] if total_price_logical_idx < len(sum_vals) else (sum_vals[-1] if sum_vals else "")
+
+                if template_summary_tr is not None:
+                    # 原位复用原模板合计行！
+                    sum_row = None
+                    for r in table.rows:
+                        if r._tr is template_summary_tr:
+                            sum_row = r
+                            break
+                    if sum_row is None:
+                        sum_row = table.rows[-1]
+
+                    sum_unique_tcs = set(c._tc for c in sum_row.cells)
+                    if len(sum_unique_tcs) == len(header_spans):
+                        # 纯标准无合并独立列：按逻辑列依次原位赋值
+                        for l_i, c_val in enumerate(sum_vals):
+                            if l_i < len(header_spans):
+                                p_col = header_spans[l_i][0]
+                                if p_col < len(sum_row.cells):
+                                    sum_row.cells[p_col].text = str(c_val).strip()
+                    elif len(sum_unique_tcs) == 1:
+                        # 全行跨列完全合并为 1 个大单元格：组合填入标签与总金额
+                        sum_row.cells[0].text = f"{sum_label} {sum_amount}".strip() if sum_amount else sum_label
+                    else:
+                        # 部分跨列合并（如前两列/前三列合并）：
+                        # 1. 首格填合计标签
+                        sum_row.cells[0].text = sum_label
+                        # 2. 分项总价列精准填入总金额
+                        sum_p_col = header_spans[total_price_logical_idx][0] if total_price_logical_idx < len(header_spans) else total_cols - 2
+                        if sum_p_col < len(sum_row.cells) and sum_amount:
+                            # 显式清空单价列（如果单价列未与首格合并）
+                            if sum_p_col - 1 > 0 and sum_row.cells[sum_p_col - 1]._tc is not sum_row.cells[0]._tc:
+                                sum_row.cells[sum_p_col - 1].text = ""
+                            sum_row.cells[sum_p_col].text = str(sum_amount).strip()
+                        # 3. 备注列置空
+                        if total_cols - 1 < len(sum_row.cells) and total_cols - 1 > sum_p_col:
+                            if sum_row.cells[total_cols - 1]._tc is not sum_row.cells[sum_p_col]._tc:
+                                sum_row.cells[total_cols - 1].text = ""
+
+                    for c in sum_row.cells:
+                        for p_in_cell in c.paragraphs:
                             for r_in_cell in p_in_cell.runs:
                                 _apply_run_style_xml(r_in_cell, enable_underline=False, is_table=True)
-                success_count += 1
-            logger.info(f"   [DOM 表格原位写盘] 成功向表格 {p_path} 原位填充 {len(matrix)} 行数据")
+                    success_count += 1
+                else:
+                    new_sum_row = table.add_row()
+                    if footer_anchor_tr is not None and footer_anchor_tr.getparent() is not None:
+                        footer_anchor_tr.addprevious(new_sum_row._tr)
+                    for c_i, c_val in enumerate(sum_vals):
+                        if c_i < len(new_sum_row.cells):
+                            new_sum_row.cells[c_i].text = str(c_val).strip()
+                            for p_in_cell in new_sum_row.cells[c_i].paragraphs:
+                                for r_in_cell in p_in_cell.runs:
+                                    _apply_run_style_xml(r_in_cell, enable_underline=False, is_table=True)
+                    success_count += 1
+
+            # 7. 清理多余未使用的旧模板行（如果明细行写完后，原数据区还有未使用的行，起始行从 hdr_count + len(detail_matrix) 开始）
+            cleaned_start_idx = hdr_count + len(detail_matrix)
+            cleaned_end_idx = min(footer_start_idx, len(table.rows) - (1 if template_summary_tr is not None else 0))
+            for r_i in range(cleaned_start_idx, cleaned_end_idx):
+                if r_i < len(table.rows):
+                    r = table.rows[r_i]
+                    for c in r.cells:
+                        c.text = ""
+
+            logger.info(f"   [DOM 表格原位写盘] 成功向表格 {p_path} 原位填充 {len(matrix)} 行数据（明细 {len(detail_matrix)} 行 + 合计 1 行, 表头 {hdr_count} 行完好）")
 
         # 2. 按 Path 对段落/单槽位 Proposals 进行归组
         path_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -1065,9 +1543,10 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                 if not proposed_val:
                     continue
 
-                if not is_in_table and (p_item.get("type") == "sentence_batch" or (("招标编号" in proposed_val and "项目名称" in proposed_val) or (len(proposed_val) > 25 and ("：" in proposed_val or ":" in proposed_val)))):
-                    p_elem._element.clear_content()
-                    _apply_run_style_xml(p_elem.add_run(proposed_val), enable_underline=use_underline, is_table=is_in_table)
+                p_type = str(p_item.get("type", "")).strip()
+
+                if not is_in_table and _is_full_paragraph_replacement(real_text, proposed_val, p_type):
+                    _render_diff_paragraph_runs(p_elem, real_text, proposed_val, enable_underline_on_diff=True, is_table=False)
                     success_count += 1
                     continue
 
@@ -1180,6 +1659,21 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                         start_pos, end_pos = ph_match.span()
                         before_text = real_text[:start_pos]
                         after_text = real_text[end_pos:]
+
+                        # [防切片重复与嵌套爆炸自愈]
+                        # 若 proposed_val 已经包含了 before_text 或 after_text 的核心词，说明这是一句整句，绝不能插在 slot 里！
+                        b_clean = re.sub(r'[\s:：_＿\[\]［］\(\)（）]', '', before_text)
+                        a_clean = re.sub(r'[\s:：_＿\[\]［］\(\)（）]', '', after_text)
+                        is_nested_dup = (
+                            (len(b_clean) >= 4 and proposed_val.startswith(b_clean[:4])) or
+                            (len(a_clean) >= 4 and proposed_val.endswith(a_clean[-4:])) or
+                            (len(proposed_val) >= 20 and len(b_clean) >= 4 and b_clean in proposed_val)
+                        )
+                        if is_nested_dup or _is_full_paragraph_replacement(real_text, proposed_val, p_type):
+                            _render_diff_paragraph_runs(p_elem, real_text, proposed_val, enable_underline_on_diff=True, is_table=False)
+                            success_count += 1
+                            continue
+
                         p_elem._element.clear_content()
                         if before_text:
                             _apply_run_style_xml(p_elem.add_run(before_text), enable_underline=False, is_table=False)
@@ -1223,7 +1717,16 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                 real_text = p_elem.text or ""
                 combined_orig_ctx = "".join([str(p.get("original_context", "")) for p in group_items])
                 use_underline = (not is_in_table) and bool(re.search(r'(_{2,}|＿{2,})', real_text + combined_orig_ctx))
-                
+
+                # 检查多槽位组合中是否存在已包含整句覆盖的提案
+                full_rep_item = next((p for p in group_items if _is_full_paragraph_replacement(real_text, str(p.get("proposed_text") if p.get("proposed_text") is not None else p.get("value", "")), str(p.get("type", "")))), None)
+                if full_rep_item:
+                    f_val = str(full_rep_item.get("proposed_text") if full_rep_item.get("proposed_text") is not None else full_rep_item.get("value", "")).strip()
+                    _render_diff_paragraph_runs(p_elem, real_text, f_val, enable_underline_on_diff=True, is_table=is_in_table)
+                    success_count += len(group_items)
+                    logger.info(f"   [多槽位整句直写] 命中整句提案，成功整段渲染写入段落 {path}！")
+                    continue
+
                 current_text = real_text
                 runs_to_build: List[Tuple[str, bool]] = []
                 filled_items_count = 0
@@ -1260,10 +1763,14 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
             from app.agents.review_engine import check_and_rollback_single_node
             check_and_rollback_single_node(p_elem, real_text, path)
 
+        # 表格全自动留白自检与 LLM 动态自愈修复引擎（绝不删行，零业务硬编码）
+        from app.utils.table_utils import inspect_and_repair_table_blanks
+        inspect_and_repair_table_blanks(doc)
+
         if success_count > 0:
             from app.agents.tools.bid_db_tools import _safe_save_doc
             _safe_save_doc(doc, docx_path)
-            logger.info(f"   [DOM 原位填报与美化] 成功原位写入并修饰 {success_count} 条提案（表格外保留下划线, 表格内取消下划线）")
+            logger.info(f"   [DOM 原位填报与美化] 成功原位写入并修饰 {success_count} 条提案（表格外保留下划线, 表格内取消下划线，留白单元格智能闭合）")
         return success_count
     except Exception as exc:
         logger.error(f"   DOM 级写盘填报异常: {exc}")

@@ -3,6 +3,7 @@ import httpx
 from unittest.mock import patch, MagicMock
 from app.main import app
 from app.api.deps import get_current_active_user
+from app.db.models.metadata import FinancialMetadata
 
 @pytest.mark.asyncio
 async def test_update_cost_analysis_should_succeed():
@@ -68,7 +69,7 @@ async def test_update_cost_analysis_should_succeed():
                 assert data["items"][1]["subtotal"] == 15000.0
                 assert data["items"][2]["name"] == "售后运维服务费"
                 assert data["items"][2]["subtotal"] == 5000.0
-                assert "预算可控" in data["budget_status"]
+                assert "可控" in data["budget_status"]
                 
                 # 验证 mock_doc 中的 parsed_metadata 正确持久化
                 saved_cost = mock_doc.parsed_metadata["cost_analysis"]
@@ -76,3 +77,61 @@ async def test_update_cost_analysis_should_succeed():
                 assert len(saved_cost["items"]) == 3
     finally:
         app.dependency_overrides.clear()
+
+@pytest.mark.asyncio
+async def test_update_cost_analysis_with_financial_max_price_limit_exceeded():
+    """测试当 FinancialMetadata 存在最高投标限价，且人工修改总成本超出限额时，精准返回已超出最高限价与超额金额"""
+    mock_user = MagicMock()
+    mock_user.id = "user-test-999"
+    mock_user.tenant_id = "tenant-test-888"
+    app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+    mock_doc = MagicMock()
+    mock_doc.project_id = "proj-123"
+    mock_doc.parsed_metadata = {}
+
+    # Mock FinancialMetadata
+    mock_fin = MagicMock(spec=FinancialMetadata)
+    mock_fin.max_price_limit = {"amount": 50000.0, "currency": "CNY"}
+    mock_fin.budget = {"amount": 60000.0, "currency": "CNY"}
+
+    payload = {
+        "items": [
+            {
+                "name": "高规格逆变器",
+                "qty": 2,
+                "ref_price": 30000.0,
+                "unit": "台"
+            }
+        ],
+        "analysis_summary": "人工调整为高规格逆变器"
+    }
+
+    mock_db_session = MagicMock()
+    mock_db_session.query.return_value.filter.return_value.first.return_value = mock_fin
+    from app.api.endpoints.analysis import get_db
+    app.dependency_overrides[get_db] = lambda: mock_db_session
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        
+        # Mock DB 查询 FinancialMetadata
+        with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("sqlalchemy.orm.attributes.flag_modified"):
+
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.put("/api/v1/analysis/doc-exceed/cost-analysis", json=payload)
+                
+                assert res.status_code == 200
+                res_json = res.json()
+                data = res_json["data"]
+                
+                # 总成本 60000.0 > 最高限价 50000.0，超额 10000.0
+                assert data["total_cost"] == 60000.0
+                assert data["budget_numeric"] == 50000.0
+                assert data["limit_type"] == "max_price_limit"
+                assert "已超出最高投标限价" in data["budget_status"]
+                assert "10,000.00" in data["budget_status"] or "10000" in data["budget_status"]
+    finally:
+        app.dependency_overrides.clear()
+

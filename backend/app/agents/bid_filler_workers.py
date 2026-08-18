@@ -40,16 +40,18 @@ def _filter_dom_scope(raw_structure: str, target_chapter: str, keyword: str, win
     """
     [视口切碎保持器 (Strict Scope Splicing)]
     当文档包含大量节点时，仅精准保留目标点及邻近 ±window_size 段的纯净视口，彻底消除跨章节信息过载与注意力稀释。
+    硬上限约束：最多保留 25 行、总长度不超过 4000 字符，杜绝超大 DOM 导致 LLM API 超时。
     """
-    if not raw_structure or (not target_chapter and not keyword):
-        return raw_structure
+    if not raw_structure:
+        return ""
     lines = [line.strip() for line in raw_structure.split("\n") if line.strip()]
-    if len(lines) <= 30 and not keyword:
+    if len(lines) <= 30 and not keyword and len(raw_structure) <= 3500:
         return raw_structure
 
     search_term = keyword.strip() if keyword else target_chapter.strip()
     if not search_term:
-        return raw_structure
+        safe_lines = lines[:25]
+        return "\n".join(safe_lines) + ("\n...(全文过长，默认仅截取前25行DOM)..." if len(lines) > 25 else "")
 
     matched_indices = [i for i, l in enumerate(lines) if search_term in l]
     if not matched_indices and len(search_term) > 3:
@@ -58,7 +60,8 @@ def _filter_dom_scope(raw_structure: str, target_chapter: str, keyword: str, win
 
     if not matched_indices:
         # 若为常规不涉及精准命中的表，回退保护不过载
-        return raw_structure[:3500] + ("\n...(部分跨章冗余节点已按规则保护折叠)..." if len(raw_structure) > 3500 else "")
+        logger.info(f"   🔎 [DOM视口] 未直接命中关键词 '{search_term}'，回退截取前 3000 字符安全视口")
+        return raw_structure[:3000] + ("\n...(部分跨章冗余节点已按规则保护折叠)..." if len(raw_structure) > 3000 else "")
 
     selected_indices = set()
     for idx in matched_indices:
@@ -67,16 +70,30 @@ def _filter_dom_scope(raw_structure: str, target_chapter: str, keyword: str, win
 
     sorted_indices = sorted(selected_indices)
     filtered_lines = [lines[i] for i in sorted_indices]
+
+    # 安全防爆 1：若匹配行数过多，仅保留前 25 行
+    if len(filtered_lines) > 25:
+        logger.warning(f"   ⚠️ [DOM视口保护] 匹配节点行数过多 ({len(filtered_lines)} 行)，自动修剪至前 25 行")
+        filtered_lines = filtered_lines[:25] + ["...(其余冗余匹配行已自动截断以防 Token 溢出)..."]
+
     summary_hdr = (
         f"✂️ [切碎视口绝缘池 (Scope Spliced)]: 全文件 {len(lines)} 个 DOM 节点 -> 依据 '{search_term}' "
-        f"聚合锁定前后 ±{window_size} 段 ({len(filtered_lines)} 个精准目标行)，已屏蔽一切异章噪音：\n"
+        f"聚合锁定前后 ±{window_size} 段 ({len(filtered_lines)} 个目标行)：\n"
     )
-    return summary_hdr + "\n".join(filtered_lines)
+    result_text = summary_hdr + "\n".join(filtered_lines)
+
+    # 安全防爆 2：硬字符上限 4000 字符
+    if len(result_text) > 4000:
+        logger.warning(f"   ⚠️ [DOM视口保护] 视口字符数达到 {len(result_text)} 字符，自动截断至 4000 字符")
+        result_text = result_text[:4000] + "\n...(超出 4000 字符部分已安全截断)..."
+
+    logger.info(f"   🔎 [DOM视口交付] 原始 {len(raw_structure)} 字符 -> 最终裁切交付 Agent: {len(result_text)} 字符 ({len(filtered_lines)} 行)")
+    return result_text
 
 
 def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_proposals: List[Dict[str, Any]] = None) -> List:
     """
-    为 Worker 组装完整只读+直写工具集，并支持实时闭环提案捕获：
+    为 Worker 组装完整只读+直写工具集，并支持实时闭环提案捕获与安全长度守护：
     - DB 工具：全部 6 个 DB 工具；
     - Office CLI 工具：结构查询、单槽位写盘、长句原子批处理写盘、表格全量追加填充、资质图像嵌入。
     """
@@ -115,14 +132,25 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_
     def officecli_query_structure(selector: str = "paragraph", keyword_filter: str = "", window: int = 3) -> str:
         """
         [精准切口查询工具] 查询当前 Word 文档的 DOM 结构。
+        优先提供当前章节专属的 100% 完整段落与表格（零信息丢失、零跨章干扰）。
         参数：
         - selector: 'paragraph' / 'table' / 'all'
         - keyword_filter: 填入关键词短语。
         - window: 匹配点外延上下关联段数（默认 3 段）。
         """
         logger.info(f"   [Worker 视野] 查询结构 (selector='{selector}', kw='{keyword_filter}')")
+
+        # 优先使用精准章节提取器（100% 完整无损提取当前章节专属 DOM 节点）
+        from app.utils.table_utils import extract_chapter_dom_structure
+        chapter_dom = extract_chapter_dom_structure(docx_temp_path, chapter_title, selector=selector)
+        if chapter_dom and len(chapter_dom) > 50:
+            logger.info(f"   🎯 [章节专属视野命中] 成功提取章节 [{chapter_title}] 100% 完整 DOM 结构 ({len(chapter_dom)} 字符)，零噪音且无信息丢失！")
+            return chapter_dom
+
+        # 降级：调用 OfficeCLI 并通过视口剪裁
         raw_text = _sync_call_async(officecli_query_structure_tool.coroutine, file_path=docx_temp_path, selector=selector)
-        filtered = _filter_dom_scope(str(raw_text), chapter_title, keyword_filter, window)
+        raw_str = str(raw_text)
+        filtered = _filter_dom_scope(raw_str, chapter_title, keyword_filter, window)
         if selector in ("table", "all"):
             tbl_info = extract_docx_tables_summary(docx_temp_path, chapter_title)
             if tbl_info:
@@ -138,6 +166,15 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_
         p_path = str(path).strip()
         p_val = str(value).strip()
         logger.info(f"   [Worker 提案注册] 节点 {p_path} -> {p_val[:60]}")
+        if p_path and p_val is not None:
+            collected_proposals.append({
+                "path": p_path,
+                "proposed_text": p_val,
+                "value": p_val,
+                "type": "text",
+                "status": "success"
+            })
+        return f"成功提交节点 {p_path} 的替换提案，已进入主控集中刷盘队列"
         if p_path and p_val is not None:
             collected_proposals.append({
                 "path": p_path,
@@ -227,7 +264,7 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_
         search_bidding_document,
         extract_text_by_style,
     ] + list(db_tools)
-    logger.info(f"   🛠️ [Worker 工具包] 组装完成: {len(db_tools)} DB工具 + 5 Office CLI 工具 + 2 RAG/全章检索工具 + 1 样式定向提取工具")
+    logger.info(f"   🛠️ [Worker 工具包] 组装完成: {len(db_tools)} DB工具 + 5 Office CLI 工具 + 2 原生 RAG 工具 + 1 样式提取工具")
     return worker_tools
 
 
@@ -242,50 +279,12 @@ def extract_docx_tables_summary(docx_path: str, chapter_title: str = "") -> str:
         return ""
     try:
         from docx import Document
+        from app.utils.table_utils import detect_table_header_rows, get_merged_header_texts, get_chapter_specific_table_indices
         doc = Document(docx_path)
         if not doc.tables:
             return ""
 
-        # 1. 优先根据 DOM 文档流顺序，提取位于当前章节标题下方的专属表格
-        ch_clean = (chapter_title or "").replace("、", " ").replace("章", " ").strip()
-        ch_tokens = [t for t in ch_clean.split() if len(t) >= 2]
-        
-        target_tbl_indices = []
-        found_chapter = False
-
-        for elem in doc.element.body:
-            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-            if tag == "p":
-                p_text = "".join(elem.itertext()).strip()
-                if not p_text:
-                    continue
-                # 检测是否进入当前章节标题
-                if ch_tokens and any(tk in p_text for tk in ch_tokens):
-                    found_chapter = True
-                elif found_chapter and (re.match(r'^[一二三四五六七八九十百0-9]{1,3}[、\.\s]', p_text) or "章" in p_text[:6] or "节" in p_text[:6]):
-                    # 遇到下一个同级或更高层级章节标题，结束当前章节范围
-                    break
-            elif tag == "tbl" and found_chapter:
-                # 找到属于当前章节的表格节点
-                for idx, t in enumerate(doc.tables):
-                    if t._element == elem:
-                        target_tbl_indices.append(idx)
-                        break
-
-        # 若未通过流式定位到，退化为按章节标题关键词在表格前后段落或表头中匹配
-        if not target_tbl_indices:
-            for tbl_idx, table in enumerate(doc.tables):
-                if not table.rows:
-                    continue
-                header_str = "".join([c.text.strip() for c in table.rows[0].cells])
-                # 若表头包含当前章节核心词
-                if ch_tokens and any(tk in header_str for tk in ch_tokens):
-                    target_tbl_indices.append(tbl_idx)
-
-        # 若依然没有精确命中，仅在表格数量为 1 时返回，避免过载
-        if not target_tbl_indices and len(doc.tables) == 1:
-            target_tbl_indices = [0]
-
+        target_tbl_indices = get_chapter_specific_table_indices(doc, chapter_title)
         if not target_tbl_indices:
             return ""
 
@@ -295,12 +294,14 @@ def extract_docx_tables_summary(docx_path: str, chapter_title: str = "") -> str:
                 table = doc.tables[tbl_idx]
                 if not table.rows:
                     continue
-                headers = [c.text.strip().replace("\n", "") for c in table.rows[0].cells]
+                hdr_count = detect_table_header_rows(table)
+                headers = get_merged_header_texts(table, hdr_count)
                 if not any(headers):
                     continue
                 tbl_path = f"/body/tbl[{tbl_idx + 1}]"
                 headers_str = " | ".join(headers)
-                tables_info.append(f"- 目标表格 `{tbl_path}`（共 {len(headers)} 列, 预置 {len(table.rows)} 行）：真实表头定义为 `[{headers_str}]`")
+                hdr_desc = f"包含 {hdr_count} 行复合表头, " if hdr_count > 1 else ""
+                tables_info.append(f"- 【本章节专属唯一目标表格】：`{tbl_path}`（共 {len(headers)} 列, {hdr_desc}预置 {len(table.rows)} 行）：真实表头定义为 `[{headers_str}]`。严禁将数据错误填报到其他章节的表格中！")
 
         if tables_info:
             return "\n".join(tables_info)
@@ -341,20 +342,24 @@ def build_worker_prompt(
     # 2. 差异化专家工作流与职责
     if is_pricing:
         role_title = "造价工程师与分项报价专家"
-        domain_workflow = f"""【造价工程师与分项报价专项工作流 — 严禁漏表漏列与虚假概括】
-1. **全章节多表格结构扫描**：
-   - 必须使用 `officecli_query_structure(selector='table', keyword_filter='{chapter_title}')` 扫描获取本章节内所有表格的 DOM 路径与行列结构；
-   - **全表覆盖铁律**：若章节内包含多张表格（如主设备分项报价表、耗材配件报价表、开标一览表等），必须逐一完整填报，严禁遗漏任何一张表格！
-2. **BOM成本与市场价格全量库精准检索**：
-   - 必须调用 `query_financial_quotation_tool('{document_id}')` 与 `query_bom_pricing_tool('{document_id}')` 检索全量清单明细。
-3. **表格逐行逐格精准填报（严格单格单列绑定与真实数据逐格提交）**：
-   - **单格单列精准绑定**：各列数据（序号、名称、规格、品牌、单位、数量、单价、合价、备注）必须分别独立填入对应的 `tc[1]` ~ `tc[N]` 单元格中，绝对禁止将多列数据用 '/' 拼接后挤入单列！
-   - **严禁虚假概括伪语法**：必须为每一行的每一个单元格输出具体的物理路径（如 `/body/tbl[N]/tr[Y]/tc[Z]/p[1]`）与实际数据，**绝对禁止输出 `tr[2]~tr[17]` 或 `tc[1..9]` 等虚假概括性假提案**！
-   - **表头跳过与表尾合计行规范**：
-     * 跳过表头 `tr[1]`；数据行从 `tr[2]` 序号 1 连续自增填写；
-     * 表尾若包含【总报价（大写）】、【交货期限/工期】等合计行，必须将检索得出的中文大写总价与承诺交货期准确填入对应尾行单元格，确保小写总计与分项合价之和 100% 严谨一致！
-4. **全量清单提案提交**：
-   - 请在总结中优先以标准 JSON 数组代码块 ```json [...] ``` 提交全量单元格提案（逐行逐格包含 path 与 value/proposed_text），确保全量清单明细 100% 完整刷盘。"""
+        domain_workflow = f"""【造价工程师与分项报价专家工作流 — 分项全量展开铁律】
+1. **结构扫描与清单检索**：
+   - 调用 `officecli_query_structure(selector='table', keyword_filter='{chapter_title}')` 获取表格结构与列定义；
+   - 调用 `query_financial_quotation_tool(document_id='{document_id}', field_key='cost_estimates')` 检索数据库中全量设备、材料、工程及服务清单与测算价格。
+2. **【分项全量展开最高铁律 — 绝对严禁仅填大类汇总行】**：
+   - **全量展开强制要求**：若表格模板包含汇总大类（如序号 1、序号 2 等大类）及 `......` 占位行，**必须在汇总大类下方，将数据库中查得的全部具体标的物/设备/材料/工程施工清单细项（编号为 2.1, 2.2, 2.3... 2.K 等全部查得项）逐行完整展开并按顺序编号排列**！
+   - **绝对严禁偷懒**：绝对禁止仅填报大类 1 和 2 两行而省略二级细项！每个细项必须具备明确独立的具体标的物名称、单价与分项总价；
+   - **各列严格分离对齐**：第 1 列【序号】填入层级编号（如 1、2、2.1 等），第 2 列【项目/费用名称】填纯标的物名称（严禁把序号重复写在名称列）；
+   - **【单价】与【分项总价】列严格分离与对齐规范**：
+     * **设备材料采购细项**（具有明确单价与数量/工程量的标的物）：【单价】列填单价数值（如按台/套/块计价），【分项总价】列填数量 × 单价之合价；
+     * **按项包干/工程安装/大类汇总/未细分单价项**（如建设费汇总大类、加固工程、防水工程、电缆敷设、设计费等）：【单价】列填破折号 `"——"` 或留空，【分项总价】列填写该项的总金额；**绝对严禁将整项包干大额总金额错误复制到单价列**！
+     * **不单独计取/包含在总价内/0元项目**（如设计费 0.00）：【单价】列填 `"——"`（或 `0.00`），【分项总价】列填 `0.00`；
+     * **各列严格独立对齐**：必须严格根据表头列序逐列对应，确保【单价】与【分项总价】两列数据精准独立，绝不错列、串列或重复填报！
+   - **占位符全量覆盖**：细分数据行必须全量自动覆盖替换模板原有的 `......` 和空白数据行，严禁残留；
+   - **备注列默认留空**：【备注】列默认保持留空 `""`，无需长篇赘述，保持表格清爽；
+   - **金额层级平衡**：所有 N.1~N.K 细项合价之和必须精准等于所属大类 N 的总额，所有一级大类总额之和必须精准等于表尾【合计总价】（大写与小写一致）。
+3. **整表 2D 矩阵一次性写盘**：
+   - 必须将大类 1、大类 2、全部展开细项（如 2.1, 2.2, ... 2.K）以及表尾合计总价行组合为一个完整的 2D 数据矩阵，调用 `officecli_fill_table_rows(table_path, rows_json_str)` 一次性提交写盘，原位覆盖并彻底清除模板原有的空白行和 `......` 占位符！"""
     elif is_qualification:
         role_title = "资格审查与资质证明专家"
         domain_workflow = f"""【资格审查与资质证明专项工作流 — 原位图像嵌入】
@@ -368,24 +373,24 @@ def build_worker_prompt(
    - **严禁将核心资质证明遗漏或误堆砌到文档其他章节**，必须 100% 严格在《资格证明文件》章节对应条款后原位落盘！"""
     elif is_deviation:
         role_title = "商务合规与技术响应专家"
-        domain_workflow = f"""【偏离表与条款逐条响应专项工作流 — 严禁丢参截断与遗漏条款】
-1. **扫描识别偏离表结构**：使用 `officecli_query_structure(selector='table', keyword_filter='{chapter_title}')` 获取偏离表行数与列定义。
+        domain_workflow = f"""【偏离表与实质性条款响应专项工作流 — 允许全量生成与覆盖重写】
+1. **扫描识别目标表格结构**：使用 `officecli_query_structure(selector='table', keyword_filter='{chapter_title}')` 获取表格路径与列定义。
 2. **原文件整章全量阅读与交叉检索**：
-   - **必须调用 `get_full_chapter_text('{document_id}', chapter_name)` 检索原招标文件对应章节全量原文**（如技术规格、需求描述、合同条款或商务要求章节），获取全部条款与技术规格细节！
-3. **条款逐条独立拆分填报规范（一事一行，严禁合并挤压，覆盖全部表格行）**：
-   - **一事一行独立呈现**：严禁将多个独立条款强行合并压缩到同一行！必须将各项具体要求（如交货期、交货地点、质保期、售后运维、付款方式、验收标准、履约保证金、违约责任、各项核心设备参数等）**逐条独立拆分为单独的数据行**，保证表格所有行均得到充分、清晰的逐条响应！
+   - **必须调用 `get_full_chapter_text('{document_id}', chapter_name)` 检索原招标文件对应章节全量原文**（如第四章项目需求、技术规格、合同条款或商务要求章节），获取全部条款与技术规格细节！
+3. **【表格全量覆盖重写授权 (Full Table Matrix Overwrite)】**：
+   - **全面重写与覆盖原表格数据行**：你有完全的权限使用 `officecli_fill_table_rows(table_path, rows_json_str)` 从序号 1 开始将所有梳理出的条款生成完整的二维矩阵，一次性覆写替换原表格的所有明细行！
+   - **杜绝单点打补丁**：严禁受限于原模板历史残留的空行或部分行，必须从序号 1 到 N 全量生成整张完整规范的对照表！
+4. **条款逐条独立拆分填报规范（一事一行，严禁合并挤压，覆盖全部表格行）**：
+   - **一事一行独立呈现**：严禁将多个独立条款强行合并压缩到同一行！必须将原招标文件中的所有各项独立条款与参数指标约束（包括各项商务约束、技术参数、履约要求等）**逐条独立拆分为单独的数据行**，保证表格所有行均得到充分、清晰的逐条响应！
    - **各列严格对齐填报规范**：
      * **第 1 列 `tc[1]`【序号】**：填入连续纯序号数字 `1, 2, 3...`，严禁长文本混入；
      * **第 2 列 `tc[2]`【招标文件要求】**：完整原样呈现原招标文件对应条款条文，严禁使用 `...` 截断；
-     * **第 3 列 `tc[3]`【服务承诺与技术响应】**：逐项一对一应答承诺，详细列明所投品牌、规格型号、性能指标实测承诺、质保年限、出厂报告交付承诺等，形成完整专业法律承诺；
-     * **第 4 列 `tc[4]`【有无偏离】**：统一填写“无偏离”或“无”；
-     * **第 5 列 `tc[5]`【偏离内容及原因】**：统一填写“完全响应招标文件要求，无偏离。”。
-4. **高效提报方式（推荐 2D 表格矩阵工具 — 严禁加号 '+' 拼接与概括伪语法）**：
-   - **【绝对禁止使用加号 '+' 拼接伪语法与概括废话】**：
-     * ❌ 严重违规：输出 `"XXX技术要求 + 服务承诺 + '无' + '完全响应'"` 或 `"技术要求全文 + 承诺"` 等任何带有 `+` 拼接的概括性偷懒假文字！
-     * ✅ 正确做法：必须将第 2 列【招标文件真实条款条文】与第 3 列【我方一对一具体技术服务承诺】完整书写为严谨真实的中文法律闭合语句！
-   - 强烈推荐直接调用 `officecli_fill_table_rows(table_path, rows_json_str)` 一次性提交全部数据行（每行 5 列 `["序号", "招标文件要求", "服务承诺", "无偏离", "偏离说明"]`，或 4 列 `["招标文件要求", "服务承诺", "无", "完全响应招标文件要求，无偏离。"]` 底层会自动对齐序号）；
-   - 或在总结中使用标准 JSON 数组代码块 ```json [...] ``` 逐行逐格提交提案，确保整表 100% 完整填满！"""
+     * **第 3 列 `tc[3]`【服务承诺与技术响应/是否响应】**：若表头为“是否响应（填是或者否）”，统一填写“是”；若表头为“响应情况/技术承诺”，详细列明所投指标响应及法律承诺；
+     * **第 4 列 `tc[4]`【有无偏离】**（若有）：统一填写“无偏离”或“无”；
+     * **第 5 列 `tc[5]`【偏离内容及原因】**（若有）：统一填写“完全响应招标文件要求，无偏离。”。
+5. **高效提报方式（首选 officecli_fill_table_rows 一次性全量写盘）**：
+   - 必须优先直接调用 `officecli_fill_table_rows(table_path, rows_json_str)` 一次性提交整张表格的全部数据行（每行按表头列数装配 `["序号", "招标文件要求", "是/服务承诺", ...]`，底层引擎会自动保留表头并以全新数据行全量覆写原表格数据区）；
+   - 严禁对表格单元格零敲碎打地调用 write_slot_value 局部打补丁！"""
     else:
         role_title = "公文函件与表单填报专家"
         domain_workflow = f"""【法定公文函件与表单填报专项工作流 — 原位切片注入】
@@ -420,6 +425,7 @@ def build_worker_prompt(
    若目标段落/槽位原文本包含字段属性名标签（例如 `"XXX名称：______"` 或 `"XXX编号：______"`），提交的替换数据 `value` **绝对禁止包含"XXX名称："等前缀标签，仅允许填入纯粹的数据值！**
    - 正确写法 (纯数据)：`value = "XXX内容值"`
 6. **查无结果立刻止步**：若 DB 工具返回 "未找到..."、"尚未录入" 或空记录，**严禁换用类似关键词重复循环调库**！应当立即将该槽位标记为 "[待补充: <字段名>]"，并直接完成该句/表单写盘。绝对严禁捏造假数据！
+7. **【严禁重复盲目查询 — 快速闭环铁律】**：当你从 Prompt 或 `officecli_query_structure` 已经明确当前章节的目标表格路径（如 `/body/tbl[N]`）及表头定义后，**绝对禁止使用各种同义词（如‘偏离表’、‘供货一览表’、‘开标一览表’等）重复调用 query 工具**！明确表格路径后，必须立即调用 `officecli_fill_table_rows` 或 `officecli_write_slot_value` 提交写盘提案并完成总结，迅速闭环！
 
 {domain_workflow}
 
@@ -433,7 +439,11 @@ def build_worker_prompt(
     if extra_instructions:
         system_prompt += f"""
 
-【用户自定义指令】
+【用户单章节专属重新生成与微调指令 — 最高优先级】
+当前任务为单章节重新生成与覆写，必须与主流程初次生成完全一致：
+1. **源头全量检索**：根据具体的表格表头与章节要求，主动调用查原文工具（`get_full_chapter_text`、`search_bidding_document`）或企业数据库工具，从源头完整检索所有条款、技术参数与业务数据；
+2. **整表全量覆写**：针对表格章节，必须从序号 1 开始将所检索出的全部条文装配为完整的二维数据矩阵，调用 `officecli_fill_table_rows(table_path, rows_json_str)` 全量覆写原表格，严禁受历史半成品残留影响做局部打补丁！
+3. **用户微调要求**：
 {extra_instructions}"""
 
     if repair_instructions:
@@ -525,10 +535,19 @@ def run_chapter_worker(
             worker_llm = llm_service.raw_llm
         logger.info(f"Worker [{chapter_title}] ({cat}) → 分配模型温度 (temperature={target_temp})")
 
+        # 详细打印大模型初始输入（System Prompt 与 User Prompt 概况）
+        logger.info(
+            f"🚀 [LLM Prompt 准备发送] [{chapter_title}] | System Prompt: {len(system_prompt)} 字符 | "
+            f"User Prompt: {len(user_prompt)} 字符 | 工具集数量: {len(worker_tools)}"
+        )
+        logger.info(f"   📋 [User Prompt 完整内容]:\n{user_prompt}")
+        if extra_instructions:
+            logger.info(f"   🎯 [注入的微调提示词]: '{extra_instructions}'")
+
         agent = create_react_agent(worker_llm, worker_tools)
         import time
         t_start = time.time()
-        
+
         # 自动重试机制（针对网络波动与大模型 API 连接限流进行容错退避）
         max_retries = 3
         result = None
@@ -542,9 +561,10 @@ def run_chapter_worker(
             except Exception as err:
                 err_str = str(err).lower()
                 is_conn_err = any(k in err_str for k in ["connection", "timeout", "reset", "disconnected", "http", "rate", "500", "502", "503", "504"])
+                logger.error(f"[Worker 异常调用报错] [{chapter_title}] 第 {attempt} 次失败: {err}")
                 if is_conn_err and attempt < max_retries:
-                    backoff = attempt * 1.5
-                    logger.warning(f"[Worker 网络重试] [{chapter_title}] 第 {attempt} 次请求遇到 API 连接异常 ({err})，等待 {backoff:.1f}s 后自动重试...")
+                    backoff = attempt * 2.0
+                    logger.warning(f"[Worker 网络重试] [{chapter_title}] 等待 {backoff:.1f}s 后自动重试...")
                     time.sleep(backoff)
                 else:
                     raise err
@@ -930,26 +950,32 @@ def _parse_proposals(raw_text: str) -> List[Dict[str, Any]]:
                     "status": "success"
                 })
 
-    # 6. 双向归一化与融合去重
-    normalized_list = []
-    seen_paths = set()
+    # 6. 双向归一化与融合去重（优先保留更精确的提议类型与上下文）
+    normalized_dict: Dict[str, Dict[str, Any]] = {}
 
     for it in parsed_json_items:
         norm = _normalize_proposal_item(it)
         if norm:
             p_key = norm["path"]
-            if p_key not in seen_paths:
-                seen_paths.add(p_key)
-                normalized_list.append(norm)
+            if p_key not in normalized_dict:
+                normalized_dict[p_key] = norm
 
-    # 融合 Markdown 表格提取项（补充 JSON 中缺失的明细行）
+    # 融合 Markdown 表格提取项（补充缺失行，并提升 JSON 中可能被泛化的提议类型）
     for it in markdown_table_items:
         norm = _normalize_proposal_item(it)
         if norm:
             p_key = norm["path"]
-            if p_key not in seen_paths:
-                seen_paths.add(p_key)
-                normalized_list.append(norm)
+            if p_key not in normalized_dict:
+                normalized_dict[p_key] = norm
+            else:
+                existing = normalized_dict[p_key]
+                # 若 JSON 项为通用 "text" 且 Markdown 表格标记了更具体的 sentence_batch / table_rows / image，提升之
+                if existing.get("type") in ("text", "", None) and norm.get("type") in ("sentence_batch", "table_rows", "image"):
+                    existing["type"] = norm.get("type")
+                if not existing.get("original_context") and norm.get("original_context"):
+                    existing["original_context"] = norm.get("original_context")
+
+    normalized_list = list(normalized_dict.values())
 
     if normalized_list:
         logger.info(f"   [Worker 提案提炼成功] 归一化并融合产出 {len(normalized_list)} 条合法提案明细")

@@ -328,6 +328,7 @@ export function AnalysisDashboard() {
         <CostTable
           documentId={activeDocId}
           equipmentList={eng.main_equipment_list || []}
+          financial={fin}
           costAnalysis={result?.cost_analysis || {}}
           onReextract={() => handleReextract('cost_estimation')}
           onCostUpdated={(updatedCost) => {
