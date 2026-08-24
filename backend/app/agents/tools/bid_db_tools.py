@@ -173,12 +173,13 @@ def resolve_qualification_image_path(file_url: Optional[str]) -> Tuple[Optional[
 
 
 @tool
-def query_company_qualification_tool(cert_keyword: str = "") -> str:
+def query_company_qualification_tool(cert_keyword: str = "", tenant_id: Optional[str] = None) -> str:
     """
     [数据库直查工具] 查询企业资质与证书数据库 (company_qualifications 表)。
     支持 Agent 自主检索：可输入关键字搜索，若关键字为空则自动列出所有有效资质证书及其磁盘图片路径。
 
     :param cert_keyword: 证书名称关键字（可选，如 '营业执照', '电力工程', 'ISO9001' 等）
+    :param tenant_id: 租户 ID（可选）。有当前会话租户时强制使用会话租户，防止 Agent 参数越权。
     :return: 匹配的资质证书记录列表（包含资质名称、等级、到期日、图片物理路径 local_image_path）
     """
     logger.info(f"🛠️ [DB Tool] query_company_qualification_tool 被调用, 关键字: '{cert_keyword}'")
@@ -186,17 +187,24 @@ def query_company_qualification_tool(cert_keyword: str = "") -> str:
     try:
         kw = cert_keyword.strip() if cert_keyword else ""
 
+        from app.core.context import current_tenant_id
+        context_tenant = current_tenant_id.get()
+        effective_tenant = context_tenant or tenant_id or "default-tenant"
+
+        base_query = db.query(CompanyQualification).filter(
+            CompanyQualification.tenant_id == effective_tenant
+        )
         if kw:
-            quals = db.query(CompanyQualification).filter(
+            quals = base_query.filter(
                 CompanyQualification.name.ilike(f"%{kw}%")
             ).order_by(CompanyQualification.created_at.desc()).all()
         else:
-            quals = db.query(CompanyQualification).order_by(CompanyQualification.created_at.desc()).all()
+            quals = base_query.order_by(CompanyQualification.created_at.desc()).all()
 
         # 若精准匹配未查到，自动回退全表列表供 Agent 自主挑选
         if not quals and kw:
             logger.info(f"🛠️ [DB Tool] 关键字 '{kw}' 未直接匹配，回退查询租户全量资质供 Agent 自主匹配...")
-            quals = db.query(CompanyQualification).order_by(CompanyQualification.created_at.desc()).all()
+            quals = base_query.order_by(CompanyQualification.created_at.desc()).all()
 
         if quals:
             res_list = []
@@ -211,7 +219,7 @@ def query_company_qualification_tool(cert_keyword: str = "") -> str:
                 )
 
             result_str = "\n".join(res_list)
-            logger.info(f"🛠️ [DB Tool] 成功检索到 {len(quals)} 条资质证书记录")
+            logger.info(f"🛠️ [DB Tool] 成功检索到 {len(quals)} 条资质证书记录 (tenant_id={effective_tenant})")
             return f"查询到以下资质证书记录：\n{result_str}"
 
         logger.warning(f"🛠️ [DB Tool] 数据库中未找到符合条件的资质证书记录")
@@ -306,25 +314,56 @@ def _safe_save_doc(doc, docx_path: str, max_retries: int = 10) -> bool:
 
 
 def check_qual_matches_paragraph(item_name: str, text: str) -> bool:
-    """精准判定资质名称 item_name 是否与条款段落文本 text 匹配（杜绝因'总承包'等公共词导致的误配过配）"""
+    """精准判定资质名称 item_name 是否与条款段落文本 text 匹配（杜绝因公共词导致的误配过配）"""
     name = item_name.strip()
-    if "营业" in name or "执照" in name:
+    if not name or not text:
+        return False
+    if "营业执照" in name or "执照" in name:
         return "营业执照" in text or "执照" in text or "法人" in text
-    if "安全" in name:
-        return "安全" in text
-    if "承装" in name or "修试" in name or "设施" in name:
-        return any(k in text for k in ["承装", "修试", "承修", "承试", "电力设施"])
-    if "电力" in name:
-        return "电力" in text
-    if "机电" in name:
-        return "机电" in text
-    if "建筑" in name:
-        return "建筑" in text
-    if "市政" in name:
-        return "市政" in text
-    core = name.replace("工程", "").replace("专业承包", "").replace("施工总承包", "").replace("二级", "").replace("三级", "").replace("一级", "")
+
+    # 动态剥离行政级别与通用公文修饰后缀，提取核心业务特征词进行比对
+    noise_patterns = [
+        "中华人民共和国", "国家", "省", "市", "施工总承包", "专业承包", "总承包",
+        "特级", "一级", "二级", "三级", "甲级", "乙级", "丙级",
+        "资质证书", "证书", "资质", "执照", "许可证"
+    ]
+    core = name
+    for pat in noise_patterns:
+        core = core.replace(pat, "")
+    core = core.strip()
+
     if len(core) >= 2 and core in text:
         return True
+    return False
+
+
+def _is_explicit_qualification_evidence_request(text: str) -> bool:
+    """判断段落是否明确要求提供/提交资质证明材料，而非仅提到资质关键词。"""
+    normalized = re.sub(r"\s+", "", text or "")
+    if not normalized:
+        return False
+
+    # 这些短语本身就是明确的插图/附件意图。
+    explicit_markers = [
+        "请插入图片", "插入图片", "附资质图片", "附证书图片",
+        "图片见附件", "证明材料见附件", "证明文件见附件",
+    ]
+    if any(marker in normalized for marker in explicit_markers):
+        return True
+
+    evidence_terms = r"(?:营业执照|执照|资质|资质证书|证书|许可证|体系认证|证明文件|证明材料|身份证明|扫描件|复印件|原件)"
+    request_actions = r"(?:提供|提交|附上|附具|随附|上传|递交|报送|取得|持有|具有|应附|须附|需附|应提供|须提供|需提供|应提交|须提交|需提交|应上传|须上传|需上传)"
+
+    # 只有“动作 + 证明材料”同时出现时，才允许纯文本条款触发兜底插图。
+    if re.search(request_actions, normalized) and re.search(evidence_terms, normalized):
+        return True
+
+    # 兼容“营业执照等证明文件”“资质证书扫描件”等结构化材料描述。
+    if re.search(rf"{evidence_terms}.{{0,10}}(?:证明文件|证明材料|扫描件|复印件|原件)", normalized):
+        return True
+    if re.search(rf"(?:证明文件|证明材料|扫描件|复印件|原件).{{0,10}}{evidence_terms}", normalized):
+        return True
+
     return False
 
 
@@ -349,11 +388,18 @@ def auto_embed_qualification_images_in_docx(docx_path: str, tenant_id: Optional[
         from app.db.session import SessionLocal
         from app.db.models.business import CompanyQualification
 
+        from app.core.context import current_tenant_id
+        context_tenant = current_tenant_id.get()
+        effective_tenant = (
+            tenant_id
+            if tenant_id and tenant_id != "default-tenant"
+            else (context_tenant or tenant_id or "default-tenant")
+        )
+
         db: Session = SessionLocal()
         try:
             query = db.query(CompanyQualification)
-            if tenant_id:
-                query = query.filter(CompanyQualification.tenant_id == tenant_id)
+            query = query.filter(CompanyQualification.tenant_id == effective_tenant)
             quals = query.all()
 
             valid_quals = []
@@ -465,12 +511,15 @@ def auto_embed_qualification_images_in_docx(docx_path: str, tenant_id: Optional[
                     toc_item_count += 1
                     continue
 
+            qualification_section_markers = ["资格证明", "资质文件", "资格审查", "资质证明", "企业资质"]
+
             # 离开资质章节判定：遇到后续大章标题且非资质相关时重置 in_qual_section
-            is_new_chapter_title = bool(re.match(r'^\s*(?:[一二三四五六七八九十百\d]+[、\.．\s]|第[一二三四五六七八九十\d]+[章节部分篇]|【[一二三四五六七八九十\d]+】)', text)) or (p.style and p.style.name and p.style.name.startswith("Heading"))
-            if is_new_chapter_title and not any(h in text for h in ["资格证明", "资质文件", "营业执照", "证书"]):
+            # 普通的“1.”、“8.”资格条款不是新章节，不能因此退出资格证明章节。
+            is_new_chapter_title = bool(re.match(r'^\s*(?:[一二三四五六七八九十百]+[、\.．\s]|第[一二三四五六七八九十\d]+[章节部分篇]|【[一二三四五六七八九十\d]+】)', text)) or (p.style and p.style.name and p.style.name.startswith("Heading"))
+            if is_new_chapter_title and not any(h in text for h in qualification_section_markers):
                 in_qual_section = False
 
-            if any(h in text for h in ["资格证明", "资质文件", "营业执照"]):
+            if any(h in text for h in qualification_section_markers):
                 in_qual_section = True
 
             # 场景 A: 包含显式占位符 [待手动补充资质证书: xxx] 或 [待...]
@@ -483,8 +532,9 @@ def auto_embed_qualification_images_in_docx(docx_path: str, tenant_id: Optional[
                     logger.info(f"   🖼️ 已原位替换段落占位符 '{text[:30]}' -> 资质图片 {matched_q['name']}")
                 continue
 
-            # 场景 B: 纯文本资质要求条款（仅限定在资质章节内部，或显式包含通用资质类型词组）
-            if in_qual_section or any(k in text for k in ["执照", "资质", "证书", "许可证", "体系认证"]):
+            # 场景 B: 纯文本资质要求条款。
+            # 仅有“资质/证书/执照”等关键词不代表需要插图，必须同时具备明确的材料提供语义。
+            if in_qual_section and _is_explicit_qualification_evidence_request(text):
                 # 若该条款下方已存在插入好的资质图片或图注，坚决跳过，防重复插入
                 if paragraph_or_next_has_inserted_qual_image(p):
                     logger.info(f"   ⏩ [跳过已存图片] 条款 '{text[:30]}' 下方已存在资质图片或图注")
@@ -554,50 +604,6 @@ def auto_embed_qualification_images_in_docx(docx_path: str, tenant_id: Optional[
                                     embedded_image_paths_in_doc.add(matched_q["image_path"])
                                     embedded_count += 1
                                     logger.info(f"   🖼️ 已原位替换表格单元格占位符 '{text[:30]}' -> 资质图片 {matched_q['name']}")
-
-            # 3. 针对《资格证明文件》章节，若全文档完全没有任何资质图片，自动在章节末尾追加插入有效资质图片
-            if embedded_count == 0 and len(embedded_image_paths_in_doc) == 0:
-                qual_p_list = []
-                in_section = False
-                in_toc_fb = False
-                toc_count_fb = 0
-                for p in doc.paragraphs:
-                    p_text = p.text.strip()
-                    if not p_text:
-                        continue
-                    if any(k in p_text for k in ["目录", "目 录", "文件目录"]):
-                        in_toc_fb = True
-                        continue
-                    if in_toc_fb:
-                        if bool(re.match(r'^\s*(?:[一1][、\.．\s]|第一[章节部分篇]|【[一1]】)', p_text)) and toc_count_fb > 3:
-                            in_toc_fb = False
-                        else:
-                            toc_count_fb += 1
-                            continue
-                    if any(h in p_text for h in ["资格证明", "资质文件", "营业执照"]):
-                        in_section = True
-                        qual_p_list.append(p)
-                        continue
-                    if in_section:
-                        is_next_chap = bool(re.match(r'^\s*(?:[一二三四五六七八九十百\d]+[、\.．\s]|第[一二三四五六七八九十\d]+[章节部分篇]|【[一二三四五六七八九十\d]+】)', p_text)) or (p.style and p.style.name and p.style.name.startswith("Heading"))
-                        if is_next_chap and not any(h in p_text for h in ["资格证明", "资质文件", "营业执照", "证书"]):
-                            in_section = False
-                            break
-                        else:
-                            qual_p_list.append(p)
-
-                if qual_p_list:
-                    target_p = qual_p_list[-1]
-                    last_p = target_p
-                    for item in valid_quals:
-                        if item["image_path"] in embedded_image_paths_in_doc:
-                            continue
-                        new_p = insert_paragraph_after(last_p, doc)
-                        replace_paragraph_with_image(new_p, item)
-                        embedded_image_paths_in_doc.add(item["image_path"])
-                        last_p = new_p
-                        embedded_count += 1
-                        logger.info(f"   🖼️ 已在资格证明章节末尾追加插入资质图片: {item['name']}")
 
             if embedded_count > 0:
                 _safe_save_doc(doc, docx_path)
@@ -716,6 +722,76 @@ def query_project_metadata_tool(document_id: str, field_key: str) -> str:
         db.close()
 
 
+def sort_cost_items_by_scope_and_hierarchy(cost_items: List[Any]) -> List[Any]:
+    """
+    【区域聚类优先、区域内保持前端顺序的排序算法 — 零行业与零设备硬编码】
+    检测到多个区域/标段时，先按区域/标段聚类，再在每个区域内严格按照
+    前端 BOM 的 sort_order 排序；没有多个区域时，完全保持前端顺序。
+    对没有 sort_order 的历史数据，使用原始列表位置作为区域内顺序。
+    根据清单项的通用区域/标段结构特征（如第X标段、第X包、第X期、第X区等）进行聚合，
+    并严格保持同区域/标段内部原招标文件抽取时的自然相对次序（Original Relative Order），
+    使同区域/同标段项目连续聚合，杜绝多标段交叉穿插，适用于任何招投标行业与品类。
+    """
+    if not cost_items or len(cost_items) <= 1:
+        return cost_items
+
+    import re
+
+    def _extract_scope_key(item: Any) -> tuple:
+        name = str(getattr(item, 'item_name', '') or '')
+        sec = str(getattr(item, 'section_name', '') or '')
+        combined = f"{sec} {name}"
+
+        scope_num = 999
+        scope_str = ""
+
+        # 通用区域/标段结构模式匹配（支持中英文括号或词尾区划标识，如 1标段、包2、一期、二区等）
+        scope_match = re.search(r'[\(（]([^\)）]*(?:区|期|标|包|段|厂|站)[^\)）]*)[\)）]', combined)
+        if not scope_match:
+            scope_match = re.search(r'([一二三四五六七八九十\d]+(?:区|期|标段|包|标|分厂|车间))', combined)
+
+        if scope_match:
+            scope_str = scope_match.group(1).strip()
+            # 通用中文数字映射
+            cn_num_map = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+            digit_m = re.search(r'(\d+)', scope_str)
+            if digit_m:
+                scope_num = int(digit_m.group(1))
+            else:
+                for cn_char, val in cn_num_map.items():
+                    if cn_char in scope_str:
+                        scope_num = val
+                        break
+
+        return (scope_num, scope_str)
+
+    # cost_estimates.sort_order 是前端 CostTable 的原始列表索引。
+    # 先按区域聚类，再用 sort_order 作为区域内的稳定顺序，避免聚类破坏前端顺序。
+    has_explicit_order = any(getattr(item, "sort_order", None) is not None for item in cost_items)
+    has_scope = any(_extract_scope_key(item)[1] for item in cost_items)
+
+    def _frontend_order(item: Any, original_index: int) -> tuple:
+        raw_order = getattr(item, "sort_order", None)
+        if raw_order is None:
+            return (1, original_index)
+        try:
+            return (0, int(raw_order))
+        except (TypeError, ValueError):
+            return (1, original_index)
+
+    # 没有区域/标段时，完全按前端顺序；有区域时才执行聚类。
+    indexed_items = list(enumerate(cost_items))
+    if has_scope:
+        indexed_items.sort(key=lambda pair: (
+            _extract_scope_key(pair[1])[0],
+            _extract_scope_key(pair[1])[1],
+            _frontend_order(pair[1], pair[0]) if has_explicit_order else (0, pair[0]),
+        ))
+    elif has_explicit_order:
+        indexed_items.sort(key=lambda pair: _frontend_order(pair[1], pair[0]))
+    return [pair[1] for pair in indexed_items]
+
+
 def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optional[List[str]] = None) -> List[List[str]]:
     """
     【纯 ORM 字段名直映射引擎 — 语义映射由 Worker LLM 负责】
@@ -731,6 +807,11 @@ def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optio
     """
     if not cost_items:
         return []
+
+    import re
+
+    # 0. 自动执行区域与分项智能聚类排序
+    cost_items = sort_cost_items_by_scope_and_hierarchy(cost_items)
 
     # 1. 动态获取 ORM 模型物理字段列表（排除系统字段）
     from app.db.models.ai_analysis import CostEstimate
@@ -748,29 +829,159 @@ def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optio
         if not header_columns:
             header_columns = model_columns
 
-    # 3. 按字段名顺序生成二维矩阵（纯 ORM 直查）
+    # 3. 按区域进行通用聚合分组
+    from itertools import groupby
+    def _get_scope_name(it: Any) -> str:
+        name = str(getattr(it, 'item_name', '') or '')
+        sec = str(getattr(it, 'section_name', '') or '')
+        combined = f"{sec} {name}"
+        scope_match = re.search(r'[\(（]([^\)）]*(?:区|期|标|包|段|厂|站)[^\)）]*)[\)）]', combined)
+        if not scope_match:
+            scope_match = re.search(r'([一二三四五六七八九十\d]+(?:区|期|标段|包|标|分厂|车间))', combined)
+        return scope_match.group(1).strip() if scope_match else ""
+
+    groups = []
+    for k, g in groupby(cost_items, key=_get_scope_name):
+        groups.append((k, list(g)))
+
+    # 识别名称列与总价列索引
+    name_col_idx = 1
+    total_col_idx = -1
+    for i, col in enumerate(header_columns):
+        if col in ("item_name", "product_name"):
+            name_col_idx = i
+        if col in ("calculated_total", "total_price", "amount", "total"):
+            total_col_idx = i
+    if total_col_idx == -1:
+        total_col_idx = len(header_columns) - 1
+
+    has_multi_scopes = len(groups) > 1 and any(g[0] for g in groups)
+
+    def _extract_cell_value(item: Any, col_name: str, row_idx: int, g_prefix: str = "") -> str:
+        col_key = str(col_name).strip()
+        col_lower = col_key.lower().replace(" ", "").replace("_", "").replace("（", "(").replace("）", ")")
+
+        # 1. 序号列
+        if col_key == "__INDEX__" or any(kw in col_lower for kw in ["序号", "no", "no.", "项号", "num"]):
+            return f"{g_prefix}{row_idx}" if g_prefix else str(row_idx)
+
+        # 2. 品牌规格型号合并列
+        if col_key == "__BRAND_SPEC__" or ("品牌" in col_lower and ("规格" in col_lower or "型号" in col_lower)):
+            brand = str(getattr(item, 'brand', '') or '').strip()
+            spec = str(getattr(item, 'spec', '') or '').strip()
+            spec_clean = re.sub(r'[\r\n\t]+', ' ', spec).strip()
+            if brand and spec_clean:
+                if spec_clean.startswith(brand):
+                    return spec_clean
+                return f"{brand} {spec_clean}".strip()
+            return brand or spec_clean
+
+        # 3. 生产厂家列（支持多级回溯解析：item.manufacturer -> item.brand）
+        if col_key in ("manufacturer", "mfg", "producer", "factory") or any(kw in col_lower for kw in ["生产厂家", "制造厂家", "制造厂商", "生产厂商", "制造商", "厂家", "生产企业", "制造企业", "产地"]):
+            mfg_val = str(getattr(item, 'manufacturer', '') or '').strip()
+            if not mfg_val:
+                mfg_val = str(getattr(item, 'brand', '') or '').strip()
+            return mfg_val
+
+        # 4. 品牌列
+        if col_key in ("brand", "trademark") or any(kw in col_lower for kw in ["品牌", "商标"]):
+            b_val = str(getattr(item, 'brand', '') or '').strip()
+            if not b_val:
+                b_val = str(getattr(item, 'manufacturer', '') or '').strip()
+            return b_val
+
+        # 5. 名称/标的物/货物列
+        if col_key in ("item_name", "product_name", "name") or any(kw in col_lower for kw in ["标的物", "货物名称", "设备名称", "材料名称", "项目名称", "品名", "名称"]):
+            val = getattr(item, 'item_name', '') or ''
+            return re.sub(r'[\r\n\t]+', ' ', str(val)).strip()
+
+        # 6. 规格型号列
+        if col_key in ("spec", "specification") or any(kw in col_lower for kw in ["规格型号", "规格及型号", "规格", "型号", "技术参数", "技术要求"]):
+            val = getattr(item, 'spec', '') or ''
+            return re.sub(r'[\r\n\t]+', ' ', str(val)).strip()
+
+        # 7. 计量单位列
+        if col_key in ("unit", "measure_unit") or any(kw in col_lower for kw in ["单位", "计量单位"]):
+            return str(getattr(item, 'unit', '') or '').strip()
+
+        # 8. 数量/工程量列
+        if col_key in ("quantity", "qty", "amount_count") or any(kw in col_lower for kw in ["数量", "工程量", "采购量"]):
+            val = getattr(item, 'quantity', None)
+            if val is not None:
+                return f"{val:g}" if isinstance(val, (int, float)) else str(val).strip()
+            return ""
+
+        # 9. 单价列
+        if col_key in ("unit_price", "price") or any(kw in col_lower for kw in ["单价", "综合单价", "投标单价", "参考单价"]):
+            val = getattr(item, 'unit_price', None)
+            if val is not None:
+                if isinstance(val, (int, float)):
+                    return f"{val:,.2f}"
+                return str(val).strip()
+            return ""
+
+        # 10. 合价/总价列
+        if col_key in ("calculated_total", "total_price", "amount", "total") or any(kw in col_lower for kw in ["合价", "总价", "分项总价", "金额", "小计"]):
+            val = getattr(item, 'calculated_total', None)
+            if val is not None:
+                if isinstance(val, (int, float)):
+                    return f"{val:,.2f}"
+                return str(val).strip()
+            return ""
+
+        # 11. 备注/说明列
+        if col_key in ("remark", "note", "desc") or any(kw in col_lower for kw in ["备注", "说明"]):
+            val = getattr(item, 'remark', '') or ''
+            return re.sub(r'[\r\n\t]+', ' ', str(val)).strip()
+
+        # 12. 反射模型属性兜底
+        if hasattr(item, col_key):
+            val = getattr(item, col_key, None)
+            if val is not None:
+                return re.sub(r'[\r\n\t]+', ' ', str(val)).strip()
+
+        return ""
+
     matrix = []
-    for idx, item in enumerate(cost_items, start=1):
-        row = []
-        for col_name in header_columns:
-            col_key = str(col_name).strip()
-            if col_key == "__INDEX__":
-                # 自动递增序号列
-                row.append(str(idx))
-            elif col_key == "__BRAND_SPEC__":
-                # 品牌+规格合并列
-                brand = str(getattr(item, 'brand', '') or '')
-                spec = str(getattr(item, 'spec', '') or '')
-                row.append(f"{brand} {spec}".strip())
-            elif hasattr(item, col_key):
-                # 直接获取 ORM 实体字段属性
-                val = getattr(item, col_key, None)
-                row.append(str(val) if val is not None else "")
-            else:
-                # 未知列名填空
-                logger.warning(f"⚠️ [Matrix] 未识别的 ORM 字段名 '{col_key}'，填空。可用模型字段: {model_columns}")
-                row.append("")
-        matrix.append(row)
+
+    # 4. 单一区域降级模式（无分部结构）
+    if not has_multi_scopes:
+        for idx, item in enumerate(cost_items, start=1):
+            row = [_extract_cell_value(item, col_name, idx) for col_name in header_columns]
+            matrix.append(row)
+        return matrix
+
+    # 5. 多区域模式：插入区域分部标题行、分部层级序号与小计行
+    cn_nums = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
+
+    for g_i, (scope_name, group_items) in enumerate(groups):
+        section_cn = cn_nums[g_i] if g_i < len(cn_nums) else str(g_i + 1)
+        scope_display = scope_name or f"分部工程 {section_cn}"
+
+        # 5.1 区域分部标题行
+        sec_header_row = ["" for _ in header_columns]
+        if "__INDEX__" in header_columns:
+            sec_header_row[header_columns.index("__INDEX__")] = f"{section_cn}、"
+        if 0 <= name_col_idx < len(header_columns):
+            sec_header_row[name_col_idx] = f"{scope_display}"
+        matrix.append(sec_header_row)
+
+        # 5.2 区域明细数据行
+        group_total = 0.0
+        for item_i, item in enumerate(group_items, start=1):
+            item_total = float(getattr(item, 'calculated_total', 0) or 0)
+            group_total += item_total
+            row = [_extract_cell_value(item, col_name, item_i, g_prefix=f"{g_i + 1}.") for col_name in header_columns]
+            matrix.append(row)
+
+        # 5.3 区域分部小计行
+        sec_subtotal_row = ["" for _ in header_columns]
+        if 0 <= name_col_idx < len(header_columns):
+            sec_subtotal_row[name_col_idx] = f"{scope_display} 小计"
+        if 0 <= total_col_idx < len(header_columns):
+            sec_subtotal_row[total_col_idx] = f"{group_total:,.2f}"
+        matrix.append(sec_subtotal_row)
+
     return matrix
 
 
@@ -780,12 +991,14 @@ def query_financial_quotation_tool(document_id: str, field_key: str = "cost_esti
     [数据库直查工具] 全量查询财务报价、BOM 清单、分项造价、保证金及付款条款数据。
 
     :param document_id: 招标文件 ID
-    :param field_key: 查询类型 ('cost_estimates', 'bom_list', 'cost_estimates_json_matrix', 'total_price_numeric', 'total_price_chinese', 'bid_bond', 'performance_bond', 'payment_milestones')，默认值为 'cost_estimates'
+    :param field_key: 查询类型 ('cost_estimates', 'bom_list', 'cost_estimates_json_matrix', 'total_price_numeric', 'total_price_chinese', 'bid_bond', 'performance_bond', 'payment_milestones')，默认值为 'cost_estimates'。
+        【重要提示】：若你的目标是为 Word 表格生成数据并调用 officecli_fill_table_rows 写盘，必须直接指定 field_key='cost_estimates_json_matrix' 并传入 header_columns_json，严禁先查 cost_estimates 纯文本再查 matrix！
     :param header_columns_json: 【重要 - 获取 matrix 时强烈建议传入】JSON 字符串数组，包含你根据 Word 表格实际表头推理映射后的 ORM 字段名列表。
         可用的 ORM 字段名（按实际需要选用、排列）：
           - "__INDEX__"       → 自动生成 1..N 递增序号
           - "item_name"       → 名称/标的物/设备/货物/品名
           - "brand"           → 品牌
+          - "manufacturer"    → 生产厂家/制造厂商/生产企业
           - "spec"            → 规格/型号/技术参数
           - "__BRAND_SPEC__"  → 品牌+规格合并为一列 (当表头为"品牌、规格、型号"时使用)
           - "unit"            → 单位/计量单位
@@ -793,9 +1006,8 @@ def query_financial_quotation_tool(document_id: str, field_key: str = "cost_esti
           - "unit_price"      → 单价/综合单价
           - "calculated_total"→ 总价/合价/小计/金额
           - "remark"          → 备注/说明
-        示例：表头为 [序号, 标的物名称, 品牌规格型号, 生产厂家, 单位, 数量, 单价, 总价, 备注]
-              → header_columns_json = '["__INDEX__", "item_name", "__BRAND_SPEC__", "remark", "unit", "quantity", "unit_price", "calculated_total", "remark"]'
-        注意：不在上述列表中的表头列（如"生产厂家"在数据库中无对应字段），可映射为最接近的字段或 "remark"。
+        示例：若表头为 [序号, 货物名称, 规格型号, 生产厂家, 单位, 数量, 单价, 合价, 备注]
+              → header_columns_json = '["__INDEX__", "item_name", "spec", "manufacturer", "unit", "quantity", "unit_price", "calculated_total", "remark"]'
     :return: 分项报价明细列表、价格、保证金或付款条款字符串
     """
     logger.info(f"🛠️ [DB Tool] query_financial_quotation_tool 被调用, doc_id: '{document_id}', 字段: '{field_key}'")
@@ -814,7 +1026,17 @@ def query_financial_quotation_tool(document_id: str, field_key: str = "cost_esti
                     return json.dumps(fin_meta.payment_milestones, ensure_ascii=False)
 
         # 2. 查询成本测算总价与大写转换
-        cost_items = db.query(CostEstimate).filter(CostEstimate.document_id == document_id).all()
+        cost_items = (
+            db.query(CostEstimate)
+            .filter(CostEstimate.document_id == document_id)
+            .order_by(
+                CostEstimate.sort_order.asc().nullslast(),
+                CostEstimate.created_at.asc(),
+            )
+            .all()
+        )
+        # 有 sort_order 时由排序函数严格保持前端顺序；旧数据仍兼容区域聚类。
+        cost_items = sort_cost_items_by_scope_and_hierarchy(cost_items)
         
         # 针对分项清单、BOM 表或分项单价/合价查询，返回每行精细列表
         if any(k in key_lower for k in ["cost", "bom", "item", "清单", "明细", "分项", "配置", "设备", "sub", "quote", "报价"]):
@@ -838,8 +1060,9 @@ def query_financial_quotation_tool(document_id: str, field_key: str = "cost_esti
             for item in cost_items:
                 brand_str = f" [品牌: {item.brand}]" if getattr(item, 'brand', None) else ""
                 spec_str = f" [规格: {item.spec}]" if getattr(item, 'spec', None) else ""
+                unit_str = str(item.unit) if item.unit else ""
                 res_items.append(
-                    f"- {item.item_name}{brand_str}{spec_str} | 数量: {item.quantity}{item.unit} | 参考单价: {item.unit_price}元 | 测算合计合价(总价): {item.calculated_total}元 | 备注: {getattr(item, 'remark', '')}"
+                    f"- {item.item_name}{brand_str}{spec_str} | 数量: {item.quantity}{unit_str} | 参考单价: {item.unit_price}元 | 测算合计合价(总价): {item.calculated_total}元 | 备注: {getattr(item, 'remark', '')}"
                 )
             logger.info(f"🛠️ [DB Tool] 成功查得并回传 {len(res_items)} 条 BOM 分项成本报价明细")
             return "\n".join(res_items) + f"\n\n【分项展开提示】共检索到 {len(res_items)} 项具体分项清单。在分项报价表中，必须在建设费等汇总大类下方将全部具体细项逐行完整展开（按 2.1, 2.2... 2.K 编号），严禁只填大类总额。"

@@ -20,18 +20,8 @@ def get_company_profile(db: Session = Depends(get_db)):
     """
     profile = db.query(CompanyProfileModel).first()
     if not profile:
-        # 若数据库中无记录，自动创建初始档案记录
-        profile = CompanyProfileModel(
-            company_name="四川石楠建设工程有限公司",
-            legal_representative="张三",
-            authorized_delegate="李四",
-            credit_code="91510000MA6X12345X",
-            registered_address="四川省成都市高新区天府大道北段128号",
-            contact_phone="028-85123456",
-            email="bidding@shinan-construction.com",
-            bank_name="中国工商银行股份有限公司成都高新支行",
-            bank_account="4402 2410 1910 0123 456"
-        )
+        # 若数据库中无记录，自动创建初始空档案记录
+        profile = CompanyProfileModel()
         db.add(profile)
         db.commit()
         db.refresh(profile)

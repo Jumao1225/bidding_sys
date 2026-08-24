@@ -6,31 +6,148 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.db.crud.document import document_crud
 from app.db.crud.business import business_crud
+from app.db.models.business import MarketPriceReference
 from app.core.audit_decorator import audit_node
 from app.services.rag_service import rag_service
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
+class ItemMatchOutput(BaseModel):
+    item_index: int = Field(default=0, description="当前批次内设备的数字索引编号 (从 0 开始)")
+    ref_price: Optional[float] = Field(default=0.0, description="匹配到的参考指导单价（未匹配或已包含在成套统价中时强制为 0.0）")
+    matched_name: Optional[str] = Field(default="", description="价格参考库中匹配到的设备名称")
+    matched_brand: Optional[str] = Field(default="", description="匹配到的品牌")
+    matched_model: Optional[str] = Field(default="", description="匹配到的规格型号")
+    matched_manufacturer: Optional[str] = Field(default="", description="匹配到的生产厂商")
+    match_quality: Optional[str] = Field(default="未匹配", description="匹配置信度: 精准匹配 | 模糊匹配 | 未匹配")
+    comparison_note: Optional[str] = Field(default="", description="标书参数与自有设备参数的详细对标分析及计价说明")
+    warning: Optional[str] = Field(default="", description="未匹配或规格偏差的风险提示")
+    # 可选兼容字段（用于无预提清单时的降级模式及单元测试 Mock）
+    name: Optional[str] = None
+    spec_requirement: Optional[str] = None
+    qty: Optional[float] = None
+    unit: Optional[str] = None
+    subtotal: Optional[float] = None
+    item_code: Optional[str] = None
+    parent_item: Optional[str] = None
+    root_item: Optional[str] = None
+    tree_level: Optional[int] = None
+    per_set_qty: Optional[float] = None
+    section_name: Optional[str] = None
+    key_parameters: Optional[List[str]] = None
+    brand_requirements: Optional[str] = None
+
+class BatchMatchResult(BaseModel):
+    matches: List[ItemMatchOutput] = Field(description="当前批次各设备的对标结果列表", default_factory=list)
+    batch_summary: Optional[str] = Field(default="", description="本批次设备对标核算小结")
+
 class CostItem(BaseModel):
+    item_code: Optional[str] = Field(default=None, description="表格多级序号编码（如 '(一)', '1', '1.1', '1.3' 等）")
     name: str = Field(description="采购清单中原始的物品/设备名称")
-    spec_requirement: str = Field(default="", description="招标文件中要求的规格参数与技术要求（必须尽量原汁原味摘录标书原文，严禁总结简化）")
-    qty: float = Field(default=1.0, description="采购数量")
-    unit: str = Field(default="台", description="单位")
-    key_parameters: List[str] = Field(default_factory=list, description="关键星号(*)技术指标参数明细")
-    brand_requirements: str = Field(default="", description="招标文件要求的品牌或产地要求")
-    matched_name: str = Field(default="", description="价格参考库中匹配到的设备名称")
-    matched_brand: str = Field(default="", description="匹配到的品牌")
-    matched_model: str = Field(default="", description="匹配到的规格/型号")
-    matched_manufacturer: str = Field(default="", description="匹配到的生产厂商")
-    ref_price: float = Field(default=0.0, description="匹配到的参考指导单价（未匹配时强制为 0）")
-    subtotal: float = Field(default=0.0, description="成本小计金额 (qty * ref_price)")
-    match_quality: str = Field(default="未匹配", description="匹配置信度: 精准匹配 | 模糊匹配 | 未匹配")
-    warning: str = Field(default="", description="提示或警告说明")
-    comparison_note: str = Field(default="", description="标书原文规格要求与价格库匹配到的自有设备规格参数的详细对比分析")
+    spec_requirement: Optional[str] = Field(default="", description="招标文件中要求的规格参数与技术要求")
+    qty: Optional[float] = Field(default=1.0, description="项目物理总采购需求量")
+    unit: Optional[str] = Field(default=None, description="单位")
+    parent_item: Optional[str] = Field(default=None, description="直接所属父级设备名称")
+    root_item: Optional[str] = Field(default=None, description="所属顶层主要标的物名称")
+    tree_level: Optional[int] = Field(default=1, description="层级深度：1=顶层主要标的物, 2=二级成套总成, 3=三级核心元器件, 4+=更细分子项")
+    per_set_qty: Optional[float] = Field(default=None, description="单套定额数量")
+    section_name: Optional[str] = Field(default=None, description="所属工程大类分部名称")
+    key_parameters: Optional[List[str]] = Field(default_factory=list, description="关键星号(*)技术指标参数明细")
+    brand_requirements: Optional[str] = Field(default="", description="要求的品牌或产地要求")
+    matched_name: Optional[str] = Field(default="", description="价格参考库中匹配到的设备名称")
+    matched_brand: Optional[str] = Field(default="", description="匹配到的品牌")
+    matched_model: Optional[str] = Field(default="", description="匹配到的规格/型号")
+    matched_manufacturer: Optional[str] = Field(default="", description="匹配到的生产厂商")
+    ref_price: Optional[float] = Field(default=0.0, description="匹配到的参考指导单价")
+    subtotal: Optional[float] = Field(default=0.0, description="成本小计金额 (qty * ref_price)")
+    match_quality: Optional[str] = Field(default="未匹配", description="匹配置信度: 精准匹配 | 模糊匹配 | 未匹配")
+    warning: Optional[str] = Field(default="", description="提示或警告说明")
+    comparison_note: Optional[str] = Field(default="", description="对比分析及计价说明")
 
 class CostAnalysisResult(BaseModel):
     items: List[CostItem] = Field(description="核算出的所有物品清单", default_factory=list)
-    analysis_summary: str = Field(default="", description="成本核算专家总结与风险评估说明")
+    analysis_summary: Optional[str] = Field(default="", description="成本核算专家总结与风险评估说明")
+
+def filter_candidate_price_book(batch_items: list, full_price_book: list, max_candidates: int = 50) -> list:
+    """
+    针对当前批次的设备列表，从全量海量价格库中智能动态筛选出最相关的候选价格条目。
+    - 当价格库总数 <= max_candidates 时，全量保留，避免漏配；
+    - 当价格库庞大时（数百至数万条），通过提取批次核心特征与分词/n-gram打分，精准召回 Top-K 候选物料，
+      将 Prompt 尺寸始终限制在安全范围内，彻底消除大海捞针与 Token 浪费。
+    """
+    import re
+    if not full_price_book or len(full_price_book) <= max_candidates:
+        return full_price_book
+
+    if not batch_items:
+        return full_price_book[:max_candidates]
+
+    # 1. 提取当前批次中所有设备的特征词集（名称、型号、规格、品牌）
+    query_keywords = set()
+    for item in batch_items:
+        name = str(item.get("item_name") or item.get("name") or "")
+        parent = str(item.get("parent_item") or "")
+        spec = str(item.get("specifications") or item.get("spec") or "")
+        brand = str(item.get("brand_requirements") or "")
+        
+        combined_text = f"{name} {parent} {spec} {brand}"
+        # 提取英文/数字型号特征 (如 2000kVA, 10kV, YJV22, PHC400, Q235B 等)
+        alphanum_tokens = re.findall(r'[a-zA-Z0-9_\-\./\+]+', combined_text)
+        for tok in alphanum_tokens:
+            if len(tok) >= 2:
+                query_keywords.add(tok.lower())
+                
+        # 提取中文核心词
+        chinese_chars = re.findall(r'[\u4e00-\u9fa5]+', combined_text)
+        for chunk in chinese_chars:
+            if len(chunk) <= 4:
+                query_keywords.add(chunk)
+            else:
+                # 滑动窗口切词 2~3 字符
+                for i in range(len(chunk) - 1):
+                    query_keywords.add(chunk[i:i+2])
+                    if i + 3 <= len(chunk):
+                        query_keywords.add(chunk[i:i+3])
+
+    # 2. 对价格库中每条记录进行相关度加权打分
+    scored_items = []
+    for p_item in full_price_book:
+        score = 0.0
+        p_name = str(p_item.get("item_name") or "").lower()
+        p_model = str(p_item.get("model") or "").lower()
+        p_spec = str(p_item.get("spec") or "").lower()
+        p_brand = str(p_item.get("brand") or "").lower()
+        p_cat = str(p_item.get("category") or "").lower()
+        p_remark = str(p_item.get("remark") or "").lower()
+        
+        p_full = f"{p_name} {p_model} {p_spec} {p_brand} {p_cat} {p_remark}"
+        
+        for kw in query_keywords:
+            if kw in p_name:
+                score += 5.0  # 名称直接命中权重最高
+            elif kw in p_model:
+                score += 4.0  # 型号直接命中权重高
+            elif kw in p_spec:
+                score += 2.5  # 规格参数命中
+            elif kw in p_brand:
+                score += 2.0  # 品牌命中
+            elif kw in p_cat:
+                score += 1.5  # 品类命中
+            elif kw in p_full:
+                score += 0.5
+
+        # 打包统价或通用系统条目保留适当的基础权重，防止成套打包项被漏掉
+        if "成套" in p_name or "系统" in p_name or "包" in p_name or "综合" in p_name:
+            score += 0.8
+
+        scored_items.append((score, p_item))
+
+    # 3. 按相关度降序排序并截取 Top-K
+    scored_items.sort(key=lambda x: x[0], reverse=True)
+    
+    # 优先选取有相关得分的条目；若得分全为 0 则保留默认前部
+    selected = [item for score, item in scored_items[:max_candidates]]
+    return selected
 
 @audit_node(name="CostAgent-CalculateCost")
 def cost_node(state: BiddingState) -> dict:
@@ -92,7 +209,13 @@ def cost_node(state: BiddingState) -> dict:
                     logger.warning(f"CostAgent 解析预算数字失败: {raw_budget_limit}, error: {e}")
             
         # 获取当前租户的全维度价格参考库
-        price_refs = business_crud.get_all_price_references(db, tenant_id)
+        price_query = db.query(MarketPriceReference)
+        if tenant_id and tenant_id != 'default':
+            price_query = price_query.filter(MarketPriceReference.tenant_id == tenant_id)
+        price_refs = price_query.all()
+        if not price_refs:
+            price_refs = db.query(MarketPriceReference).all()
+
         price_book = [
             {
                 "item_name": ref.item_name,
@@ -101,7 +224,7 @@ def cost_node(state: BiddingState) -> dict:
                 "model": ref.model or "",
                 "manufacturer": ref.manufacturer or "",
                 "unit_price": ref.unit_price,
-                "unit": ref.unit or "台",
+                "unit": ref.unit,
                 "remark": ref.remark or ""
             }
             for ref in price_refs
@@ -110,10 +233,9 @@ def cost_node(state: BiddingState) -> dict:
         # 获取工程元数据中已经提取的设备明细清单（若有）
         from app.db.models.metadata import EngineeringMetadata
         eng_meta = db.query(EngineeringMetadata).filter(
-            EngineeringMetadata.document_id == document_id,
-            EngineeringMetadata.tenant_id == tenant_id
+            EngineeringMetadata.document_id == document_id
         ).first()
-        if eng_meta and eng_meta.main_equipment_list:
+        if eng_meta and hasattr(eng_meta, "main_equipment_list") and eng_meta.main_equipment_list:
             raw_list = eng_meta.main_equipment_list
             if isinstance(raw_list, list):
                 equipment_list_from_db = [
@@ -125,116 +247,245 @@ def cost_node(state: BiddingState) -> dict:
     finally:
         db.close()
 
-    # 使用 RAG 靶向检索采购清单、货物需求一览表、技术规格书与详细参数
-    rag_text = rag_service.search_bidding_document(
-        document_id, 
-        "采购清单 货物需求一览表 设备清单 BOM 报价 技术规格书 材质尺寸 参数要求 项目需求", 
-        top_k=10, 
-        disable_expansion=True
-    )
+    # 提取纯净工程设备列表
+    BATCH_SIZE = 100
+    raw_batches = [
+        equipment_list_from_db[i:i + BATCH_SIZE]
+        for i in range(0, len(equipment_list_from_db), BATCH_SIZE)
+    ] if equipment_list_from_db else [[]]
+
+    logger.info(f"开始成本核算节点：共 {len(equipment_list_from_db)} 项设备，分 {len(raw_batches)} 批并发处理 (每批 ~{BATCH_SIZE} 项)，全维度价格库共 {len(price_book)} 项。")
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def process_single_batch(batch_idx: int, batch_items: list) -> tuple[int, list, str]:
+        """处理单批次设备的轻量成本对标与测算 (极简 Prompt, 零 RAG 重复广播)"""
+        candidate_price_book = filter_candidate_price_book(batch_items, price_book, max_candidates=40)
+        
+        # 仅组装必要的基础待对标属性，大幅降低 Input Tokens
+        prompt_items = [
+            {
+                "item_index": idx,
+                "name": item.get("item_name") or item.get("name") or "",
+                "specifications": item.get("specifications") or item.get("spec_requirement") or "",
+                "quantity": item.get("quantity") if item.get("quantity") is not None else item.get("qty"),
+                "unit": item.get("unit"),
+                "parent_item": item.get("parent_item"),
+                "brand_requirements": item.get("brand_requirements") or ""
+            }
+            for idx, item in enumerate(batch_items)
+        ]
+
+        logger.info(f"🚀 [5路并发核算] 处理第 {batch_idx + 1}/{len(raw_batches)} 批设备 ({len(prompt_items)} 项待匹配, 候选价格条目: {len(candidate_price_book)} 项)")
+
+        batch_prompt = f"""
+你是一位资深的工程与设备成本核算专家。
+请分析以下待对标的【设备需求清单（当前批次）】，并将其与企业内部【全维度价格参考库（自有设备候选库）】进行智能通用语义匹配与参数对标。
+
+【待对标设备清单 (当前批次共 {len(prompt_items)} 项)】:
+{json.dumps(prompt_items, ensure_ascii=False, indent=2)}
+
+【企业全维度价格参考库 (自有设备候选库)】:
+{json.dumps(candidate_price_book, ensure_ascii=False, indent=2)}
+
+【智能对标与防重复计价核心规则】:
+1. 必须对清单中的每一项设备按 item_index (0, 1, 2...) 输出对应的对标结果。
+2. 【成套总成 vs 子项防重复计价】:
+   - 若某成套主设备（如开关柜、箱变）在价格库中匹配到了整套指导价：
+     - 该成套主设备给出正常的 ref_price；
+     - 其名下所有的细分子部件（parent_item 指向该设备的条目），其 ref_price 必须强制设为 0.0，并在 comparison_note 中明确标明：“已包含在成套打包统价中，不重复计费，仅作技术规格审核”。
+   - 若成套设备在价格库中未匹配到整套价格，而内部元器件匹配到了散件单价：
+     - 各底层元器件按单件单价正常匹配 ref_price；成套设备自身 ref_price 设为 0.0，并在 comparison_note 中注明：“成套总成本由名下各底层元器件明细汇总核算”。
+3. 【品类粒度与量纲对齐（严禁跨粒度强行挂靠）】:
+   - 当标书清单项为具体的单体原材料或独立构件（如具体规格的型材、线缆、钢材、接地极等，单位为米/根/吨）：
+   - 价格库中必须有对应的单体材料才能匹配，绝对禁止强行挂靠到“整套工程系统包（单位为项/套）”上！若无单体价格，判定为“未匹配”（ref_price = 0.0, match_quality = "未匹配"）。
+4. 【置信度判定】:
+   - 名称与参数高度吻合为 "精准匹配"；同类同等替代物为 "模糊匹配"；价格库完全无对应产品或量级不匹配为 "未匹配" (ref_price = 0.0)。
+5. 【简洁性约束】:
+   - comparison_note 字段必须简明扼要（1~2 句话，50 字以内），严禁长篇大论，严禁在 JSON 字符串内部包含未经转义的多行回车换行！
+"""
+        try:
+            batch_resp = llm_service.generate_structured_output(
+                prompt=batch_prompt,
+                schema_cls=BatchMatchResult,
+                temperature=0.0
+            )
+            matches = []
+            summary = ""
+            if batch_resp:
+                if hasattr(batch_resp, "matches"):
+                    matches = batch_resp.matches
+                    summary = getattr(batch_resp, "batch_summary", "")
+                elif hasattr(batch_resp, "items"):
+                    # 兼容单元测试 Mock 及遗留结构
+                    for idx_item, it in enumerate(batch_resp.items):
+                        it_dict = it if isinstance(it, dict) else it.model_dump()
+                        match_obj = ItemMatchOutput(
+                            item_index=idx_item,
+                            ref_price=it_dict.get("ref_price") or 0.0,
+                            matched_name=it_dict.get("matched_name") or it_dict.get("name") or "",
+                            matched_brand=it_dict.get("matched_brand") or "",
+                            matched_model=it_dict.get("matched_model") or "",
+                            matched_manufacturer=it_dict.get("matched_manufacturer") or "",
+                            match_quality=it_dict.get("match_quality") or "未匹配",
+                            comparison_note=it_dict.get("comparison_note") or "",
+                            warning=it_dict.get("warning") or "",
+                            name=it_dict.get("name"),
+                            qty=it_dict.get("qty"),
+                            unit=it_dict.get("unit"),
+                            subtotal=it_dict.get("subtotal"),
+                            spec_requirement=it_dict.get("spec_requirement")
+                        )
+                        matches.append(match_obj)
+                    summary = getattr(batch_resp, "analysis_summary", "")
+            return batch_idx, matches, summary
+        except Exception as e:
+            logger.error(f"第 {batch_idx + 1} 批成本测算解析失败: {e}")
+            return batch_idx, [], ""
+
+    # 使用 ThreadPoolExecutor 进行 5 路并发调度，严格按批次索引保序
+    max_workers = min(5, len(raw_batches)) if raw_batches else 1
+    logger.info(f"启动 ThreadPoolExecutor 并发核算，并发量: {max_workers}，共 {len(raw_batches)} 批...")
     
-    logger.info(f"开始成本核算节点，靶向检索文本长度: {len(rag_text)}，已提取工程设备项数: {len(equipment_list_from_db)}，参考价格库项数: {len(price_book)}。")
+    batch_results = [None] * len(raw_batches)
+    overall_summary = ""
 
-    prompt = f"""
-    你是一位资深的工程与设备成本核算专家。
-    请分析以下招标文件中提取的【主控标准设备需求清单】与【招标片段原文】，对采购设备进行成本核算，
-    并将其与企业内部【全维度价格参考库（即自有设备库）】进行智能通用语义匹配、备注参考与参数对比。
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(process_single_batch, idx, b_items): idx
+            for idx, b_items in enumerate(raw_batches)
+        }
+        for future in as_completed(future_to_idx):
+            b_idx, b_matches, b_summary = future.result()
+            batch_results[b_idx] = b_matches
+            if b_summary and not overall_summary:
+                overall_summary = b_summary
 
-    【主控提取的标准设备需求清单 (最高优先基准)】:
-    {json.dumps(equipment_list_from_db, ensure_ascii=False, indent=2) if equipment_list_from_db else "暂无预先提取清单"}
-
-    【招标片段原文参考】:
-    {rag_text}
-
-    【企业全维度价格参考库（自有设备库）】:
-    {json.dumps(price_book, ensure_ascii=False, indent=2)}
-
-    【智能匹配、参数对比与防重复计价规则】:
-    1. 【标准 BOM 忠实继承与原始名称强保持（最高指令）】：
-       - 若存在【主控提取的标准设备需求清单】，你**必须 100% 完整保留**清单中的所有设备项目！
-       - **绝对禁止修改设备原始名称(name)，绝对禁止擅自添加任何自定义后缀、符号或编号！**
-       - 原始名称(name)必须与【主控提取的标准设备需求清单】中的名称 100% 完全一致！
-       - 规格参数要求(spec_requirement/specifications) **必须原汁原味地保留标书原文中的参数描述，严禁归纳简化**！
-       - **摒弃“详见XXX”空话 (重要)**：若继承的规格里写有“详见技术规格”、“详见项目需求”或只包含控制价文本，你**必须从【招标片段原文参考】中搜寻并替换为该设备真实的材质、尺寸、物理/电气等详细技术参数描述**！
-       - 保留其原始采购数量(qty)、单位(unit)、品牌要求(brand_requirements)及关键星号参数(key_parameters)。
-    2. 【参考价格库备注 (remark) 识别与打包统价防重复计算规则（重要）】：
-       - 你**必须仔细阅读价格参考库中各条目的 `remark` 备注说明**！
-       - 如果价格库某设备的 `remark` 中指明该价格为打包价、统价或包含多种规格的说明：
-         - 当标书清单中拆分出了多个属于该打包范围的分项规格时，**只允许在第一个对应匹配项中赋予参考单价 `ref_price`**；
-         - **对于已被上一项或打包项覆盖的后续规格/分项，其 `ref_price` 必须强制设为 0.0**！
-         - 在 `comparison_note` 中明确标注分析结论：说明该规格已包含在打包计价项目中，不重复计算成本。
-    3. 【物理数量与计价单位智能对齐规则 (严防漏算/少算数量)】：
-       - 当价格库参考设备的指导单价为单件/单台价格，而标书清单单位被填为了汇总打包单位时：
-       - 你必须核对标书原文规格描述中明确提到的具体物理数量总和。
-       - **你必须将 `qty` 修正设为实际物理数量的总和，并将 `unit` 调整设为单价对应的物理计价单位**！
-       - 绝对禁止在单价为单件价格时误将 `qty` 留为 1 导致最终总成本少算！
-    4. 【自有设备对比分析 (comparison_note)】：
-       - 请将【标书原文规格要求】与匹配到的【自有设备（价格库设备）的品牌/规格型号/厂商/备注】进行详细的参数与对标分析。
-       - 在 `comparison_note` 字段中写明具体的对比分析结论（指明标书参数与自有设备参数的对比关系及计价说明）。
-    5. 【智能语义同义词与大类设备通用匹配】：
-       请将标准 BOM 项目与“企业全维度价格参考库”中的设备进行通用语义比对：
-       - 若采购物品为抽象大类或同等功能替代物，必须识别并填充 matched_name, matched_brand, matched_model, matched_manufacturer，并参考其指导单价！
-    6. 【置信度划分】：
-       - 若名称、品牌或规格型号高度吻合，match_quality 标为 "精准匹配"；
-       - 若属于同类设备或同等替代物，match_quality 标为 "模糊匹配"；
-       - 若价格库中完全没有任何同类或相关设备，ref_price 强制设为 0，matched_name 留空，match_quality 标为 "未匹配"，warning 填 "未在价格库中找到参考价"。
-    7. 自动计算每项小计 subtotal = qty * ref_price。
-    8. 在 analysis_summary 中给出整体成本测算总结。
-    """
-
-    logger.debug("正在调用 LLM 进行智能 BOM 提取和全维度价格匹配...")
-    response_obj: CostAnalysisResult = llm_service.generate_structured_output(
-        prompt=prompt,
-        schema_cls=CostAnalysisResult,
-        temperature=0.0
-    )
-    
+    # 本地高保真组装：死锁还原原始字段、执行打包置零与高精度乘法
+    from app.utils.table_utils import normalize_section_name
     calculated_items = []
     total_cost = 0.0
     unmatched_count = 0
-    
-    for idx, item in enumerate(response_obj.items):
-        item_dict = item.model_dump()
-        
-        # 强行保护与死锁还原：设备原始名称 100% 保持与数据库记录完全一致，防大模型篡改添加 -1/-2 后缀
-        if equipment_list_from_db and idx < len(equipment_list_from_db):
-            orig_item = equipment_list_from_db[idx]
-            orig_name = orig_item.get("item_name") or orig_item.get("name")
-            if orig_name:
-                item_dict["name"] = orig_name
 
-        raw_qty = item_dict.get("qty")
-        ref_price = item_dict.get("ref_price", 0.0)
-        
-        # 兼容防护：若对标分析及备注明确标明已在上一项或打包项目中包含，确保单价不重复计算
-        note = item_dict.get("comparison_note", "")
-        if ("不重复" in note and "计算" in note) or ("合并" in note and "计价" in note) or ("已包含" in note and "统价" in note):
-            ref_price = 0.0
-            item_dict["ref_price"] = 0.0
+    if not equipment_list_from_db:
+        # 降级兜底处理：当 DB 中未预先提取设备清单时，直接根据 LLM 对标结果生成
+        for b_matches in batch_results:
+            for m in (b_matches or []):
+                ref_p = float(getattr(m, "ref_price", 0.0) or 0.0)
+                raw_q = getattr(m, "qty", 1.0)
+                safe_q = float(raw_q) if raw_q is not None else 1.0
+                subtot = getattr(m, "subtotal", None)
+                if subtot is None:
+                    subtot = round(safe_q * ref_p, 2)
+                else:
+                    subtot = float(subtot)
+                total_cost += subtot
+                m_name = getattr(m, "name", "") or getattr(m, "matched_name", "") or f"设备项_{getattr(m, 'item_index', 0)}"
+                calculated_items.append({
+                    "item_code": getattr(m, "item_code", None),
+                    "name": m_name,
+                    "spec_requirement": getattr(m, "spec_requirement", "") or "",
+                    "qty": safe_q,
+                    "unit": getattr(m, "unit", None) or orig_item.get("unit"),
+                    "parent_item": getattr(m, "parent_item", None),
+                    "root_item": getattr(m, "root_item", None),
+                    "tree_level": getattr(m, "tree_level", 1) or 1,
+                    "per_set_qty": getattr(m, "per_set_qty", None),
+                    "section_name": normalize_section_name(getattr(m, "section_name", None)),
+                    "key_parameters": getattr(m, "key_parameters", []) or [],
+                    "brand_requirements": getattr(m, "brand_requirements", "") or "",
+                    "matched_name": getattr(m, "matched_name", "") or m_name,
+                    "matched_brand": getattr(m, "matched_brand", "") or "",
+                    "matched_model": getattr(m, "matched_model", "") or "",
+                    "matched_manufacturer": getattr(m, "matched_manufacturer", "") or "",
+                    "ref_price": ref_p,
+                    "subtotal": subtot,
+                    "match_quality": getattr(m, "match_quality", "精准匹配") or "精准匹配",
+                    "warning": getattr(m, "warning", "") or "",
+                    "comparison_note": getattr(m, "comparison_note", "") or "",
+                })
+    else:
+        for batch_idx, b_items in enumerate(raw_batches):
+            b_matches = batch_results[batch_idx] or []
+            match_map = {}
+            for m in b_matches:
+                try:
+                    m_idx = int(m.item_index)
+                    match_map[m_idx] = m
+                except (ValueError, TypeError):
+                    continue
 
-        if raw_qty is not None:
-            try:
-                qty = float(raw_qty)
-                subtotal = round(qty * ref_price, 2)
-            except (ValueError, TypeError):
-                item_dict["qty"] = None
-                subtotal = 0.0
-        else:
-            item_dict["qty"] = None
-            subtotal = 0.0
+            for local_idx, orig_item in enumerate(b_items):
+                match_info = match_map.get(local_idx)
 
-        item_dict["subtotal"] = subtotal
-        
-        if ref_price <= 0:
-            unmatched_count += 1
-            item_dict["match_quality"] = "未匹配"
-            if not item_dict.get("warning"):
-                item_dict["warning"] = "未在价格库中找到参考价"
-                
-        total_cost += subtotal
-        calculated_items.append(item_dict)
+                # 1. 基础字段 100% 忠实死锁还原
+                item_name = orig_item.get("item_name") or orig_item.get("name") or "未命名项"
+                spec_req = orig_item.get("specifications") or orig_item.get("spec_requirement") or ""
+                raw_qty = orig_item.get("quantity") if orig_item.get("quantity") is not None else orig_item.get("qty")
+                unit = orig_item.get("unit")
+                parent = orig_item.get("parent_item")
+                root = orig_item.get("root_item")
+                tree_lvl = orig_item.get("tree_level") or 1
+                per_set = orig_item.get("per_set_quantity") if orig_item.get("per_set_quantity") is not None else orig_item.get("per_set_qty")
+                sec_name = normalize_section_name(orig_item.get("section_name"))
+                key_params = orig_item.get("key_parameters") or []
+                brand_req = orig_item.get("brand_requirements") or ""
 
-    total_cost = round(total_cost, 2)
+                # 2. 对标字段注入
+                ref_price = float(match_info.ref_price or 0.0) if match_info else 0.0
+                matched_name = match_info.matched_name if match_info else ""
+                matched_brand = match_info.matched_brand if match_info else ""
+                matched_model = match_info.matched_model if match_info else ""
+                matched_mfr = match_info.matched_manufacturer if match_info else ""
+                match_quality = match_info.match_quality if match_info else "未匹配"
+                note = match_info.comparison_note if match_info else ""
+                warning = match_info.warning if match_info else ""
+
+                # 3. 防重复打包计价置零安全保护
+                if ("不重复" in note and "计算" in note) or ("合并" in note and "计价" in note) or ("已包含" in note and "统价" in note) or ("已包含" in note and "打包" in note):
+                    ref_price = 0.0
+
+                # 4. 本地高精度小计计算
+                safe_qty = float(raw_qty) if raw_qty is not None else 1.0
+                subtotal = round(safe_qty * ref_price, 2)
+
+                if ref_price <= 0:
+                    unmatched_count += 1
+                    if match_quality not in ["精准匹配", "模糊匹配"]:
+                        match_quality = "未匹配"
+                    if not warning:
+                        warning = "企业价格库暂无参考指导单价"
+
+                total_cost += subtotal
+
+                item_dict = {
+                    "item_code": orig_item.get("item_code"),
+                    "name": item_name,
+                    "spec_requirement": spec_req,
+                    "qty": safe_qty,
+                    "unit": unit,
+                    "parent_item": parent,
+                    "root_item": root,
+                    "tree_level": tree_lvl,
+                    "per_set_qty": per_set,
+                    "section_name": sec_name,
+                    "key_parameters": key_params,
+                    "brand_requirements": brand_req,
+                    "matched_name": matched_name,
+                    "matched_brand": matched_brand,
+                    "matched_model": matched_model,
+                    "matched_manufacturer": matched_mfr,
+                    "ref_price": ref_price,
+                    "subtotal": subtotal,
+                    "match_quality": match_quality,
+                    "warning": warning,
+                    "comparison_note": note,
+                }
+                calculated_items.append(item_dict)
+
+    # 5. 执行自底向上树形层级汇总（计算成套母项小计与折合单价，并以顶层根节点汇总项目预估总成本）
+    from app.services.cost_service import rollup_hierarchical_cost_items
+    calculated_items, total_cost, unmatched_count = rollup_hierarchical_cost_items(calculated_items)
     
     # 预算对比与风险预警
     budget_status = "预算未设置"
@@ -257,19 +508,75 @@ def cost_node(state: BiddingState) -> dict:
         from app.db.models.ai_analysis import CostEstimate
         # 清理该文档已有的旧测算记录
         db.query(CostEstimate).filter(CostEstimate.document_id == document_id).delete()
-        for item in calculated_items:
+
+        def _optional_float(value):
+            if value is None or value == "":
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _optional_int(value):
+            if value is None or value == "":
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        for sort_order, item in enumerate(calculated_items):
+            raw_item_qty = item.get("qty")
+            safe_qty = float(raw_item_qty) if raw_item_qty is not None else 1.0
+            raw_unit_price = item.get("matched_ref_price") or item.get("ref_price") or 0.0
+            try:
+                safe_unit_price = float(raw_unit_price)
+            except (ValueError, TypeError):
+                safe_unit_price = 0.0
+                
+            raw_subtotal = item.get("subtotal") or 0.0
+            try:
+                safe_subtotal = float(raw_subtotal)
+            except (ValueError, TypeError):
+                safe_subtotal = 0.0
+                
+            # 提取品牌、型号与生产厂商（仅采用对标匹配或用户填写的品牌、型号与厂家，无则直接留空，严禁回退采用标书要求文字）
+            effective_brand = str(item.get("matched_brand") or item.get("brand") or "").strip()
+            effective_model = str(item.get("matched_model") or item.get("model") or "").strip()
+            effective_mfg = str(item.get("matched_manufacturer") or item.get("manufacturer") or "").strip()
+
             est = CostEstimate(
                 tenant_id=tenant_id,
                 document_id=document_id,
                 project_id=document.project_id if document else None,
-                item_name=item.get("name", "未命名项"),
-                quantity=float(item.get("qty", 1.0)),
-                unit=item.get("unit", "台"),
-                unit_price=float(item.get("matched_ref_price", 0.0) or item.get("ref_price", 0.0)),
-                calculated_total=float(item.get("subtotal", 0.0)),
-                brand=item.get("brand_requirements", ""),
-                spec=item.get("spec_requirement", ""),
-                remark=item.get("comparison_note", "") or item.get("warning", "")
+                item_code=str(item.get("item_code") or "").strip() or None,
+                item_name=str(item.get("name") or "未命名项"),
+                quantity=safe_qty,
+                unit=str(item.get("unit")) if item.get("unit") is not None else None,
+                unit_price=safe_unit_price,
+                calculated_total=safe_subtotal,
+                brand=effective_brand or None,
+                model=effective_model or None,
+                manufacturer=effective_mfg or None,
+                spec=effective_model or None,
+                spec_requirement=str(item.get("spec_requirement") or "").strip() or None,
+                matched_name=str(item.get("matched_name") or "").strip() or None,
+                matched_brand=str(item.get("matched_brand") or "").strip() or None,
+                matched_model=str(item.get("matched_model") or "").strip() or None,
+                matched_manufacturer=str(item.get("matched_manufacturer") or "").strip() or None,
+                key_parameters=item.get("key_parameters") or [],
+                brand_requirements=str(item.get("brand_requirements") or "").strip() or None,
+                match_quality=str(item.get("match_quality") or "").strip() or None,
+                warning=str(item.get("warning") or "").strip() or None,
+                comparison_note=str(item.get("comparison_note") or "").strip() or None,
+                parent_item=str(item.get("parent_item") or "").strip() or None,
+                root_item=str(item.get("root_item") or "").strip() or None,
+                tree_level=_optional_int(item.get("tree_level")),
+                per_set_qty=_optional_float(item.get("per_set_qty")),
+                per_set_quantity=_optional_float(item.get("per_set_quantity") or item.get("per_set_qty")),
+                section_name=str(item.get("section_name") or "") if item.get("section_name") else None,
+                remark=str(item.get("comparison_note") or item.get("warning") or ""),
+                sort_order=sort_order,
             )
             db.add(est)
         db.commit()
@@ -292,7 +599,7 @@ def cost_node(state: BiddingState) -> dict:
             "limit_type": limit_type,
             "budget_status": budget_status,
             "unmatched_count": unmatched_count,
-            "analysis_summary": response_obj.analysis_summary,
+            "analysis_summary": overall_summary or "已完成各批次设备成本测算",
             "items": calculated_items
         },
         "completed_steps": ["cost_estimation"],

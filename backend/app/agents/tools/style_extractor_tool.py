@@ -6,6 +6,9 @@
 import os
 import docx
 from typing import List, Dict, Any, Optional
+from docx.document import Document as DocxDocument
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from langchain_core.tools import tool
 from loguru import logger
 
@@ -60,6 +63,43 @@ def resolve_document_file_path(target: str) -> Optional[str]:
     return None
 
 
+def _iter_document_blocks(document: DocxDocument):
+    """按 Word 文档实际顺序遍历正文段落和表格，避免章节上下文错位。"""
+    body = document.element.body
+    for element in body.iterchildren():
+        if element.tag.endswith("}p"):
+            yield Paragraph(element, document)
+        elif element.tag.endswith("}tbl"):
+            yield Table(element, document)
+
+
+def _iter_table_paragraphs(table: Table):
+    """遍历表格所有单元格中的段落，覆盖响应对照表等表格内容。"""
+    for row in table.rows:
+        for cell in row.cells:
+            yield from cell.paragraphs
+
+
+def _match_style(run: Any, style_type: str) -> bool:
+    """判断单个 Run 是否符合指定的字体样式。"""
+    is_bold = bool(run.bold)
+    is_italic = bool(run.italic)
+    is_underline = bool(run.underline)
+
+    if style_type == "italic_underline":
+        return is_italic and is_underline
+    if style_type == "bold":
+        return is_bold
+    if style_type == "italic":
+        return is_italic
+    if style_type == "underline":
+        return is_underline
+    if style_type == "bold_red":
+        color_rgb = str(run.font.color.rgb) if (run.font and run.font.color and run.font.color.rgb) else ""
+        return is_bold and "FF0000" in color_rgb.upper()
+    return False
+
+
 @tool
 def extract_text_by_style(
     document_id: Optional[str] = None,
@@ -104,48 +144,40 @@ def extract_text_by_style(
         current_chapter = "未分类章节"
         matched_results: List[Dict[str, str]] = []
 
-        for p in doc.paragraphs:
-            text = p.text.strip()
+        def collect_paragraph_matches(paragraph: Paragraph, chapter: str) -> None:
+            """收集单个段落中符合样式的 Run。"""
+            text = paragraph.text.strip()
             if not text:
-                continue
+                return
 
-            # 判断并记录当前段落归属的章节
-            style_name = p.style.name.lower() if p.style else ""
-            if "heading" in style_name or text.startswith(("第", "附")):
-                current_chapter = text
+            if chapter_keyword and chapter_keyword not in chapter and chapter_keyword not in text:
+                return
 
-            # 章节关键字过滤：如果指定了 chapter_keyword，且当前章节名不包含关键字，跳过
-            if chapter_keyword and chapter_keyword not in current_chapter and chapter_keyword not in text:
-                continue
-
-            for run in p.runs:
+            for run in paragraph.runs:
                 r_text = run.text.strip()
-                if not r_text:
-                    continue
-
-                is_bold = bool(run.bold)
-                is_italic = bool(run.italic)
-                is_underline = bool(run.underline)
-
-                is_match = False
-                if style_type == "italic_underline" and is_italic and is_underline:
-                    is_match = True
-                elif style_type == "bold" and is_bold:
-                    is_match = True
-                elif style_type == "italic" and is_italic:
-                    is_match = True
-                elif style_type == "underline" and is_underline:
-                    is_match = True
-                elif style_type == "bold_red":
-                    color_rgb = str(run.font.color.rgb) if (run.font and run.font.color and run.font.color.rgb) else ""
-                    if is_bold and "FF0000" in color_rgb.upper():
-                        is_match = True
-
-                if is_match:
+                if r_text and _match_style(run, style_type):
                     matched_results.append({
-                        "chapter": current_chapter,
+                        "chapter": chapter,
                         "text": r_text
                     })
+
+        for block in _iter_document_blocks(doc):
+            if isinstance(block, Paragraph):
+                p = block
+                text = p.text.strip()
+                if not text:
+                    continue
+
+                # 章节标题只从正文段落识别，避免表格中的“第1项”等内容误切换章节。
+                style_name = p.style.name.lower() if p.style else ""
+                if "heading" in style_name or text.startswith(("第", "附")):
+                    current_chapter = text
+
+                collect_paragraph_matches(p, current_chapter)
+            else:
+                # 表格属于当前位置的章节，逐单元格保留 Run 级字体样式。
+                for cell_paragraph in _iter_table_paragraphs(block):
+                    collect_paragraph_matches(cell_paragraph, current_chapter)
 
         if not matched_results:
             chapter_info = f"在章节 [{chapter_keyword}] 中" if chapter_keyword else "在全篇文档中"

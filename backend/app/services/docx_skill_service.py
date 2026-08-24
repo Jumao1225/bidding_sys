@@ -243,7 +243,7 @@ class DocxSkillService:
     def extract_comments(self, docx_bytes: bytes) -> List[Dict[str, Any]]:
         """
         抓取 Word 文档 (word/comments.xml) 中的所有审阅批注信息
-        返回结构化字典列表: [{"id": "1", "author": "张三", "date": "2026-07-24", "text": "此处项目预算需复核"}]
+        返回结构化字典列表: [{"id": "1", "author": "[批注人]", "date": "YYYY-MM-DD", "text": "[批注内容]"}]
         """
         comments: List[Dict[str, Any]] = []
         if not docx_bytes:

@@ -66,3 +66,26 @@ def test_add_formatted_text_to_paragraph_should_support_italic_and_underline():
     assert any("斜体文本" in r.text for r in italic_runs)
     assert any("斜体二" in r.text for r in italic_runs)
 
+
+def test_export_bid_format_with_html_table_should_render_word_table():
+    """测试将包含 HTML <table> 的段落正确转换为 Word 表格"""
+    structure = BidFormatStructure(
+        document_title="HTML表格测试 - 投标文件格式",
+        source_chapter_name="第六章 投标文件格式",
+        sections=[
+            BidFormatSection(
+                section_title="开标一览表",
+                content_type=ContentTypeEnum.FORM_TABLE,
+                body_markdown="<table><tr><td>项目名称</td><td>总价(元)</td></tr><tr><td>渔光互补项目</td><td>43520000</td></tr></table>",
+                placeholders=[]
+            )
+        ]
+    )
+
+    docx_bytes = docx_exporter_service.export_bid_format_to_docx_bytes(structure)
+    doc = Document(io.BytesIO(docx_bytes))
+    assert len(doc.tables) == 1
+    assert doc.tables[0].rows[0].cells[0].text == "项目名称"
+    assert doc.tables[0].rows[1].cells[1].text == "43520000"
+
+

@@ -161,6 +161,26 @@ class DocxExporterService:
 
                     for line in lines:
                         clean_line = line.strip()
+
+                        # 解析 HTML <table> 节点并转为原生 Word 表格
+                        if '<table' in clean_line.lower() or '<tr>' in clean_line.lower():
+                            if in_table and table_rows_data:
+                                self._render_table_from_data(doc, table_rows_data)
+                                table_rows_data = []
+                                in_table = False
+                            import re
+                            trs = re.findall(r'<tr.*?>(.*?)</tr>', clean_line, re.DOTALL | re.IGNORECASE)
+                            if trs:
+                                html_rows = []
+                                for tr in trs:
+                                    tds = re.findall(r'<t[dh].*?>(.*?)</t[dh]>', tr, re.DOTALL | re.IGNORECASE)
+                                    clean_tds = [re.sub(r'<.*?>', '', td).strip() for td in tds]
+                                    if clean_tds:
+                                        html_rows.append(clean_tds)
+                                if html_rows:
+                                    self._render_table_from_data(doc, html_rows)
+                                    continue
+
                         # 解析 Markdown 表格 (包含 | 的行)
                         if clean_line.startswith('|') and clean_line.endswith('|'):
                             # 过滤分隔行如 |---|---|

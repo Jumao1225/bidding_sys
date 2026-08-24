@@ -135,3 +135,236 @@ async def test_update_cost_analysis_with_financial_max_price_limit_exceeded():
     finally:
         app.dependency_overrides.clear()
 
+@pytest.mark.asyncio
+async def test_update_cost_analysis_with_section_name():
+    """测试多区域/分标段场景下，section_name 字段的正确传递、自愈与持久化"""
+    mock_user = MagicMock()
+    mock_user.id = "user-test-999"
+    mock_user.tenant_id = "tenant-test-888"
+    app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+    mock_doc = MagicMock()
+    mock_doc.project_id = "proj-123"
+    mock_doc.parsed_metadata = {}
+
+    payload = {
+        "items": [
+            {
+                "name": "光伏组件 635Wp",
+                "spec_requirement": "单晶硅正A级",
+                "qty": 956,
+                "unit": "块",
+                "ref_price": 880.0,
+                "section_name": "斜桥工业二区",
+                "match_quality": "精准匹配"
+            },
+            {
+                "name": "光伏组件 635Wp",
+                "spec_requirement": "单晶硅正A级",
+                "qty": 384,
+                "unit": "块",
+                "ref_price": 880.0,
+                "section_name": "斜桥工业园区",
+                "match_quality": "精准匹配"
+            }
+        ],
+        "analysis_summary": "两区域光伏组件分项核算"
+    }
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("sqlalchemy.orm.attributes.flag_modified"):
+            
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.put("/api/v1/analysis/doc-section-1/cost-analysis", json=payload)
+                
+                assert res.status_code == 200
+                res_json = res.json()
+                data = res_json["data"]
+                
+                assert len(data["items"]) == 2
+                assert data["items"][0]["section_name"] == "斜桥工业二区"
+                assert data["items"][0]["qty"] == 956
+                assert data["items"][1]["section_name"] == "斜桥工业园区"
+                assert data["items"][1]["qty"] == 384
+                # 956*880 + 384*880 = (956+384)*880 = 1340*880 = 1179200.0
+                assert data["total_cost"] == 1179200.0
+                
+                saved_cost = mock_doc.parsed_metadata["cost_analysis"]
+                assert saved_cost["items"][0]["section_name"] == "斜桥工业二区"
+                assert saved_cost["items"][1]["section_name"] == "斜桥工业园区"
+    finally:
+        app.dependency_overrides.clear()
+
+@pytest.mark.asyncio
+async def test_update_cost_analysis_hierarchical_rollup_for_parent_items():
+    """测试多级 BOM 成套母项自底向上自动汇总子项总价、计算折合单价并防双重计费"""
+    mock_user = MagicMock()
+    mock_user.id = "user-test-999"
+    mock_user.tenant_id = "tenant-test-888"
+    app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+    mock_doc = MagicMock()
+    mock_doc.project_id = "proj-123"
+    mock_doc.parsed_metadata = {}
+
+    # 模拟“导体和导线”成套主标的物及其下属 3 个子项（电缆、终端等）
+    payload = {
+        "items": [
+            {
+                "name": "导体和导线",
+                "spec_requirement": "成套主标的物，含多规格电缆及终端",
+                "qty": 1,
+                "unit": "项",
+                "ref_price": 0.0,
+                "parent_item": None,
+                "tree_level": 1,
+                "match_quality": "未匹配"
+            },
+            {
+                "name": "10kV交流电缆 3*300",
+                "spec_requirement": "ZC-YJV22-8.7/15kV-3*300",
+                "qty": 200,
+                "unit": "米",
+                "ref_price": 920.61,
+                "parent_item": "导体和导线",
+                "tree_level": 2,
+                "match_quality": "手动修改"
+            },
+            {
+                "name": "10kV交流电缆 3*70",
+                "spec_requirement": "ZC-YJV22-8.7/15kV-3*70",
+                "qty": 700,
+                "unit": "米",
+                "ref_price": 330.0,
+                "parent_item": "导体和导线",
+                "tree_level": 2,
+                "match_quality": "手动修改"
+            },
+            {
+                "name": "10kV交流电缆终端",
+                "spec_requirement": "户内配合 3*300",
+                "qty": 4,
+                "unit": "套",
+                "ref_price": 3650.0,
+                "parent_item": "导体和导线",
+                "tree_level": 2,
+                "match_quality": "手动修改"
+            }
+        ],
+        "analysis_summary": "已填写电缆及终端子项价格"
+    }
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("sqlalchemy.orm.attributes.flag_modified"):
+            
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.put("/api/v1/analysis/doc-rollup-1/cost-analysis", json=payload)
+                
+                assert res.status_code == 200
+                res_json = res.json()
+                data = res_json["data"]
+                
+                items = data["items"]
+                # 子项金额计算：
+                # 200 * 920.61 = 184122.0
+                # 700 * 330.0 = 231000.0
+                # 4 * 3650.0 = 14600.0
+                # 汇总 = 184122.0 + 231000.0 + 14600.0 = 429722.0
+                expected_rollup_subtotal = 429722.0
+                
+                # 验证母项“导体和导线”自动获得了子项汇总小计与折算单价
+                parent_node = items[0]
+                assert parent_node["name"] == "导体和导线"
+                assert parent_node["subtotal"] == expected_rollup_subtotal
+                assert parent_node["ref_price"] == expected_rollup_subtotal  # qty=1 时单价等于小计
+                assert parent_node["match_quality"] == "成套汇总"
+                
+                # 验证预估总成本（严格等于母项根节点金额，不重复计费）
+                assert data["total_cost"] == expected_rollup_subtotal
+    finally:
+        app.dependency_overrides.clear()
+
+@pytest.mark.asyncio
+async def test_update_cost_analysis_with_custom_brand_model_should_persist_fields():
+    """测试手动更新与新增分项时，品牌、规格型号、生产厂家字段能够正确解析并持久化落盘"""
+    mock_user = MagicMock()
+    mock_user.id = "user-test-999"
+    mock_user.tenant_id = "tenant-test-888"
+    app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+    mock_doc = MagicMock()
+    mock_doc.project_id = "proj-123"
+    mock_doc.parsed_metadata = {}
+
+    payload = {
+        "items": [
+            {
+                "name": "组串式逆变器",
+                "spec_requirement": "110kW 组串式逆变器",
+                "qty": 5,
+                "unit": "台",
+                "ref_price": 28000.0,
+                "matched_name": "组串式逆变器",
+                "matched_brand": "华为",
+                "matched_model": "SUN2000-110KTL",
+                "matched_manufacturer": "华为技术有限公司",
+                "match_quality": "手动修改"
+            },
+            {
+                "name": "深化设计+屋面承载力验算",
+                "spec_requirement": "具备电力、结构双资质设计院出具",
+                "qty": 1,
+                "unit": "项",
+                "ref_price": 16000.0,
+                "brand": "自定义",
+                "model": "标准验算服务",
+                "manufacturer": "某建筑设计研究院",
+                "match_quality": "手动添加"
+            }
+        ],
+        "analysis_summary": "已补充品牌、型号与生产厂家信息。"
+    }
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("sqlalchemy.orm.attributes.flag_modified"):
+            
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.put("/api/v1/analysis/doc-brand-model/cost-analysis", json=payload)
+                
+                assert res.status_code == 200
+                res_json = res.json()
+                data = res_json["data"]
+                
+                # 验证返回的数据结构包含正确的品牌、型号与厂商
+                items = data["items"]
+                assert len(items) == 2
+                
+                assert items[0]["matched_brand"] == "华为"
+                assert items[0]["matched_model"] == "SUN2000-110KTL"
+                assert items[0]["matched_manufacturer"] == "华为技术有限公司"
+                
+                assert items[1]["matched_brand"] == "自定义"
+                assert items[1]["matched_model"] == "标准验算服务"
+                assert items[1]["matched_manufacturer"] == "某建筑设计研究院"
+                
+                # 验证 mock_doc 中的 parsed_metadata 正确持久化
+                saved_cost = mock_doc.parsed_metadata["cost_analysis"]
+                saved_items = saved_cost["items"]
+                assert saved_items[0]["matched_brand"] == "华为"
+                assert saved_items[0]["matched_model"] == "SUN2000-110KTL"
+                assert saved_items[0]["matched_manufacturer"] == "华为技术有限公司"
+                assert saved_items[1]["matched_brand"] == "自定义"
+                assert saved_items[1]["matched_model"] == "标准验算服务"
+                assert saved_items[1]["matched_manufacturer"] == "某建筑设计研究院"
+    finally:
+        app.dependency_overrides.clear()
+
+
+
+

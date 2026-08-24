@@ -4,6 +4,10 @@ import json
 import logging
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 from app.db.session import SessionLocal
 from app.db.models.project import Document
@@ -23,15 +27,15 @@ def test_engineering():
             
         print(f"✅ 找到测试文档: {doc.filename} (ID: {doc.id})")
         
-        search_keywords = "主要设备 规格 星号参数 标准 规范 样品 测试报告 CMA CNAS 现场施工难点 注意事项"
+        search_keywords = "主要设备 规格参数 货物需求表 技术规格书 工程量清单 采购清单 材质尺寸 参数要求 项目需求 分项清单 设备明细 特殊工况 现场施工难点 注意事项"
         print(f"🔍 正在使用 RAG 从数据库中检索相关上下文 (关键词: {search_keywords})...")
         
         context = rag_service.search_bidding_document(
             document_id=doc.id,
             query=search_keywords,
-            top_k=3,
+            top_k=10,
             section_title="项目需求",  # 强行限定仅在“项目需求”相关章节中检索
-            context_mode="window",
+            context_mode="chapter",
             query_mode="split"
         )
         

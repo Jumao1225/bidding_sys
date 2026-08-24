@@ -24,6 +24,8 @@ from app.agents.bid_filler_agent import (
     should_repair,
     BidFillerState,
 )
+from app.agents.bid_filler_workers import _build_worker_tools
+from app.agents.tools.writer_tools import WRITER_TOOLS
 from app.mcp.office_cli_server import officecli_create_docx
 from app.services.office_cli_service import office_cli_service
 
@@ -95,8 +97,35 @@ def test_get_all_office_cli_agent_tools_count_should_be_six():
     assert len(tools) == 6
 
 
-def test_supervisor_audit_node_should_pass_when_no_unfilled_slots():
-    """测试 Supervisor 质量审查：无未填槽位时直接通过"""
+def test_all_bid_writing_worker_roles_should_receive_style_extractor_tool():
+    """测试标书撰写 Worker 的所有角色工具包均包含格式识别工具"""
+    role_cases = [
+        ("报价表", "pricing", "needs_data"),
+        ("实质性要求响应对照表", "deviation", "needs_data"),
+        ("资格审查表", "qualification", "needs_data"),
+        ("投标函", "bid_letter", "needs_fill"),
+        ("其他固定格式表单", "_unknown", "needs_fill"),
+    ]
+
+    for chapter_title, mapping_hint, category in role_cases:
+        tools = _build_worker_tools(
+            docx_temp_path="/tmp/bid-writing-tool-test.docx",
+            chapter_title=chapter_title,
+            mapping_hint=mapping_hint,
+            category=category,
+        )
+        assert any(tool.name == "extract_text_by_style" for tool in tools), (
+            f"章节 [{chapter_title}] 的 Worker 未分配 extract_text_by_style"
+        )
+
+
+def test_writer_tools_should_expose_style_extractor_tool():
+    """测试通用标书写作工具集暴露格式识别工具"""
+    assert any(tool.name == "extract_text_by_style" for tool in WRITER_TOOLS)
+
+
+def test_supervisor_audit_node_should_block_when_artifact_is_missing():
+    """测试 Supervisor 质量审查：缺少工作副本时必须阻断发布"""
     state: BidFillerState = {
         "document_id": "doc123",
         "original_context": "",
@@ -119,7 +148,8 @@ def test_supervisor_audit_node_should_pass_when_no_unfilled_slots():
     }
 
     result = supervisor_audit_node(state)
-    assert result.get("audit_passed") is True
+    assert result.get("audit_passed") is False
+    assert result.get("audit_blocked") is True
 
 
 def test_should_repair_routing_logic():
@@ -129,6 +159,9 @@ def test_should_repair_routing_logic():
 
     state_fail: BidFillerState = {"audit_passed": False}  # type: ignore
     assert should_repair(state_fail) == "agent_fill_node"
+
+    state_blocked: BidFillerState = {"audit_passed": False, "audit_blocked": True}  # type: ignore
+    assert should_repair(state_blocked) == "blocked_docx_node"
 
 
 def test_parse_proposals_should_skip_info_tables_and_extract_valid_table_rows():
@@ -342,6 +375,114 @@ def test_fill_docx_proposals_in_dom_formatted_json_matrix_deviation_table_should
         assert "直流电缆" in r4_cells[1]
         assert "江南品牌" in r4_cells[2]
 
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_partial_deviation_matrix_should_not_erase_later_cell_proposals():
+    """局部整表矩阵与单元格提案并存时，不能清空矩阵之后的已有数据行。"""
+    import tempfile
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    table = doc.add_table(rows=23, cols=5)
+    headers = ["序号", "招标文件商务条款中的要求", "投标文件对应要求的服务承诺", "有无偏离", "偏离内容及原因"]
+    for c_idx, header in enumerate(headers):
+        table.rows[0].cells[c_idx].text = header
+
+    # 预置 22 行完整内容，模拟前一轮已经写入的结果。
+    for r_idx in range(1, 23):
+        values = [str(r_idx), f"原条款-{r_idx}", f"原承诺-{r_idx}", "无", "原偏离说明"]
+        for c_idx, value in enumerate(values):
+            table.rows[r_idx].cells[c_idx].text = value
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+        partial_matrix = [
+            [str(i), f"新条款-{i}", f"新承诺-{i}", "无", "完全响应招标文件要求，无偏离。"]
+            for i in range(6, 16)
+        ]
+        proposals = [
+            {
+                "path": "/body/tbl[1]",
+                "proposed_text": json.dumps(partial_matrix, ensure_ascii=False),
+                "type": "table_rows",
+                "chapter_title": "商务条款响应及偏离表",
+            },
+            {
+                "path": "/body/tbl[1]/tr[13]/tc[3]",
+                "proposed_text": "补写第12行承诺",
+                "type": "text",
+                "chapter_title": "商务条款响应及偏离表",
+            },
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+        assert count >= 11
+
+        result = Document(temp_path).tables[0]
+        assert len(result.rows) == 23
+        # 矩阵从序号 6 开始，必须按序号写入对应行；矩阵之后的行不能被清理。
+        assert result.rows[1].cells[2].text.strip() == "原承诺-1"
+        assert result.rows[6].cells[1].text.strip() == "新条款-6"
+        assert result.rows[10].cells[2].text.strip() == "新承诺-10"
+        assert result.rows[11].cells[1].text.strip() == "新条款-11"
+        assert result.rows[11].cells[2].text.strip() == "新承诺-11"
+        assert result.rows[12].cells[1].text.strip() == "新条款-12"
+        assert result.rows[12].cells[2].text.strip() == "补写第12行承诺"
+        assert result.rows[16].cells[2].text.strip() == "原承诺-16"
+        assert result.rows[19].cells[2].text.strip() == "原承诺-20"
+        assert result.rows[19].cells[3].text.strip() == "无"
+        assert result.rows[19].cells[4].text.strip() == "原偏离说明"
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_full_deviation_matrix_should_trim_stale_rows_and_fill_all_columns():
+    """完整的无序号商务矩阵应覆盖旧表，不保留历史追加行或空列。"""
+    import tempfile
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    table = doc.add_table(rows=43, cols=5)
+    headers = ["序号", "招标文件商务条款中的要求", "投标文件对应要求的服务承诺", "有无偏离", "偏离内容及原因"]
+    for c_idx, header in enumerate(headers):
+        table.rows[0].cells[c_idx].text = header
+    for r_idx in range(1, 43):
+        for c_idx, value in enumerate([str(r_idx), f"旧条款-{r_idx}", f"旧承诺-{r_idx}", "无", "旧说明"]):
+            table.rows[r_idx].cells[c_idx].text = value
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+        matrix = [
+            [f"对应商务条款-{i}", f"我方承诺-{i}", "无", "完全响应招标文件要求，无偏离。"]
+            for i in range(1, 33)
+        ]
+        matrix[-1][0] = "履约保证金：合同总价款的10%"
+        proposals = [{
+            "path": "/body/tbl[1]",
+            "proposed_text": json.dumps(matrix, ensure_ascii=False),
+            "type": "table_rows",
+            "chapter_title": "商务条款响应及偏离表",
+        }]
+
+        fill_docx_proposals_in_dom(temp_path, proposals)
+        result = Document(temp_path).tables[0]
+        assert len(result.rows) == 33
+        for r_idx in range(1, 33):
+            values = [cell.text.strip() for cell in result.rows[r_idx].cells]
+            assert values[0] == str(r_idx)
+            assert all(values)
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -920,11 +1061,3 @@ def test_fill_docx_proposals_in_dom_hierarchical_pricing_table_exact_alignment_a
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-
-
-
-
-
-
-
-

@@ -55,8 +55,6 @@ export const DraftCard: React.FC<DraftCardProps> = ({
       }
 
       const modeHeader = response.headers.get('X-Extraction-Mode');
-      const modeText = modeHeader === 'native_docx' ? '原生 Word 切片' : 'LLM 结构化重建';
-
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -67,7 +65,13 @@ export const DraftCard: React.FC<DraftCardProps> = ({
       a.remove();
       window.URL.revokeObjectURL(url);
 
-      setDownloadNotice(`✅ 全套《投标文件格式》提取完成（模式: ${modeText}），已导出 Word！`);
+      if (modeHeader === 'fallback_template') {
+        setDownloadNotice('⚠️ 提示：未在原标书中精准提取到格式章节，已自动导出通用托底格式模板 Word 文件！');
+      } else if (modeHeader === 'native_docx') {
+        setDownloadNotice('✅ 全套《投标文件格式》提取完成（模式: 原生 Word 切片），已导出 Word！');
+      } else {
+        setDownloadNotice('✅ 全套《投标文件格式》提取完成（模式: LLM 结构化重建），已导出 Word！');
+      }
       setTimeout(() => setDownloadNotice(null), 5000);
     } catch (err: any) {
       setDownloadNotice(`❌ 提取投标文件格式失败: ${err.message || '未知错误'}`);

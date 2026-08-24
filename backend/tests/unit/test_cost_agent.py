@@ -169,3 +169,61 @@ def test_cost_node_with_financial_metadata_max_limit_exceeded(
     assert cost_data["limit_type"] == "max_price_limit"
     assert "已超出最高投标限价" in cost_data["budget_status"]
     assert "5,000.00" in cost_data["budget_status"] or "5000" in cost_data["budget_status"]
+
+def test_filter_candidate_price_book_with_large_database():
+    """测试当企业价格库条数庞大时，算法能够根据当前批次设备特征精准召回高相关候选物料"""
+    from app.agents.nodes.cost_agent import filter_candidate_price_book
+
+    # 构造一个包含 200 条不同类型设备的大型模拟价格库
+    large_price_book = []
+    # 干扰项 100 项
+    for i in range(100):
+        large_price_book.append({
+            "item_name": f"无关线缆材料_{i}",
+            "spec": f"规格_{i}",
+            "model": f"Model_{i}",
+            "brand": "某品牌",
+            "unit_price": float(100 + i)
+        })
+    # 目标项：变压器与断路器
+    large_price_book.append({
+        "item_name": "10kV油浸式变压器",
+        "spec": "2000kVA 10/0.4kV",
+        "model": "S13-M-2000",
+        "brand": "特变电工",
+        "unit_price": 65000.0
+    })
+    large_price_book.append({
+        "item_name": "真空断路器",
+        "spec": "12kV 630A 25kA",
+        "model": "ZN63A-12",
+        "brand": "ABB",
+        "unit_price": 7500.0
+    })
+    # 更多干扰项 98 项
+    for i in range(100, 198):
+        large_price_book.append({
+            "item_name": f"无关监控摄像头_{i}",
+            "spec": f"镜头_{i}",
+            "model": f"IPC_{i}",
+            "brand": "海康",
+            "unit_price": float(500 + i)
+        })
+
+    assert len(large_price_book) == 200
+
+    # 当前批次待核算设备：包含变压器与断路器
+    batch_items = [
+        {"item_name": "2000kVA光伏升压箱变", "specifications": "2000kVA, 10kV", "quantity": 4.0},
+        {"item_name": "高压真空断路器", "specifications": "12kV, 630A, 25kA", "quantity": 4.0}
+    ]
+
+    # 执行动态候选筛选 (设定最大候选 10 项)
+    candidates = filter_candidate_price_book(batch_items, large_price_book, max_candidates=10)
+    assert len(candidates) <= 10
+
+    candidate_names = [c["item_name"] for c in candidates]
+    # 验证关键的变压器与断路器 100% 成功排在候选库前列
+    assert "10kV油浸式变压器" in candidate_names
+    assert "真空断路器" in candidate_names
+

@@ -138,3 +138,39 @@ def test_fill_docx_proposals_in_dom_table_collision_guard_should_redirect_and_pr
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+def test_get_chapter_specific_table_indices_cover_and_text_chapters_should_return_empty():
+    """验证封面、公文文本等不含表格的章节，绝不会被错误绑定到文档后面的任何表格。"""
+    doc = Document()
+
+    # 1. 封面（纯文本，无表格）
+    doc.add_paragraph("投标文件封面")
+    doc.add_paragraph("项目名称：XXX工程")
+    doc.add_paragraph("投标人：XXX公司")
+
+    # 2. 投标函（纯文本，无表格）
+    doc.add_paragraph("一、投标函格式")
+    doc.add_paragraph("致：招标人...")
+
+    # 3. 商务偏离表（包含表格 0）
+    doc.add_paragraph("十二、商务条款响应及偏离表")
+    t1 = doc.add_table(rows=2, cols=5)
+    t1.rows[0].cells[0].text = "序号"
+    t1.rows[0].cells[1].text = "招标文件商务条款"
+    t1.rows[0].cells[2].text = "投标响应"
+    t1.rows[0].cells[3].text = "有无偏离"
+    t1.rows[0].cells[4].text = "说明"
+
+    # 断言 1: 封面绝不应匹配到任何表格
+    cover_indices = get_chapter_specific_table_indices(doc, "封面")
+    assert cover_indices == []
+
+    # 断言 2: 投标函格式绝不应匹配到任何表格
+    letter_indices = get_chapter_specific_table_indices(doc, "投标函格式")
+    assert letter_indices == []
+
+    # 断言 3: 商务偏离表必须精准命中表格 0
+    dev_indices = get_chapter_specific_table_indices(doc, "商务条款响应及偏离表")
+    assert dev_indices == [0]
+

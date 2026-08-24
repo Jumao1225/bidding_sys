@@ -225,14 +225,71 @@ def clean_row_vmerge(row):
                     pass
 
 
+def is_fixed_slot_form_table(table, header_rows_count: int = 1) -> bool:
+    """
+    通过纯结构与排版特征智能判定 Word 表格是否为“固定单元格填报表（Fixed-Slot Form Table）”。
+    【零硬编码原则】：不依赖任何硬编码的章节名称、固定项目名或写死的价格标签，而是基于表格几何拓扑与单元格预置形态判定：
+
+    1. 【行数规模小且结构封闭】：
+       - 扣除表头后，数据行通常只有 1 行；
+       - 或总行数较少（如数据行 1 行 + 1 行跨列合并的表尾/汇总/落款行）；
+    2. 【预置内容与特定槽位】：
+       - 数据行中已预印有特定的描述性文本/属性标签，并非全空的列表占位行；
+       - 仅有局部特定单元格处于空白或待填状态；
+    3. 【非动态清单结构】：
+       - 动态清单表通常表头包含多列明细属性（如序号、品名、规格、数量、单价、合价等），且数据区留有较大空白占位行以供展开。
+    """
+    if table is None or not hasattr(table, 'rows') or not table.rows:
+        return False
+
+    total_rows = len(table.rows)
+    if total_rows <= 1:
+        return True
+
+    hdr_count = max(1, min(header_rows_count, total_rows - 1))
+    data_rows = table.rows[hdr_count:]
+    if not data_rows:
+        return True
+
+    first_data_cells = [c.text.strip() for c in data_rows[0].cells]
+    has_pre_printed_content = any(len(txt) >= 2 for txt in first_data_cells)
+
+    # 1. 结构判定：如果有效数据行仅有 1 行，且已预印了具体描述内容（而非纯空占位行）
+    if len(data_rows) == 1:
+        return has_pre_printed_content
+
+    # 2. 如果数据行仅有 2 行，且最后一行存在跨列合并特征（如跨多列合并的汇总或落款行）
+    if len(data_rows) == 2:
+        total_cols = len(table.rows[0].cells)
+        last_row_unique_tcs = set(c._tc for c in data_rows[-1].cells)
+        if len(last_row_unique_tcs) < total_cols:
+            # 只有当首个数据行已经预印了具体项目内容时，才作为固定表单；若首行全为空白占位，则是带表尾的动态清单表
+            return has_pre_printed_content
+
+    # 3. 检查首个数据行是否预置了具体文字内容（非纯空白占位行）且总数据行较少
+    if has_pre_printed_content and len(data_rows) <= 3:
+        return True
+
+    return False
+
+
+def is_fixed_slot_summary_table(table, chapter_title: str = "") -> bool:
+    """
+    向后兼容别名函数，底层调用零硬编码的 is_fixed_slot_form_table。
+    """
+    return is_fixed_slot_form_table(table)
+
+
 def get_doc_chapter_tables_mapping(doc) -> List[Dict[str, Any]]:
     """
     单次拓扑遍历 Word 文档 body 流，构建每个章节标题与其下方专属表格的拓扑映射列表。
+    支持大章层级包含关系：大章条目不仅记录自身紧随的表格，还会自动聚合其下属所有子节的表格。
     """
     if doc is None or not hasattr(doc, 'element') or not hasattr(doc.element, 'body'):
         return []
 
     mapping = []
+    current_major_entry = None
     current_entry = {"chapter_title": "PREAMBLE", "table_indices": []}
 
     for elem in doc.element.body:
@@ -241,26 +298,48 @@ def get_doc_chapter_tables_mapping(doc) -> List[Dict[str, Any]]:
             txt = "".join(elem.itertext()).strip()
             if not txt:
                 continue
-            # 判断是否为章节大标题
-            is_chapter_title = bool(
+
+            # 判定是否为一级大章节标题 (如 "五、投标配置及分项报价表" 或 "第X章 ...")
+            is_major_title = bool(
                 re.match(r'^[一二三四五六七八九十百0-9]{1,3}[、\.\s]', txt)
                 or re.match(r'^第[一二三四五六七八九十0-9]+[章节篇部分]', txt)
-                or ("格式" in txt[:15] and len(txt) <= 80)
-                or (txt.endswith("表") and len(txt) <= 80 and not any(p in txt for p in ["。", "；", ";"]))
-            )
-            if is_chapter_title and not ("。" in txt or "；" in txt or "！" in txt):
+            ) and len(txt) <= 150 and not any(p in txt for p in ["。", "；", ";", "！"])
+
+            # 判定是否为子节/子表格标题 (如 "投标报价分析表"、"技术要求响应及偏离表")
+            is_sub_title = bool(
+                ("格式" in txt[:20] and len(txt) <= 150)
+                or (txt.endswith("表") and len(txt) <= 150 and not any(p in txt for p in ["。", "；", ";", "！"]))
+            ) and not any(p in txt for p in ["。", "；", "！"])
+
+            if is_major_title:
                 if current_entry["chapter_title"] != "PREAMBLE" or current_entry["table_indices"]:
-                    mapping.append(current_entry)
-                current_entry = {"chapter_title": txt, "table_indices": []}
+                    if current_entry not in mapping:
+                        mapping.append(current_entry)
+                current_major_entry = {"chapter_title": txt, "table_indices": [], "is_major": True}
+                current_entry = current_major_entry
+            elif is_sub_title:
+                if current_entry["chapter_title"] != "PREAMBLE" or current_entry["table_indices"]:
+                    if current_entry not in mapping and current_entry is not current_major_entry:
+                        mapping.append(current_entry)
+                current_entry = {"chapter_title": txt, "table_indices": [], "is_major": False}
+
         elif tag == "tbl":
             # 找到对应 table 的索引
             for t_idx, t in enumerate(doc.tables):
                 if t._element == elem:
-                    current_entry["table_indices"].append(t_idx)
+                    if t_idx not in current_entry["table_indices"]:
+                        current_entry["table_indices"].append(t_idx)
+                    # 大章自动层级包含下属子节的表格
+                    if current_major_entry and current_entry is not current_major_entry:
+                        if t_idx not in current_major_entry["table_indices"]:
+                            current_major_entry["table_indices"].append(t_idx)
                     break
 
     if current_entry["chapter_title"] != "PREAMBLE" or current_entry["table_indices"]:
-        mapping.append(current_entry)
+        if current_entry not in mapping:
+            mapping.append(current_entry)
+    if current_major_entry and current_major_entry not in mapping:
+        mapping.append(current_major_entry)
 
     return mapping
 
@@ -268,14 +347,15 @@ def get_doc_chapter_tables_mapping(doc) -> List[Dict[str, Any]]:
 def get_chapter_specific_table_indices(doc, chapter_title: str) -> List[int]:
     """
     根据章节标题精准计算该章节在 Word DOM 拓扑中拥有的专属表格索引列表 (0-indexed)。
-    具备【目录与正文智能去重】机制，自动过滤文档开头的目录项，100% 锁定正文中的真实表格。
+    具备【目录与正文智能去重】与【大章子表层级包含】机制，自动过滤文档开头的目录项，100% 锁定正文中的真实表格。
+    若该章节不包含任何表格（如封面、投标函文本段），严格返回空列表 []。
     """
     if not doc or not doc.tables or not chapter_title:
         return []
 
     mapping = get_doc_chapter_tables_mapping(doc)
     if not mapping:
-        return [0] if len(doc.tables) == 1 else []
+        return []
 
     # 1. 清洗 chapter_title 的核心词汇
     clean_target = re.sub(r'^[一二三四五六七八九十百0-9\s、\.\(\)（）]+', '', chapter_title).strip()
@@ -289,7 +369,7 @@ def get_chapter_specific_table_indices(doc, chapter_title: str) -> List[int]:
         for i in range(len(clean_target) - 2):
             target_tokens.add(clean_target[i:i+3])
 
-    best_score = -1.0
+    best_score = 0.0
     best_entry = None
 
     for entry in mapping:
@@ -302,41 +382,51 @@ def get_chapter_specific_table_indices(doc, chapter_title: str) -> List[int]:
         if not clean_entry:
             continue
 
-        score = 0.0
-        if clean_target in clean_entry or clean_entry in clean_target:
-            score += 10.0
+        # 严格要求基础文本相似度
+        base_score = 0.0
+        if clean_target == clean_entry:
+            base_score = 100.0
+        elif clean_target in clean_entry or clean_entry in clean_target:
+            base_score = 60.0
+        elif target_tokens:
+            matched_tokens = sum(1 for tk in target_tokens if tk in clean_entry)
+            token_ratio = matched_tokens / len(target_tokens)
+            if token_ratio >= 0.5:
+                base_score = token_ratio * 50.0
 
-        # 计算 2-gram 匹配度
-        matched_tokens = sum(1 for tk in target_tokens if tk in clean_entry)
-        if target_tokens:
-            score += (matched_tokens / len(target_tokens)) * 5.0
+        # 若没有任何文本相似度，坚决跳过，严禁给无关联章节加分！
+        if base_score <= 0.0:
+            continue
 
-        # 【核心去重加权】：如果该条目拥有真实的表格（属于正文），大幅加 100 分，彻底压过无表格的目录项
+        # 仅在文本确实匹配的前提下：若该条目在正文中拥有真实表格，大幅加 100 分（用于有效区分无表格的目录项与有表格的正文项）
+        score = base_score
         if entry.get("table_indices"):
             score += 100.0
+            # 若表格数量更多（属于大章聚合），额外微调优先匹配大章集合
+            score += len(entry["table_indices"]) * 2.0
 
-        if score >= best_score and score >= 2.0:
+        if score > best_score:
             best_score = score
             best_entry = entry
 
     if best_entry and best_entry.get("table_indices"):
         return best_entry["table_indices"]
 
-    # 2. 如果拓扑映射未直接命中表格，按表头关键词二级回退
+    # 2. 如果拓扑映射未直接命中表格，按表头关键词二级回退（严格要求强相关）
     header_matches = []
     for t_idx, table in enumerate(doc.tables):
         if not table.rows:
             continue
         hdr_txt = "".join(c.text.strip() for c in table.rows[0].cells)
-        if any(tk in hdr_txt for tk in target_tokens if len(tk) >= 2):
+        if clean_target and (clean_target in hdr_txt or (len(hdr_txt) <= 20 and hdr_txt in clean_target)):
             header_matches.append(t_idx)
+        elif target_tokens:
+            matched_tokens = sum(1 for tk in target_tokens if tk in hdr_txt)
+            if len(target_tokens) >= 2 and (matched_tokens / len(target_tokens)) >= 0.7:
+                header_matches.append(t_idx)
 
-    if len(header_matches) == 1:
+    if 1 <= len(header_matches) <= 2:
         return header_matches
-
-    # 3. 兜底：如果整个文档只有 1 个表格
-    if len(doc.tables) == 1:
-        return [0]
 
     return []
 
@@ -427,11 +517,17 @@ def extract_chapter_dom_structure(
                     collected_lines.append(f"📌 [当前目标章节正文标题] /body/p[{p_idx}]: {txt}")
                     continue
                 elif in_target and p_idx > target_start_p:
-                    # 判断是否遇到下一个同级大章节标题
-                    is_ch_title = bool(
-                        re.match(r'^[一二三四五六七八九十百0-9]{1,3}[、\.\s]', txt)
+                    # 判断是否遇到下一个同级大章节标题（严格匹配中文大写序号/第X章/附件X，严禁将 1、2、5、等正文条款细项误判为大章标题）
+                    is_top_chapter_pattern = bool(
+                        re.match(r'^[一二三四五六七八九十百]+[、\.\s]', txt)
                         or re.match(r'^第[一二三四五六七八九十0-9]+[章节篇部分]', txt)
-                    ) and len(txt) <= 80 and not ("。" in txt or "；" in txt or "！" in txt)
+                        or re.match(r'^【[一二三四五六七八九十0-9]+】', txt)
+                        or re.match(r'^附件[一二三四五六七八九十0-9]+', txt)
+                    )
+                    is_not_body_clause = not txt.endswith((':', '：', '；', ';', '。', '，', ',', '！', '!')) and not any(
+                        kw in txt for kw in ["有关事宜", "通讯地址", "如下", "为：", "即：", "规定", "履行", "承诺", "如果", "保证", "同意"]
+                    )
+                    is_ch_title = is_top_chapter_pattern and is_not_body_clause and len(txt) <= 80
                     if is_ch_title:
                         in_target = False
                         break
@@ -528,6 +624,45 @@ def inspect_and_repair_table_blanks(doc, document_id: str = "") -> int:
                     main_desc = cells_txt[c_idx]
                     break
 
+            # 对已有条款行做确定性的列级补齐，避免把“合同总价款”等普通商务词
+            # 误当成汇总行，也避免完全依赖 LLM 自愈后仍留下空单元格。列位置只
+            # 依据当前表头识别，不假设固定列数或固定列号。
+            header_indexes = {
+                "commitment": None,
+                "status": None,
+                "reason": None,
+            }
+            header_defaults = {"status": "无"}
+            for h_idx, h_text in enumerate(hdr_cells):
+                if header_indexes["commitment"] is None and any(
+                    keyword in h_text for keyword in ["服务承诺", "响应情况", "投标响应", "响应内容", "承诺内容"]
+                ):
+                    header_indexes["commitment"] = h_idx
+                if header_indexes["status"] is None and any(
+                    keyword in h_text for keyword in ["有无偏离", "是否偏离", "偏离情况", "是否响应"]
+                ):
+                    header_indexes["status"] = h_idx
+                    header_defaults["status"] = "是" if "是否响应" in h_text else "无"
+                if header_indexes["reason"] is None and any(
+                    keyword in h_text for keyword in ["偏离内容", "偏离原因", "偏离说明"]
+                ):
+                    header_indexes["reason"] = h_idx
+
+            if main_desc and (header_indexes["commitment"] is not None or header_indexes["status"] is not None or header_indexes["reason"] is not None):
+                commitment_idx = header_indexes["commitment"]
+                status_idx = header_indexes["status"]
+                reason_idx = header_indexes["reason"]
+                if commitment_idx is not None and commitment_idx < len(row.cells) and not row.cells[commitment_idx].text.strip():
+                    row.cells[commitment_idx].text = "我方承诺完全响应该条款要求。"
+                if status_idx is not None and status_idx < len(row.cells):
+                    current_status = row.cells[status_idx].text.strip()
+                    valid_statuses = {"是", "否", "无", "无偏离", "有", "有偏离"}
+                    if not current_status or current_status.isdigit() or current_status not in valid_statuses:
+                        row.cells[status_idx].text = header_defaults["status"]
+                if reason_idx is not None and reason_idx < len(row.cells) and not row.cells[reason_idx].text.strip():
+                    row.cells[reason_idx].text = "完全响应招标文件要求，无偏离。"
+                cells_txt = [c.text.strip() for c in row.cells]
+
             # 若有实质条款描述，但后续有空白单元格，则判定为待修复留白行
             if main_desc and any(not cells_txt[c_idx] for c_idx in range(1, total_cols)):
                 unfilled_rows_info.append({
@@ -607,4 +742,269 @@ def inspect_and_repair_table_blanks(doc, document_id: str = "") -> int:
                         curr_seq += 1
 
     return repaired_total
+
+
+def extract_equipment_tables_and_context(raw_text: str) -> str:
+    """
+    智能靶向过滤（全量无截断）：
+    精准提取所有【标的物/设备材料清单表格】、关联章节标题以及技术工况/关键技术要求段落，
+    仅剔除无关的纯行政人事表（人员社保、执业证书、财务审计等），绝不进行字符截断以保证上下文 100% 完整。
+    """
+    if not raw_text:
+        return ""
+
+    # 1. 查找所有 HTML 表格和 Markdown 表格
+    html_pattern = re.compile(r'<table[\s\S]*?</table>', re.IGNORECASE)
+    md_pattern = re.compile(r'(?:(?:^|\n)\|[^\n]+\|\n(?:\|[-:\s|]+\|\n)(?:\|[^\n]+\|\n?)+)', re.MULTILINE)
+
+    table_spans = []
+    for m in html_pattern.finditer(raw_text):
+        table_spans.append((m.start(), m.end(), "html", m.group(0)))
+    for m in md_pattern.finditer(raw_text):
+        table_spans.append((m.start(), m.end(), "md", m.group(0)))
+
+    table_spans.sort(key=lambda x: x[0])
+
+    if not table_spans:
+        # 若没有识别出表格，完整保留原文，绝不截断
+        return raw_text
+
+    # 纯通用清单表格特征词（严格杜绝任何具体设备或行业特定名词硬编码）
+    EQUIPMENT_KEYWORDS = ["设备", "标的", "货物", "材料", "物资", "产品", "服务", "工程量", "清单", "规格", "型号", "参数", "指标", "数量", "单位", "单价", "合价", "总价", "定额"]
+    EXCLUDE_KEYWORDS = ["近三年财务", "财务审计", "营业额", "社保缴纳", "人员资质", "执业证书", "身份证", "评分细则", "评分标准"]
+
+    filtered_sections = []
+    last_end = 0
+
+    for start, end, t_type, tbl_content in table_spans:
+        plain_tbl = re.sub(r'<[^>]+>', ' ', tbl_content).lower()
+        is_equipment_table = any(kw in plain_tbl for kw in EQUIPMENT_KEYWORDS)
+        is_excluded = any(kw in plain_tbl for kw in EXCLUDE_KEYWORDS) and not any(k in plain_tbl for k in ["采购清单", "主要标的物", "设备名称", "货物名称"])
+
+        preceding_text = raw_text[last_end:start].strip()
+        
+        if is_equipment_table and not is_excluded:
+            # 提取紧随该设备表格前方的章节大标题或说明（如 "第X标段/分部工程清单"）
+            if preceding_text:
+                preceding_lines = [l.strip() for l in preceding_text.split('\n') if l.strip()]
+                # 倒序向上查找最近的各级标题行与技术说明（扩大探测窗口至 15 行），确保大标题 100% 完整保留
+                headers = []
+                for l in reversed(preceding_lines[-15:]):
+                    if l.startswith('#') or re.match(r'^(?:[0-9]+[、.．]|[一二三四五六七八九十]+[、.．]|第[0-9一二三四五六七八九十]+[标标段章节部分区]|(?:（|\()[0-9一二三四五六七八九十]+(?:）|\)))', l):
+                        headers.append(l)
+                    elif any(c in l for c in ['表', '清单', '需求', '规格', '标段', '工程', '部分', '系统', '一览表']):
+                        headers.append(l)
+                headers = list(reversed(headers))
+                if not headers and preceding_lines:
+                    headers = preceding_lines[-3:]
+                if headers:
+                    filtered_sections.append("\n".join(headers))
+            filtered_sections.append(tbl_content)
+        else:
+            # 若是非设备表格（如人员资质表、财务表），跳过该表格及其紧贴标题
+            pass
+        
+        last_end = end
+
+    # 处理最后一个表格后面的剩余文本（保留特殊工况、现场施工要求、技术门槛等完整说明，绝不截断）
+    remaining_text = raw_text[last_end:].strip()
+    if remaining_text:
+        filtered_sections.append(remaining_text)
+
+    if not filtered_sections:
+        return raw_text
+
+    return "\n\n".join(filtered_sections)
+
+
+def normalize_section_name(raw_sec: Optional[str]) -> Optional[str]:
+    """
+    分部/工程大类规范化函数：
+    忠实保留标书提取的原始 section_name，去除前后多余空白，杜绝任何硬编码或破坏性截断。
+    """
+    if not raw_sec or not isinstance(raw_sec, str):
+        return None
+    s = raw_sec.strip()
+    return s if s else None
+
+
+def is_narrative_clause_or_lead_in(text: str) -> bool:
+    """
+    基于通用语法标点与公文篇章结构，纯通用判断文本是否为正文叙述句、条款导语或转折声明句（而非表单属性标签/槽位）。
+
+    【核心原则】：严禁任何硬编码业务数据与具体名称，纯基于语言学标点、公文篇章结构与谓语特征判定。
+
+    判定规则：
+    1. 标点特征：真正表单属性标签绝不包含句中标点（逗号、分号、句号、感叹号、问号）；
+       若文本在冒号之前或主体部分包含 `[，,；;。！!？?]`，判定为叙述从句（如 "据此函，签字人兹宣布同意如下："）。
+    2. 条款序号特征：若文本以公文条款序号开头（如 `1、`, `5.`, `（一）`, `(2)`, `一、` 等），判定为条款正文/导语标题（如 "5、与本投标有关的正式通讯地址为："）。
+    3. 公文致函抬头特征：以公文致函抬头开头（如 "致某某单位："）。
+    4. 公文导语/动词结构特征：
+       - 包含承前启后引导词（如 "如下", "为：", "据此", "特此", "兹宣布", "兹同意", "兹授权", "根据贵方", "有关事宜", "全权处理", "声明如下", "承诺如下", "保证如下", "授权如下" 等）；
+       - 结尾系词（如 "通讯地址为："、"条件为："）。
+    5. 长度与结构特征：
+       - 纯表单属性标签为简短的名词短语（去除符号空格后长度通常 <= 20）；
+       - 超过 25 字符且无明确待填占位符（如连续下划线/多个空格）的文本判定为长叙述句。
+    """
+    if not text or not isinstance(text, str):
+        return False
+
+    raw = text.strip()
+    if not raw:
+        return False
+
+    # 1. 标点特征：表单属性标签绝不包含逗号、分号、句号、感叹号、问号
+    # 若在冒号前含有这些标点，100% 为叙述从句
+    colon_idx = -1
+    for c_char in [':', '：']:
+        idx = raw.find(c_char)
+        if idx != -1:
+            colon_idx = idx if colon_idx == -1 else min(colon_idx, idx)
+
+    text_before_colon = raw[:colon_idx] if colon_idx != -1 else raw
+    if re.search(r'[，,；;。！!？?]', text_before_colon):
+        return True
+
+    # 2. 条款序号特征：以条款序号开头（如 `1、`, `5.`, `（一）`, `(2)`, `一、` 等）
+    if re.match(r'^\s*(?:\d+[\.、\)]|[一二三四五六七八九十百]+[\.、\)]|\([0-9一二三四五六七八九十]+\)|（[0-9一二三四五六七八九十]+）)', raw):
+        return True
+
+    # 3. 公文致函抬头特征（如 "致某某单位："）
+    if re.match(r'^\s*致[^\n:：]{2,50}[:：]?\s*$', raw):
+        return True
+
+    # 4. 公文转折/引导词与谓语动词结构特征
+    clean_no_punct = re.sub(r'[\s_＿\-\–\—\(\)（）\[\]［］【】:：\.\,，。；;、“”"\'`]', '', raw)
+    narrative_markers = [
+        "如下", "宣布", "同意", "据此", "特此", "兹宣布", "兹同意", "兹授权",
+        "根据贵方", "有关事宜", "全权处理", "履行合同", "承担责任", "严格履行",
+        "为以下", "声明如下", "承诺如下", "保证如下", "授权如下"
+    ]
+    if any(marker in clean_no_punct for marker in narrative_markers):
+        return True
+
+    # 结尾系词判断（如 "通讯地址为："、"条件为："）
+    if re.search(r'为[:：]\s*$', raw):
+        return True
+
+    # 5. 长度与结构特征：无占位符且长度过长的文本
+    has_explicit_slot = bool(re.search(r'(?:_{2,}|＿{2,}|\s{3,}|\[待[^\]]+\]|［待[^］]+］|\s*年\s*月\s*日)', raw))
+    if len(clean_no_punct) > 25 and not has_explicit_slot:
+        return True
+
+    return False
+
+
+def get_chapter_body_elements(doc, chapter_title: str) -> List[Any]:
+    """
+    提取 Word 文档中属于指定章节的所有 body 级 XML 元素节点（段落与表格）
+    """
+    if doc is None or not hasattr(doc, 'element') or not hasattr(doc.element, 'body') or not chapter_title:
+        return []
+
+    clean_target = re.sub(r'^[一二三四五六七八九十百0-9\s、\.\(\)（）]+', '', chapter_title).strip()
+    clean_target = re.sub(r'[\s、\.\(\)（）]+', '', clean_target)
+    target_tokens = set(clean_target[i:i+2] for i in range(len(clean_target) - 1)) if len(clean_target) > 1 else {clean_target}
+
+    candidates = []
+    p_count = 0
+    for elem in doc.element.body:
+        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if tag == "p":
+            p_count += 1
+            txt = "".join(elem.itertext()).strip()
+            if not txt:
+                continue
+            clean_p = re.sub(r'^[一二三四五六七八九十百0-9\s、\.\(\)（）]+', '', txt).strip()
+            clean_p = re.sub(r'[\s、\.\(\)（）]+', '', clean_p)
+            score = 0.0
+            if clean_target and clean_p:
+                if clean_target in clean_p or clean_p in clean_target:
+                    score += 100.0
+                elif target_tokens:
+                    overlap = sum(1 for tk in target_tokens if tk in clean_p)
+                    score += (overlap / len(target_tokens)) * 50.0
+
+            if score >= 30.0:
+                candidates.append((p_count, elem, score))
+
+    if not candidates:
+        return []
+
+    max_score = max(c[2] for c in candidates)
+    target_start_elem = [c[1] for c in candidates if c[2] == max_score][-1]
+
+    collected = []
+    in_target = False
+    for elem in doc.element.body:
+        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if elem == target_start_elem:
+            in_target = True
+            collected.append(elem)
+            continue
+        elif in_target:
+            if tag == "p":
+                txt = "".join(elem.itertext()).strip()
+                is_top_chapter_pattern = bool(
+                    re.match(r'^[一二三四五六七八九十百]+[、\.\s]', txt)
+                    or re.match(r'^第[一二三四五六七八九十0-9]+[章节篇部分]', txt)
+                    or re.match(r'^【[一二三四五六七八九十0-9]+】', txt)
+                    or re.match(r'^附件[一二三四五六七八九十0-9]+', txt)
+                )
+                is_not_body_clause = not txt.endswith((':', '：', '；', ';', '。', '，', ',', '！', '!')) and not any(
+                    kw in txt for kw in ["有关事宜", "通讯地址", "如下", "为：", "即：", "规定", "履行", "承诺", "如果", "保证", "同意"]
+                )
+                if is_top_chapter_pattern and is_not_body_clause and len(txt) <= 80:
+                    break
+            collected.append(elem)
+
+    return collected
+
+
+def reset_chapter_to_template(
+    working_docx_path: str,
+    clean_template_path: str,
+    chapter_title: str
+) -> bool:
+    """
+    单章节重置器：在重新生成/微调某章节前，将工作副本中该章节的所有段落与表格精准重置为原始纯净模板状态。
+    
+    【核心目的】：彻底抹除历史运行中可能产生的脏数据或过时填充，确保本次重新生成 100% 覆盖原内容。
+    """
+    import os
+    if not os.path.exists(working_docx_path) or not os.path.exists(clean_template_path):
+        return False
+    try:
+        from docx import Document
+        from copy import deepcopy
+        doc_work = Document(working_docx_path)
+        doc_tpl = Document(clean_template_path)
+
+        tpl_elems = get_chapter_body_elements(doc_tpl, chapter_title)
+        work_elems = get_chapter_body_elements(doc_work, chapter_title)
+
+        if not tpl_elems or not work_elems:
+            logger.warning(f"重置章节未找到对应 DOM 元素: tpl={len(tpl_elems)}, work={len(work_elems)}")
+            return False
+
+        # 精确切片替换：将 work 章节范围内的所有元素移除，并在原位置插入 tpl 纯净模板的所有元素
+        parent = work_elems[0].getparent()
+        if parent is not None:
+            insert_idx = parent.index(work_elems[0])
+            for w_elem in work_elems:
+                parent.remove(w_elem)
+            for i, t_elem in enumerate(tpl_elems):
+                parent.insert(insert_idx + i, deepcopy(t_elem))
+
+        doc_work.save(working_docx_path)
+        logger.info(f"🔄 [单章节重置] 成功将目标章节 [{chapter_title}]（旧 {len(work_elems)} 节点 -> 模板 {len(tpl_elems)} 节点）精准还原为原始模板样式！其余章节 100% 保持不变。")
+        return True
+    except Exception as e:
+        logger.warning(f"重置章节至模板状态异常: {e}")
+        return False
+
+
+
+
+
 

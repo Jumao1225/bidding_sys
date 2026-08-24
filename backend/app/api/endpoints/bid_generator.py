@@ -128,11 +128,36 @@ async def get_bid_fill_worker_logs(
         worker_items = []
         seen_chapters = set()
 
+        # 检查是否已存在正式完成的 Supervisor 记录，以便过滤掉最初的 in_progress 占位日志
+        has_final_supervisor = any(
+            (log.node_name and "Supervisor" in log.node_name) and log.status in ("success", "master_completed")
+            for log in logs
+        )
+
+        total_wall_time_ms = 0
+        min_created_at = None
+        max_created_at = None
+
         for log in logs:
+            if log.created_at:
+                if min_created_at is None or log.created_at < min_created_at:
+                    min_created_at = log.created_at
+                if max_created_at is None or log.created_at > max_created_at:
+                    max_created_at = log.created_at
+
+            # 如果已有正式完成的 Supervisor 日志，则忽略最初纯占位的 in_progress 日志
+            if has_final_supervisor and log.node_name and "Supervisor" in log.node_name and log.status == "in_progress":
+                continue
+
+            if log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
+                total_wall_time_ms = max(total_wall_time_ms, log.execution_time_ms)
+
             if log.action_type in ("llm_call_worker", "llm_call_supervisor", "chapter_execution") or (log.node_name and (log.node_name.startswith("BidFillerWorker") or "Supervisor" in log.node_name)):
                 inp = log.inputs or {}
                 out = log.outputs or {}
-                ch_title = inp.get("chapter_title") or (log.node_name.replace("BidFillerWorker-", "") if log.node_name else "未知章节")
+                is_supervisor = (log.node_name and "Supervisor" in log.node_name) or log.action_type == "llm_call_supervisor"
+                
+                ch_title = "Supervisor 总控调度" if is_supervisor else (inp.get("chapter_title") or (log.node_name.replace("BidFillerWorker-", "") if log.node_name else "未知章节"))
 
                 if ch_title in seen_chapters:
                     continue
@@ -140,12 +165,12 @@ async def get_bid_fill_worker_logs(
 
                 worker_items.append({
                     "id": str(log.id),
-                    "node_name": log.node_name or f"BidFillerWorker-{ch_title}",
+                    "node_name": "Supervisor-总控调度" if is_supervisor else (log.node_name or f"BidFillerWorker-{ch_title}"),
                     "chapter_title": ch_title,
-                    "category": inp.get("category", "needs_fill"),
+                    "category": "supervisor_master" if is_supervisor else inp.get("category", "needs_fill"),
                     "status": log.status or "success",
                     "execution_time_ms": log.execution_time_ms or 0,
-                    "total_tokens": log.total_tokens or 0,
+                    "total_tokens": log.total_tokens or ((log.prompt_tokens or 0) + (log.completion_tokens or 0)),
                     "prompt_tokens": log.prompt_tokens or 0,
                     "completion_tokens": log.completion_tokens or 0,
                     "summary": out.get("summary", "已完成填报分析与写盘。"),
@@ -156,17 +181,27 @@ async def get_bid_fill_worker_logs(
                     "created_at": log.created_at.strftime("%Y-%m-%d %H:%M:%S") if log.created_at else None
                 })
 
+        total_worker_time_ms = sum(w.get("execution_time_ms", 0) for w in worker_items)
+        if total_wall_time_ms == 0 and min_created_at and max_created_at:
+            delta_ms = int((max_created_at - min_created_at).total_seconds() * 1000)
+            if delta_ms > 0:
+                total_wall_time_ms = delta_ms
+
         return {
             "document_id": document_id,
             "total_workers_count": len(worker_items),
-            "worker_items": worker_items
+            "worker_items": worker_items,
+            "total_wall_time_ms": total_wall_time_ms,
+            "total_worker_time_ms": total_worker_time_ms
         }
     except Exception as e:
         logger.exception(f"获取 Agent 运行日志出现异常: {e}")
         return {
             "document_id": document_id,
             "total_workers_count": 0,
-            "worker_items": []
+            "worker_items": [],
+            "total_wall_time_ms": 0,
+            "total_worker_time_ms": 0
         }
 
 
@@ -214,11 +249,33 @@ async def stream_bid_fill_worker_logs(
                 worker_items = []
                 seen_chapters = set()
 
+                has_final_supervisor = any(
+                    (log.node_name and "Supervisor" in log.node_name) and log.status in ("success", "master_completed")
+                    for log in logs
+                )
+
+                total_wall_time_ms = 0
+                min_created_at = None
+                max_created_at = None
+
                 for log in logs:
+                    if log.created_at:
+                        if min_created_at is None or log.created_at < min_created_at:
+                            min_created_at = log.created_at
+                        if max_created_at is None or log.created_at > max_created_at:
+                            max_created_at = log.created_at
+
+                    if has_final_supervisor and log.node_name and "Supervisor" in log.node_name and log.status == "in_progress":
+                        continue
+
+                    if log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
+                        total_wall_time_ms = max(total_wall_time_ms, log.execution_time_ms)
+
                     if log.action_type in ("llm_call_worker", "llm_call_supervisor", "chapter_execution") or (log.node_name and (log.node_name.startswith("BidFillerWorker") or "Supervisor" in log.node_name)):
                         inp = log.inputs or {}
                         out = log.outputs or {}
-                        ch_title = inp.get("chapter_title") or (log.node_name.replace("BidFillerWorker-", "") if log.node_name else "未知章节")
+                        is_supervisor = (log.node_name and "Supervisor" in log.node_name) or log.action_type == "llm_call_supervisor"
+                        ch_title = "Supervisor 总控调度" if is_supervisor else (inp.get("chapter_title") or (log.node_name.replace("BidFillerWorker-", "") if log.node_name else "未知章节"))
 
                         if ch_title in seen_chapters:
                             continue
@@ -228,12 +285,12 @@ async def stream_bid_fill_worker_logs(
 
                         worker_items.append({
                             "id": str(log.id),
-                            "node_name": log.node_name or f"BidFillerWorker-{ch_title}",
+                            "node_name": "Supervisor-总控调度" if is_supervisor else (log.node_name or f"BidFillerWorker-{ch_title}"),
                             "chapter_title": ch_title,
-                            "category": inp.get("category", "needs_fill"),
+                            "category": "supervisor_master" if is_supervisor else inp.get("category", "needs_fill"),
                             "status": status_val,
                             "execution_time_ms": log.execution_time_ms or 0,
-                            "total_tokens": log.total_tokens or 0,
+                            "total_tokens": log.total_tokens or ((log.prompt_tokens or 0) + (log.completion_tokens or 0)),
                             "prompt_tokens": log.prompt_tokens or 0,
                             "completion_tokens": log.completion_tokens or 0,
                             "summary": out.get("summary", "已完成填报分析与写盘。"),
@@ -244,6 +301,12 @@ async def stream_bid_fill_worker_logs(
                             "created_at": log.created_at.strftime("%Y-%m-%d %H:%M:%S") if log.created_at else None
                         })
 
+                total_worker_time_ms = sum(w.get("execution_time_ms", 0) for w in worker_items)
+                if total_wall_time_ms == 0 and min_created_at and max_created_at:
+                    delta_ms = int((max_created_at - min_created_at).total_seconds() * 1000)
+                    if delta_ms > 0:
+                        total_wall_time_ms = delta_ms
+
                 # 判断所有最新状态的节点中是否还有正在进行中的任务
                 has_in_progress = any(w.get("status") in ("in_progress", "running") for w in worker_items)
 
@@ -252,13 +315,15 @@ async def stream_bid_fill_worker_logs(
                     bool(logs) and 
                     not has_in_progress and 
                     len(worker_items) > 0 and 
-                    any(w.get("status") == "success" for w in worker_items)
+                    any(w.get("status") in ("success", "master_completed") for w in worker_items)
                 )
 
                 payload = {
                     "document_id": document_id,
                     "worker_items": worker_items,
                     "is_completed": all_completed,
+                    "total_wall_time_ms": total_wall_time_ms,
+                    "total_worker_time_ms": total_worker_time_ms,
                     "timestamp": time.time()
                 }
                 payload_str = json.dumps(payload, ensure_ascii=False)
@@ -315,24 +380,29 @@ async def regenerate_single_chapter(
 
     logger.info(f"🔄 收到单章节重新生成/微调请求: doc_id={document_id}, chapter={chapter_title}, prompt='{custom_prompt[:60]}'")
 
-    # 1. 准备 Word 工作副本
+    # 1. 准备 Word 工作副本与纯净原始模板
     drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
     os.makedirs(drafts_dir, exist_ok=True)
     working_docx_path = os.path.join(drafts_dir, f"bid_fill_{document_id[:8]}.docx")
     result_docx_path = os.path.join(drafts_dir, f"agent_fill_result_{document_id[:8]}.docx")
+    template_docx_path = os.path.join(drafts_dir, f"template_{document_id[:8]}.docx")
+
+    # 确保纯净模板存在（供单章微调提取纯净无污染的占位符上下文）
+    if not os.path.exists(template_docx_path):
+        template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
+            db=db, doc_id=document_id, user_id=None, tenant_id=None
+        )
+        if template_bytes:
+            with open(template_docx_path, "wb") as f:
+                f.write(template_bytes)
 
     if not os.path.exists(working_docx_path):
         if os.path.exists(result_docx_path):
             import shutil
             shutil.copyfile(result_docx_path, working_docx_path)
-        else:
-            template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
-                db=db, doc_id=document_id, user_id=None, tenant_id=None
-            )
-            if not template_bytes:
-                raise HTTPException(status_code=404, detail="未找到该文档的标书模板")
-            with open(working_docx_path, "wb") as f:
-                f.write(template_bytes)
+        elif os.path.exists(template_docx_path):
+            import shutil
+            shutil.copyfile(template_docx_path, working_docx_path)
 
     # 2. 注入上下文变量
     from app.core.context import current_user_id, current_tenant_id, current_task_id
@@ -366,16 +436,23 @@ async def regenerate_single_chapter(
         from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
         from app.utils.table_utils import extract_chapter_dom_structure
 
-        # 仅精准提取属于该章节专属的纯净表格表头与结构定义（消除半成品残缺行的诱导）
+        # 优先从纯净模板提取章节专属上下文，并在重新生成前将工作副本中该章节重置为纯净模板状态（确保100%覆盖）
         from app.agents.bid_filler_workers import extract_docx_tables_summary
-        from app.utils.table_utils import get_chapter_specific_table_indices
-        target_tbl_summary = extract_docx_tables_summary(working_docx_path, chapter_title)
+        from app.utils.table_utils import get_chapter_specific_table_indices, reset_chapter_to_template
+
+        if os.path.exists(template_docx_path) and os.path.exists(working_docx_path):
+            reset_chapter_to_template(working_docx_path, template_docx_path, chapter_title)
+
+        template_source_path = template_docx_path if os.path.exists(template_docx_path) else working_docx_path
+        target_tbl_summary = extract_docx_tables_summary(template_source_path, chapter_title)
         
         # 组装纯净模板提示（如为表格章节，突出表头定义与全量重写要求）
         if target_tbl_summary:
             chapter_pure_context = f"【本章节专属表格表头定义】\n{target_tbl_summary}\n（请根据招标文件原文及企业数据库全量检索数据，生成完整 2D 矩阵全量覆写）"
         else:
-            chapter_pure_context = extract_chapter_dom_structure(working_docx_path, chapter_title)
+            chapter_pure_context = extract_chapter_dom_structure(template_source_path, chapter_title)
+            if not chapter_pure_context and template_source_path != working_docx_path:
+                chapter_pure_context = extract_chapter_dom_structure(working_docx_path, chapter_title)
             if not chapter_pure_context:
                 chapter_pure_context = f"【目标章节】: {chapter_title}"
 
@@ -400,6 +477,49 @@ async def regenerate_single_chapter(
         except Exception:
             pass
 
+        # 预读取企业档案与项目元数据（用于公文类单章微调定向注入）
+        prefetched_metadata: Dict[str, Any] = {}
+        try:
+            from app.db.models.business import CompanyProfileModel
+            from app.db.models.metadata import TimelineMetadata, FinancialMetadata
+            from app.utils.rmb_formatter import number_to_chinese_rmb
+
+            prof = db.query(CompanyProfileModel).first()
+            if prof:
+                if prof.company_name: prefetched_metadata["company_name"] = prof.company_name
+                if prof.credit_code: prefetched_metadata["credit_code"] = prof.credit_code
+                if prof.legal_representative: prefetched_metadata["legal_person"] = prof.legal_representative
+                if prof.registered_address: prefetched_metadata["address"] = prof.registered_address
+                if prof.contact_phone: prefetched_metadata["phone"] = prof.contact_phone
+                if prof.email: prefetched_metadata["email"] = prof.email
+
+            tl = db.query(TimelineMetadata).filter(TimelineMetadata.document_id == document_id).first()
+            if tl:
+                if getattr(tl, "project_name", None): prefetched_metadata["project_name"] = tl.project_name
+                proj_code = getattr(tl, "project_id_code", None) or getattr(tl, "project_code", None)
+                if proj_code: prefetched_metadata["project_code"] = proj_code
+                
+                period_str = str(getattr(tl, "construction_period_description", "") or "").strip()
+                if not period_str and getattr(tl, "construction_period_days", None):
+                    period_str = f"{tl.construction_period_days} 日历天"
+                if period_str:
+                    prefetched_metadata["delivery_period"] = period_str
+
+            from app.db.models.ai_analysis import CostEstimate
+            cost_items = db.query(CostEstimate).filter(CostEstimate.document_id == document_id).all()
+            if cost_items:
+                total_val = sum(getattr(it, "calculated_total", 0.0) or 0.0 for it in cost_items)
+                if total_val > 0:
+                    prefetched_metadata["total_price_str"] = f"{total_val:,.2f} 元"
+                    try:
+                        prefetched_metadata["total_price_words"] = number_to_chinese_rmb(float(total_val))
+                    except Exception:
+                        pass
+
+            prefetched_metadata["quality_standard"] = "合格，完全符合国家及行业现行有关标准、规范要求"
+        except Exception as e_meta:
+            logger.warning(f"微调接口预读取企业与项目元数据异常: {e_meta}")
+
         start_time = time.time()
         worker_res = await run_in_threadpool(
             run_chapter_worker,
@@ -413,6 +533,7 @@ async def regenerate_single_chapter(
             content_hint="（请根据招标文件原文与企业数据库检索全量数据，按要求全量重新起草与覆写本章节）",
             extra_instructions=custom_prompt or "请按照主流程标准，全量重新检索招标文件与数据库并完成全表覆写。",
             repair_instructions="",
+            prefetched_metadata=prefetched_metadata,
         )
         elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -421,9 +542,9 @@ async def regenerate_single_chapter(
         summary = worker_res.get("summary", "单章节微调已完成。")
 
         # 4. 原位刷盘
-        if proposals and os.path.exists(working_docx_path):
+        if os.path.exists(working_docx_path):
             try:
-                write_count = fill_docx_proposals_in_dom(working_docx_path, proposals)
+                write_count = fill_docx_proposals_in_dom(working_docx_path, proposals) if proposals else 0
                 logger.info(f"✅ 单章节微调原位写盘完成，写入 {write_count} 处修改")
                 # 同步到 result 文件
                 import shutil
@@ -902,6 +1023,8 @@ def _run_agent_bid_filling_in_background(
     token_u = current_user_id.set(u_id)
     token_t = current_tenant_id.set(t_id)
     db: Session = SessionLocal()
+    import time as _bg_time
+    bg_start_t = _bg_time.time()
     try:
         template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
             db=db, doc_id=document_id, user_id=None, tenant_id=None
@@ -951,7 +1074,8 @@ def _run_agent_bid_filling_in_background(
                     f.write(filled_bytes)
             logger.info(f"✅ 后台标书撰写完成并已保存至: {result_path}")
 
-            # 写入 Supervisor 最终完成日志，确保前端 SSE 和控制台能够侦测到全量收官
+            # 写入 Supervisor 最终完成日志，记录端到端真实物理总耗时
+            total_wall_ms = int((_bg_time.time() - bg_start_t) * 1000)
             try:
                 from app.db.models.audit import AgentAuditLog
                 final_sup_log = AgentAuditLog(
@@ -961,8 +1085,9 @@ def _run_agent_bid_filling_in_background(
                     node_name="Supervisor-总控调度",
                     action_type="llm_call_supervisor",
                     status="master_completed",
-                    inputs={"document_id": document_id, "chapter_title": "Supervisor-总控调度"},
-                    outputs={"summary": "✨ AI 团队自主撰写与原位写盘已全量收官！所有章节卡片均已更新。"}
+                    execution_time_ms=total_wall_ms,
+                    inputs={"document_id": document_id, "chapter_title": "Supervisor-总控调度", "wall_time_ms": total_wall_ms},
+                    outputs={"summary": f"✨ AI 团队自主撰写与原位写盘已全量收官！全流程耗时 {total_wall_ms / 1000:.1f} 秒。所有章节卡片均已更新。"}
                 )
                 db.add(final_sup_log)
                 db.commit()

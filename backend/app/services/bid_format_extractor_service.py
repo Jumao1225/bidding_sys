@@ -38,16 +38,16 @@ class BidFormatExtractorService:
         self.extractor_service = ExtractorService()
         self.llm_service = LLMService()
 
-        # 匹配“投标文件格式”大章标题正则表达式探照灯
+        # 匹配“投标文件格式”大章标题正则表达式探照灯 (兼容 Markdown # / ** / ## 标记与内部空格)
         self.chapter_start_patterns = [
-            re.compile(r'^\s*第[一二三四五六七八九十\d]+[章篇部分]\s*(投标文件格式|响应文件格式|投标文件组成|格式及附件|投标文件格式要求)'),
-            re.compile(r'^\s*(投标文件格式|响应文件格式|投标文件格式及附件)\s*$'),
-            re.compile(r'^\s*附[件录]\s*.*(投标文件格式|响应文件格式)'),
+            re.compile(r'^[#\s\*]*第\s*[一二三四五六七八九十\d]+\s*[章篇部分卷节][\s\:\、\.\*]*(投标文件格式|响应文件格式|投标文件组成|格式及附件|投标文件格式要求|投标格式|响应格式)'),
+            re.compile(r'^[#\s\*]*(投标文件格式|响应文件格式|投标文件格式及附件|投标格式及要求)[\s\*]*$'),
+            re.compile(r'^[#\s\*]*附\s*[件录][\s\:\、\.\*]*(投标文件格式|响应文件格式|投标文件组成|投标格式)'),
         ]
 
-        # 匹配下一个大章（用于判定“投标文件格式”章节的终止界限）
+        # 匹配下一个大章（用于判定“投标文件格式”章节的终止界限，兼容 Markdown # / ** 标记）
         self.chapter_next_patterns = [
-            re.compile(r'^\s*第[一二三四五六七八九十\d]+[章篇部分]\s*'),
+            re.compile(r'^[#\s\*]*第\s*[一二三四五六七八九十\d]+\s*[章篇部分卷]'),
         ]
 
     def extract_and_export_bid_format(
@@ -98,8 +98,8 @@ class BidFormatExtractorService:
 
         # 3. 回退模式 / PDF 模式：利用 ExtractorService 与 LLM 重建标准 Word
         logger.info(f"使用 LLM 结构化提取模式处理文件: {file_path}")
-        docx_bytes = self._extract_with_llm_and_rebuild(db, doc_obj)
-        return docx_bytes, export_filename, "llm_rebuilt"
+        docx_bytes, mode = self._extract_with_llm_and_rebuild(db, doc_obj)
+        return docx_bytes, export_filename, mode
 
     def _is_toc_line(self, text: str, element=None) -> bool:
         """
@@ -156,8 +156,8 @@ class BidFormatExtractorService:
         if self._is_toc_line(clean_txt, element):
             return False
 
-        # 匹配大章主标题模式，如 第七章、第八章
-        main_chapter_pattern = re.compile(r'^\s*第[一二三四五六七八九十\d]+[章篇]\s*')
+        # 匹配大章主标题模式，如 第七章、第八章 (兼容 Markdown # / ** / ## 标记与空格)
+        main_chapter_pattern = re.compile(r'^[#\s\*]*第\s*[一二三四五六七八九十\d]+\s*[章篇部分卷]')
         if not main_chapter_pattern.search(clean_txt):
             return False
 
@@ -272,9 +272,10 @@ class BidFormatExtractorService:
         output.seek(0)
         return output.getvalue()
 
-    def _extract_with_llm_and_rebuild(self, db: Session, doc_obj) -> bytes:
+    def _extract_with_llm_and_rebuild(self, db: Session, doc_obj) -> Tuple[bytes, str]:
         """
         LLM 提取模式：结合 ExtractorService 与 LLM 提取文本，并用 DocxExporterService 渲染 Word。
+        :return: (docx_bytes, actual_mode) 其中 actual_mode 为 "llm_rebuilt" 或 "fallback_template"
         """
         # 读取文本
         md_file_path = (
@@ -286,60 +287,80 @@ class BidFormatExtractorService:
         if md_file_path and os.path.exists(md_file_path):
             with open(md_file_path, "r", encoding="utf-8") as f:
                 doc_text = f.read()
+            logger.info(f"成功读取 Markdown 缓存文件: {md_file_path} (文本总长度: {len(doc_text)} 字符)")
         else:
             chunks = document_crud.get_document_chunks(db, doc_obj.id)
             doc_text = "\n\n".join([c.content for c in chunks]) if chunks else ""
+            logger.info(f"从数据库切片提取文本完成 (共 {len(chunks) if chunks else 0} 个切片, 文本总长度: {len(doc_text)} 字符)")
 
         if not doc_text.strip():
-            logger.warning("文档未提取到任何有效文本，使用备用基础模板数据构建")
+            logger.warning("⚠️ [投标文件格式提取] 文档未提取到任何有效文本，使用备用基础模板数据构建")
             structure = self._build_fallback_structure(doc_obj.filename)
-            return docx_exporter_service.export_bid_format_to_docx_bytes(structure)
+            return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
 
         # 正则快速定位文本范围
         target_text = self._slice_text_by_keywords(doc_text)
 
         # 构建 Prompt 引导 LLM 输出结构化数据
-        prompt = f"""你是一名资深招投标专家。请分析以下招标文件中的“投标文件格式/响应格式”部分文本，提取出全套格式附件目录与样张模版。
+        prompt = f"""你是一名资深招投标专家。请分析以下招标文件中的“投标文件格式/响应格式”部分文本，严格依据原文提取出完整的格式附件目录与样张模版。
+
+【最高指令】:
+1. 100% 忠实于【待分析文本】原文提取，严禁凭常识臆造或捏造原文不存在的附件名称、字段或内容。
+2. 提取文本中出现的全部格式附件标题（如各类格式、附件、声明、承诺、样张等，严格以原文实际标题为准）。
+3. 原文中的表格（无论以 Markdown 表格还是 HTML <table> 形式出现）必须完整保留其行列表格结构（转换为标准 Markdown 表格输出），原文中的填空下划线 `______` 必须完整保留。
+4. 必须将原文中每个格式附件的完整正文、填空要素和表格内容原原本本提取并放入 `body_markdown`，严禁输出“原文未提供样张”等概括性文字。
 
 【待分析文本】:
-{target_text[:15000]}
+{target_text[:40000]}
 
-【提取要求】:
-1. 提取所有格式附件标题（如“附件一 投标函”、“附件二 法定代表人授权书”、“开标一览表”等）。
-2. 保留原文中的表格（用 Markdown 表格表示）和待填写下划线 `______`。
-3. 返回 JSON 格式，严格符合以下结构：
+【提取要求与结构定义】:
+`content_type` 字段可选值：'form_table' (表格样张/填报明细)、'text_template' (公文/承诺书/证明模板)、'checklist' (清单/目录)、'other' (其他格式附件)。
+请返回合法 JSON 格式对象（只输出纯 JSON，不要包含任何前导或后置解释说明），严格符合以下数据结构定义：
 {{
   "document_title": "{doc_obj.filename} - 投标文件格式模板",
   "source_chapter_name": "投标文件格式",
   "sections": [
      {{
-        "section_title": "附件一 投标函",
+        "section_title": "原文中的格式附件标题",
         "content_type": "text_template",
-        "body_markdown": "致：[招标人名称]\\n\\n我方收到贵方关于......",
-        "placeholders": ["招标人名称", "投标总价"]
+        "body_markdown": "原文中的模板正文内容或 Markdown 表格内容（完整保留填空下划线 ______）",
+        "placeholders": ["从该格式中提炼出的待填空字段名"]
      }}
   ]
 }}
 """
         try:
-            if self.llm_service.is_configured and self.llm_service.llm:
-                response = self.llm_service.llm.invoke(prompt)
-                res_content = response.content if hasattr(response, 'content') else str(response)
-                import json
-                parsed_json = json.loads(res_content)
+            if self.llm_service.is_configured:
+                logger.info(f"🚀 [投标文件格式提取] 正在调用 LLM 结构化提取招标文件格式 (待分析切片长度: {len(target_text[:40000])} 字符)...")
+                parsed_json = self.llm_service.generate_structured_json(prompt, temperature=0.1)
+                # 若大模型直接返回了 sections 数组，自动包装为字典对象
+                if isinstance(parsed_json, list):
+                    parsed_json = {
+                        "document_title": f"{doc_obj.filename} - 投标文件格式模板",
+                        "source_chapter_name": "投标文件格式",
+                        "sections": parsed_json
+                    }
                 structure = BidFormatStructure(**parsed_json)
-                logger.info(f"LLM 结构化提取格式成果，包含 {len(structure.sections)} 个格式附件")
+                if not structure.sections:
+                    logger.warning("⚠️ [投标文件格式提取] LLM 提取出的 sections 为空，自动降级至托底基础结构")
+                    structure = self._build_fallback_structure(doc_obj.filename)
+                    return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
+                else:
+                    section_names = [s.section_title for s in structure.sections]
+                    logger.info(f"✅ [投标文件格式提取] LLM 结构化提取成功！共提取出 {len(structure.sections)} 个格式附件: {section_names}")
+                    return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "llm_rebuilt"
             else:
+                logger.warning("⚠️ [投标文件格式提取] LLM 服务未配置，使用托底基础结构构建")
                 structure = self._build_fallback_structure(doc_obj.filename)
+                return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
         except Exception as e:
-            logger.error(f"LLM 提取投标文件格式 JSON 解析失败: {str(e)}，回退至基础结构")
+            logger.exception(f"❌ [投标文件格式提取] LLM 提取或解析过程发生异常: {str(e)}，正在触发托底基础结构降级构建")
             structure = self._build_fallback_structure(doc_obj.filename)
-
-        return docx_exporter_service.export_bid_format_to_docx_bytes(structure)
+            return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
 
     def _slice_text_by_keywords(self, full_text: str) -> str:
         """
-        在纯文本中截取“投标文件格式”章节（自动排除目录 TOC 行）
+        在纯文本中截取“投标文件格式”章节（自动排除目录 TOC 行，并截取至下一个独立大章之前）
         """
         lines = full_text.split('\n')
         start_idx = -1
@@ -350,10 +371,21 @@ class BidFormatExtractorService:
                     break
 
         if start_idx != -1:
-            slice_lines = lines[start_idx:]
+            end_idx = len(lines)
+            for j in range(start_idx + 1, len(lines)):
+                line_str = lines[j].strip()
+                if self._is_real_next_main_chapter(line_str):
+                    end_idx = j
+                    logger.info(f"🔍 [投标文件格式提取] 定位到下一个独立大章终止行 (第 {j + 1} 行): '{line_str[:50]}'")
+                    break
+
+            slice_lines = lines[start_idx:end_idx]
             while slice_lines and self._is_toc_line(slice_lines[0]):
                 slice_lines.pop(0)
+            logger.info(f"🔍 [投标文件格式提取] 成功定位到正文起始行 (第 {start_idx + 1} 行), 切片行数: {len(slice_lines)}")
             return "\n".join(slice_lines)
+        
+        logger.warning("⚠️ [投标文件格式提取] 未在 Markdown 中匹配到明确的'投标文件格式'章节起止标记，将截取文档前 30,000 字符交给大模型识别")
         return full_text
 
     def _build_fallback_structure(self, filename: str) -> BidFormatStructure:

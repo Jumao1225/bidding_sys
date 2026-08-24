@@ -108,3 +108,27 @@ def test_extract_text_by_style_integration(tmp_path):
         "style_type": "italic_underline"
     })
     assert "未找到样式类型为 [italic_underline] 的文本" in res_none
+
+
+def test_extract_text_by_style_table_response_matrix_should_find_formatted_text(tmp_path):
+    """测试第四章实质性要求响应对照表中的斜体下划线文字可被识别"""
+    docx_file = tmp_path / "chapter_four_response_matrix.docx"
+    doc = docx.Document()
+    doc.add_heading("第四章 项目需求", level=1)
+    table = doc.add_table(rows=2, cols=3)
+    table.cell(0, 0).text = "序号"
+    table.cell(0, 1).text = "实质性要求"
+    table.cell(0, 2).text = "响应情况"
+    formatted_run = table.cell(1, 1).paragraphs[0].add_run("必须满足招标文件规定的实质性要求")
+    formatted_run.italic = True
+    formatted_run.underline = True
+    doc.save(str(docx_file))
+
+    result = extract_text_by_style.invoke({
+        "file_path": str(docx_file),
+        "chapter_keyword": "第四章",
+        "style_type": "italic_underline",
+    })
+
+    assert "成功找到样式类型 [italic_underline] 匹配结果" in result
+    assert "必须满足招标文件规定的实质性要求" in result

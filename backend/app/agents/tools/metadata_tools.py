@@ -97,16 +97,58 @@ def extract_timeline_info(document_id: str, search_keywords: str = "项目编号
     return _extract_and_format(timeline_service, document_id, search_keywords, section_title)
 
 @tool
-def extract_engineering_info(document_id: str, search_keywords: str = "主要设备 规格参数 货物需求表 技术规格书 材质尺寸 参数要求 特殊工况 现场施工难点 注意事项", section_title: str = None) -> str:
+def extract_engineering_info(document_id: str, search_keywords: str = "主要设备 规格参数 货物需求表 技术规格书 工程量清单 采购清单 材质尺寸 参数要求 项目需求 分项清单 设备明细 特殊工况 现场施工难点 注意事项", section_title: str = None) -> str:
     """
     【技术工况提取工具】
     当你需要分析工程量清单中的核心设备数量，或排查现场施工是否具有特殊高危工况（如跨河、带电、高空）时，调用此工具。
     参数:
       - document_id: 必须提供，当前处理的招标文档ID
-      - search_keywords: 默认自带施工相关关键词，你可以根据需要补充
+      - search_keywords: 默认自带工程量清单与技术规格相关关键词，你可以根据需要补充
       - section_title: 可选，如果你知道技术清单在哪个具体章节（如"项目需求"），请填入以缩小检索范围，防止幻觉
     """
-    return _extract_and_format(engineering_service, document_id, search_keywords, section_title, context_mode="chapter")
+    try:
+        from app.worker.tasks import emit_agent_log
+        from app.agents.tools.security import validate_document_access
+        from app.db.session import SessionLocal
+        from app.db.crud.document import document_crud
+        import os
+        
+        if not validate_document_access(document_id):
+            return f"拒绝访问：您无权提取文档 {document_id} 的信息。"
+
+        emit_agent_log("tool_call", "正在提取工程量清单与技术要求全量上下文...")
+        
+        # 优先读取完整的 Markdown 文本以保证所有大型清单表格与前置大章节标题 100% 完整无遗漏
+        db = SessionLocal()
+        full_context = ""
+        try:
+            doc = document_crud.get_document_by_id(db, document_id)
+            if doc and doc.parsed_metadata and doc.parsed_metadata.get("md_file_path"):
+                md_path = doc.parsed_metadata.get("md_file_path")
+                if os.path.exists(md_path):
+                    with open(md_path, "r", encoding="utf-8") as f:
+                        full_context = f.read()
+            if not full_context:
+                # 降级从数据库拉取全部 chunks 拼装
+                chunks = document_crud.get_document_chunks(db, document_id)
+                if chunks:
+                    full_context = "\n\n".join([c.content for c in chunks])
+        finally:
+            db.close()
+
+        if not full_context:
+            return _extract_and_format(engineering_service, document_id, search_keywords, section_title, context_mode="chapter")
+
+        emit_agent_log("info", "开始进行工程元数据多表格并发结构化提取与宏观大类状态机归口...")
+        metadata_obj = engineering_service.extract_metadata(full_context, document_id)
+        emit_agent_log("success", "✅ 工程量清单与技术工况元数据提取并落盘成功！")
+        
+        if hasattr(metadata_obj, "model_dump"):
+            return json.dumps(metadata_obj.model_dump(), indent=2, ensure_ascii=False)
+        else:
+            return json.dumps(metadata_obj.dict(), indent=2, ensure_ascii=False)
+    except Exception as e:
+        return _extract_and_format(engineering_service, document_id, search_keywords, section_title, context_mode="chapter")
 
 @tool
 def extract_evaluation_info(document_id: str, search_keywords: str = "评标办法 评分权重 商务分 技术分 质保期 售后响应 违约金 扣罚", section_title: str = None) -> str:

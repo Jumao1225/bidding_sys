@@ -52,7 +52,7 @@ async def officecli_write_slot_value_tool(file_path: str, path: str, value: str)
 
     :param file_path: 待修改 Word 文档路径
     :param path: 目标节点的物理 Path (如 '/body/p[12]')
-    :param value: 欲填入的真实数据文本 (如 '聚猫科技股份有限公司')
+    :param value: 欲填入的真实数据文本 (如 '[投标人企业全称]')
     :return: 执行结果描述
     """
     logger.info(f"✍️ [OfficeCLI Tool] officecli_write_slot_value_tool 被调用, file: '{file_path}', path: '{path}', 填入值: '{value}'")
@@ -195,8 +195,42 @@ async def officecli_fill_table_rows_tool(
         if not isinstance(raw_rows, list):
             return "[错误: rows_json_str 必须为二维 JSON 列表]"
 
+        # 写盘前校验每一行的列数，避免 OfficeCLI 只写入 enumerate(row_data)
+        # 中实际存在的列，导致短行静默留下空单元格。允许两种合法形态：
+        #   1) 与物理表格列数一致（包含序号列）；
+        #   2) 少一列（不包含序号列，由 auto_index 补齐）。
+        # 其它列数直接拒绝，保证不会产生半行写入。
+        physical_existing_row_count = None
+        try:
+            from docx import Document
+            import re
+            peek_doc = Document(file_path)
+            table_match = re.search(r'/tbl\[(\d+)\]', table_path)
+            if table_match:
+                peek_idx = int(table_match.group(1)) - 1
+                if 0 <= peek_idx < len(peek_doc.tables) and peek_doc.tables[peek_idx].rows:
+                    peek_table = peek_doc.tables[peek_idx]
+                    physical_existing_row_count = len(peek_table.rows)
+                    physical_cols = len(peek_table.rows[0].cells)
+                    invalid_rows = [
+                        (i + 1, len(row))
+                        for i, row in enumerate(raw_rows)
+                        if not isinstance(row, list) or len(row) not in (physical_cols, max(1, physical_cols - 1))
+                    ]
+                    if invalid_rows:
+                        return (
+                            f"[错误: 表格 {table_path} 存在列数不完整的数据行 {invalid_rows[:5]}，"
+                            f"要求每行 {physical_cols} 列（含序号）或 {max(1, physical_cols - 1)} 列（不含序号）]"
+                        )
+        except Exception as shape_err:
+            logger.warning(f"📊 [OfficeCLI Tool] 表格行列数预校验异常，将继续交由后续流程处理: {shape_err}")
+
         # 1. 查询表格现有 DOM 节点，正则精准解析表格现有 rows=N 行数
-        existing_row_count = 1  # 默认至少包含 1 行表头
+        # OfficeCLI 的结构查询在部分文档/路径上可能无法返回 rows=，不能因此
+        # 把 existing_row_count 错当成 1，否则所有新数据都会追加到原模板空行
+        # 后面，最终出现“内容重复 + 中间空白行”。优先使用 python-docx 读取的
+        # 物理行数，再用 OfficeCLI 查询结果补充或校正。
+        existing_row_count = physical_existing_row_count or 1  # 默认至少包含 1 行表头
         try:
             import re
             struct_str = await office_cli_service.query_structure(file_path, "table")
@@ -204,7 +238,8 @@ async def officecli_fill_table_rows_tool(
                 if table_path in line:
                     m = re.search(r'rows=(\d+)', line) or re.search(r'children=(\d+)', line)
                     if m:
-                        existing_row_count = int(m.group(1))
+                        queried_row_count = int(m.group(1))
+                        existing_row_count = max(existing_row_count, queried_row_count)
                         logger.info(f"📊 [OfficeCLI Tool] 成功识别到表格 '{table_path}' 现有行数: {existing_row_count}")
                         break
         except Exception as err:
@@ -296,7 +331,8 @@ def officecli_insert_image_tool(
     target_path: str,
     image_path: str,
     width_inches: float = 5.5,
-    caption: str = ""
+    caption: str = "",
+    anchor_text: str = "",
 ) -> str:
     """
     [Office CLI Tool] 在 Word 文档 (.docx) 的指定节点 Path (如 '/body/p[12]' 或 '/body/tbl[1]/tr[2]/tc[1]') 原位插入资质证明图片。
@@ -307,6 +343,7 @@ def officecli_insert_image_tool(
     :param image_path: 资质证书图片的磁盘绝对路径 (需存在于 uploads/qualifications)
     :param width_inches: 图片渲染宽度 (单位: 英寸, 默认 5.5)
     :param caption: 可选，图片下方的说明图注 (如 '营业执照 (统一社会信用代码: xxx)')
+    :param anchor_text: 当前文档动态提取的原文锚点，用于防止图片错插
     :return: 执行结果描述
     """
     logger.info(f"🖼️ [OfficeCLI Tool] officecli_insert_image_tool 被调用, file: '{file_path}', target: '{target_path}', img: '{image_path}'")
@@ -324,13 +361,43 @@ def officecli_insert_image_tool(
         doc = Document(file_path)
         target_p = None
 
-        p_match = re.search(r'/body/p\[(\d+)\]$', target_path)
-        tc_match = re.search(r'/body/tbl\[(\d+)\]/(?:row|tr)\[(\d+)\]/(?:cell|tc)\[(\d+)\]$', target_path)
+        p_match = re.search(r'/body/p\[(\d+)\](?:/r\[\d+\])?$', target_path)
+        para_id_match = re.search(r'@paraId=([A-Fa-f0-9]+)', target_path)
+        tc_match = re.search(r'/body/tbl\[(\d+)\]/(?:row|tr)\[(\d+)\]/(?:cell|tc)\[(\d+)\](?:/p\[\d+\])?$', target_path)
 
         if p_match:
             p_idx = int(p_match.group(1)) - 1
             if 0 <= p_idx < len(doc.paragraphs):
                 target_p = doc.paragraphs[p_idx]
+        elif para_id_match:
+            target_para_id = para_id_match.group(1).upper()
+
+            def _paragraph_para_id(paragraph) -> str:
+                for key, value in paragraph._element.attrib.items():
+                    if str(key).lower().endswith('paraid'):
+                        return str(value).strip().upper()
+                return ""
+
+            for paragraph in doc.paragraphs:
+                para_id = _paragraph_para_id(paragraph)
+                if para_id and para_id == target_para_id:
+                    target_p = paragraph
+                    break
+            if not target_p:
+                for table in doc.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            for paragraph in cell.paragraphs:
+                                para_id = _paragraph_para_id(paragraph)
+                                if para_id and para_id == target_para_id:
+                                    target_p = paragraph
+                                    break
+                            if target_p:
+                                break
+                        if target_p:
+                            break
+                    if target_p:
+                        break
         elif tc_match:
             tbl_idx = int(tc_match.group(1)) - 1
             row_idx = int(tc_match.group(2)) - 1
@@ -343,15 +410,23 @@ def officecli_insert_image_tool(
                         cell = row.cells[col_idx]
                         target_p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
 
-        # 后备查找：若物理 Path 未能精确定位，正则匹配占位符文本
+        # 禁止在无法精确定位时随机寻找或新建段落，避免图片落入日期、落款等无关位置。
         if not target_p:
-            for p in doc.paragraphs:
-                if target_path in p.text or "[待" in p.text or "资质" in p.text:
-                    target_p = p
-                    break
+            return f"[错误: 无法精确定位 Word 节点 {target_path}]"
 
-        if not target_p and doc.paragraphs:
-            target_p = doc.add_paragraph()
+        if anchor_text and (target_p.text or "").strip():
+            from app.agents.bid_filler_agent import _image_target_matches_anchor
+
+            probe = {
+                "caption": caption,
+                "anchor_text": anchor_text,
+                "original_context": anchor_text,
+            }
+            if not _image_target_matches_anchor(target_p, probe):
+                logger.warning(
+                    f"🖼️ [OfficeCLI Tool] 图片锚点校验失败，拒绝写入节点: {target_path}"
+                )
+                return f"[错误: 图片原文锚点与目标节点不匹配 {target_path}]"
 
         if target_p:
             target_p.text = ""
@@ -389,5 +464,3 @@ def get_all_office_cli_agent_tools() -> List[Any]:
         officecli_fill_table_rows_tool,
         officecli_insert_image_tool,
     ]
-
-

@@ -15,6 +15,7 @@ from app.db.session import SessionLocal
 from app.db.models.business import CompanyQualification
 from app.services.rag_service import rag_service
 from app.utils.rmb_formatter import number_to_chinese_rmb
+from app.agents.tools.style_extractor_tool import extract_text_by_style
 
 
 def get_company_qualifications_tool(tenant_id: str = None) -> List[Dict[str, Any]]:
@@ -183,6 +184,6 @@ def fetch_chapter_clause_requirements(document_id: str, chapter_title: str) -> s
 WRITER_TOOLS = [
     get_company_qualifications,
     get_cost_estimation_data,
-    fetch_chapter_clause_requirements
+    fetch_chapter_clause_requirements,
+    extract_text_by_style,
 ]
-

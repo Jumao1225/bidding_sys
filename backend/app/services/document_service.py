@@ -61,13 +61,83 @@ class DocumentService:
             if md_obj:
                 metadata_dict[key] = {k: v for k, v in md_obj.__dict__.items() if not k.startswith('_')}
 
+        cost_analysis = dict(doc_obj.parsed_metadata.get("cost_analysis", {})) if doc_obj.parsed_metadata else {}
+
+        # cost_estimates 是项目 BOM 成本报价的主表；parsed_metadata 中的
+        # cost_analysis 仅作为兼容旧数据和保存汇总状态的 JSON 快照。
+        from app.db.models.ai_analysis import CostEstimate
+        cost_rows = (
+            db.query(CostEstimate)
+            .filter(
+                CostEstimate.document_id == doc_id,
+                CostEstimate.tenant_id == tenant_id,
+            )
+            .order_by(CostEstimate.sort_order.asc(), CostEstimate.created_at.asc())
+            .all()
+        )
+        if cost_rows:
+            cost_analysis["items"] = [
+                {
+                    "id": row.id,
+                    "item_code": row.item_code,
+                    "name": row.item_name,
+                    "spec_requirement": row.spec_requirement or "",
+                    "qty": row.quantity,
+                    "unit": row.unit,
+                    "ref_price": row.unit_price or 0.0,
+                    "subtotal": row.calculated_total or 0.0,
+                    "matched_name": row.matched_name or row.item_name,
+                    "matched_brand": row.matched_brand or row.brand or "",
+                    "matched_model": row.matched_model or row.model or row.spec or "",
+                    "matched_manufacturer": row.matched_manufacturer or row.manufacturer or "",
+                    "brand": row.brand or "",
+                    "model": row.model or row.spec or "",
+                    "manufacturer": row.manufacturer or "",
+                    "key_parameters": row.key_parameters or [],
+                    "brand_requirements": row.brand_requirements or "",
+                    "match_quality": row.match_quality or "",
+                    "warning": row.warning or "",
+                    "comparison_note": row.comparison_note or "",
+                    "parent_item": row.parent_item,
+                    "root_item": row.root_item,
+                    "tree_level": row.tree_level or 1,
+                    "per_set_qty": row.per_set_qty,
+                    "per_set_quantity": row.per_set_quantity,
+                    "section_name": row.section_name,
+                }
+                for row in cost_rows
+            ]
+            cost_analysis["total_cost"] = sum(row.calculated_total or 0.0 for row in cost_rows)
+        # 自动校验与修复 cost_analysis 中的 parent_item 树形关联与 section_name 区域标签
+        if cost_analysis and isinstance(cost_analysis.get("items"), list):
+            eng_obj = metadata_objs.get("engineering")
+            if eng_obj and hasattr(eng_obj, "main_equipment_list") and isinstance(eng_obj.main_equipment_list, list):
+                eng_meta_map = {}
+                for eq in eng_obj.main_equipment_list:
+                    if isinstance(eq, dict) and eq.get("item_name"):
+                        eng_meta_map[eq["item_name"].strip()] = {
+                            "parent_item": eq.get("parent_item"),
+                            "per_set_qty": eq.get("per_set_quantity") or eq.get("per_set_qty"),
+                            "section_name": eq.get("section_name")
+                        }
+                for itm in cost_analysis["items"]:
+                    if isinstance(itm, dict):
+                        nm = (itm.get("name") or "").strip()
+                        if nm in eng_meta_map:
+                            if not itm.get("parent_item") and eng_meta_map[nm].get("parent_item"):
+                                itm["parent_item"] = eng_meta_map[nm]["parent_item"]
+                            if not itm.get("per_set_qty") and eng_meta_map[nm].get("per_set_qty"):
+                                itm["per_set_qty"] = eng_meta_map[nm]["per_set_qty"]
+                            if not itm.get("section_name") and eng_meta_map[nm].get("section_name"):
+                                itm["section_name"] = eng_meta_map[nm]["section_name"]
+
         result = {
             "document_id": doc_id,
             "filename": doc_obj.filename,
             "extracted_text": doc_text,
             "qualifications_analysis": doc_obj.parsed_metadata.get("qualifications_analysis", {}) if doc_obj.parsed_metadata else {},
             "risks_analysis": doc_obj.parsed_metadata.get("risks_analysis", []) if doc_obj.parsed_metadata else [],
-            "cost_analysis": doc_obj.parsed_metadata.get("cost_analysis", {}) if doc_obj.parsed_metadata else {},
+            "cost_analysis": cost_analysis,
             "metadata": metadata_dict
         }
         

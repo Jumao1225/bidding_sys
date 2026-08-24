@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../utils/api';
 import { motion } from 'framer-motion';
-import { QualificationCard, type Qualification } from '../components/qualifications/QualificationCard';
+import type { Qualification } from '../components/qualifications/QualificationCard';
 import { QualificationUploadModal } from '../components/qualifications/QualificationUploadModal';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';

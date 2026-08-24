@@ -680,6 +680,61 @@ _CELL_POLLUTION_PATTERNS = [
     re.compile(r'^\s*表头\s*tc[:：]?\s*', re.IGNORECASE),
 ]
 
+# 匹配各种说明性元数据与零改动注释括号
+_ZERO_CHANGE_ANNOTATION_PATTERNS = [
+    re.compile(r'[\(（]\s*(?:原文|模板|固定|正文|章节|标题|大标题|引言|注|甲方)?\s*(?:无槽位|固定原文|零改动|原样保留|无需改动|无需修改|无需写盘|盲守|100%|已写|保留原文|待线下|线下盖章|线下签字|线下签署|线下办理)[^()（）]*[\)）]', re.IGNORECASE),
+    re.compile(r'[\(（]\s*(?:原文|模板|正文|章节|标题)?\s*(?:100%|盲守|零改动|原样保留|保留原文)[^()（）]*[\)）]', re.IGNORECASE),
+    re.compile(r'[\(（]\s*正文已写[，,\s]*零改动\s*[\)）]', re.IGNORECASE),
+    re.compile(r'[\(（]\s*原文无槽位[，,\s]*零改动保留\s*[\)）]', re.IGNORECASE),
+    re.compile(r'[\(（]\s*固定原文[，,\s]*零改动保留\s*[\)）]', re.IGNORECASE),
+    re.compile(r'[\(（]\s*(?:原文)?无槽位[，,\s]*(?:零改动|原样)?保留\s*[\)）]', re.IGNORECASE),
+]
+
+
+def clean_zero_change_annotations(text: str) -> str:
+    """
+    程序化剥离文本中残留的各类零改动、无槽位、固定原文等说明性注释括号。
+    例如：
+    - "致太湖咨询：（原文无槽位，零改动保留）" -> "致太湖咨询："
+    - "据此函，签字人宣布如下：（固定原文，零改动保留）" -> "据此函，签字人宣布如下："
+    """
+    if not text:
+        return text
+    cleaned = text
+    for pat in _ZERO_CHANGE_ANNOTATION_PATTERNS:
+        cleaned = pat.sub('', cleaned)
+    return cleaned.strip()
+
+
+def is_zero_change_or_no_op_proposal(proposed_text: str, original_context: str = "", prop_type: str = "") -> bool:
+    """
+    判定提案是否属于“零改动/无需修改”的无操作提案 (No-Op Proposal)。
+    如果提案文本剥离注释后为空、为元数据标记词、或与原文模板完全一致，则返回 True，指示无需写盘改写。
+    """
+    if prop_type in ("image", "table_rows"):
+        return False
+    if not proposed_text:
+        return True
+
+    cleaned_p = clean_zero_change_annotations(proposed_text).strip()
+    # 纯元数据标记检测
+    if not cleaned_p or any(cleaned_p == k for k in ["—", "-", "--", "同上", "略", "无变更", "原样保留", "无需写盘", "零改动", "固定原文", "无槽位"]):
+        return True
+    if any(k in proposed_text for k in ["（原文无槽位", "(原文无槽位", "（固定原文", "(固定原文", "（无需写盘", "（零改动", "(零改动", "（原样保留", "(原样保留"]) and not cleaned_p:
+        return True
+
+    if original_context:
+        cleaned_orig = clean_zero_change_annotations(original_context).strip()
+        # 骨架去标点空白比较
+        p_core = re.sub(r'[\s:：_＿\[\]［］\(\)（）\.\,，。；;、“”"\'`]', '', cleaned_p)
+        o_core = re.sub(r'[\s:：_＿\[\]［］\(\)（）\.\,，。；;、“”"\'`]', '', cleaned_orig)
+        if p_core and o_core and p_core == o_core:
+            return True
+        if cleaned_p == cleaned_orig:
+            return True
+
+    return False
+
 
 def clean_all_ellipsis(text: str) -> str:
     """
@@ -714,7 +769,7 @@ def clean_all_ellipsis(text: str) -> str:
 
 def clean_cell_text_value(text: str, ctx: str = "") -> str:
     """
-    程序化清理表格单元格文本中的污染前缀与多余指示词。
+    程序化清理表格单元格文本中的污染前缀、零改动注释与多余指示词。
     """
     if not text or text.startswith("["):
         return text
@@ -724,6 +779,9 @@ def clean_cell_text_value(text: str, ctx: str = "") -> str:
     for pat in _CELL_POLLUTION_PATTERNS:
         while pat.search(cleaned):
             cleaned = pat.sub('', cleaned).strip()
+
+    # 剥离零改动等说明性元数据注释
+    cleaned = clean_zero_change_annotations(cleaned)
 
     # 特殊规范化：对【有无偏离】单元格文本进行标准判定与提取
     combined = f"{text} {ctx}".lower()

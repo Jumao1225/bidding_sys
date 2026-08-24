@@ -46,6 +46,10 @@ export const AgentAuditPage: React.FC = () => {
 
   const [workers, setWorkers] = useState<WorkerItem[]>([]);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
+  // 审计日志每次刷新/微调都会生成新的 id，章节名才是稳定的选中键。
+  const [selectedChapterTitle, setSelectedChapterTitle] = useState<string | null>(null);
+  const selectedWorkerIdRef = useRef<string | null>(null);
+  const selectedChapterTitleRef = useRef<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [activeTab, setActiveTab] = useState<'details' | 'thought' | 'raw'>('details');
   const [showDocModal, setShowDocModal] = useState(false);
@@ -55,6 +59,28 @@ export const AgentAuditPage: React.FC = () => {
   const [showRefineModal, setShowRefineModal] = useState(false);
   const [refinePrompt, setRefinePrompt] = useState('');
   const [isRefining, setIsRefining] = useState(false);
+
+  const syncWorkerSelection = (items: WorkerItem[]) => {
+    const sameWorker = selectedWorkerIdRef.current
+      ? items.find(i => i.id === selectedWorkerIdRef.current)
+      : undefined;
+    const sameChapter = selectedChapterTitleRef.current
+      ? items.find(i => i.chapter_title === selectedChapterTitleRef.current)
+      : undefined;
+    const nextWorker = sameWorker || sameChapter || items[0];
+
+    if (nextWorker) {
+      selectedWorkerIdRef.current = nextWorker.id;
+      selectedChapterTitleRef.current = nextWorker.chapter_title;
+      setSelectedWorkerId(nextWorker.id);
+      setSelectedChapterTitle(nextWorker.chapter_title);
+    } else {
+      selectedWorkerIdRef.current = null;
+      selectedChapterTitleRef.current = null;
+      setSelectedWorkerId(null);
+      setSelectedChapterTitle(null);
+    }
+  };
 
   // 同步 URL 参数变更
   useEffect(() => {
@@ -93,8 +119,10 @@ export const AgentAuditPage: React.FC = () => {
 
   const [isLivePolling, setIsLivePolling] = useState(false);
 
-  // 实时撰写计时器 State (支持 100ms 级别实时毫秒/秒级跳动计时)
+  // 真实物理端到端耗时与秒表计时器 State (支持 100ms 级别实时毫秒/秒级跳动计时与平滑冻结)
   const [liveTimerMs, setLiveTimerMs] = useState(0);
+  const [serverWallTimeMs, setServerWallTimeMs] = useState(0);
+  const [frozenDurationMs, setFrozenDurationMs] = useState(0);
   const timerStartRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -110,7 +138,6 @@ export const AgentAuditPage: React.FC = () => {
       }, 100);
     } else {
       timerStartRef.current = null;
-      setLiveTimerMs(0);
     }
 
     return () => {
@@ -143,11 +170,10 @@ export const AgentAuditPage: React.FC = () => {
 
       const items: WorkerItem[] = data.worker_items || [];
       setWorkers(items);
-      if (items.length > 0) {
-        setSelectedWorkerId(prev => (prev && items.some(i => i.id === prev)) ? prev : items[0].id);
-      } else {
-        setSelectedWorkerId(null);
+      if (typeof data.total_wall_time_ms === 'number' && data.total_wall_time_ms > 0) {
+        setServerWallTimeMs(data.total_wall_time_ms);
       }
+      syncWorkerSelection(items);
       setError(null);
     } catch (err: any) {
       console.warn('获取 Agent 履历数据出差/暂无履历:', err);
@@ -175,11 +201,13 @@ export const AgentAuditPage: React.FC = () => {
         if (data.worker_items && Array.isArray(data.worker_items)) {
           setWorkers(data.worker_items);
           setLoading(false);
-          if (data.worker_items.length > 0) {
-            setSelectedWorkerId(prev => (prev && data.worker_items.some((i: any) => i.id === prev)) ? prev : data.worker_items[0].id);
-          }
+          syncWorkerSelection(data.worker_items as WorkerItem[]);
         }
-        if (data.is_completed && data.worker_items && data.worker_items.length > 0 && data.worker_items.some((w: any) => w.status === 'success')) {
+        if (typeof data.total_wall_time_ms === 'number' && data.total_wall_time_ms > 0) {
+          setServerWallTimeMs(data.total_wall_time_ms);
+        }
+        if (data.is_completed && data.worker_items && data.worker_items.length > 0 && data.worker_items.some((w: any) => w.status === 'success' || w.status === 'master_completed')) {
+          setFrozenDurationMs(prev => (liveTimerMs > 0 ? liveTimerMs : prev));
           setIsLivePolling(false);
           setIsGenerating(false);
           setLoading(false);
@@ -198,6 +226,11 @@ export const AgentAuditPage: React.FC = () => {
   };
 
   useEffect(() => {
+    selectedWorkerIdRef.current = null;
+    selectedChapterTitleRef.current = null;
+    setSelectedWorkerId(null);
+    setSelectedChapterTitle(null);
+
     if (activeDocId) {
       fetchWorkerLogs(activeDocId);
       setupSSELogStream(activeDocId);
@@ -224,7 +257,14 @@ export const AgentAuditPage: React.FC = () => {
     // 清空历史旧履历，重置呈现最新一轮 Agent 思考与原位落盘弹增过程
     setWorkers([]);
     setSelectedWorkerId(null);
+    setSelectedChapterTitle(null);
+    selectedWorkerIdRef.current = null;
+    selectedChapterTitleRef.current = null;
     setLoading(false);
+    setLiveTimerMs(0);
+    setFrozenDurationMs(0);
+    setServerWallTimeMs(0);
+    timerStartRef.current = Date.now();
 
     try {
       // 先发起 POST 请求，触发后端瞬间清理旧日志并写入初始 in_progress 记录
@@ -322,10 +362,12 @@ export const AgentAuditPage: React.FC = () => {
       a.download = filename;
       document.body.appendChild(a);
       a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
-
-      setNotice('✅ 《投标文件格式》原格式标书文件已成功下载！');
+      const modeHeader = response.headers.get('X-Extraction-Mode');
+      if (modeHeader === 'fallback_template') {
+        setNotice('⚠️ 《投标文件格式》原标书章节未精准命中，已下载通用托底格式模板！');
+      } else {
+        setNotice('✅ 《投标文件格式》标书格式文件已成功下载！');
+      }
     } catch (err: any) {
       setError(`下载原格式标书失败: ${err.message}`);
     } finally {
@@ -363,6 +405,11 @@ export const AgentAuditPage: React.FC = () => {
       // 更新本地 workers 列表并刷新履历
       if (data.worker_item) {
         setWorkers(prev => prev.map(w => w.chapter_title === data.chapter_title ? { ...w, ...data.worker_item } : w));
+        // 微调会生成新的审计日志 id，必须同步更新选中项，不能让 selectedWorker 回退到第一张卡片。
+        selectedWorkerIdRef.current = data.worker_item.id;
+        selectedChapterTitleRef.current = data.chapter_title;
+        setSelectedWorkerId(data.worker_item.id);
+        setSelectedChapterTitle(data.chapter_title);
       } else {
         fetchWorkerLogs(activeDocId, false);
       }
@@ -379,22 +426,40 @@ export const AgentAuditPage: React.FC = () => {
       w.node_name.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  const selectedWorker = workers.find((w) => w.id === selectedWorkerId) || filteredWorkers[0];
+  const selectedWorker =
+    (selectedChapterTitle && workers.find((w) => w.chapter_title === selectedChapterTitle)) ||
+    (selectedWorkerId && workers.find((w) => w.id === selectedWorkerId)) ||
+    filteredWorkers[0];
 
   const totalTokens = workers.reduce((acc, w) => acc + (w.total_tokens || 0), 0);
-  const totalTimeMs = workers.reduce((acc, w) => acc + (w.execution_time_ms || 0), 0);
-  
-  // 实时耗时计算：当 AI 团队全自主撰写运行中时使用 liveTimerMs 高频跳动计时，完成后精准呈现累计总耗时
-  const displayTimeSeconds = (isGenerating || isLivePolling)
-    ? (liveTimerMs / 1000).toFixed(1)
-    : (totalTimeMs / 1000).toFixed(1);
+  const totalPromptTokens = workers.reduce((acc, w) => acc + (w.prompt_tokens || 0), 0);
+  const totalCompletionTokens = workers.reduce((acc, w) => acc + (w.completion_tokens || 0), 0);
+  const totalWorkerComputeTimeMs = workers.reduce((acc, w) => acc + (w.execution_time_ms || 0), 0);
+
+  // 真实物理端到端耗时计算：
+  // 1. 运行中：展示秒表高频跳动 liveTimerMs；
+  // 2. 完成后：优先采用后端返回的真实物理耗时 serverWallTimeMs，或刚结束时冻结的秒表 frozenDurationMs，或最大单 Worker 耗时，确保数字平滑绝不突增暴增！
+  const actualEffectiveWallTimeMs = (isGenerating || isLivePolling)
+    ? liveTimerMs
+    : (serverWallTimeMs > 0
+      ? serverWallTimeMs
+      : (frozenDurationMs > 0
+        ? frozenDurationMs
+        : Math.max(...workers.map(w => w.execution_time_ms || 0), 0)));
+
+  const displayTimeSeconds = (actualEffectiveWallTimeMs / 1000).toFixed(1);
+
+  // 并发加速倍率（算力总工时 / 物理耗时）
+  const accelerationRatio = actualEffectiveWallTimeMs > 0 && totalWorkerComputeTimeMs > actualEffectiveWallTimeMs
+    ? (totalWorkerComputeTimeMs / actualEffectiveWallTimeMs).toFixed(1)
+    : '1.0';
 
   // 计算成功写盘且无失败的章节数 (包含 success, completed, skipped, master_completed)
   const successfulWorkers = workers.filter((w) => {
     const s = (w.status || '').toLowerCase();
     return s === 'success' || s === 'completed' || s === 'skipped' || s === 'master_completed';
   });
-  
+
   // 按用户要求使用全量章节数 (workers.length) 作为固定分母计算真实成功率
   const writeSuccessRateStr = workers.length > 0
     ? `${Math.round((successfulWorkers.length / workers.length) * 100)}%`
@@ -589,6 +654,11 @@ export const AgentAuditPage: React.FC = () => {
                 )}
               </div>
               <div className="text-lg font-bold text-white font-mono">{displayTimeSeconds} 秒</div>
+              {Number(accelerationRatio) > 1.1 && !isGenerating && !isLivePolling && (
+                <div className="text-[10px] text-blue-400/80 font-mono mt-0.5" title={`并发累计算力工时: ${(totalWorkerComputeTimeMs / 1000).toFixed(1)} 秒`}>
+                  ⚡ 多Agent加速 {accelerationRatio}x
+                </div>
+              )}
             </div>
           </div>
 
@@ -599,6 +669,11 @@ export const AgentAuditPage: React.FC = () => {
             <div>
               <div className="text-[11px] text-slate-400 font-medium">Token 思考总消耗</div>
               <div className="text-lg font-bold text-emerald-400 font-mono">{totalTokens.toLocaleString()}</div>
+              {totalTokens > 0 && (
+                <div className="text-[10px] text-slate-500 font-mono mt-0.5">
+                  P: {totalPromptTokens.toLocaleString()} | C: {totalCompletionTokens.toLocaleString()}
+                </div>
+              )}
             </div>
           </div>
 
@@ -643,30 +718,33 @@ export const AgentAuditPage: React.FC = () => {
                 return (
                   <div
                     key={w.id || idx}
-                    onClick={() => setSelectedWorkerId(w.id)}
-                    className={`p-3 rounded-xl border transition-all cursor-pointer select-none ${
-                      isSelected
+                    onClick={() => {
+                      selectedWorkerIdRef.current = w.id;
+                      selectedChapterTitleRef.current = w.chapter_title;
+                      setSelectedWorkerId(w.id);
+                      setSelectedChapterTitle(w.chapter_title);
+                    }}
+                    className={`p-3 rounded-xl border transition-all cursor-pointer select-none ${isSelected
                         ? isSupervisor
                           ? 'bg-gradient-to-r from-purple-900/90 to-amber-950/80 border-amber-400 text-white shadow-xl shadow-amber-950/40 ring-1 ring-amber-400/50'
                           : 'bg-purple-950/60 border-purple-500 text-white shadow-lg shadow-purple-950/50'
                         : isSupervisor
                           ? 'bg-slate-900/90 border-amber-500/40 text-amber-200 hover:bg-slate-800/80 hover:border-amber-400/60'
                           : 'bg-slate-900/40 border-slate-800/80 text-slate-300 hover:bg-slate-800/60 hover:border-slate-700'
-                    }`}
+                      }`}
                   >
                     <div className="flex items-center justify-between mb-1">
                       <span className="font-bold text-xs truncate max-w-[170px]" title={w.chapter_title}>
                         {isSupervisor ? `👑 ${w.chapter_title}` : w.chapter_title}
                       </span>
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                        w.status === 'in_progress'
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${w.status === 'in_progress'
                           ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse'
                           : w.status === 'failed'
                             ? 'bg-red-500/20 text-red-400 border border-red-500/30'
                             : isSupervisor
                               ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono'
                               : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                      }`}>
+                        }`}>
                         {w.status === 'in_progress' ? '🤖 思考撰写中' : w.status === 'failed' ? '❌ 执行失败' : isSupervisor ? '👑 总控决策' : '✅ 已填报'}
                       </span>
                     </div>
@@ -708,6 +786,7 @@ export const AgentAuditPage: React.FC = () => {
                     <span>耗时: {(selectedWorker.execution_time_ms / 1000).toFixed(1)} 秒</span>
                     <span>Prompt: {selectedWorker.prompt_tokens.toLocaleString()}</span>
                     <span>Completion: {selectedWorker.completion_tokens.toLocaleString()}</span>
+                    <span className="text-emerald-400 font-semibold">Total: {selectedWorker.total_tokens.toLocaleString()} tok</span>
                     <span>写盘提案: {selectedWorker.proposals_count} 项</span>
                   </div>
                 </div>
@@ -740,27 +819,24 @@ export const AgentAuditPage: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => setActiveTab('details')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        activeTab === 'details' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
-                      }`}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${activeTab === 'details' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                        }`}
                     >
                       📌 结构化写盘与工具履历
                     </button>
                     <button
                       type="button"
                       onClick={() => setActiveTab('thought')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        activeTab === 'thought' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
-                      }`}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${activeTab === 'thought' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                        }`}
                     >
                       🧠 完整思维链推导 (CoT)
                     </button>
                     <button
                       type="button"
                       onClick={() => setActiveTab('raw')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                        activeTab === 'raw' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
-                      }`}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${activeTab === 'raw' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                        }`}
                     >
                       📄 原始 JSON 履历
                     </button>
@@ -1062,11 +1138,11 @@ export const AgentAuditPage: React.FC = () => {
                 <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-purple-600 to-indigo-600 text-white flex items-center justify-center text-3xl mx-auto mb-4 shadow-lg shadow-purple-900/50">
                   📄
                 </div>
-                
+
                 <h3 className="text-xl font-bold text-white mb-2">
                   {currentDocObj ? (currentDocObj.display_label || currentDocObj.filename) : '已定位招标文件'}
                 </h3>
-                
+
                 <p className="text-xs text-slate-400 mb-6 leading-relaxed">
                   系统已载入目标招标文件。点击下方【一键启动 Agent 全自主撰写标书】，多智能体专家团队将自动识别排版槽位、关联企业知识库与价格库，在后台原位扩写并刷盘生成标准 Word (.docx) 标书响应文档。
                 </p>
@@ -1172,11 +1248,10 @@ export const AgentAuditPage: React.FC = () => {
                         navigate(`/agent-audit/${doc.id}`);
                         setShowDocModal(false);
                       }}
-                      className={`p-4 rounded-2xl border transition-all cursor-pointer flex flex-col justify-between group ${
-                        isCurrent
+                      className={`p-4 rounded-2xl border transition-all cursor-pointer flex flex-col justify-between group ${isCurrent
                           ? 'bg-purple-950/60 border-purple-500 ring-2 ring-purple-500/30 shadow-lg shadow-purple-950/50'
                           : 'bg-slate-950/60 border-slate-800 hover:border-purple-600/60 hover:bg-slate-800/40'
-                      }`}
+                        }`}
                     >
                       <div>
                         <div className="flex items-start justify-between gap-2 mb-2">
@@ -1256,11 +1331,7 @@ export const AgentAuditPage: React.FC = () => {
                 <div className="flex flex-wrap gap-2">
                   {[
                     "商务条款与技术要求全部严格填报无偏离",
-                    "强调售后服务团队2小时内到达现场响应",
-                    "根据企业资质中心调取最新资质证书与业绩证明图片",
-                    "所有单价按含13%增值税计算，总价大写金额严格对齐",
                     "指定项目负责人为张三，具备一级建造师资格与高级工程师职称",
-                    "原位覆盖所有占位符下划线，保持表格排版工整美观",
                   ].map((tag, idx) => (
                     <button
                       key={idx}

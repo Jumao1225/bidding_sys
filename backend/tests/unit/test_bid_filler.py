@@ -457,7 +457,7 @@ def test_build_dynamic_matrix_for_header_custom_columns():
     hdr_orm = ["item_name", "quantity", "unit_price", "calculated_total"]
     mat_orm = build_dynamic_matrix_for_header(cost_items, hdr_orm)
     assert len(mat_orm[0]) == 4
-    assert mat_orm[0] == ["XXX设备", "10", "100.0", "1000.0"]
+    assert mat_orm[0] == ["XXX设备", "10", "100.00", "1,000.00"]
 
     # 测试场景2: 5 列包含 __INDEX__ 的动态 ORM 字段提取
     hdr_5col = ["__INDEX__", "item_name", "spec", "quantity", "calculated_total"]
@@ -467,7 +467,7 @@ def test_build_dynamic_matrix_for_header_custom_columns():
     assert mat_5col[0][1] == "XXX设备"    # item_name
     assert mat_5col[0][2] == "XXX规格"    # spec
     assert mat_5col[0][3] == "10"         # quantity
-    assert mat_5col[0][4] == "1000.0"     # calculated_total
+    assert mat_5col[0][4] == "1,000.00"   # calculated_total
 
     # 测试场景3: 9 列传统表头 (含 __BRAND_SPEC__ 品牌+规格合并列)
     hdr_9col = ["__INDEX__", "item_name", "__BRAND_SPEC__", "manufacturer", "unit", "quantity", "unit_price", "calculated_total", "remark"]
@@ -477,8 +477,8 @@ def test_build_dynamic_matrix_for_header_custom_columns():
     assert mat_9col[0][1] == "XXX设备"
     assert mat_9col[0][2] == "XXX品牌 XXX规格"  # 品牌+规格合并
     assert mat_9col[0][3] == "XXX厂商"
-    assert mat_9col[0][6] == "100.0"  # 单价
-    assert mat_9col[0][7] == "1000.0"  # 总价
+    assert mat_9col[0][6] == "100.00"    # 单价
+    assert mat_9col[0][7] == "1,000.00"  # 总价
 
 
 def test_auto_repair_officecli_nested_path():
@@ -674,6 +674,246 @@ def test_ellipsis_cleanup_in_review_engine():
     # 场景3: 纯省略号残缺行
     res3 = clean_cell_text_value("..")
     assert res3 == ""
+
+
+def test_clean_zero_change_annotations_and_no_op_detection():
+    """测试剥离各类‘（原文无槽位，零改动保留）’说明性元数据注释与无操作提案检测"""
+    from app.agents.review_engine import clean_zero_change_annotations, is_zero_change_or_no_op_proposal
+
+    # 1. 测试剥离括号注释
+    t1 = "致太湖咨询：（原文无槽位，零改动保留）"
+    assert clean_zero_change_annotations(t1) == "致太湖咨询："
+
+    t2 = "据此函，签字人兹宣布同意如下：（固定原文，零改动保留）"
+    assert clean_zero_change_annotations(t2) == "据此函，签字人兹宣布同意如下："
+
+    t3 = "1、同意向贵方提供贵方可能另外要求的与投标有关的任何证据或资料。（固定原文，零改动保留）"
+    assert clean_zero_change_annotations(t3) == "1、同意向贵方提供贵方可能另外要求的与投标有关的任何证据或资料。"
+
+    t4 = "授权声明段（模板固定原文，100%盲守）"
+    assert clean_zero_change_annotations(t4) == "授权声明段"
+
+    t5 = "（正文已写，零改动）"
+    assert clean_zero_change_annotations(t5) == ""
+
+    # 2. 保护合法业务括号不被误删
+    t_legal = "根据贵方的 SZDZ-2026-HC008 号招标文件，正式授权下述签字人张三（法定代表人）代表我方（单位盖章），全权处理本次项目投标的有关事宜。"
+    assert clean_zero_change_annotations(t_legal) == t_legal
+
+    # 3. 测试无操作提案 (No-Op Proposal) 识别
+    assert is_zero_change_or_no_op_proposal("致太湖咨询：（原文无槽位，零改动保留）", "致太湖咨询：") is True
+    assert is_zero_change_or_no_op_proposal("（固定原文，零改动保留）", "") is True
+    assert is_zero_change_or_no_op_proposal("无需写盘", "原内容") is True
+    assert is_zero_change_or_no_op_proposal("原样保留", "原内容") is True
+
+    # 4. 实际修改的提案不被误判为 No-Op
+    t_filled = "根据贵方的 SZDZ-2026-HC008 号招标文件，正式授权下述签字人张三（法定代表人）代表我方四川某公司，全权处理本次项目投标的有关事宜。（固定原文，零改动保留）"
+    orig_template = "根据贵方的 ________ 号招标文件，正式授权下述签字人________（法定代表人）代表我方________，全权处理本次项目投标的有关事宜。"
+    assert is_zero_change_or_no_op_proposal(t_filled, orig_template) is False
+    assert clean_zero_change_annotations(t_filled) == "根据贵方的 SZDZ-2026-HC008 号招标文件，正式授权下述签字人张三（法定代表人）代表我方四川某公司，全权处理本次项目投标的有关事宜。"
+
+
+def test_fill_docx_proposals_in_dom_should_filter_zero_change_annotations():
+    """测试 DOM 填充引擎对带有零改动注释的提案进行防护，确保原文档不被污染"""
+    import tempfile
+    import os
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    p1 = doc.add_paragraph("致苏州太湖项目管理咨询有限公司：")
+    p2 = doc.add_paragraph("据此函，签字人兹宣布同意如下：")
+    p3 = doc.add_paragraph("根据贵方的 ________ 号招标文件，正式授权下述签字人________代表我方________，全权处理本次项目投标的有关事宜。")
+
+    proposals = [
+        {
+            "path": "/body/p[1]",
+            "original_context": "致苏州太湖项目管理咨询有限公司：",
+            "proposed_text": "致苏州太湖项目管理咨询有限公司：（原文无槽位，零改动保留）",
+            "type": "sentence_batch"
+        },
+        {
+            "path": "/body/p[2]",
+            "original_context": "据此函，签字人兹宣布同意如下：",
+            "proposed_text": "据此函，签字人兹宣布同意如下：（固定原文，零改动保留）",
+            "type": "sentence_batch"
+        },
+        {
+            "path": "/body/p[3]",
+            "original_context": "根据贵方的 ________ 号招标文件，正式授权下述签字人________代表我方________，全权处理本次项目投标的有关事宜。",
+            "proposed_text": "根据贵方的 SZDZ-2026-HC008 号招标文件，正式授权下述签字人张三代表我方四川在截建设工程有限公司，全权处理本次项目投标的有关事宜。（固定原文，零改动保留）",
+            "type": "sentence_batch"
+        }
+    ]
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+
+        res_doc = Document(temp_path)
+        # p1 与 p2 为零改动段落，不应包含任何“（原文无槽位，零改动保留）”或“（固定原文，零改动保留）”
+        assert res_doc.paragraphs[0].text.strip() == "致苏州太湖项目管理咨询有限公司："
+        assert "原文无槽位" not in res_doc.paragraphs[0].text
+        assert "零改动" not in res_doc.paragraphs[0].text
+
+        assert res_doc.paragraphs[1].text.strip() == "据此函，签字人兹宣布同意如下："
+        assert "固定原文" not in res_doc.paragraphs[1].text
+        assert "零改动" not in res_doc.paragraphs[1].text
+
+        # p3 有实质性填充，其末尾的“（固定原文，零改动保留）”应被彻底清洗剥离
+        assert "固定原文" not in res_doc.paragraphs[2].text
+        assert "零改动" not in res_doc.paragraphs[2].text
+        assert "SZDZ-2026-HC008" in res_doc.paragraphs[2].text
+        assert "张三" in res_doc.paragraphs[2].text
+        assert "四川在截建设工程有限公司" in res_doc.paragraphs[2].text
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_is_fixed_slot_form_table_structural_detection():
+    """测试基于纯结构与版面形态判定固定单元格填报表（零硬编码）"""
+    from docx import Document
+    from app.utils.table_utils import is_fixed_slot_form_table
+
+    doc = Document()
+
+    # 1. 结构 1：固定单项汇总表（1 行表头 + 1 行预置标的物数据行 + 1 行跨列合并表尾行）
+    tbl_fixed = doc.add_table(rows=3, cols=4)
+    tbl_fixed.rows[0].cells[0].text = "标的物"
+    tbl_fixed.rows[0].cells[1].text = "技术指标"
+    tbl_fixed.rows[0].cells[2].text = "总金额"
+    tbl_fixed.rows[0].cells[3].text = "备注"
+    tbl_fixed.rows[1].cells[0].text = "某分布式光伏发电工程项目"
+    tbl_fixed.rows[1].cells[1].text = "满足招标文件技术规范"
+    tbl_fixed.rows[1].cells[2].text = ""  # 待填
+    tbl_fixed.rows[1].cells[3].text = ""
+    tbl_fixed.rows[2].cells[0].merge(tbl_fixed.rows[2].cells[3])
+    tbl_fixed.rows[2].cells[0].text = "总计大写金额："
+
+    assert is_fixed_slot_form_table(tbl_fixed) is True
+
+    # 2. 结构 2：动态多行展开清单表（1 行表头 + 1 行全空占位行 + 1 行合计行，总行数 > 3 或多数据行）
+    tbl_dynamic = doc.add_table(rows=5, cols=6)
+    for i, h in enumerate(["序号", "设备名称", "规格型号", "数量", "单价", "合价"]):
+        tbl_dynamic.rows[0].cells[i].text = h
+    # 中间均为待展开行
+    assert is_fixed_slot_form_table(tbl_dynamic) is False
+
+
+def test_is_narrative_clause_or_lead_in_generic_rules():
+    """测试基于通用语法标点与篇章结构判定正文叙述句/条款导语（零硬编码）"""
+    from app.utils.table_utils import is_narrative_clause_or_lead_in
+
+    # 1. 叙述句/公文导语/条款标题（必须返回 True，严禁被误当成表单属性标签）
+    narrative_samples = [
+        "据此函，签字人兹宣布同意如下：",
+        "5、与本投标有关的正式通讯地址为：",
+        "致苏州大智项目管理咨询有限公司：",
+        "致某某招标代理机构：",
+        "1、同意向贵方提供贵方可能另外要求的与投标有关的任何证据或资料；",
+        "2、我们完全理解贵方不一定将合同授予最低报价的投标人；",
+        "根据贵方的 SZDZ-2026-NG008 号招标文件，正式授权下述签字人李四代表我方，全权处理本次项目投标的有关事宜。",
+        "我方在此声明如下：",
+        "本投标人郑重承诺如下：",
+        "现授权如下：",
+        "特此声明：",
+        "（一）关于资格证明文件的书面声明如下：",
+    ]
+
+    for s in narrative_samples:
+        assert is_narrative_clause_or_lead_in(s) is True, f"'{s}' 应被识别为正文叙述/导语句"
+
+    # 2. 真正的表单属性标签/留白槽位（必须返回 False，允许自愈或填报）
+    valid_property_labels = [
+        "地    址：                                ",
+        "地 址：",
+        "电    话：                                ",
+        "电 话：",
+        "邮    编：                                ",
+        "传    真：                                ",
+        "投标单位代表姓名（签字）：                ",
+        "投标单位名称：                            ",
+        "公    章：                               ",
+        "日    期：     年      月     日",
+        "法定代表人（签字）：",
+        "授权代表（签字）：",
+        "法定代表人或授权代表签字（或盖章）：                       年     月    日",
+        "投标人全称（加盖公章）：",
+        "开户银行及账号：",
+        "统一社会信用代码：",
+    ]
+
+    for lbl in valid_property_labels:
+        assert is_narrative_clause_or_lead_in(lbl) is False, f"'{lbl}' 应被识别为合法表单属性标签"
+
+
+def test_reset_chapter_to_template_should_cleanly_reset_target_chapter():
+    """测试单章节重置器能够将工作副本中被污染的段落100%精准重置回纯净模板状态"""
+    import tempfile, os
+    from docx import Document
+    from app.utils.table_utils import reset_chapter_to_template
+
+    # 1. 构建纯净模板
+    doc_tpl = Document()
+    doc_tpl.add_heading("一、封面", level=1)
+    doc_tpl.add_paragraph("项目名称：______")
+    doc_tpl.add_heading("二、投标函格式", level=1)
+    doc_tpl.add_paragraph("致某某咨询公司：")
+    doc_tpl.add_paragraph("根据贵方的______号招标文件，正式授权下述签字人______代表我方______...")
+    doc_tpl.add_paragraph("据此函，签字人兹宣布同意如下：")
+    doc_tpl.add_paragraph("5、与本投标有关的正式通讯地址为：")
+    doc_tpl.add_paragraph("地    址：                                ")
+    doc_tpl.add_heading("三、开标一览表", level=1)
+    doc_tpl.add_paragraph("开标一览表说明")
+
+    # 2. 构建被历史错误填报污染过的工作副本
+    doc_work = Document()
+    doc_work.add_heading("一、封面", level=1)
+    doc_work.add_paragraph("项目名称：已填充的某光伏项目")
+    doc_work.add_heading("二、投标函格式", level=1)
+    doc_work.add_paragraph("致某某咨询公司：")
+    doc_work.add_paragraph("根据贵方的SZDZ-001号招标文件，正式授权下述签字人李四代表我方四川某公司...")
+    doc_work.add_paragraph("据此函，签字人兹宣布同意如下： 张三")
+    doc_work.add_paragraph("5、与本投标有关的正式通讯地址为： 四川省成都市高新区128号")
+    doc_work.add_paragraph("地    址：四川省成都市高新区128号")
+    doc_work.add_heading("三、开标一览表", level=1)
+    doc_work.add_paragraph("开标一览表说明")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf_tpl, \
+         tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf_work:
+        tpl_path = tf_tpl.name
+        work_path = tf_work.name
+
+    try:
+        doc_tpl.save(tpl_path)
+        doc_work.save(work_path)
+
+        # 执行针对“二、投标函格式”的单章节精准重置
+        success = reset_chapter_to_template(work_path, tpl_path, "二、投标函格式")
+        assert success is True
+
+        res_doc = Document(work_path)
+        res_texts = [p.text for p in res_doc.paragraphs]
+
+        # 验证“二、投标函格式”中的污染内容被 100% 清空重置为模板原文
+        assert "据此函，签字人兹宣布同意如下：" in res_texts
+        assert not any("据此函，签字人兹宣布同意如下： 张三" in t for t in res_texts)
+        assert "5、与本投标有关的正式通讯地址为：" in res_texts
+        assert not any("5、与本投标有关的正式通讯地址为： 四川省" in t for t in res_texts)
+        assert "地    址：                                " in res_texts
+
+        # 验证其余章节（如“一、封面”的已填报内容）未被影响
+        assert "项目名称：已填充的某光伏项目" in res_texts
+    finally:
+        for p in [tpl_path, work_path]:
+            if os.path.exists(p):
+                os.remove(p)
+
+
 
 
 

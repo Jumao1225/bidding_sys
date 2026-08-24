@@ -19,6 +19,7 @@ import json
 import shutil
 import tempfile
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Any, List, Optional, Tuple, TypedDict
 from loguru import logger
 from sqlalchemy.orm import Session
@@ -47,6 +48,7 @@ from app.schemas.bid_filler_schema import (
 )
 from app.services.llm_service import llm_service
 from app.utils.rmb_formatter import number_to_chinese_rmb
+from app.utils.table_utils import is_narrative_clause_or_lead_in
 
 
 # ============================================================
@@ -56,9 +58,11 @@ from app.utils.rmb_formatter import number_to_chinese_rmb
 class BidFillerState(TypedDict):
     """LangGraph Multi-Agent 标书撰写全局状态"""
     document_id: str
+    tenant_id: Optional[str]
     original_context: str
     slot_analysis: Optional[List[Dict[str, Any]]]
     worker_proposals: Optional[List[Dict[str, Any]]]  # 保留兼容
+    chapter_tasks: Optional[List[Dict[str, Any]]]  # 首轮缓存的可执行章节任务，供修复轮复用
 
     db_session: Any
     company_profile: CompanyProfile
@@ -74,11 +78,60 @@ class BidFillerState(TypedDict):
     max_repair_rounds: int
     repair_instructions_map: Optional[Dict[str, str]]   # 按章节的专项修复反馈指令
     audit_passed: Optional[bool]
+    audit_blocked: bool                                 # 达到修复上限仍不通过时阻断发布
 
     audit_items: List[FillingAuditItem]
     review_findings: Optional[List[Dict[str, Any]]]     # 终审发现列表
     audit_report: Optional[BidFillAuditReport]
     filled_docx_bytes: Optional[bytes]
+
+
+def _select_repair_chapter_tasks(
+    chapter_tasks: Optional[List[Dict[str, Any]]],
+    repair_instructions_map: Optional[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """根据终审章节名称筛选修复轮需要重新执行的章节任务。"""
+    if not chapter_tasks or not repair_instructions_map:
+        return []
+
+    repair_titles = {
+        str(title).strip()
+        for title in repair_instructions_map
+        if str(title).strip()
+    }
+    if not repair_titles:
+        return []
+
+    selected_tasks: List[Dict[str, Any]] = []
+    selected_keys = set()
+    for task in chapter_tasks:
+        if not isinstance(task, dict):
+            continue
+
+        chapter_title = str(task.get("chapter_title", "")).strip()
+        if not chapter_title:
+            continue
+
+        # 优先精确匹配，兼容终审标题带有章节编号或少量前后缀的情况。
+        is_repair_target = any(
+            chapter_title == repair_title
+            or chapter_title in repair_title
+            or repair_title in chapter_title
+            for repair_title in repair_titles
+        )
+        if not is_repair_target:
+            continue
+
+        task_key = (
+            str(task.get("chapter_number", "")).strip(),
+            chapter_title,
+        )
+        if task_key in selected_keys:
+            continue
+        selected_keys.add(task_key)
+        selected_tasks.append(task)
+
+    return selected_tasks
 
 
 
@@ -131,7 +184,6 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     Supervisor Agent — 读文档 → 识别章节 → 四类分类 → 并发派发 Worker 独立直写 Word。
     支持在质量审核不达标时接收专项修复指令。
     """
-    logger.info("[LangGraph Node 2/4] agent_fill_node: 启动 Supervisor 决策 Agent...")
     doc_id = state.get("document_id", "")
     original_context = state.get("original_context", "")
     docx_temp_path = state.get("docx_temp_path")
@@ -139,6 +191,22 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     repair_instructions_map = state.get("repair_instructions_map") or {}
     repair_count = state.get("repair_count", 0)
     audit_items: List[FillingAuditItem] = list(state.get("audit_items") or [])
+    dispatched_chapter_tasks: List[Dict[str, Any]] = []
+    cached_repair_tasks = _select_repair_chapter_tasks(
+        state.get("chapter_tasks"),
+        repair_instructions_map,
+    )
+
+    if repair_count > 0 and cached_repair_tasks:
+        logger.info("[LangGraph Node 2/4] agent_fill_node: 进入问题章节专项修复直通模式...")
+    else:
+        logger.info("[LangGraph Node 2/4] agent_fill_node: 启动 Supervisor 决策 Agent...")
+
+    # 修复轮次必须只处理本轮新提案，避免上一轮已经写入的提案再次进入集中刷盘队列。
+    from app.agents.bid_filler_workers import clear_worker_proposals
+    if repair_count > 0:
+        clear_worker_proposals(doc_id)
+        logger.info(f"   [提案池隔离] 进入第 {repair_count} 轮修复，已清理上一轮文档 {doc_id} 的旧提案")
 
     if repair_instructions_map:
         logger.warning(f"[Supervisor 专项修复轮次 {repair_count}] 存在 {len(repair_instructions_map)} 个章节需针对性整改修复")
@@ -151,7 +219,10 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     if category_hints:
         logger.info(f"   [Supervisor] 收到 {len(category_hints)} 条章节类别指令: {list(category_hints.keys())}")
 
-    if not hasattr(llm_service, 'raw_llm') or llm_service.raw_llm is None:
+    if (
+        not hasattr(llm_service, 'raw_llm')
+        or llm_service.raw_llm is None
+    ) and not cached_repair_tasks:
         logger.error("LLM 服务未初始化")
         return {"audit_items": audit_items}
     if not docx_temp_path or not os.path.exists(docx_temp_path):
@@ -162,6 +233,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     # Supervisor 工具箱（4 个决策工具）
     # ================================================================
     from app.mcp.office_cli_client import office_cli_mcp_client
+    from app.agents.tools.style_extractor_tool import extract_text_by_style
     import asyncio as _asyncio
     import concurrent.futures as _cf
 
@@ -256,6 +328,15 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
         if not tasks:
             return "没有需要处理的章节（全部为 skip / needs_writing）"
 
+        # 修复轮只允许执行终审指出的章节，避免误传全量章节时扩大重试范围。
+        if repair_count > 0 and repair_instructions_map:
+            tasks = _select_repair_chapter_tasks(tasks, repair_instructions_map)
+            logger.info(f"   [专项修复范围] 本轮仅保留 {len(tasks)} 个问题章节 Worker")
+
+        dispatched_chapter_tasks[:] = tasks
+        if not tasks:
+            return "没有可执行的目标章节（终审问题章节未匹配到首轮任务缓存）"
+
         logger.info(f"   并发派发 {len(tasks)} 个章节 Worker（直写 Word 模式）:")
         for c in tasks:
             logger.info(f"      ➤ {c.get('chapter_title', '?')} (分类: {c.get('category', '?')}, 标签: {c.get('mapping_hint', '?')})")
@@ -293,6 +374,54 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
                 status="in_progress"
             )
 
+        # 预读取企业基础工商档案与项目关键元数据，供公文函件类 Worker 定向注入使用（避免多轮调库）
+        prefetched_metadata: Dict[str, Any] = {}
+        try:
+            from app.db.session import SessionLocal
+            from app.db.models.business import CompanyProfileModel
+            from app.db.models.metadata import TimelineMetadata, FinancialMetadata
+            from app.utils.rmb_formatter import number_to_chinese_rmb
+
+            db_meta = SessionLocal()
+            try:
+                prof = db_meta.query(CompanyProfileModel).first()
+                if prof:
+                    if prof.company_name: prefetched_metadata["company_name"] = prof.company_name
+                    if prof.credit_code: prefetched_metadata["credit_code"] = prof.credit_code
+                    if prof.legal_representative: prefetched_metadata["legal_person"] = prof.legal_representative
+                    if prof.registered_address: prefetched_metadata["address"] = prof.registered_address
+                    if prof.contact_phone: prefetched_metadata["phone"] = prof.contact_phone
+                    if prof.email: prefetched_metadata["email"] = prof.email
+
+                tl = db_meta.query(TimelineMetadata).filter(TimelineMetadata.document_id == doc_id).first()
+                if tl:
+                    if getattr(tl, "project_name", None): prefetched_metadata["project_name"] = tl.project_name
+                    proj_code = getattr(tl, "project_id_code", None) or getattr(tl, "project_code", None)
+                    if proj_code: prefetched_metadata["project_code"] = proj_code
+
+                    period_str = str(getattr(tl, "construction_period_description", "") or "").strip()
+                    if not period_str and getattr(tl, "construction_period_days", None):
+                        period_str = f"{tl.construction_period_days} 日历天"
+                    if period_str:
+                        prefetched_metadata["delivery_period"] = period_str
+
+                from app.db.models.ai_analysis import CostEstimate
+                cost_items = db_meta.query(CostEstimate).filter(CostEstimate.document_id == doc_id).all()
+                if cost_items:
+                    total_val = sum(getattr(it, "calculated_total", 0.0) or 0.0 for it in cost_items)
+                    if total_val > 0:
+                        prefetched_metadata["total_price_str"] = f"{total_val:,.2f} 元"
+                        try:
+                            prefetched_metadata["total_price_words"] = number_to_chinese_rmb(float(total_val))
+                        except Exception:
+                            pass
+
+                prefetched_metadata["quality_standard"] = "合格，完全符合国家及行业现行有关标准、规范要求"
+            finally:
+                db_meta.close()
+        except Exception as e_meta:
+            logger.warning(f"预读取企业与项目元数据异常: {e_meta}")
+
         from app.agents.bid_filler_workers import run_chapter_worker
 
         max_workers = min(4, max(1, len(tasks)))
@@ -329,6 +458,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
                     content_hint=task.get("content_hint", ""),
                     extra_instructions=extra_instructions,
                     repair_instructions=ch_repair_inst,
+                    prefetched_metadata=prefetched_metadata,
                 )
                 future_map[future] = ch_title
 
@@ -362,6 +492,40 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
         return json.dumps({"total": len(tasks), "success": success, "results": results}, ensure_ascii=False)
 
 
+    # 修复轮直接复用首轮缓存的章节元数据，不再重新启动 Supervisor 全量读文档、分析章节。
+    repair_tasks = cached_repair_tasks
+    if repair_count > 0 and repair_tasks:
+        logger.warning(
+            f"   [专项修复直通] 第 {repair_count} 轮仅重试 {len(repair_tasks)} 个问题章节，跳过全量 Supervisor 分析"
+        )
+        try:
+            dispatch_chapter_workers.invoke({
+                "chapters_json": json.dumps(repair_tasks, ensure_ascii=False),
+            })
+
+            from app.agents.bid_filler_workers import get_worker_proposals
+            worker_proposals = get_worker_proposals(doc_id)
+            if worker_proposals:
+                commands, approved, rejected = proposals_to_commands(worker_proposals)
+                _fallback_write_commands(
+                    docx_temp_path=docx_temp_path,
+                    commands=commands,
+                    audit_items=audit_items,
+                    approved=approved,
+                    rejected=rejected,
+                    proposals=worker_proposals,
+                )
+
+            return {
+                "audit_items": audit_items,
+                "docx_temp_path": docx_temp_path,
+                "worker_proposals": worker_proposals,
+                "chapter_tasks": state.get("chapter_tasks") or repair_tasks,
+            }
+        except Exception as repair_error:
+            logger.exception(f"   [专项修复直通失败] 将回退到 Supervisor 兼容流程: {repair_error}")
+
+
     # --- 工具 4: 审查 Worker 结果 ---
     @tool
     def review_worker_results(worker_summary_json: str) -> str:
@@ -377,6 +541,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 
     supervisor_tools = [
         officecli_query_doc_structure,
+        extract_text_by_style,
         analyze_chapters,
         dispatch_chapter_workers,
         review_worker_results,
@@ -390,9 +555,10 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 
 【核心工作流（严格按顺序）】
 1. 读文档：用 officecli_query_doc_structure(selector='all') 获取 Word 完整 DOM 结构
-2. 分类章节：用 analyze_chapters 传入 DOM 结构文本，识别所有章节并做四类分类
-3. 派发 Worker：用 dispatch_chapter_workers 传入 analyze_chapters 返回的 JSON，系统自动并发处理
-4. 审查结果：用 review_worker_results 查看各 Worker 执行情况
+2. 样式核验：若章节涉及实质性要求、响应对照表、偏离表或其他格式强调条款，调用 `extract_text_by_style` 核验斜体、下划线、加粗及红色加粗内容
+3. 分类章节：用 analyze_chapters 传入 DOM 结构文本，识别所有章节并做四类分类
+4. 派发 Worker：用 dispatch_chapter_workers 传入 analyze_chapters 返回的 JSON，系统自动并发处理
+5. 审查结果：用 review_worker_results 查看各 Worker 执行情况
 
 【四类分类规则】
 - needs_fill: 有 ____ 下划线/占位符的固定格式文书（投标函、授权书、承诺书）
@@ -406,7 +572,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 - 传入 analyze_chapters 返回的完整 JSON 即可
 
 【约束】
-- 严格按 1→2→3→4 顺序执行
+- 严格按 1→2→3→4→5 顺序执行；若无格式强调条款，样式核验可返回未找到后继续
 - dispatch_chapter_workers 完成后直接结束，回复: 投标书撰写完成"""
 
     user_prompt = f"""【任务】
@@ -432,13 +598,28 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            # Supervisor 自身网络重试也不能复用上一尝试可能残留的 Worker 提案。
+            if attempt > 1:
+                clear_worker_proposals(doc_id)
+                logger.info(f"   [提案池隔离] Supervisor 第 {attempt} 次尝试前清理残留提案")
+            import time as _time
+            sup_t0 = _time.time()
             logger.info(f"   🧠 启动 Supervisor Agent（{len(supervisor_tools)} 个决策工具, 第 {attempt}/{MAX_RETRIES} 次）...")
             with sandbox.transaction([docx_temp_path] if docx_temp_path else None):
                 result = supervisor_agent.invoke({
                     "messages": [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)],
                 })
+            sup_exec_time_ms = int((_time.time() - sup_t0) * 1000)
             final_msg = result["messages"][-1].content
             logger.info(f"   🧠 Supervisor 完成决策:\n{final_msg}")
+
+            # 真实提取 Supervisor Agent 的 Token 消耗
+            sup_p_tok, sup_c_tok = 0, 0
+            for m in result.get("messages", []):
+                if hasattr(m, "response_metadata") and isinstance(m.response_metadata, dict):
+                    usage = m.response_metadata.get("token_usage") or m.response_metadata.get("usage") or {}
+                    sup_p_tok += usage.get("prompt_tokens", 0)
+                    sup_c_tok += usage.get("completion_tokens", 0)
 
             audit_items.append(FillingAuditItem(
                 target_field="[Supervisor 调度]",
@@ -507,9 +688,9 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
                             }
                         ]
                     },
-                    prompt_tokens=1500,
-                    completion_tokens=450,
-                    execution_time_ms=850,
+                    prompt_tokens=sup_p_tok,
+                    completion_tokens=sup_c_tok,
+                    execution_time_ms=sup_exec_time_ms,
                     status="success"
                 )
             except Exception as audit_err:
@@ -565,6 +746,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
         "audit_items": audit_items,
         "docx_temp_path": docx_temp_path,
         "worker_proposals": worker_proposals,
+        "chapter_tasks": dispatched_chapter_tasks or state.get("chapter_tasks") or [],
     }
 
 
@@ -598,26 +780,28 @@ def _extract_prefix_from_text(text: str, orig_ctx: str = "") -> str:
     if m_colon:
         p_str = m_colon.group(1).strip()
         if not re.search(r'(?:表格|第\s*\d+\s*行|第\s*\d+\s*列|段落原文)', p_str) and not p_str.startswith("http"):
-            return p_str
+            if not is_narrative_clause_or_lead_in(p_str) and not is_narrative_clause_or_lead_in(clean_src):
+                return p_str
 
     # 场景 2: 匹配占位符前无冒号的文本: "投标人名称____" 或 "投标人名称[占位符]"
     m_ph = re.search(r'^\s*([^\n_\[］\[\]]{1,50}?)\s*(?:_{2,}|\[[^\]]+\]|［[^］]+］)', clean_src)
     if m_ph:
         prefix = m_ph.group(1).rstrip()
-        if prefix and not prefix.startswith("http"):
+        if prefix and not prefix.startswith("http") and not is_narrative_clause_or_lead_in(prefix):
             if not prefix.endswith((':', '：')) and re.search(r'[\u4e00-\u9fa5]', prefix):
                 prefix += "："
             return prefix
 
     # 场景 3: 通用短文本字段标签（2-25字无标点纯文本，如 "项目名称"、"交货期限"、"Contract Price"）
-    if len(clean_src) <= 30 and not re.search(r'[，。；？！,\.\?!]', clean_src):
+    if len(clean_src) <= 30 and not re.search(r'[，。；？！,\.\?!]', clean_src) and not is_narrative_clause_or_lead_in(clean_src):
         m_label = re.search(r'^\s*((?:\d+[\.\、\s]*)?[\u4e00-\u9fa5A-Za-z0-9\(\)（）\/\s]{2,25})\s*$', clean_src)
         if m_label:
             lbl = m_label.group(1).strip()
             if not lbl.startswith("http") and not re.search(r'(?:表格|第\s*\d+\s*行|第\s*\d+\s*列|段落原文)', lbl):
-                if not lbl.endswith((':', '：')):
-                    lbl += "："
-                return lbl
+                if not is_narrative_clause_or_lead_in(lbl):
+                    if not lbl.endswith((':', '：')):
+                        lbl += "："
+                    return lbl
 
     return ""
 
@@ -625,6 +809,174 @@ def _extract_prefix_from_text(text: str, orig_ctx: str = "") -> str:
 def _extract_label_prefix(ctx_str: str) -> str:
     """兼容适配封装：从文本提取前缀标签"""
     return _extract_prefix_from_text("", ctx_str)
+
+
+def _normalize_table_path(path: str) -> str:
+    """将外部表格路径统一为 Word 内部使用的 tc 单元格路径。"""
+    if not path:
+        return path
+
+    normalized = str(path).replace("`", "").strip()
+    # td 是 HTML 语义，Word XML/Python-docx 的标准单元格节点是 tc；cell 也统一到 tc。
+    normalized = re.sub(r"/(?:td|cell)\[(\d+)\]", r"/tc[\1]", normalized)
+    return normalized
+
+
+def _parse_decimal_amount(value: str) -> Optional[Decimal]:
+    """安全解析表格中的阿拉伯数字金额，无法解析时返回 None。"""
+    if not value:
+        return None
+
+    clean_value = re.sub(r"[,，\s元人民币¥￥]", "", str(value)).strip()
+    if not re.fullmatch(r"\d+(?:\.\d+)?", clean_value):
+        return None
+
+    try:
+        return Decimal(clean_value).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        logger.warning(f"金额解析失败，跳过金额校验: {value}")
+        return None
+
+
+def _is_non_actionable_placeholder(value: str) -> bool:
+    """判断提案是否只是无法从数据源确认的占位说明。"""
+    normalized = re.sub(r"\s+", "", str(value or "")).strip()
+    return bool(
+        re.match(r"^\[待补充[:：]", normalized)
+        or re.match(r"^［待补充[:：]", normalized)
+        or normalized.startswith("待补充")
+    )
+
+
+def validate_filled_docx_integrity(
+    docx_path: str,
+    expected_total: Optional[Decimal] = None,
+    expected_total_words: str = "",
+    company_name: str = "",
+    proposals: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, str]]:
+    """回读已写入的 Word，校验提案实际落位，并按需校验金额闭环。"""
+    findings: List[Dict[str, str]] = []
+    if not docx_path or not os.path.exists(docx_path):
+        findings.append({
+            "type": "artifact_missing",
+            "path": "N/A",
+            "snippet": "写盘后的 Word 工作副本不存在，无法进行产物校验",
+        })
+        return findings
+
+    try:
+        doc = Document(docx_path)
+    except Exception as exc:
+        logger.exception(f"回读 Word 产物失败: {docx_path}")
+        return [{
+            "type": "artifact_unreadable",
+            "path": "N/A",
+            "snippet": f"Word 产物无法回读: {exc}",
+        }]
+
+    # 通用提案回读：不依赖具体业务字段，只验证“提案值是否真的落到了提案指定的单元格”。
+    for proposal in proposals or []:
+        raw_path = str(proposal.get("path", "")).strip()
+        normalized_path = _normalize_table_path(raw_path)
+        if not re.search(r"/tbl\[\d+\]/(?:tr|row)\[\d+\]/tc\[\d+\]", normalized_path):
+            continue
+        if str(proposal.get("type", "")).strip() in {"image", "table_rows"}:
+            continue
+
+        expected_value = str(
+            proposal.get("proposed_text")
+            if proposal.get("proposed_text") is not None
+            else proposal.get("value", "")
+        ).strip()
+        if not expected_value or _is_non_actionable_placeholder(expected_value):
+            continue
+
+        target_paragraph = _find_paragraph_by_path(doc, normalized_path)
+        actual_value = target_paragraph.text.strip() if target_paragraph is not None else ""
+        compact_expected = re.sub(r"\s+", "", expected_value)
+        compact_actual = re.sub(r"\s+", "", actual_value)
+        expected_amount = _parse_decimal_amount(expected_value)
+        actual_amount = _parse_decimal_amount(actual_value)
+        if expected_amount is not None and actual_amount == expected_amount:
+            continue
+        if compact_expected not in compact_actual:
+            findings.append({
+                "type": "proposal_writeback_mismatch",
+                "path": normalized_path,
+                "chapter": str(proposal.get("chapter_title", "产物回读校验")),
+                "snippet": f"提案值未落到目标单元格，期望='{expected_value}'，实际='{actual_value}'",
+            })
+
+    for table_index, table in enumerate(doc.tables, start=1):
+        if not table.rows:
+            continue
+
+        header_values = [cell.text.strip() for cell in table.rows[0].cells]
+        total_col_index = next(
+            (
+                index for index, value in enumerate(header_values)
+                if "总价" in value and "备注" not in value
+            ),
+            None,
+        )
+        if "项目名称" not in "".join(header_values) or total_col_index is None:
+            continue
+
+        data_row = None
+        footer_row = None
+        for row in table.rows[1:]:
+            row_text = "".join(cell.text.strip() for cell in row.cells)
+            if any(keyword in row_text for keyword in ["投标总报价", "大写"]):
+                footer_row = row
+                continue
+            if data_row is None:
+                data_row = row
+
+        table_prefix = f"/body/tbl[{table_index}]"
+        if data_row is not None and expected_total is not None:
+            actual_total = _parse_decimal_amount(
+                data_row.cells[total_col_index].text if total_col_index < len(data_row.cells) else ""
+            )
+            if actual_total != expected_total:
+                    findings.append({
+                        "type": "opening_total_mismatch",
+                        "path": f"{table_prefix}/tr[2]/tc[{total_col_index + 1}]",
+                        "chapter": "产物回读校验",
+                        "snippet": (
+                        f"开标一览表总价实际值为 {data_row.cells[total_col_index].text.strip() if total_col_index < len(data_row.cells) else ''}，"
+                        f"期望值为 {expected_total}"
+                    ),
+                })
+
+            if data_row is not None and "无偏离" in "".join(cell.text for cell in data_row.cells):
+                findings.append({
+                    "type": "opening_total_semantic_mismatch",
+                    "path": f"{table_prefix}/tr[2]",
+                    "chapter": "产物回读校验",
+                    "snippet": "开标一览表数据行包含偏离表语义，疑似发生错列写入",
+                })
+
+        if footer_row is not None and expected_total_words:
+            footer_text = " ".join(dict.fromkeys(cell.text.strip() for cell in footer_row.cells if cell.text.strip()))
+            if expected_total_words not in footer_text:
+                findings.append({
+                    "type": "opening_total_words_mismatch",
+                    "path": f"{table_prefix}/tr[{len(table.rows)}]",
+                    "chapter": "产物回读校验",
+                    "snippet": f"大写金额行未找到期望值: {expected_total_words}",
+                })
+            if company_name and company_name in footer_text and expected_total_words not in footer_text:
+                findings.append({
+                    "type": "opening_footer_wrong_value",
+                    "path": f"{table_prefix}/tr[{len(table.rows)}]",
+                    "chapter": "产物回读校验",
+                    "snippet": "大写金额行被错误填入投标人名称",
+                })
+
+        return findings
+
+    return findings
 
 
 def _extract_element_paraid(elem) -> str:
@@ -641,6 +993,8 @@ def _find_paragraph_by_path(doc: Document, path: str):
     """根据 XPath 定位 Word 文档中的 Paragraph 节点 (优先表格物理层级索引，无缝兼容 @paraId)"""
     if not path or not doc:
         return None
+
+    path = _normalize_table_path(path)
 
     # 1. 优先处理表格结构化路径: /body/tbl[T]/tr[R]/tc[C] 或整行路径 /body/tbl[T]/tr[R]
     tbl_cell_match = re.search(r'/tbl\[(\d+)\]/(?:tr|row)\[(\d+)\]/(?:tc|cell)\[?(\d+)', path)
@@ -672,6 +1026,11 @@ def _find_paragraph_by_path(doc: Document, path: str):
                         return cell.paragraphs[p_sub_idx]
                     elif cell.paragraphs:
                         return cell.paragraphs[0]
+
+    # 明确指定了单元格但解析失败时必须阻断，不能退化到该行首单元格。
+    if re.search(r'/tbl\[\d+\]/(?:tr|row)\[\d+\]/tc\[\d+\]', path):
+        logger.error(f"拒绝解析非法表格单元格路径，避免错写行首单元格: {path}")
+        return None
 
     # 1.2 支持整行路径: /body/tbl[T]/tr[R]（自动定位到该行第 1 个单元格段落，为后续行级分发提供 DOM 锚点）
     tbl_row_match = re.search(r'/tbl\[(\d+)\]/(?:tr|row)\[(\d+)\]', path)
@@ -719,6 +1078,102 @@ def _find_paragraph_by_path(doc: Document, path: str):
             return doc.paragraphs[p_idx]
 
     return None
+
+
+def _anchor_terms(value: str) -> List[str]:
+    """提取动态锚点中的有效词组，不依赖具体业务名称。"""
+    if not value:
+        return []
+
+    normalized = re.sub(r"[\[\]（）()：:，,。；;、/\\_\-]+", " ", str(value).strip())
+    terms = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]{2,}", normalized)
+    ignored_terms = {"图片", "图注", "证书", "等级", "范围", "原文", "模板", "待补充"}
+    return [term for term in terms if term not in ignored_terms]
+
+
+def _image_target_matches_anchor(paragraph, proposal: Dict[str, Any]) -> bool:
+    """校验图片图注/原文锚点与目标段落是否语义匹配。"""
+    target_text = str(getattr(paragraph, "text", "") or "").strip()
+    if not target_text:
+        return True
+
+    caption = str(proposal.get("caption", "") or "").strip()
+    anchor_text = str(
+        proposal.get("anchor_text") or proposal.get("original_context") or ""
+    ).strip()
+    caption_terms = _anchor_terms(caption)
+    anchor_terms = _anchor_terms(anchor_text)
+    target_normalized = re.sub(r"\s+", "", target_text)
+
+    anchor_matches = False
+    if anchor_text:
+        anchor_normalized = re.sub(r"\s+", "", anchor_text)
+        if anchor_normalized and (
+            anchor_normalized in target_normalized
+            or target_normalized in anchor_normalized
+        ):
+            anchor_matches = True
+        elif any(term in target_normalized for term in anchor_terms):
+            anchor_matches = True
+
+    caption_matches = bool(
+        caption_terms and any(term in target_normalized for term in caption_terms)
+    )
+
+    # 有图注时必须同时满足原文锚点和图注匹配，防止“目标节点存在但证书类型错误”。
+    if caption_terms:
+        return anchor_matches and caption_matches if anchor_text else caption_matches
+
+    if anchor_text:
+        return anchor_matches
+
+    return False
+
+
+def _insert_image_proposal(anchor_paragraph, source_paragraph, proposal: Dict[str, Any]):
+    """在已校验的动态锚点后插入单张图片，并返回新的插入锚点。"""
+    image_path = str(
+        proposal.get("proposed_text")
+        if proposal.get("proposed_text") is not None
+        else proposal.get("value", "")
+    ).strip()
+    if not image_path or not os.path.exists(image_path):
+        logger.warning(f"   [图片写盘拦截] 图片文件不存在: {image_path}")
+        return anchor_paragraph, 0
+
+    if not _image_target_matches_anchor(source_paragraph, proposal):
+        logger.warning(
+            "   [图片写盘拦截] 图注/原文锚点与目标段落不匹配，拒绝插入: "
+            f"target={str(source_paragraph.text or '')[:80]}"
+        )
+        return anchor_paragraph, 0
+
+    from docx.shared import Inches, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.text.paragraph import Paragraph
+
+    source_text = str(source_paragraph.text or "").strip()
+    is_substantive = bool(source_text)
+    if is_substantive:
+        new_p_elem = parse_xml(r'<w:p %s/>' % nsdecls("w"))
+        anchor_paragraph._element.addnext(new_p_elem)
+        target_paragraph = Paragraph(new_p_elem, anchor_paragraph._parent)
+    else:
+        source_paragraph._element.clear_content()
+        target_paragraph = source_paragraph
+
+    target_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    image_run = target_paragraph.add_run()
+    image_run.add_picture(image_path, width=Inches(float(proposal.get("width_inches", 5.5))))
+
+    caption = str(proposal.get("caption", "") or "").strip()
+    if caption:
+        caption_run = target_paragraph.add_run(f"\n图：{caption}")
+        caption_run.font.bold = True
+        caption_run.font.size = Pt(10)
+        caption_run.font.name = "宋体"
+
+    return target_paragraph, 1
 
 
 def _apply_run_style_xml(run, enable_underline: bool = False, is_table: bool = False) -> None:
@@ -1028,6 +1483,12 @@ def _render_diff_paragraph_runs(
     4. 彻底消除单槽位切片导致的重复前缀、重复后缀与未填占位符残留！
     """
     import difflib
+    from app.agents.review_engine import clean_zero_change_annotations, is_zero_change_or_no_op_proposal
+
+    proposed_val = clean_zero_change_annotations(proposed_val)
+    if is_zero_change_or_no_op_proposal(proposed_val, real_text):
+        return
+
     p_elem._element.clear_content()
 
     if not real_text or not proposed_val:
@@ -1057,6 +1518,168 @@ def _render_diff_paragraph_runs(
             pass
 
 
+def _remove_redundant_pricing_subtitle(doc: Document) -> int:
+    """
+    清理报价章节中重复的子标题。
+
+    部分招标模板在一级标题下又放置一个“报价分析表”子标题，随后紧接着
+    招标编号与项目名称。系统最终输出要求这一段只保留项目信息行，因此仅在
+    同时满足“报价章节 + 分析类子标题 + 项目信息行”三个结构条件时移除子标题，
+    不影响其他章节中的普通标题。
+    """
+    if doc is None or not hasattr(doc, "element") or not hasattr(doc.element, "body"):
+        return 0
+
+    body = doc.element.body
+    children = list(body)
+    removed_count = 0
+
+    for index, elem in enumerate(children):
+        if not elem.tag.endswith("}p"):
+            continue
+
+        major_text = "".join(elem.itertext()).strip()
+        if not major_text or "配置" not in major_text or "分项报价" not in major_text:
+            continue
+
+        subtitle_elem = None
+        subtitle_text = ""
+        info_elem = None
+        info_text = ""
+
+        # 允许标题与子标题之间存在空段落，但不跨越表格或其他正文节点。
+        cursor = index + 1
+        while cursor < len(children):
+            candidate = children[cursor]
+            if candidate.tag.endswith("}tbl"):
+                break
+            if not candidate.tag.endswith("}p"):
+                cursor += 1
+                continue
+
+            candidate_text = "".join(candidate.itertext()).strip()
+            if not candidate_text:
+                cursor += 1
+                continue
+
+            if subtitle_elem is None:
+                subtitle_elem = candidate
+                subtitle_text = candidate_text
+                cursor += 1
+                continue
+
+            info_elem = candidate
+            info_text = candidate_text
+            break
+
+        is_analysis_subtitle = (
+            subtitle_elem is not None
+            and "分析" in subtitle_text
+            and subtitle_text.endswith("表")
+        )
+        has_project_info = "招标编号" in info_text and "项目名称" in info_text
+        if is_analysis_subtitle and has_project_info:
+            parent = subtitle_elem.getparent()
+            if parent is not None:
+                parent.remove(subtitle_elem)
+                removed_count += 1
+                logger.info(
+                    "   [报价章节标题归一化] 已移除重复的报价分析子标题，保留招标编号与项目名称行"
+                )
+
+    return removed_count
+
+
+def _collapse_redundant_paragraph_proposals(proposals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    合并同一正文 Path 的重复提案，防止多轮 Worker 结果被当成多槽位拼接。
+
+    同一段落确实可能包含多个合法槽位，因此不做无条件去重：仅合并完全相同的
+    提案，或删除明显是另一提案完整超集的复合提案（例如“标题 + 项目信息”与
+    单独的“项目信息”同时出现）。不同字段值仍按原顺序保留。
+    """
+    if not proposals:
+        return []
+
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    first_seen_order: List[Tuple[str, Dict[str, Any]]] = []
+    for proposal in proposals:
+        path = _normalize_table_path(str(proposal.get("path", "")).strip())
+        is_body_paragraph = bool(re.fullmatch(r"/body/p\[\d+\]", path))
+        if not is_body_paragraph:
+            first_seen_order.append(("", proposal))
+            continue
+        if path not in grouped:
+            first_seen_order.append((path, proposal))
+        grouped[path].append(proposal)
+
+    resolved_by_path: Dict[str, List[Dict[str, Any]]] = {}
+    for path, items in grouped.items():
+        if len(items) <= 1:
+            resolved_by_path[path] = items
+            continue
+
+        # 同值提案只保留最后一份，最后一份通常来自本轮更高优先级的工具结果。
+        unique_items: List[Dict[str, Any]] = []
+        seen_values = set()
+        for item in items:
+            value = str(
+                item.get("proposed_text")
+                if item.get("proposed_text") is not None
+                else item.get("value", "")
+            ).strip()
+            value_key = re.sub(r"\s+", "", value)
+            if value_key in seen_values:
+                continue
+            seen_values.add(value_key)
+            unique_items.append(item)
+
+        # 只在存在明确复合字段（同一值包含两个以上属性标签）时清除超集，
+        # 避免误伤同一段落内“姓名 + 职务”等多个独立槽位。
+        compact_items: List[Dict[str, Any]] = []
+        for item in unique_items:
+            value = str(
+                item.get("proposed_text")
+                if item.get("proposed_text") is not None
+                else item.get("value", "")
+            ).strip()
+            value_core = re.sub(r"[\s:：、，,（）()【】\[\]]", "", value)
+            label_count = sum(value_core.count(label) for label in ("项目名称", "招标编号", "投标人名称", "投标单位"))
+            is_redundant_superset = False
+            if label_count >= 2:
+                for other in unique_items:
+                    if other is item:
+                        continue
+                    other_value = str(
+                        other.get("proposed_text")
+                        if other.get("proposed_text") is not None
+                        else other.get("value", "")
+                    ).strip()
+                    if other_value and other_value != value and other_value in value:
+                        is_redundant_superset = True
+                        break
+            if not is_redundant_superset:
+                compact_items.append(item)
+
+        resolved_by_path[path] = compact_items or unique_items
+        if len(resolved_by_path[path]) != len(items):
+            logger.warning(
+                f"   [正文提案冲突收敛] 路径 {path} 合并 {len(items)} 条重复/超集提案，"
+                f"保留 {len(resolved_by_path[path])} 条，阻止多值拼接污染"
+            )
+
+    resolved: List[Dict[str, Any]] = []
+    emitted_paths = set()
+    for path, proposal in first_seen_order:
+        if path and path not in emitted_paths:
+            resolved.extend(resolved_by_path.get(path, [proposal]))
+            emitted_paths.add(path)
+        elif not path:
+            resolved.append(proposal)
+
+    return resolved
+
+
 def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
     """
     DOM 级标书全量原位替换与格式排版引擎：
@@ -1066,11 +1689,18 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
     4. 表格内部的单元格填报内容统一为【宋体 小五 (9pt)】，取消下划线（确保表格内文字整洁美观）；
     5. 单次内存处理刷盘，性能与呈现效果兼备。
     """
-    if not docx_path or not os.path.exists(docx_path) or not proposals:
+    if not docx_path or not os.path.exists(docx_path):
         return 0
 
     try:
         doc = Document(docx_path)
+        proposals = _collapse_redundant_paragraph_proposals(proposals or [])
+        if not proposals:
+            subtitle_removed = _remove_redundant_pricing_subtitle(doc)
+            if subtitle_removed:
+                doc.save(docx_path)
+            return subtitle_removed
+        subtitle_removed = 0
         success_count = 0
 
         # 0. 跨章节表格路径冲突检测与智能重定向守卫 (Table Path Collision Guard)
@@ -1085,7 +1715,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
         # 扫描所有表格提案进行冲突检测
         tbl_proposals_by_target = defaultdict(list)
         for p_idx, p in enumerate(proposals):
-            p_path = str(p.get("path", "")).strip()
+            p_path = _normalize_table_path(str(p.get("path", "")).strip())
             raw_val = p.get("proposed_text") if p.get("proposed_text") is not None else p.get("value", "")
             p_val = str(raw_val).strip() if raw_val is not None else ""
             p_type = str(p.get("type", "")).strip()
@@ -1164,7 +1794,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
         # 1. 优先处理表格批量插行/原位填报提案
         handled_tbl_proposals = set()
         for p_idx, p in enumerate(proposals):
-            p_path = str(p.get("path", "")).strip()
+            p_path = _normalize_table_path(str(p.get("path", "")).strip())
             raw_val = p.get("proposed_text") if p.get("proposed_text") is not None else p.get("value", "")
             p_val = str(raw_val).strip() if raw_val is not None else ""
             p_type = str(p.get("type", "")).strip()
@@ -1225,14 +1855,35 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
             total_cols = len(header_row.cells)
             header_spans = get_table_header_logical_spans(table, hdr_count)
             logical_cols_count = len(header_spans) if header_spans else total_cols
+            header_text_joined = "".join(
+                str(cell.text or "").replace("\n", "").strip()
+                for cell in header_row.cells
+            )
+            is_response_deviation_table = any(
+                keyword in header_text_joined
+                for keyword in ["商务条款", "技术要求", "响应", "偏离", "服务承诺"]
+            ) and logical_cols_count >= 4
 
             # 找到【分项总价】在逻辑列中的索引
             total_price_logical_idx = logical_cols_count - 2 if logical_cols_count >= 4 else logical_cols_count - 1
+            total_price_found = False
+            response_status_logical_idx = None
+            response_status_default = "无"
+            deviation_detail_logical_idx = None
             for l_i, (s_c, e_c) in enumerate(header_spans):
                 h_text = header_row.cells[s_c].text.strip()
-                if any(k in h_text for k in ["分项总价", "总价", "合价", "总金额", "金额（元）", "小计（元）"]):
+                if (not total_price_found) and any(k in h_text for k in ["分项总价", "总价", "合价", "总金额", "金额（元）", "小计（元）"]):
                     total_price_logical_idx = l_i
-                    break
+                    total_price_found = True
+                if (
+                    any(k in h_text for k in ["有无偏离", "是否偏离", "偏离情况", "是否响应"])
+                    and "服务承诺" not in h_text
+                    and "响应情况" not in h_text
+                ):
+                    response_status_logical_idx = l_i
+                    response_status_default = "是" if "是否响应" in h_text else "无"
+                if any(k in h_text for k in ["偏离内容", "偏离原因", "偏离说明"]):
+                    deviation_detail_logical_idx = l_i
 
             # 1. 检查原表格最后一行是否是原模板自带的【合计总价】行（包含"合计"或"总计"）
             template_summary_tr = None
@@ -1258,10 +1909,48 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
             summary_row_data = None
             for r_idx, r_data in enumerate(matrix):
                 r_str = " ".join(str(c) for c in r_data)
-                if r_idx == len(matrix) - 1 and any(k in r_str for k in ["合计", "总计", "总价", "小计"]):
+                # 响应/偏离表的商务条款里经常出现“合同总价款”“投标总价”等词，
+                # 不能因为普通条款包含“总价”就误判为表尾合计行。只有明确以
+                # “合计/总计/小计”开头的行才允许作为响应表的汇总行。
+                if is_response_deviation_table:
+                    summary_probe = " ".join(str(c or "").strip() for c in r_data[:2])
+                    is_summary_row = summary_probe.startswith(("合计", "总计", "小计"))
+                else:
+                    is_summary_row = any(k in r_str for k in ["合计", "总计", "总价", "小计"])
+                if r_idx == len(matrix) - 1 and is_summary_row:
                     summary_row_data = r_data
                 else:
                     detail_matrix.append(r_data)
+
+            # 商务/技术响应表的无序号 4 列矩阵，或从序号 1 开始的完整矩阵，
+            # 表示模型提交的是整张表的最终结果。此时旧文件中可能已经残留
+            # 上一轮追加出来的多余数据行，写入后必须一并裁掉，不能只覆盖前半段。
+            response_matrix_serials = []
+            for r_data in detail_matrix:
+                if isinstance(r_data, list) and len(r_data) == logical_cols_count:
+                    seq_match = re.fullmatch(r"\s*(\d+)\s*[、.．)]?\s*", str(r_data[0]))
+                    response_matrix_serials.append(int(seq_match.group(1)) if seq_match else None)
+                else:
+                    response_matrix_serials.append(None)
+            response_matrix_is_full = bool(
+                is_response_deviation_table
+                and detail_matrix
+                and (
+                    all(
+                        isinstance(r_data, list) and len(r_data) == max(1, logical_cols_count - 1)
+                        for r_data in detail_matrix
+                    )
+                    or response_matrix_serials == list(range(1, len(detail_matrix) + 1))
+                )
+            )
+
+            # [固定表单防增行保护机制]
+            # 若目标表格为固定单元格填报表（如单项汇总表/固定表单），仅保留第 1 行项目汇总数据，绝对严禁插入/追加额外行！
+            from app.utils.table_utils import is_fixed_slot_form_table
+            prop_ch = str(p.get("chapter_title", "") or "")
+            if is_fixed_slot_form_table(table) and len(detail_matrix) > 1:
+                logger.info(f"   🛡️ [固定表单防增行保护] 表格 /body/tbl[{tbl_idx+1}] 为固定单项汇总表，仅保留首行项目汇总数据，忽略多余分项拆行")
+                detail_matrix = detail_matrix[:1]
 
             # 4. 确定数据区的可用行范围
             max_available_detail_idx = footer_start_idx
@@ -1272,9 +1961,48 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
             for row_i, row_data in enumerate(detail_matrix):
                 if not isinstance(row_data, list):
                     continue
+                # 响应/偏离表只接受完整的 4 列（不含序号）或 5 列（含序号）
+                # 行。对异常短行不做“尽力写入”，避免把半行静默刷入 Word。
+                if is_response_deviation_table and len(row_data) not in (
+                    logical_cols_count,
+                    max(1, logical_cols_count - 1),
+                ):
+                    logger.warning(
+                        f"   ⚠️ [表格行列数保护] 跳过 {p_path} 第 {row_i + 1} 行："
+                        f"收到 {len(row_data)} 列，期望 {logical_cols_count} 列或 {logical_cols_count - 1} 列"
+                    )
+                    continue
                 # row_vals 对齐到逻辑列数 (logical_cols_count)
                 row_vals = align_table_row_cells(row_data, logical_cols_count, row_i)
-                target_row_idx = hdr_count + row_i  # 绝对跳过所有表头行 (0 ~ hdr_count-1)
+                if is_response_deviation_table:
+                    # 只对实际存在且能从表头识别出的列补默认值，不假定固定列号。
+                    if (
+                        response_status_logical_idx is not None
+                        and response_status_logical_idx < len(row_vals)
+                        and not str(row_vals[response_status_logical_idx]).strip()
+                    ):
+                        row_vals[response_status_logical_idx] = response_status_default
+                    if (
+                        deviation_detail_logical_idx is not None
+                        and deviation_detail_logical_idx < len(row_vals)
+                        and not str(row_vals[deviation_detail_logical_idx]).strip()
+                    ):
+                        row_vals[deviation_detail_logical_idx] = "完全响应招标文件要求，无偏离。"
+                target_row_idx = hdr_count + row_i  # 默认按矩阵顺序写入，绝对跳过所有表头行
+                if is_response_deviation_table and len(row_data) == logical_cols_count:
+                    # 商务/技术响应矩阵经常只携带某个中间区间（例如序号 6~15）。
+                    # 这类矩阵不能按 row_i 从第一条数据行覆盖，优先使用首列序号
+                    # 定位模板中的对应行；否则会把内容错写到前面的条款行。
+                    seq_match = re.fullmatch(r"\s*(\d+)\s*[、.．)]?\s*", str(row_data[0]))
+                    if seq_match:
+                        serial_row_idx = hdr_count + int(seq_match.group(1)) - 1
+                        if serial_row_idx < len(table.rows) and serial_row_idx < max_available_detail_idx:
+                            target_serial = str(table.rows[serial_row_idx].cells[0].text or "").strip()
+                            if not target_serial or re.match(
+                                rf"^\s*{re.escape(seq_match.group(1))}\s*[、.．)]?\s*$",
+                                target_serial,
+                            ):
+                                target_row_idx = serial_row_idx
 
                 if target_row_idx < max_available_detail_idx and target_row_idx < len(table.rows):
                     old_row = table.rows[target_row_idx]
@@ -1375,12 +2103,49 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                                     _apply_run_style_xml(r_in_cell, enable_underline=False, is_table=True)
                     success_count += 1
 
-            # 7. 清理多余未使用的旧模板行（如果明细行写完后，原数据区还有未使用的行，起始行从 hdr_count + len(detail_matrix) 开始）
-            cleaned_start_idx = hdr_count + len(detail_matrix)
-            cleaned_end_idx = min(footer_start_idx, len(table.rows) - (1 if template_summary_tr is not None else 0))
-            for r_i in range(cleaned_start_idx, cleaned_end_idx):
-                if r_i < len(table.rows):
+            if response_matrix_is_full:
+                trim_start_idx = hdr_count + len(detail_matrix)
+                trim_end_idx = min(
+                    footer_start_idx,
+                    len(table.rows) - (1 if template_summary_tr is not None else 0),
+                )
+                for r_i in range(trim_end_idx - 1, trim_start_idx - 1, -1):
+                    if 0 <= r_i < len(table.rows):
+                        stale_row = table.rows[r_i]._tr
+                        parent = stale_row.getparent()
+                        if parent is not None:
+                            parent.remove(stale_row)
+                if trim_end_idx > trim_start_idx:
+                    logger.info(
+                        f"   [响应表整表覆盖] 已清理矩阵之后的 {trim_end_idx - trim_start_idx} 行旧模板/重复数据"
+                    )
+
+            # 7. 安全清理未使用的模板空行。
+            #
+            # 旧逻辑会无条件清空矩阵末尾之后的所有行。对于“局部 table_rows
+            # 矩阵 + 其它单元格提案”的合法场景，这会先擦掉后续行，再导致后续
+            # 只有部分单元格被恢复，最终生成 Word 出现空单元格。现在只清理：
+            # 1) 当前表没有单元格级提案；
+            # 2) 目标行本身只有空白/省略号占位符；
+            # 非空的原有内容绝不因局部矩阵被擦除。
+            table_root = f"/body/tbl[{tbl_idx + 1}]"
+            has_cell_level_proposals = any(
+                str(other.get("path", "")).strip().startswith(table_root + "/")
+                and bool(re.search(r'/(?:tr|row|tc|cell)\[\d+\]', str(other.get("path", ""))))
+                for other in proposals
+                if isinstance(other, dict)
+            )
+            if not has_cell_level_proposals:
+                cleaned_start_idx = hdr_count + len(detail_matrix)
+                cleaned_end_idx = min(footer_start_idx, len(table.rows) - (1 if template_summary_tr is not None else 0))
+                for r_i in range(cleaned_start_idx, cleaned_end_idx):
+                    if r_i >= len(table.rows):
+                        continue
                     r = table.rows[r_i]
+                    row_values = [str(c.text or "").strip() for c in r.cells]
+                    # 仅清除真正的空模板行或“……”占位行，保护已有业务数据。
+                    if any(v and v not in ("...", "…", "……", "......") for v in row_values):
+                        continue
                     for c in r.cells:
                         c.text = ""
 
@@ -1391,14 +2156,14 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
         for p_idx, p in enumerate(proposals):
             if p_idx in handled_tbl_proposals:
                 continue
-            p_path = str(p.get("path", "")).strip().replace("`", "")
+            p_path = _normalize_table_path(str(p.get("path", "")).strip().replace("`", ""))
             p_val = str(p.get("proposed_text") if p.get("proposed_text") is not None else p.get("value", "")).strip().replace("`", "").replace("**", "")
             if p_path and p_val and not p_val.startswith("["):
                 if not re.search(r'/tbl\[\d+\]$', p_path):
                     path_groups[p_path].append(p)
 
         for path, group_items in path_groups.items():
-            clean_path = path.replace("`", "").strip()
+            clean_path = _normalize_table_path(path.replace("`", "").strip())
             p_elem = _find_paragraph_by_path(doc, clean_path)
             if not p_elem:
                 continue
@@ -1410,6 +2175,20 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                     is_in_table = True
 
             slot_pattern = r'(_{1,}|＿{1,}|\[[^\]]+\]|［[^］]+］|【[^】]+】|（(?:姓名和职务|投标人的名称|投标人名称|代表姓名|职务)[^）]*）|\([^\)]*(?:name and title|bidder name)[^\)]*|\d*\s*年\s*\d*\s*月\s*\d*\s*日|(?<=[:：])\s{2,}|\s{2,}$)'
+
+            # 同一条资格要求可能对应多张不同资质图片，统一以同一动态条款为锚点顺序插入。
+            if group_items and all(item.get("type") == "image" for item in group_items):
+                insertion_anchor = p_elem
+                inserted_count = 0
+                for image_item in group_items:
+                    insertion_anchor, current_count = _insert_image_proposal(
+                        insertion_anchor,
+                        p_elem,
+                        image_item,
+                    )
+                    inserted_count += current_count
+                success_count += inserted_count
+                continue
 
             if is_in_table or len(group_items) == 1:
                 p_item = group_items[0]
@@ -1537,13 +2316,20 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                             logger.info(f"   [图片防字面量自愈成功] 成功在条款下方插入图片: {q_info['name']} -> {q_info['path']}")
                         continue
 
-                # 自动清理省略号与截断
-                from app.agents.review_engine import clean_all_ellipsis
-                proposed_val = clean_all_ellipsis(proposed_val)
+                # 自动清理零改动注释、省略号与截断
+                from app.agents.review_engine import clean_zero_change_annotations, clean_all_ellipsis, is_zero_change_or_no_op_proposal
+                p_type = str(p_item.get("type", "")).strip()
+
+                if p_type != "image":
+                    proposed_val = clean_zero_change_annotations(proposed_val)
+                    proposed_val = clean_all_ellipsis(proposed_val)
+
                 if not proposed_val:
                     continue
 
-                p_type = str(p_item.get("type", "")).strip()
+                if is_zero_change_or_no_op_proposal(proposed_val, real_text, p_type) or is_zero_change_or_no_op_proposal(proposed_val, orig_ctx, p_type):
+                    logger.info(f"   [零改动保护] 提案 '{proposed_val}' 与原文一致或为保留说明，跳过改写: {clean_path}")
+                    continue
 
                 if not is_in_table and _is_full_paragraph_replacement(real_text, proposed_val, p_type):
                     _render_diff_paragraph_runs(p_elem, real_text, proposed_val, enable_underline_on_diff=True, is_table=False)
@@ -1631,7 +2417,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                 else:
                     # 优先检测段落是否为冒号标签引导行 (形如 邮    编： 或 投标单位代表姓名（签字）： 或 投标单位名称： 或 日    期：)
                     m_lbl = re.match(r'^\s*([^:：\n]{2,25}[:：])\s*', real_text)
-                    if m_lbl and len(real_text) < 100:
+                    if m_lbl and len(real_text) < 100 and not is_narrative_clause_or_lead_in(m_lbl.group(1)) and not is_narrative_clause_or_lead_in(real_text):
                         prefix = m_lbl.group(1)
                         clean_val = proposed_val
                         clean_prefix = re.sub(r'[\s:：_\[］\[\]（）\(\)]', '', prefix)
@@ -1683,7 +2469,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                         success_count += 1
                     else:
                         prefix = _extract_prefix_from_text(real_text, orig_ctx)
-                        if prefix:
+                        if prefix and not is_narrative_clause_or_lead_in(prefix):
                             # 彻底杜绝前缀重复：若 proposed_val 已经携带了该前缀标签，剥离重复部分
                             clean_p_val = proposed_val
                             clean_prefix = re.sub(r'[\s:：_\[］\[\]（）\(\)]', '', prefix)
@@ -1703,6 +2489,15 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                             if proposed_val in real_text:
                                 logger.info(f"   段落 {clean_path} 已包含填报值 '{proposed_val}'，安全保留")
                                 success_count += 1
+                                continue
+                            # 过滤元数据说明性文本，严禁追加到正文句尾
+                            if not proposed_val or proposed_val.startswith("待补充") or proposed_val.startswith("[待") or any(
+                                k in proposed_val for k in ["无需写盘", "零改动", "固定原文", "原样保留", "无需改动", "无槽位", "待线下"]
+                            ):
+                                continue
+                            # 严格防护：若原段落为固定正文叙述句/条款导语且无槽位特征，严禁在句尾盲目追加提案
+                            if is_narrative_clause_or_lead_in(real_text):
+                                logger.warning(f"   [防叙述句尾污染] 段落 {clean_path} 为固定叙述句/条款导语 ('{real_text[:30]}')，拦截句尾追加提案 '{proposed_val}'")
                                 continue
                             # 若未包含且无已知前缀，在句尾安全追加填报值
                             p_elem._element.clear_content()
@@ -1766,8 +2561,10 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
         # 表格全自动留白自检与 LLM 动态自愈修复引擎（绝不删行，零业务硬编码）
         from app.utils.table_utils import inspect_and_repair_table_blanks
         inspect_and_repair_table_blanks(doc)
+        # 写盘路径仍按原始模板解析完毕后，再移除多余子标题，避免改变 /body/p[N] 索引。
+        subtitle_removed = _remove_redundant_pricing_subtitle(doc)
 
-        if success_count > 0:
+        if success_count > 0 or subtitle_removed > 0:
             from app.agents.tools.bid_db_tools import _safe_save_doc
             _safe_save_doc(doc, docx_path)
             logger.info(f"   [DOM 原位填报与美化] 成功原位写入并修饰 {success_count} 条提案（表格外保留下划线, 表格内取消下划线，留白单元格智能闭合）")
@@ -1835,15 +2632,32 @@ def proposals_to_commands(proposals: List[Dict]) -> tuple:
     approved, rejected = 0, 0
     import re
     for p in proposals:
-        path = str(p.get("path", "")).strip()
+        path = _normalize_table_path(str(p.get("path", "")).strip())
         text = str(p.get("proposed_text") if p.get("proposed_text") is not None else p.get("value", "")).strip()
         orig_context = str(p.get("original_context", "")).strip()
 
         # 移除对 source_tool 为 none 的硬编码拦截；只要非空且不为占位异常提示即予以放行
-        if not text or text.startswith("[待补充") or text.startswith("[建议") or text.startswith("[查询") or text.startswith("[错误"):
+        if not text or text.startswith("[待补充") or text.startswith("[建议") or text.startswith("[查询") or text.startswith("[错误") or text.startswith("待补充"):
             rejected += 1; continue
+        if any(k in text for k in ["无需写盘", "零改动", "固定原文", "原样保留", "无需改动", "无槽位", "待线下"]):
+            rejected += 1; continue
+
+        # 剥离说明性元数据注释并拦截零改动无操作提案
+        from app.agents.review_engine import clean_zero_change_annotations, is_zero_change_or_no_op_proposal
+        text = clean_zero_change_annotations(text)
+        if is_zero_change_or_no_op_proposal(text, orig_context):
+            rejected += 1; continue
+
         if not path or "~" in path or ".." in path:
             rejected += 1; continue
+
+        # 任何带表格单元格的路径必须先完成规范化，未知路径不允许降级为行级写入。
+        if re.search(r"/tbl\[\d+\]/(?:tr|row)\[\d+\]/", path) and not re.search(
+            r"/tbl\[\d+\]/(?:tr|row)\[\d+\]/tc\[\d+\]", path
+        ):
+            logger.error(f"[Reviewer] 拒绝无法定位到具体单元格的表格路径: {path}")
+            rejected += 1
+            continue
         
         # 路径精准度保护：如果是容器节点（/tbl[N] 或 /tr[N]），通常丢弃。
         # 但如果提议内容是 JSON 数组（代表批量行插入）或来源标记为表格模板行，则放行
@@ -1907,16 +2721,34 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
     audit_items: List[FillingAuditItem] = list(state.get("audit_items") or [])
 
     if not docx_temp_path or not os.path.exists(docx_temp_path):
-        logger.warning("   临时 Word 文件不存在，跳过 DOM 审核")
-        return {"audit_passed": True, "repair_count": repair_count, "audit_items": audit_items}
+        logger.error("   临时 Word 文件不存在，阻断最终文件发布")
+        return {
+            "audit_passed": False,
+            "audit_blocked": True,
+            "repair_count": repair_count,
+            "audit_items": audit_items,
+            "review_findings": [{
+                "rule_id": "R0-ARTIFACT-MISSING",
+                "severity": "error",
+                "path": "N/A",
+                "description": "临时 Word 文件不存在，无法确认最终产物正确性",
+                "current_value": "",
+                "expected_value": "可回读的 Word 工作副本",
+                "auto_fixable": False,
+            }],
+        }
 
     unfilled_findings = []
     repair_instructions_map: Dict[str, str] = {}
     chapter_unfilled_count: Dict[str, int] = defaultdict(int)
+    expected_total: Optional[Decimal] = None
+    expected_total_words = ""
+    expected_company_name = ""
 
     try:
         from app.services.office_cli_service import office_cli_service
         import asyncio, concurrent.futures
+        from app.services.office_cli_service import office_cli_service
         def _sync(coro):
             try:
                 asyncio.get_running_loop()
@@ -1993,16 +2825,266 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
                 })
                 logger.warning(f"   检出授权委托书主体错挂: '{line_str[:60]}...'")
 
-        # 3. 增强表格 DOM 结构审核（仅记录表格节点分布情况，不误判正常数据长表）
+        # 3. 深度段落与表格质检与全自动自愈管线 (Deep Document Quality Audit & Auto-Heal)
         try:
-            table_struct_str = _sync(office_cli_service.query_structure(docx_temp_path, "table"))
-            tbl_count = 0
-            for tbl_line in str(table_struct_str).split("\n"):
-                if "tbl[" in tbl_line:
-                    tbl_count += 1
-            logger.info(f"   [Supervisor DOM 扫描] 共查验 {tbl_count} 个表格结构，均已通过规范核查")
+            doc_obj = Document(docx_temp_path)
+            doc_modified = False
+            from app.db.models.business import CompanyProfileModel
+            from app.db.models.metadata import TimelineMetadata
+            from app.db.models.ai_analysis import CostEstimate
+            from app.utils.rmb_formatter import number_to_chinese_rmb
+            from datetime import datetime
+
+            db_audit: Session = SessionLocal()
+            try:
+                # 从同一份财务明细计算期望总价，供写盘后产物校验使用。
+                cost_items_for_validation = db_audit.query(CostEstimate).filter(
+                    CostEstimate.document_id == doc_id
+                ).all()
+                if isinstance(cost_items_for_validation, (list, tuple)) and cost_items_for_validation:
+                    total_amount = Decimal("0.00")
+                    for cost_item in cost_items_for_validation:
+                        item_total = _parse_decimal_amount(str(getattr(cost_item, "calculated_total", "")))
+                        if item_total is not None:
+                            total_amount += item_total
+                    if total_amount > Decimal("0.00"):
+                        expected_total = total_amount.quantize(Decimal("0.01"))
+                        expected_total_words = number_to_chinese_rmb(str(expected_total))
+
+                profile = state.get("company_profile")
+                expected_company_name = str(
+                    getattr(profile, "company_name", "") or ""
+                ).strip()
+                if not expected_company_name:
+                    profile_model = db_audit.query(CompanyProfileModel).first()
+                    expected_company_name = str(
+                        getattr(profile_model, "company_name", "") or ""
+                    ).strip()
+
+                def _safe_str(val: Any) -> Optional[str]:
+                    if val is not None and isinstance(val, str) and val.strip() and not str(val).startswith("<MagicMock"):
+                        return val.strip()
+                    return None
+
+                # 3.1 正文段落冒号留白深度自检与企业/项目数据原位自愈 (Paragraph Blank Slots Auto-Heal)
+                try:
+                    prof = db_audit.query(CompanyProfileModel).first() if db_audit else None
+                    tl = db_audit.query(TimelineMetadata).filter(TimelineMetadata.document_id == doc_id).first() if db_audit else None
+
+                    for p_idx, p_elem in enumerate(doc_obj.paragraphs):
+                        p_raw = p_elem.text.strip()
+                        if not p_raw:
+                            continue
+
+                        # 前置严格过滤：若原段落为正文叙述句、公文条款导语或含有句中标点，绝对严禁作为表单属性标签进行自愈！
+                        if is_narrative_clause_or_lead_in(p_raw):
+                            continue
+
+                        # 探测冒号后连续空格/下划线/未填占位符的属性标签行
+                        m_slot = re.match(r'^\s*([^:：\n]{2,25}[:：])(\s{2,}|_{2,}|＿{2,}|\s*年\s*月\s*日|\[待[^\]]+\]|［待[^］]+］|\s*$)', p_raw)
+                        if m_slot:
+                            lbl = m_slot.group(1)
+                            if is_narrative_clause_or_lead_in(lbl):
+                                continue
+
+                            lbl_clean = re.sub(r'[\s:：_＿（）\(\)［］\[\]]', '', lbl)
+                            if len(lbl_clean) < 2 or len(lbl_clean) > 20:
+                                continue
+
+                            filled_val = None
+
+                            if prof:
+                                # 基于企业画像与项目元数据的动态 Schema 解析表 (纯动态取值，无任何硬编码业务数据)
+                                field_resolvers = [
+                                    (["地址", "通讯地址", "注册地址", "办公地址", "单位地址", "公司地址"], lambda: _safe_str(getattr(prof, "registered_address", None))),
+                                    (["电话", "联系电话", "手机", "联系方式", "固定电话", "办公电话"], lambda: _safe_str(getattr(prof, "contact_phone", None))),
+                                    (["邮编", "邮政编码", "邮政代码"], lambda: _safe_str(getattr(prof, "postal_code", None))),
+                                    (["邮箱", "电子邮箱", "Email", "email"], lambda: _safe_str(getattr(prof, "email", None))),
+                                    (["传真", "传真号码", "公司传真", "单位传真"], lambda: _safe_str(getattr(prof, "fax_number", None))),
+                                    (["名称", "投标人", "投标单位", "单位名称", "投标人全称", "投标单位全称", "企业名称", "单位全称"], lambda: _safe_str(getattr(prof, "company_name", None))),
+                                ]
+
+                                for keywords, getter_fn in field_resolvers:
+                                    if any(k == lbl_clean or lbl_clean.endswith(k) or k in lbl_clean for k in keywords):
+                                        filled_val = getter_fn()
+                                        break
+
+                                # 法定代表人/授权代表/签字人 与日期复合槽位动态解析
+                                if not filled_val and any(k in lbl_clean for k in ["代表", "法人", "法定代表人", "签字", "授权代表", "代理人", "签署人"]):
+                                    rep_name = _safe_str(getattr(prof, "legal_representative", None))
+                                    if any(k in p_raw for k in ["年", "月", "日"]):
+                                        date_val = _safe_str(getattr(tl, "planned_delivery_date", None))
+                                        if rep_name and date_val:
+                                            filled_val = f"{rep_name}                       {date_val}"
+                                        elif rep_name:
+                                            filled_val = rep_name
+                                        elif date_val:
+                                            filled_val = date_val
+                                    else:
+                                        filled_val = rep_name
+                                elif not filled_val and (any(k in lbl_clean for k in ["日期", "日 期", "签署日期", "投标日期", "签章日期"]) or (len(lbl_clean) <= 4 and any(k in p_raw for k in ["年", "月", "日"]))):
+                                    filled_val = _safe_str(getattr(tl, "planned_delivery_date", None))
+
+                            if filled_val and isinstance(filled_val, str):
+                                p_elem._element.clear_content()
+                                _apply_run_style_xml(p_elem.add_run(lbl), enable_underline=False, is_table=False)
+                                _apply_run_style_xml(p_elem.add_run(f" {filled_val}"), enable_underline=True, is_table=False)
+                                doc_modified = True
+                                logger.info(f"   🔧 [Supervisor 段落自愈] 已自动将企业档案补全至段落槽位: {lbl} -> '{filled_val}'")
+                except Exception as exc_para:
+                    logger.warning(f"   Supervisor 段落自愈检测异常: {exc_para}")
+
+                # 3.2 深度表格质检与自愈管线 (Deep Table Quality Audit & Auto-Heal)
+                tbl_count = len(doc_obj.tables)
+                for tbl_idx, table in enumerate(doc_obj.tables, start=1):
+                    if not table.rows or len(table.rows) == 0:
+                        continue
+
+                    header_row = table.rows[0]
+                    header_texts = [cell.text.strip() for cell in header_row.cells]
+                    header_combined = " ".join(header_texts)
+
+                    # 场景 A：检查固定格式表单 / 单项汇总表
+                    from app.utils.table_utils import is_fixed_slot_form_table, detect_table_header_rows as _det_hdr
+                    hdr_c = _det_hdr(table)
+                    total_cols = len(table.rows[0].cells) if table.rows else 1
+                    is_fixed_table = is_fixed_slot_form_table(table, hdr_c)
+
+                    if is_fixed_table:
+                        # 1. 检查表格中是否存在重复插入的表尾汇总/合并行 (冗余插行自愈清理)
+                        footer_row_indices = []
+                        for r_idx in range(hdr_c, len(table.rows)):
+                            row_tcs = set(c._tc for c in table.rows[r_idx].cells)
+                            r_raw = "".join(c.text for c in table.rows[r_idx].cells)
+                            if len(row_tcs) < total_cols or any(kw in r_raw for kw in ["大写", "总价", "报价", "合计", "总计"]):
+                                if r_idx > hdr_c:
+                                    footer_row_indices.append(r_idx)
+
+                        if len(footer_row_indices) > 1:
+                            for del_r_idx in reversed(footer_row_indices[:-1]):
+                                r_elem = table.rows[del_r_idx]._tr
+                                r_elem.getparent().remove(r_elem)
+                                doc_modified = True
+                                logger.info(f"   🧹 [Supervisor 表格自愈] 清除固定表单 {tbl_idx} 中多余的重复表尾行 (第 {del_r_idx+1} 行)")
+
+                        # 2. 清除固定表单中误插入的多余分项明细行 (确保数据行只有 1 行)
+                        if len(table.rows) > hdr_c + 2:
+                            footer_row_idx = None
+                            for r_idx in range(len(table.rows) - 1, hdr_c, -1):
+                                row_tcs = set(c._tc for c in table.rows[r_idx].cells)
+                                r_raw = "".join(c.text for c in table.rows[r_idx].cells)
+                                if len(row_tcs) < total_cols or any(kw in r_raw for kw in ["大写", "总价", "报价", "合计", "总计"]):
+                                    footer_row_idx = r_idx
+                                    break
+                            if footer_row_idx is not None and footer_row_idx > hdr_c + 1:
+                                for del_idx in range(footer_row_idx - 1, hdr_c, -1):
+                                    del_tr = table.rows[del_idx]._tr
+                                    del_tr.getparent().remove(del_tr)
+                                    doc_modified = True
+                                    logger.info(f"   🧹 [Supervisor 表格自愈] 清除固定表单 {tbl_idx} 中多余插入的明细行 (第 {del_idx+1} 行)")
+
+                        # 3. 检查表尾汇总行/大写金额单元格是否留空并原位自愈
+                        for r_i in range(hdr_c, len(table.rows)):
+                            row_tcs = set(c._tc for c in table.rows[r_i].cells)
+                            r_raw = "".join(c.text for c in table.rows[r_i].cells)
+                            is_footer_or_caps = (len(row_tcs) < total_cols or any(kw in r_raw for kw in ["大写", "总价", "报价", "合计"])) and r_i >= hdr_c
+                            if is_footer_or_caps:
+                                empty_caps_cell = None
+                                for c_i, cell in enumerate(table.rows[r_i].cells):
+                                    c_txt = cell.text.strip()
+                                    if c_i > 0 and (not c_txt or any(pat in c_txt for pat in ["___", "[待", "待填", "待补充"])):
+                                        empty_caps_cell = cell
+                                        break
+
+                                if empty_caps_cell is not None:
+                                    cost_items = db_audit.query(CostEstimate).filter(CostEstimate.document_id == doc_id).all()
+                                    if cost_items:
+                                        total_val = sum(it.calculated_total for it in cost_items)
+                                        upper_cn = number_to_chinese_rmb(total_val)
+                                        empty_caps_cell.text = upper_cn
+                                        doc_modified = True
+                                        logger.info(f"   🔧 [Supervisor 表格自愈] 已自动将大写总金额 '{upper_cn}' 原位补全至表单单元格")
+                                    else:
+                                        chapter_unfilled_count["汇总表单"] += 1
+                                        unfilled_findings.append({
+                                            "chapter": "汇总表单",
+                                            "snippet": f"表单第 {r_i+1} 行大写总金额单元格留空",
+                                            "type": "unfilled_table_cell"
+                                        })
+
+                    # 场景 B：检查分项清单 / 采购明细表中的“生产厂家”等关键必填列
+                    if len(table.rows) > 1:
+                        mfg_col_idx = -1
+                        for c_i, h_txt in enumerate(header_texts):
+                            if any(kw in h_txt for kw in ["生产厂家", "制造厂家", "制造厂商", "生产厂商", "制造商", "厂家", "产地"]):
+                                mfg_col_idx = c_i
+                                break
+
+                        if mfg_col_idx != -1:
+                            data_rows = table.rows[1:]
+                            mfg_cells = []
+                            for dr in data_rows:
+                                dr_text = "".join(c.text for c in dr.cells)
+                                if not any(k in dr_text for k in ["合计", "总计", "大写", "小计"]):
+                                    if mfg_col_idx < len(dr.cells):
+                                        mfg_cells.append(dr.cells[mfg_col_idx].text.strip())
+
+                            if mfg_cells and all(not val for val in mfg_cells):
+                                cost_items = db_audit.query(CostEstimate).filter(CostEstimate.document_id == doc_id).all()
+                                if cost_items:
+                                    c_idx = 0
+                                    for dr in data_rows:
+                                        dr_text = "".join(c.text for c in dr.cells)
+                                        if not any(k in dr_text for k in ["合计", "总计", "大写", "小计"]) and c_idx < len(cost_items):
+                                            item = cost_items[c_idx]
+                                            mfg_str = str(getattr(item, 'manufacturer', '') or getattr(item, 'brand', '') or '').strip()
+                                            if mfg_str and mfg_col_idx < len(dr.cells):
+                                                dr.cells[mfg_col_idx].text = mfg_str
+                                                doc_modified = True
+                                            c_idx += 1
+                                    logger.info(f"   🔧 [Supervisor 表格自愈] 成功从数据库将生产厂家数据回填至分项报价表 (共 {c_idx} 项)")
+                                else:
+                                    chapter_unfilled_count["分项报价表"] += 1
+                                    unfilled_findings.append({
+                                        "chapter": "分项报价表",
+                                        "snippet": f"表格第 {tbl_idx} 个表【生产厂家】列数据全为空白",
+                                        "type": "unfilled_table_column"
+                                    })
+
+                if doc_modified:
+                    doc_obj.save(docx_temp_path)
+                    logger.info(f"   💾 [Supervisor 终审自愈] 全部段落与表格自动修正已同步保存至工作副本: {docx_temp_path}")
+
+                # 所有自动修正完成后重新回读产物，验证真实落位而不是仅相信 Worker 提案日志。
+                artifact_findings = validate_filled_docx_integrity(
+                    docx_path=docx_temp_path,
+                    expected_total=expected_total,
+                    expected_total_words=expected_total_words,
+                    company_name=expected_company_name,
+                    proposals=worker_proposals,
+                )
+                for finding in artifact_findings:
+                    finding_chapter = finding.get("chapter", "产物回读校验")
+                    chapter_unfilled_count[finding_chapter] += 1
+                    unfilled_findings.append({
+                        "chapter": finding_chapter,
+                        "snippet": finding.get("snippet", "Word 产物校验失败"),
+                        "type": finding.get("type", "artifact_integrity_error"),
+                        "path": finding.get("path", "N/A"),
+                    })
+                    logger.error(
+                        f"   [产物回读校验失败] {finding.get('path', 'N/A')}: "
+                        f"{finding.get('snippet', '未知错误')}"
+                    )
+
+                logger.info(
+                    f"   [Supervisor DOM 扫描] 已查验 {tbl_count} 个表格与 "
+                    f"{len(doc_obj.paragraphs)} 个段落结构，发现 {len(artifact_findings)} 项产物问题"
+                )
+            finally:
+                db_audit.close()
         except Exception as exc_tbl:
-            logger.warning(f"   Supervisor 表格结构审核异常: {exc_tbl}")
+            logger.warning(f"   Supervisor 深度质检异常: {exc_tbl}")
 
         # 4. 全图招标文件需求与填报内容对应度深度核验 (Requirement Alignment Check)
         try:
@@ -2073,12 +3155,21 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
                 logger.warning(f"      - [{ch}]: {count} 处待修项 (样例: {chapter_findings_summary[ch][:2]})")
                 repair_instructions_map[ch] = (
                     f"在【{ch}】章节的质量核实中检测出 {count} 处隐患：\n"
-                    "1. 核实填写的项目名称、招标编号、投标人全称及法人姓名，必须与数据库主档案和招标文件原文 100% 精准对应；\n"
-                    "2. 若丢失前缀标签（如'项目名称：'、'招标编号：'），重新写盘时必须完整保留前缀标签；\n"
-                    "3. 若为授权委托书，'致：___' 填招标代理机构，'参加 ___ 组织的...' 必须填采购人/招标人单位全称；\n"
-                    "4. 若本章节包含多个表格，必须优先选择章节标题正下方的第一个主表格（通常为 /body/tbl[1]）填充数据，严禁留空主表格；\n"
-                    "5. 核实数值与文字是否一致，若仍有未填下划线或占位符，请查库补齐。"
+                    "1. 逐条读取下方列出的目标路径，确认当前节点、所在行列和章节归属，不得凭旧提案猜测；\n"
+                    "2. 将实际节点内容与招标原文、企业/项目数据源重新核对，判断是提案错误、目标路径错误还是文档被其他提案覆盖；\n"
+                    "3. 只有数据源能够明确证明应填某值时才提交修复提案；数据源无法确认时保留占位状态，不得编造；\n"
+                    "4. 修复提案必须精确写入重新确认后的目标路径，保持模板固定文本、表头、合并关系和其他单元格不变；\n"
+                    "5. 写入后再次查询同一目标路径，确认实际值与修复结果一致；若仍不一致，继续定位原因并提交新的修复方案。"
                 )
+                chapter_specific_findings = [
+                    item for item in unfilled_findings if item.get("chapter") == ch
+                ]
+                if chapter_specific_findings:
+                    repair_instructions_map[ch] += "\n6. 请优先根据以下产物回读问题逐项重新定位并修复，不要只重复原提案：\n"
+                    repair_instructions_map[ch] += "\n".join(
+                        f"- 路径 {item.get('path', 'N/A')}: {item.get('snippet', '')}"
+                        for item in chapter_specific_findings[:10]
+                    )
         else:
             logger.info("   [Supervisor 全局扫描完成] 全图 Word DOM 结构与语义数据 100% 审阅完毕，准确性与原文完美对应！")
 
@@ -2102,6 +3193,25 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
         logger.exception(f"   Supervisor 全局扫描发生异常: {e}")
 
     is_passed = (len(unfilled_findings) == 0)
+    review_findings_payload = [
+        {
+            "rule_id": {
+                "unfilled_slot": "R1-UNFILLED",
+                "opening_total_mismatch": "R3-SUM-MISMATCH",
+                "opening_total_words_mismatch": "R3-UPPERCASE-MISMATCH",
+                "opening_total_semantic_mismatch": "R4-CELL-SEMANTIC-MISMATCH",
+                "opening_footer_wrong_value": "R4-CELL-VALUE-MISMATCH",
+                "proposal_writeback_mismatch": "R5-PROPOSAL-WRITEBACK-MISMATCH",
+            }.get(item.get("type", ""), "R9-ARTIFACT-INTEGRITY"),
+            "severity": "error",
+            "path": item.get("path", "N/A"),
+            "description": item.get("snippet", "产物校验失败"),
+            "current_value": "",
+            "expected_value": "",
+            "auto_fixable": False,
+        }
+        for item in unfilled_findings
+    ]
 
     if not is_passed and repair_count < max_repair_rounds:
         new_repair_count = repair_count + 1
@@ -2111,20 +3221,74 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
             "repair_count": new_repair_count,
             "repair_instructions_map": repair_instructions_map,
             "audit_items": audit_items,
+            "review_findings": review_findings_payload,
+            "audit_blocked": False,
         }
     else:
         if is_passed:
             logger.info("   [Supervisor 全局扫描通过] 标书全图填写质量全部达标！")
         else:
-            logger.warning(f"   [达到最大修复上限] 已执行 {repair_count} 轮全局扫描与修复，按现有最佳质量输出结果。")
+            logger.error(f"   [达到最大修复上限] 已执行 {repair_count} 轮修复仍未通过，阻断错误 Word 发布。")
         return {
-            "audit_passed": True,
+            "audit_passed": is_passed,
+            "audit_blocked": not is_passed,
             "audit_items": audit_items,
+            "review_findings": review_findings_payload,
         }
 
 
+def blocked_docx_node(state: BidFillerState) -> Dict[str, Any]:
+    """修复轮次耗尽后阻断自动发布，同时保留非空工作副本供下载和诊断。"""
+    doc_id = state.get("document_id", "")
+    raw_findings = state.get("review_findings") or []
+    finding_models: List[ReviewFinding] = []
+    for finding in raw_findings:
+        try:
+            finding_models.append(ReviewFinding(**finding))
+        except Exception as exc:
+            logger.warning(f"阻断报告转换质检问题失败: {exc}")
+
+    error_count = sum(1 for finding in finding_models if finding.severity == "error")
+    filled_docx_bytes: Optional[bytes] = None
+    docx_temp_path = state.get("docx_temp_path")
+
+    # 阻断只表示质量状态未通过，不应把已经写入的工作副本替换成空模板。
+    if docx_temp_path and os.path.exists(docx_temp_path):
+        try:
+            with open(docx_temp_path, "rb") as work_file:
+                filled_docx_bytes = work_file.read()
+            logger.warning(
+                f"[阻断发布] 保留已填工作副本供下载: {docx_temp_path}, bytes={len(filled_docx_bytes)}"
+            )
+        except (OSError, IOError) as read_error:
+            logger.exception(f"[阻断发布] 读取已填工作副本失败: {read_error}")
+
+    if not filled_docx_bytes:
+        original_docx = state.get("original_docx")
+        if original_docx:
+            filled_docx_bytes = original_docx
+            logger.warning("[阻断发布] 工作副本不可读，回退保留原始 Word 字节流")
+
+    report = BidFillAuditReport(
+        document_id=doc_id,
+        total_fields_count=len(state.get("audit_items", [])),
+        audit_items=state.get("audit_items", []),
+        review_findings=finding_models,
+        review_summary=f"{error_count} errors, 0 warnings, 0 infos (已阻断发布)",
+        summary_note="标书产物未通过写盘后校验，已阻断自动发布；当前保留工作副本供下载，请根据审计问题修复后重试。",
+    )
+    logger.error(f"[产物发布阻断] document_id={doc_id}, errors={error_count}")
+    return {
+        "filled_docx_bytes": filled_docx_bytes,
+        "audit_report": report,
+        "audit_blocked": True,
+    }
+
+
 def should_repair(state: BidFillerState) -> str:
-    """Supervisor 审核路由函数：通过或者已达重试上限则结项写盘，否则返回 agent_fill_node 重修"""
+    """Supervisor 审核路由函数：通过发布、未通过重试、耗尽则阻断。"""
+    if state.get("audit_blocked") is True:
+        return "blocked_docx_node"
     if state.get("audit_passed") is True:
         return "write_docx_node"
     return "agent_fill_node"
@@ -2227,10 +3391,25 @@ def write_docx_node(state: BidFillerState) -> Dict[str, Any]:
     filled_bytes: Optional[bytes] = None
     used_temp_file = False
 
+    # Agent 可能因为模型输出、工具参数或章节识别异常而没有提交 image proposal。
+    # 在最终读取工作副本前做一次租户隔离的幂等兜底，确保“资格证明文件”章节不会漏图。
     if docx_temp_path and os.path.exists(docx_temp_path):
         try:
+            from app.core.context import current_tenant_id
             from app.agents.tools.bid_db_tools import auto_embed_qualification_images_in_docx
-            auto_embed_qualification_images_in_docx(docx_temp_path)
+
+            effective_tenant = state.get("tenant_id") or current_tenant_id.get() or "default-tenant"
+            fallback_count = auto_embed_qualification_images_in_docx(
+                docx_temp_path,
+                tenant_id=effective_tenant,
+            )
+            if fallback_count:
+                logger.info(f"   🖼️ [资格证明图片兜底] 自动补插 {fallback_count} 张资质图片 (tenant_id={effective_tenant})")
+        except Exception as fallback_err:
+            logger.warning(f"   资格证明图片兜底插入失败，不影响其他章节输出: {fallback_err}")
+
+    if docx_temp_path and os.path.exists(docx_temp_path):
+        try:
             with open(docx_temp_path, "rb") as f_temp:
                 filled_bytes = f_temp.read()
             used_temp_file = True
@@ -2319,6 +3498,7 @@ def build_bid_filler_graph():
     workflow.add_node("agent_fill_node", agent_fill_node)
     workflow.add_node("supervisor_audit_node", supervisor_audit_node)
     workflow.add_node("write_docx_node", write_docx_node)
+    workflow.add_node("blocked_docx_node", blocked_docx_node)
 
     workflow.set_entry_point("scan_node")
     workflow.add_edge("scan_node", "agent_fill_node")
@@ -2329,9 +3509,11 @@ def build_bid_filler_graph():
         {
             "agent_fill_node": "agent_fill_node",
             "write_docx_node": "write_docx_node",
+            "blocked_docx_node": "blocked_docx_node",
         }
     )
     workflow.add_edge("write_docx_node", END)
+    workflow.add_edge("blocked_docx_node", END)
     return workflow.compile()
 
 
@@ -2355,17 +3537,30 @@ class BidFillerAgent:
         logger.info("启动 LangGraph BidFillerAgent Multi-Agent 标书撰写状态图...")
         from app.agents.bid_filler_workers import clear_worker_proposals
         clear_worker_proposals(document_id)
+
+        effective_tenant: Optional[str] = None
+        try:
+            from app.core.context import current_tenant_id
+            effective_tenant = current_tenant_id.get()
+            if not effective_tenant and db is not None:
+                document_obj = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+                effective_tenant = getattr(document_obj, "tenant_id", None) if document_obj else None
+        except Exception as tenant_err:
+            logger.warning(f"读取标书租户上下文失败，使用默认租户: {tenant_err}")
+        effective_tenant = effective_tenant or "default-tenant"
+
         initial_state: BidFillerState = {
-            "document_id": document_id, "original_context": "",
+            "document_id": document_id, "tenant_id": effective_tenant, "original_context": "",
             "db_session": db, "company_profile": profile,
             "original_docx": original_docx, "docx_temp_path": None,
-            "slot_analysis": None, "worker_proposals": None,
+            "slot_analysis": None, "worker_proposals": None, "chapter_tasks": None,
             "custom_instructions": custom_instructions,
             "category_hints": category_hints,
             "repair_count": 0,
             "max_repair_rounds": 2,
             "repair_instructions_map": None,
             "audit_passed": None,
+            "audit_blocked": False,
             "audit_items": [], "review_findings": None,
             "audit_report": None, "filled_docx_bytes": None,
         }
@@ -2447,11 +3642,6 @@ def bid_filler_orchestrator_node(state: dict) -> dict:
         if filled_bytes:
             with open(draft_path, "wb") as f:
                 f.write(filled_bytes)
-            try:
-                from app.agents.tools.bid_db_tools import auto_embed_qualification_images_in_docx
-                auto_embed_qualification_images_in_docx(draft_path)
-            except Exception as e_embed:
-                logger.warning(f"草稿落盘自动嵌入资质图片异常: {e_embed}")
 
         doc_obj = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
         if doc_obj:

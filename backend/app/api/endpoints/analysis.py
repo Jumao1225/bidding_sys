@@ -18,6 +18,7 @@ from app.agents.tools.metadata_tools import (
     extract_engineering_info,
     extract_evaluation_info
 )
+from app.utils.table_utils import normalize_section_name
 
 router = APIRouter()
 
@@ -246,6 +247,7 @@ async def reextract_domain(
 from pydantic import BaseModel, Field
 
 class CostItemUpdateRequest(BaseModel):
+    item_code: Optional[str] = Field(default=None, description="表格多级序号编码")
     name: str = Field(..., description="项目/设备名称")
     spec_requirement: str = Field(default="", description="规格或说明")
     qty: Optional[float] = Field(default=1.0, description="数量")
@@ -260,6 +262,15 @@ class CostItemUpdateRequest(BaseModel):
     match_quality: str = Field(default="手动添加", description="匹配置信度")
     warning: str = Field(default="", description="提示说明")
     comparison_note: str = Field(default="", description="对比说明")
+    parent_item: Optional[str] = Field(default=None, description="所属直接父级设备名称")
+    root_item: Optional[str] = Field(default=None, description="所属顶层主要标的物名称")
+    tree_level: Optional[int] = Field(default=1, description="层级深度（1=顶层主要标的物, 2=二级成套分项, 3=三级元器件）")
+    per_set_qty: Optional[Any] = Field(default=None, description="单套设备定额数量")
+    per_set_quantity: Optional[Any] = Field(default=None, description="单套设备定额数量别名")
+    brand: Optional[str] = Field(default=None, description="品牌")
+    model: Optional[str] = Field(default=None, description="规格型号")
+    manufacturer: Optional[str] = Field(default=None, description="生产厂商")
+    section_name: Optional[str] = Field(default=None, description="所属分标段/分区域/分项工程名称")
 
 class CostAnalysisUpdateRequest(BaseModel):
     items: List[CostItemUpdateRequest] = Field(..., description="BOM成本分项列表")
@@ -286,34 +297,83 @@ async def update_cost_analysis(
     if not doc:
         raise HTTPException(status_code=403, detail="无权访问该文档或文档不存在")
 
-    # 2. 重新计算小计与预估总成本
-    calculated_items = []
-    total_cost = 0.0
-    unmatched_count = 0
+    # 构建设备所属成套关系与区域属性参考字典（从工程元数据与历史记录中自动继承）
+    parent_map = {}
+    from app.db.models.metadata import EngineeringMetadata
+    eng_md = db.query(EngineeringMetadata).filter(EngineeringMetadata.document_id == document_id).first()
+    eng_list = getattr(eng_md, "main_equipment_list", None) if eng_md else None
+    if eng_list and isinstance(eng_list, list):
+        for eq in eng_list:
+            if isinstance(eq, dict) and eq.get("item_name"):
+                nm = eq["item_name"].strip()
+                parent_map[nm] = {
+                    "item_code": eq.get("item_code"),
+                    "parent_item": eq.get("parent_item"),
+                    "root_item": eq.get("root_item"),
+                    "tree_level": eq.get("tree_level"),
+                    "per_set_qty": eq.get("per_set_quantity") or eq.get("per_set_qty"),
+                    "section_name": eq.get("section_name")
+                }
+
+    # 2. 补齐属性并执行自底向上树形层级汇总（防双重计费并计算成套母项小计与折合单价）
+    from app.services.cost_service import rollup_hierarchical_cost_items
+    raw_item_list = []
+
+    def _optional_float(value):
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     for item in payload.items:
         item_dict = item.model_dump()
         raw_qty = item_dict.get("qty")
         ref_price = float(item_dict.get("ref_price") or 0.0)
         
+        # 自动补齐 parent_item、per_set_qty 与 section_name、item_code 等（如果 payload 中缺失）
+        name_key = (item_dict.get("name") or "").strip()
+        if name_key in parent_map:
+            if not item_dict.get("item_code") and parent_map[name_key].get("item_code"):
+                item_dict["item_code"] = parent_map[name_key]["item_code"]
+            if not item_dict.get("parent_item") and parent_map[name_key].get("parent_item"):
+                item_dict["parent_item"] = parent_map[name_key]["parent_item"]
+            if not item_dict.get("root_item") and parent_map[name_key].get("root_item"):
+                item_dict["root_item"] = parent_map[name_key]["root_item"]
+            if not item_dict.get("tree_level") and parent_map[name_key].get("tree_level"):
+                item_dict["tree_level"] = parent_map[name_key]["tree_level"]
+            if not item_dict.get("per_set_qty") and parent_map[name_key].get("per_set_qty"):
+                item_dict["per_set_qty"] = parent_map[name_key]["per_set_qty"]
+            if not item_dict.get("section_name") and parent_map[name_key].get("section_name"):
+                item_dict["section_name"] = parent_map[name_key]["section_name"]
+
         try:
             qty = float(raw_qty) if raw_qty is not None else 1.0
         except (ValueError, TypeError):
             qty = 1.0
             item_dict["qty"] = 1.0
 
-        subtotal = round(qty * ref_price, 2)
-        item_dict["subtotal"] = subtotal
-        
-        if ref_price <= 0:
-            unmatched_count += 1
-            if not item_dict.get("match_quality"):
-                item_dict["match_quality"] = "未匹配"
+        # 兼容品牌、型号与厂商的多别名映射
+        if item_dict.get("brand") and not item_dict.get("matched_brand"):
+            item_dict["matched_brand"] = item_dict["brand"]
+        elif item_dict.get("matched_brand") and not item_dict.get("brand"):
+            item_dict["brand"] = item_dict["matched_brand"]
+            
+        if item_dict.get("model") and not item_dict.get("matched_model"):
+            item_dict["matched_model"] = item_dict["model"]
+        elif item_dict.get("matched_model") and not item_dict.get("model"):
+            item_dict["model"] = item_dict["matched_model"]
 
-        total_cost += subtotal
-        calculated_items.append(item_dict)
+        if item_dict.get("manufacturer") and not item_dict.get("matched_manufacturer"):
+            item_dict["matched_manufacturer"] = item_dict["manufacturer"]
+        elif item_dict.get("matched_manufacturer") and not item_dict.get("manufacturer"):
+            item_dict["manufacturer"] = item_dict["matched_manufacturer"]
 
-    total_cost = round(total_cost, 2)
+        item_dict["ref_price"] = ref_price
+        raw_item_list.append(item_dict)
+
+    calculated_items, total_cost, unmatched_count = rollup_hierarchical_cost_items(raw_item_list)
 
     # 3. 评估预算与最高限价状态（严格优先级：最高投标限价 max_price_limit > 采购总预算 budget > parsed_metadata 兜底）
     from app.db.models.metadata import FinancialMetadata
@@ -392,20 +452,45 @@ async def update_cost_analysis(
                 valid_project_id = None
 
         db.query(CostEstimate).filter(CostEstimate.document_id == document_id).delete()
-        for item in calculated_items:
+        for sort_order, item in enumerate(calculated_items):
+            # 提取品牌、型号与生产厂商（仅采用对标匹配或用户填写的品牌、型号与厂家，无则直接留空，严禁回退采用标书要求文字）
+            effective_brand = str(item.get("matched_brand") or item.get("brand") or "").strip()
+            effective_model = str(item.get("matched_model") or item.get("model") or "").strip()
+            effective_mfg = str(item.get("matched_manufacturer") or item.get("manufacturer") or "").strip()
+
             est = CostEstimate(
                 tenant_id=current_user.tenant_id,
                 user_id=current_user.id,
                 document_id=document_id,
                 project_id=valid_project_id,
-                item_name=item.get("name", "未命名项"),
+                item_code=str(item.get("item_code") or "").strip() or None,
+                item_name=str(item.get("name") or "未命名项"),
                 quantity=float(item.get("qty") or 1.0),
-                unit=item.get("unit", "项"),
+                unit=str(item.get("unit")) if item.get("unit") is not None else None,
                 unit_price=float(item.get("ref_price") or 0.0),
                 calculated_total=float(item.get("subtotal") or 0.0),
-                brand=item.get("brand_requirements", "") or item.get("matched_brand", ""),
-                spec=item.get("spec_requirement", "") or item.get("matched_model", ""),
-                remark=item.get("comparison_note", "") or item.get("warning", "") or "手动新增/调整项目"
+                brand=effective_brand or None,
+                model=effective_model or None,
+                manufacturer=effective_mfg or None,
+                spec=effective_model or None,
+                spec_requirement=str(item.get("spec_requirement") or "").strip() or None,
+                matched_name=str(item.get("matched_name") or "").strip() or None,
+                matched_brand=str(item.get("matched_brand") or "").strip() or None,
+                matched_model=str(item.get("matched_model") or "").strip() or None,
+                matched_manufacturer=str(item.get("matched_manufacturer") or "").strip() or None,
+                key_parameters=item.get("key_parameters") or [],
+                brand_requirements=str(item.get("brand_requirements") or "").strip() or None,
+                match_quality=str(item.get("match_quality") or "").strip() or None,
+                warning=str(item.get("warning") or "").strip() or None,
+                comparison_note=str(item.get("comparison_note") or "").strip() or None,
+                parent_item=str(item.get("parent_item") or "").strip() or None,
+                root_item=str(item.get("root_item") or "").strip() or None,
+                tree_level=int(item.get("tree_level")) if item.get("tree_level") is not None else None,
+                per_set_qty=_optional_float(item.get("per_set_qty")),
+                per_set_quantity=_optional_float(item.get("per_set_quantity")),
+                section_name=normalize_section_name(item.get("section_name")),
+                remark=str(item.get("comparison_note") or item.get("warning") or "手动新增/调整项目"),
+                sort_order=sort_order,
             )
             db.add(est)
         db.commit()
@@ -416,6 +501,7 @@ async def update_cost_analysis(
         raise HTTPException(status_code=500, detail=f"数据落盘失败: {str(db_err)}")
 
     return success_response(data=cost_data, message="BOM 成本测算数据保存成功")
+
 
 @router.get("/draft/download/{document_id}")
 
@@ -442,13 +528,6 @@ async def download_bidding_draft(
     if not target_file_path:
         logger.info(f"未在磁盘搜寻到现成草稿，提示用户手动点击起草，文档ID: {document_id}")
         raise HTTPException(status_code=404, detail="投标书草稿尚未生成，请在页面中点击【生成/起草标书】按钮手动触发。")
-    if target_file_path and os.path.exists(target_file_path):
-        try:
-            from app.agents.tools.bid_db_tools import auto_embed_qualification_images_in_docx
-            auto_embed_qualification_images_in_docx(target_file_path)
-        except Exception as e_embed:
-            logger.warning(f"下载前自动嵌入资质图片提示: {e_embed}")
-            
     clean_filename = doc.filename.rsplit('.', 1)[0]
     filename = f"投标书草稿_{clean_filename}.docx"
     
@@ -580,4 +659,3 @@ async def download_original_file(
                 )
 
     raise HTTPException(status_code=404, detail="未找到对应的原文件")
-

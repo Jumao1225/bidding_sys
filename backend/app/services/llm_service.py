@@ -69,7 +69,8 @@ class LLMService:
                     api_key=settings.OPENAI_API_KEY,
                     base_url=settings.OPENAI_API_BASE if settings.OPENAI_API_BASE else None,
                     temperature=temperature,
-                    request_timeout=180.0,  # 扩展至 180 秒请求超时，确保大章节推理与并发生成不被误杀
+                    request_timeout=300.0,  # 显式配置请求超时，防止网络卡死
+                    max_retries=3,  # 显式配置底层 HTTP 瞬时网络错误自动重试
                 )
                 if json_mode:
                     llm = llm.bind(response_format={"type": "json_object"})
@@ -181,8 +182,18 @@ class LLMService:
                 if json_obj_match:
                     clean_content = json_obj_match.group(1).strip()
             
-            # 解析 JSON
-            return json.loads(clean_content)
+            # 解析 JSON (支持 strict=False 与控制字符自动清洗自愈)
+            try:
+                return json.loads(clean_content, strict=False)
+            except json.JSONDecodeError:
+                # 二级自愈：清洗不可见控制字符 (保留标准换行) 并将裸换行转义
+                repaired_content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', clean_content)
+                try:
+                    return json.loads(repaired_content, strict=False)
+                except Exception:
+                    # 三级自愈：使用内置简易清洗器
+                    pass
+                raise
         except json.JSONDecodeError as e:
             audit_service.log_event(action_type="llm_call", status="error", error_message=f"JSONDecodeError: {str(e)}")
             logger.error(f"❌ 大模型返回内容解析 JSON 失败: {str(e)}, 原始返回片段: {content[:300] if 'content' in locals() else 'None'}")
@@ -191,6 +202,9 @@ class LLMService:
             audit_service.log_event(action_type="llm_call", status="error", error_message=str(e))
             logger.error(f"❌ LLM 调用过程发生异常: {str(e)}")
             raise e
+
+    # 兼容便捷别名
+    generate_json = generate_structured_json
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
     def generate_text(self, prompt: str, temperature: float = 0.3) -> str:

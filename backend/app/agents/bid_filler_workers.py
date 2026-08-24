@@ -36,6 +36,52 @@ def clear_worker_proposals(document_id: str) -> None:
         _WORKER_PROPOSALS.pop(document_id, None)
 
 
+def _read_target_paragraph_text(docx_path: str, target_path: str) -> str:
+    """动态读取图片目标节点的当前文本，避免依赖固定段落编号。"""
+    if not docx_path or not os.path.exists(docx_path) or not target_path:
+        return ""
+
+    try:
+        from docx import Document
+
+        document = Document(docx_path)
+        para_id_match = re.search(r"@paraId=([A-Fa-f0-9]+)", target_path)
+        if para_id_match:
+            expected_id = para_id_match.group(1).upper()
+            paragraphs = list(document.paragraphs)
+            for table in document.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        paragraphs.extend(cell.paragraphs)
+            for paragraph in paragraphs:
+                for key, value in paragraph._element.attrib.items():
+                    if str(key).lower().endswith("paraid") and str(value).upper() == expected_id:
+                        return str(paragraph.text or "").strip()
+
+        body_path_match = re.search(r"/body/p\[(\d+)\]", target_path)
+        if body_path_match:
+            paragraph_index = int(body_path_match.group(1)) - 1
+            if 0 <= paragraph_index < len(document.paragraphs):
+                return str(document.paragraphs[paragraph_index].text or "").strip()
+    except (OSError, ValueError, ImportError) as read_error:
+        logger.warning(f"读取图片目标节点原文失败: {read_error}")
+
+    return ""
+
+
+def _proposal_merge_key(proposal: Dict[str, Any]) -> str:
+    """为提案生成动态去重键，允许同一条款挂载多张不同图片。"""
+    path = str(proposal.get("path", "")).strip()
+    if str(proposal.get("type", "")).strip() == "image":
+        image_value = str(
+            proposal.get("proposed_text")
+            if proposal.get("proposed_text") is not None
+            else proposal.get("value", "")
+        ).strip()
+        return f"{path}::image::{image_value}"
+    return path
+
+
 def _filter_dom_scope(raw_structure: str, target_chapter: str, keyword: str, window_size: int = 3) -> str:
     """
     [视口切碎保持器 (Strict Scope Splicing)]
@@ -91,16 +137,28 @@ def _filter_dom_scope(raw_structure: str, target_chapter: str, keyword: str, win
     return result_text
 
 
-def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_proposals: List[Dict[str, Any]] = None) -> List:
+def _build_worker_tools(
+    docx_temp_path: str,
+    chapter_title: str = "",
+    collected_proposals: Optional[List[Dict[str, Any]]] = None,
+    mapping_hint: str = "",
+    category: str = "",
+) -> List[Any]:
     """
-    为 Worker 组装完整只读+直写工具集，并支持实时闭环提案捕获与安全长度守护：
-    - DB 工具：全部 6 个 DB 工具；
-    - Office CLI 工具：结构查询、单槽位写盘、长句原子批处理写盘、表格全量追加填充、资质图像嵌入。
+    按填报范围的专属角色动态组装最精简的只读+直写工具集（Tool Pruning），
+    剔除无关工具定义，降低每轮 Prompt 开销。
     """
     if collected_proposals is None:
         collected_proposals = []
 
-    db_tools = get_all_bid_db_tools()
+    hint = (mapping_hint or "").lower().strip()
+    title_lower = (chapter_title or "").lower().strip()
+    cat = (category or "").lower().strip()
+
+    is_pricing = (hint in ("pricing", "cost")) or any(k in title_lower for k in ["报价", "清单", "分项", "开标一览", "主要材料"])
+    is_qualification = (hint == "qualification") or any(k in title_lower for k in ["资格", "资质", "执照", "证明文件", "安全生产", "承装"])
+    is_deviation = (hint in ("deviation", "technical")) or any(k in title_lower for k in ["偏离", "响应", "技术偏离", "商务偏离", "条款偏离"])
+    is_letter_or_form = (not is_pricing and not is_qualification and not is_deviation)
 
     from app.agents.tools.rag_tools import get_full_chapter_text, search_bidding_document
     from app.agents.tools.office_cli_agent_tools import (
@@ -128,24 +186,61 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_
         else:
             return loop.run_until_complete(async_fn(*args, **kwargs))
 
+    dom_cache: Dict[str, str] = {}
+
     @tool
     def officecli_query_structure(selector: str = "paragraph", keyword_filter: str = "", window: int = 3) -> str:
         """
-        [精准切口查询工具] 查询当前 Word 文档的 DOM 结构。
-        优先提供当前章节专属的 100% 完整段落与表格（零信息丢失、零跨章干扰）。
+        [填报范围结构一键提取工具] 一次性完整提取当前填报范围内的全部段落与表格 DOM 结构。
+        调用一次即可获得全部待填节点与物理路径（如 /body/p[N] 或 /body/tbl[M]），无需且严禁按关键词多次重复调用！
         参数：
-        - selector: 'paragraph' / 'table' / 'all'
-        - keyword_filter: 填入关键词短语。
-        - window: 匹配点外延上下关联段数（默认 3 段）。
+        - selector: 元素类型，可选 'paragraph'（段落）/ 'table'（表格）/ 'all'（全部段落与表格）
+        - keyword_filter: 辅助过滤词（通常留空即可，默认自动提供当前章节全部 100% 完整结构）
+        - window: 关联段数（默认 3）
         """
+        cache_key = f"{selector}_{keyword_filter}_{window}"
+        if cache_key in dom_cache:
+            logger.debug(f"   ⚡ [章节视野缓存复用] 章节 [{chapter_title}] 命中已提取的 DOM 缓存 (selector='{selector}')")
+            return dom_cache[cache_key]
+
         logger.info(f"   [Worker 视野] 查询结构 (selector='{selector}', kw='{keyword_filter}')")
+
+        # 资格证明材料可能由多个相邻表单组成，不能以单一章节边界截断。
+        # 直接读取完整 DOM，确保授权、承诺、证明及落款等动态节点都进入同一填报范围。
+        if is_qualification:
+            raw_text = _sync_call_async(
+                officecli_query_structure_tool.coroutine,
+                file_path=docx_temp_path,
+                selector=selector,
+            )
+            raw_str = str(raw_text)
+            result = (
+                f"【系统通知：已完整提取资格证明材料相关文档 DOM 节点（当前请求：{chapter_title}）】\n"
+                "⚠️ 核心指引：下方包含完整文档的段落、表格及物理路径。请依据运行时原文、字段标签和上下文，仅填报属于资格证明材料的节点；不得因附件标题、表单名称或跨章节位置跳过任何相关表单。\n\n"
+                f"{raw_str}"
+            )
+            if selector in ("table", "all"):
+                tbl_info = extract_docx_tables_summary(docx_temp_path, chapter_title)
+                if tbl_info:
+                    result = f"📊 【运行时检测到的表格结构】\n{tbl_info}\n\n{result}"
+            dom_cache[cache_key] = result
+            return result
 
         # 优先使用精准章节提取器（100% 完整无损提取当前章节专属 DOM 节点）
         from app.utils.table_utils import extract_chapter_dom_structure
         chapter_dom = extract_chapter_dom_structure(docx_temp_path, chapter_title, selector=selector)
         if chapter_dom and len(chapter_dom) > 50:
             logger.info(f"   🎯 [章节专属视野命中] 成功提取章节 [{chapter_title}] 100% 完整 DOM 结构 ({len(chapter_dom)} 字符)，零噪音且无信息丢失！")
-            return chapter_dom
+            result = (
+                f"【系统通知：已 100% 完整提取当前章节《{chapter_title}》的全部 DOM 节点（共 {len(chapter_dom)} 字符）】\n"
+                f"⚠️ 核心指引：本章节的所有待填段落与表格节点已全量呈现在下方（零信息丢失，且无任何其他隐藏段落）。"
+                f"请直接研读并利用下方的节点路径（如 /body/p[N] 或 /body/tbl[M]）进行数据填充与写盘，严禁针对本章节重复发起结构查询！\n\n"
+                f"{chapter_dom}"
+            )
+            dom_cache[cache_key] = result
+            # 兼容不同 keyword_filter 的重复命中，直接复用整章缓存
+            dom_cache[f"{selector}___3"] = result
+            return result
 
         # 降级：调用 OfficeCLI 并通过视口剪裁
         raw_text = _sync_call_async(officecli_query_structure_tool.coroutine, file_path=docx_temp_path, selector=selector)
@@ -154,14 +249,15 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_
         if selector in ("table", "all"):
             tbl_info = extract_docx_tables_summary(docx_temp_path, chapter_title)
             if tbl_info:
-                return f"📊 【当前具体表格的真实表头与列定义】\n{tbl_info}\n\n{filtered}"
+                filtered = f"📊 【当前具体表格的真实表头与列定义】\n{tbl_info}\n\n{filtered}"
+        dom_cache[cache_key] = filtered
         return filtered
 
     @tool
     def officecli_write_slot_value(path: str, value: str) -> str:
         """
-        [原位节点提案工具] 提议对 Word 指定节点 Path 进行 100% 格式继承的原位值替换。
-        提案将自动进入主控 Agent 统一原子刷盘队列，无需在并发阶段直接修改文件。
+        [原位节点单槽位提案工具] 提议对 Word 指定节点 Path 进行 100% 格式继承的原位值替换。
+        若有多个槽位待填，强烈建议优先使用 officecli_batch_write_slots 一次性批量提交！
         """
         p_path = str(path).strip()
         p_val = str(value).strip()
@@ -175,21 +271,44 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_
                 "status": "success"
             })
         return f"成功提交节点 {p_path} 的替换提案，已进入主控集中刷盘队列"
-        if p_path and p_val is not None:
-            collected_proposals.append({
-                "path": p_path,
-                "proposed_text": p_val,
-                "value": p_val,
-                "type": "text",
-                "status": "success"
-            })
-        return f"成功提交节点 {p_path} 的替换提案，已进入主控集中刷盘队列"
+
+    @tool
+    def officecli_batch_write_slots(slots_json_str: str) -> str:
+        """
+        [全章槽位一次性批量写盘提案工具 - 强烈推荐]
+        在收集齐本章节所有待填字段后，一次性提交全部槽位替换提案！
+        彻底避免逐个槽位多次调用工具带来的网络延迟与 Token 膨胀。
+        参数 slots_json_str 格式：'[{"path": "/body/p[2]", "value": "纯数据值1"}, {"path": "/body/p[3]", "value": "纯数据值2"}]'
+        """
+        logger.info(f"   [Worker 批量槽位提案注册] 提交批量槽位替换提案: {str(slots_json_str)[:150]}...")
+        count = 0
+        if slots_json_str:
+            try:
+                parsed_list = _json.loads(slots_json_str) if isinstance(slots_json_str, str) else slots_json_str
+                if isinstance(parsed_list, list):
+                    for it in parsed_list:
+                        if isinstance(it, dict) and "path" in it:
+                            p_path = str(it["path"]).strip()
+                            val = it.get("value") if it.get("value") is not None else (it.get("text") or it.get("proposed_text") or "")
+                            p_val = str(val).strip()
+                            if p_path and p_val is not None:
+                                collected_proposals.append({
+                                    "path": p_path,
+                                    "proposed_text": p_val,
+                                    "value": p_val,
+                                    "type": "text",
+                                    "status": "success"
+                                })
+                                count += 1
+            except Exception as je:
+                logger.warning(f"   解析 slots_json_str 异常: {je}")
+        return f"成功批量提交 {count} 个槽位的替换提案，已全量进入主控集中刷盘队列"
 
     @tool
     def officecli_batch_fill_sentence(updates_json_str: str) -> str:
         """
         [长句/段落原子批处理提案工具] 在收集齐该章节长段落的所有字段后，一次性提交更新提案。
-        参数 updates_json_str 格式：'[{{"path": "/body/p[2]", "value": "字段标签：[抽象数据内容]"}, ...]'
+        参数 updates_json_str 格式：'[{"path": "/body/p[2]", "value": "字段标签：[抽象数据内容]"}, ...]'
         """
         logger.info(f"   [Worker 原子提案注册] 提交长句批处理提案: {str(updates_json_str)[:150]}...")
         if updates_json_str:
@@ -203,7 +322,9 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_
                                 "path": str(it["path"]).strip(),
                                 "proposed_text": str(val).strip(),
                                 "value": str(val).strip(),
-                                "type": "text",
+                                # 长句提案必须按完整段落处理，避免同一段中的字段发生错位。
+                                "type": "sentence_batch",
+                                "original_context": str(it.get("original_context", "")).strip(),
                                 "status": "success"
                             })
             except Exception as je:
@@ -230,41 +351,116 @@ def _build_worker_tools(docx_temp_path: str, chapter_title: str = "", collected_
         return f"成功提交表格 {t_path} 的数据行提案，已进入主控集中刷盘队列"
 
     @tool
-    def officecli_insert_image(target_path: str, image_path: str, width_inches: float = 5.5, caption: str = "") -> str:
+    def officecli_insert_image(
+        target_path: str,
+        image_path: str,
+        width_inches: float = 5.5,
+        caption: str = "",
+        anchor_text: str = "",
+    ) -> str:
         """
         [资质证明与图片嵌入提案工具] 在 Word 指定节点 Path (如 '/body/p[12]' 或 '/body/tbl[1]/row[2]/cell[1]') 提议插入资质证明/证书图片。
         参数：
         - target_path: Word 中的物理 DOM 节点 Path
         - image_path: 资质证书图片的磁盘绝对路径 (可通过 query_company_qualification_tool 查库获取)
         - width_inches: 图片宽度 (默认 5.5 英寸)
-        - caption: 图片说明图注 (可选，如 '[资质名称]')
+        - caption: 图片说明图注（由资质库名称动态提供）
+        - anchor_text: 图片对应的原文条款，由当前文档动态提取
         """
         tg_path = str(target_path).strip()
         img_path = str(image_path).strip()
         logger.info(f"   [Worker 图片提案注册] 节点 {tg_path} -> 提议嵌入图片 {img_path}")
         if tg_path and img_path:
+            # 写入目标段落的当前原文，供主控写盘阶段做语义锚点校验。
+            resolved_anchor = str(anchor_text or _read_target_paragraph_text(docx_temp_path, tg_path)).strip()
             collected_proposals.append({
                 "path": tg_path,
                 "proposed_text": img_path,
                 "value": img_path,
                 "type": "image",
                 "caption": str(caption or "").strip(),
+                "anchor_text": resolved_anchor,
+                "original_context": resolved_anchor,
                 "status": "success"
             })
-        return f"成功提交节点 {tg_path} 的资质图片嵌入提案，已进入主控集中刷盘队列"
+        return f"已登记节点 {tg_path} 的资质图片提案，待主控写盘与回读验证"
 
     from app.agents.tools.style_extractor_tool import extract_text_by_style
-    worker_tools = [
-        officecli_query_structure,
-        officecli_write_slot_value,
-        officecli_batch_fill_sentence,
-        officecli_fill_table_rows,
-        officecli_insert_image,
-        get_full_chapter_text,
-        search_bidding_document,
-        extract_text_by_style,
-    ] + list(db_tools)
-    logger.info(f"   🛠️ [Worker 工具包] 组装完成: {len(db_tools)} DB工具 + 5 Office CLI 工具 + 2 原生 RAG 工具 + 1 样式提取工具")
+    from app.agents.tools.bid_db_tools import (
+        query_company_profile_tool,
+        query_company_qualification_tool,
+        query_project_metadata_tool,
+        query_financial_quotation_tool,
+        query_market_price_reference_tool,
+        query_evaluation_method_tool,
+    )
+
+    # 按角色动态裁剪工具包（Tool Pruning），仅保留当前章节真正需要的 2~6 个核心工具
+    if is_pricing:
+        worker_tools = [
+            officecli_query_structure,
+            extract_text_by_style,
+            query_financial_quotation_tool,
+            officecli_batch_write_slots,
+            officecli_write_slot_value,
+            officecli_fill_table_rows,
+            query_company_profile_tool,
+            query_project_metadata_tool,
+        ]
+        logger.info(f"   🛠️ [Worker 工具包裁剪] 为报价章节 [{chapter_title}] 裁剪装配 8 个专用工具 (含样式识别 + pricing + company_info)")
+    elif is_deviation:
+        worker_tools = [
+            officecli_query_structure,
+            extract_text_by_style,
+            get_full_chapter_text,
+            search_bidding_document,
+            officecli_fill_table_rows,
+        ]
+        logger.info(f"   🛠️ [Worker 工具包裁剪] 为偏离表章节 [{chapter_title}] 裁剪装配 5 个专用工具 (含样式识别 + RAG + fill_table_rows)")
+    elif is_qualification:
+        worker_tools = [
+            officecli_query_structure,
+            extract_text_by_style,
+            query_company_qualification_tool,
+            query_company_profile_tool,
+            officecli_insert_image,
+            officecli_batch_write_slots,
+            officecli_batch_fill_sentence,
+            officecli_write_slot_value,
+        ]
+        logger.info(f"   🛠️ [Worker 工具包裁剪] 为资质证明章节 [{chapter_title}] 裁剪装配 8 个专用工具 (含样式识别 + qualification + insert_image + sentence_batch)")
+    elif is_letter_or_form:
+        worker_tools = [
+            officecli_query_structure,
+            extract_text_by_style,
+            officecli_batch_write_slots,
+            officecli_write_slot_value,
+            officecli_batch_fill_sentence,
+            query_company_profile_tool,
+            query_project_metadata_tool,
+        ]
+        logger.info(f"   🛠️ [Worker 工具包裁剪] 为公文表单章节 [{chapter_title}] 裁剪装配 7 个专用轻量工具 (含样式识别 + batch_write_slots + basic_info)")
+    else:
+        # 通用兜底
+        worker_tools = [
+            officecli_query_structure,
+            officecli_batch_write_slots,
+            officecli_write_slot_value,
+            officecli_batch_fill_sentence,
+            officecli_fill_table_rows,
+            officecli_insert_image,
+            get_full_chapter_text,
+            search_bidding_document,
+            extract_text_by_style,
+            query_company_profile_tool,
+            query_company_qualification_tool,
+            query_project_metadata_tool,
+            query_financial_quotation_tool,
+            query_market_price_reference_tool,
+            query_evaluation_method_tool,
+        ]
+        logger.info(f"   🛠️ [Worker 工具包全量兜底] 为通用章节 [{chapter_title}] 组装全量工具集: {len(worker_tools)} 个工具")
+
     return worker_tools
 
 
@@ -279,7 +475,12 @@ def extract_docx_tables_summary(docx_path: str, chapter_title: str = "") -> str:
         return ""
     try:
         from docx import Document
-        from app.utils.table_utils import detect_table_header_rows, get_merged_header_texts, get_chapter_specific_table_indices
+        from app.utils.table_utils import (
+            detect_table_header_rows,
+            get_merged_header_texts,
+            get_chapter_specific_table_indices,
+            is_fixed_slot_summary_table,
+        )
         doc = Document(docx_path)
         if not doc.tables:
             return ""
@@ -289,7 +490,7 @@ def extract_docx_tables_summary(docx_path: str, chapter_title: str = "") -> str:
             return ""
 
         tables_info = []
-        for tbl_idx in target_tbl_indices:
+        for i, tbl_idx in enumerate(target_tbl_indices):
             if 0 <= tbl_idx < len(doc.tables):
                 table = doc.tables[tbl_idx]
                 if not table.rows:
@@ -301,7 +502,17 @@ def extract_docx_tables_summary(docx_path: str, chapter_title: str = "") -> str:
                 tbl_path = f"/body/tbl[{tbl_idx + 1}]"
                 headers_str = " | ".join(headers)
                 hdr_desc = f"包含 {hdr_count} 行复合表头, " if hdr_count > 1 else ""
-                tables_info.append(f"- 【本章节专属唯一目标表格】：`{tbl_path}`（共 {len(headers)} 列, {hdr_desc}预置 {len(table.rows)} 行）：真实表头定义为 `[{headers_str}]`。严禁将数据错误填报到其他章节的表格中！")
+                tbl_label = f"目标表格 ({i+1}/{len(target_tbl_indices)})" if len(target_tbl_indices) > 1 else "唯一目标表格"
+
+                is_fixed = is_fixed_slot_summary_table(table, chapter_title)
+                if is_fixed:
+                    type_rule = "👉 【表格类型：固定格式表单（严禁增加行/严禁插行）】此表已有具体的项目行与大写总价行，只需调用 `officecli_batch_write_slots` 在对应空白单元格填入数值与大写，**绝对禁止调用 `officecli_fill_table_rows` 插入新行！绝对禁止将多条 BOM 设备/细项拆行插入！**"
+                elif "商务条款" in (chapter_title or "") and any(k in (chapter_title or "") for k in ["响应", "偏离"]):
+                    type_rule = "👉 【商务条款精准对照表】只提取与本表逐项对应的商务条款，不得扩展提取技术参数、项目需求或其它章节内容；必须先按实际表头动态映射字段，每行提交与实际表格列数一致的数据，禁止空行、短行或人为补充不存在的列。"
+                else:
+                    type_rule = "👉 【表格类型：动态多行清单展开表（空位大，需增加行全量展开）】此表需要展开具体设备材料明细/响应条款，必须根据数据库中全部明细数据，调用 `officecli_fill_table_rows(table_path, rows_json_str)` 全量覆写并展开所有数据行！"
+
+                tables_info.append(f"- 【本章节专属{tbl_label}】：`{tbl_path}`（共 {len(headers)} 列, {hdr_desc}预置 {len(table.rows)} 行）：真实表头定义为 `[{headers_str}]`。\n  {type_rule}")
 
         if tables_info:
             return "\n".join(tables_info)
@@ -320,63 +531,102 @@ def build_worker_prompt(
     mapping_hint: str = "",
     extra_instructions: str = "",
     repair_instructions: str = "",
+    prefetched_metadata: Optional[Dict[str, Any]] = None,
 ) -> tuple:
     """构建章节 Worker Agent 的针对性专家 System Prompt 与 User Prompt（支持四类专家角色分治、真实表头注入与专项修复）。
 
     :param mapping_hint: 章节分类标签（如 pricing / qualification / deviation / bid_letter / authorization 等）
     :param extra_instructions: 用户自定义额外指令
     :param repair_instructions: Supervisor 下发的专项修复反馈指令
+    :param prefetched_metadata: 预读取的企业档案与项目核心元数据（仅在公文函件类章节定向按需注入）
     """
     cat = (category or "needs_fill").lower().strip()
     hint = (mapping_hint or "").lower().strip()
     title_lower = (chapter_title or "").lower().strip()
 
-    # 动态提取当前章节专属的目标表格结构与真实表头定义（严格切片，零跨章干扰）
+    # 动态提取当前填报范围内的目标表格结构与真实表头定义。
     tables_summary = extract_docx_tables_summary(docx_temp_path, chapter_title) if docx_temp_path else ""
 
     # 1. 判定专家角色类型
     is_pricing = (hint in ("pricing", "cost")) or any(k in title_lower for k in ["报价", "清单", "分项", "开标一览", "主要材料"])
     is_qualification = (hint == "qualification") or any(k in title_lower for k in ["资格", "资质", "执照", "证明文件", "安全生产", "承装"])
     is_deviation = (hint in ("deviation", "technical")) or any(k in title_lower for k in ["偏离", "响应", "技术偏离", "商务偏离", "条款偏离"])
+    is_business_deviation = "商务" in title_lower and (
+        "偏离" in title_lower or "响应" in title_lower
+    )
+    is_letter_or_form = (not is_pricing and not is_qualification and not is_deviation)
+    structure_scope_rule = (
+        "当前资格证明材料集合（允许跨附件、跨表单读取相关节点）"
+        if is_qualification
+        else f"当前章节《{chapter_title}》"
+    )
 
     # 2. 差异化专家工作流与职责
     if is_pricing:
         role_title = "造价工程师与分项报价专家"
-        domain_workflow = f"""【造价工程师与分项报价专家工作流 — 分项全量展开铁律】
-1. **结构扫描与清单检索**：
-   - 调用 `officecli_query_structure(selector='table', keyword_filter='{chapter_title}')` 获取表格结构与列定义；
-   - 调用 `query_financial_quotation_tool(document_id='{document_id}', field_key='cost_estimates')` 检索数据库中全量设备、材料、工程及服务清单与测算价格。
-2. **【分项全量展开最高铁律 — 绝对严禁仅填大类汇总行】**：
-   - **全量展开强制要求**：若表格模板包含汇总大类（如序号 1、序号 2 等大类）及 `......` 占位行，**必须在汇总大类下方，将数据库中查得的全部具体标的物/设备/材料/工程施工清单细项（编号为 2.1, 2.2, 2.3... 2.K 等全部查得项）逐行完整展开并按顺序编号排列**！
-   - **绝对严禁偷懒**：绝对禁止仅填报大类 1 和 2 两行而省略二级细项！每个细项必须具备明确独立的具体标的物名称、单价与分项总价；
-   - **各列严格分离对齐**：第 1 列【序号】填入层级编号（如 1、2、2.1 等），第 2 列【项目/费用名称】填纯标的物名称（严禁把序号重复写在名称列）；
-   - **【单价】与【分项总价】列严格分离与对齐规范**：
-     * **设备材料采购细项**（具有明确单价与数量/工程量的标的物）：【单价】列填单价数值（如按台/套/块计价），【分项总价】列填数量 × 单价之合价；
-     * **按项包干/工程安装/大类汇总/未细分单价项**（如建设费汇总大类、加固工程、防水工程、电缆敷设、设计费等）：【单价】列填破折号 `"——"` 或留空，【分项总价】列填写该项的总金额；**绝对严禁将整项包干大额总金额错误复制到单价列**！
-     * **不单独计取/包含在总价内/0元项目**（如设计费 0.00）：【单价】列填 `"——"`（或 `0.00`），【分项总价】列填 `0.00`；
-     * **各列严格独立对齐**：必须严格根据表头列序逐列对应，确保【单价】与【分项总价】两列数据精准独立，绝不错列、串列或重复填报！
-   - **占位符全量覆盖**：细分数据行必须全量自动覆盖替换模板原有的 `......` 和空白数据行，严禁残留；
-   - **备注列默认留空**：【备注】列默认保持留空 `""`，无需长篇赘述，保持表格清爽；
-   - **金额层级平衡**：所有 N.1~N.K 细项合价之和必须精准等于所属大类 N 的总额，所有一级大类总额之和必须精准等于表尾【合计总价】（大写与小写一致）。
-3. **整表 2D 矩阵一次性写盘**：
-   - 必须将大类 1、大类 2、全部展开细项（如 2.1, 2.2, ... 2.K）以及表尾合计总价行组合为一个完整的 2D 数据矩阵，调用 `officecli_fill_table_rows(table_path, rows_json_str)` 一次性提交写盘，原位覆盖并彻底清除模板原有的空白行和 `......` 占位符！"""
+        domain_workflow = f"""【造价工程师与分项报价专家工作流 — 场景分流与全量展开铁律】
+
+1. **【表格类型智能识别与填报原则】**：
+   - **固定格式表单（已有具体单元格填报要求）**：
+     * **特征**：表格预置总行数固定（如仅有 1 行标的物汇总行 + 1 行大写金额/落款合并行），或各单元格已有明确的预置描述与填报槽位；
+     * **填报规范**：**只需要原位填写空白单元格，绝对严禁增加行或插入新行！** 严禁将多条明细拆行插入到固定表单中；
+     * **填报方式**：必须调用 `officecli_batch_write_slots` 对空白单元格进行【原位赋值】：
+       - 项目汇总行：填入标的物名称、技术要求、阿拉伯数字总价金额（纯数字值，如金额数据）、备注；
+       - 大写金额行：对应单元格直接填入人民币汉字大写金额；
+   - **动态多行清单展开表（空位较大，需展开多条明细）**：
+     * **特征**：表格为分项清单、设备明细、偏离对照、人员清单等明细表格，模板中通常留有较大空白占位行；
+     * **填报规范**：**必须增加行并全量展开（Full Matrix Expand）！** 将数据库中的全部明细条目从第 1 项到第 N 项逐行完整展开列出；
+     * **执行步骤**：按以下第 2、3 步执行 2D 矩阵全量直查与覆写。
+
+2. **表头感知与 2D 数据矩阵一步直查（支持生产厂家与多列智能映射）**：
+   - 若 User Prompt 中【文档中检测到的实际表格与真实表头定义】已包含目标表格路径及真实表头，**严禁再次调用 `officecli_query_structure` 重复扫描结构**；
+   - 仔细研读真实表头各列名称，将其映射为 ORM 字段名称列表 JSON：
+     * 可用 ORM 字段：`__INDEX__`, `item_name`, `spec`, `manufacturer`, `brand`, `__BRAND_SPEC__`, `unit`, `quantity`, `unit_price`, `calculated_total`, `remark`；
+     * **【生产厂家映射要求】**：若表头包含“生产厂家”、“制造厂商”、“生产企业”、“制造商”等列，**必须明确映射为 `"manufacturer"`**，严禁映射为 remark 或留空！
+     * 示例：若表头为 [序号, 货物名称, 规格型号, 生产厂家, 单位, 数量, 单价, 合价, 备注]
+       → `header_columns_json = '["__INDEX__", "item_name", "spec", "manufacturer", "unit", "quantity", "unit_price", "calculated_total", "remark"]'`；
+   - **必须且仅调用一次** `query_financial_quotation_tool(document_id='{document_id}', field_key='cost_estimates_json_matrix', header_columns_json='...')` 获取与表头完全对齐的 2D 数据矩阵；
+   - **【严禁冗余查询】**：在分项清单表格填报任务中，**绝对禁止同时或重复调用 `field_key='cost_estimates'` 纯文本字段**，直接使用返回的 2D 矩阵！
+
+3. **【分项清单全量展开与对齐规范】**：
+   - **细项逐行展开**：若表格模板包含汇总大类及占位行，必须在汇总大类下方，将数据库中查得的全部具体标的物细项逐行完整展开并按顺序编号排列，严禁省略二级细项；
+   - **各列严格分离对齐**：第 1 列【序号】填入层级编号（如 1、2 等），第 2 列【项目/标的物名称】填纯名称（严禁重复前缀或序号）；
+   - **【单价】与【合价/总价】列严格分离**：
+     * **设备材料等采购细项**：【单价】列填单价数值，【分项总价】列填数量 × 单价之合价；
+     * **按项包干/工程安装/未细分单价项**：【单价】列填破折号 `"——"` 或留空，【分项总价】列填写该项的总金额，严禁将整项包干大额总金额错误复制到单价列；
+     * **包含在总价内/不单独计价项**：【单价】列填 `"——"`（或 `0.00`），【分项总价】列填 `0.00`；
+     * **各列严格独立对齐**：严格按表头列序逐列对应，确保【单价】与【分项总价】两列数据精准独立，绝不错列、串列；
+   - **金额层级平衡**：所有二级细项合价之和必须精准等于所属大类总额，所有一级大类总额之和必须精准等于表尾【合计总价】（大写与小写一致）。
+   - **整表 2D 矩阵一次性写盘**：确认矩阵数据完整后，直接调用 `officecli_fill_table_rows(table_path, rows_json_str)` 一次性提交写盘，原位覆盖并彻底清除模板原有的空白行和占位符！"""
     elif is_qualification:
         role_title = "资格审查与资质证明专家"
-        domain_workflow = f"""【资格审查与资质证明专项工作流 — 原位图像嵌入】
-1. **扫描识别条款要求**：使用 `officecli_query_structure(selector='paragraph', keyword_filter='{chapter_title}')` 扫描章节内全部资格审查条款及证明材料清单要求。
-2. **企业资质档案库精准检索**：
-   - 提取各条款要求提供的资质类型关键词（如基础资质证明、行业许可、体系认证等通用类别）；
-   - 针对各条款要求，分别调用 `query_company_qualification_tool(category='资质类别关键词')` 检索对应的合法资质证书或证明图片路径。
-3. **资质图片必须调用专用工具（严禁正文打印路径文本）**：
-   - 查得资质证明图片后，**必须且仅允许调用 `officecli_insert_image(target_path, image_path, caption='证书名称')` 工具**将图片原位嵌入在对应条款正下方；
-   - **严禁在正文字符串中直接打印资质图片本地文件路径等字面量**；
-   - **严禁将核心资质证明遗漏或误堆砌到文档其他章节**，必须 100% 严格在《资格证明文件》章节对应条款后原位落盘！"""
+        domain_workflow = f"""【资格审查与资质证明专项工作流 — 文字与图片全量填报】
+1. **一次扫描全部材料内容**：调用 `officecli_query_structure(selector='all')` 获取当前资格证明材料范围内的全部段落、表格和空白字段。凡是该材料范围内出现的声明、身份证明、授权委托、承诺书、落款和日期栏，均属于本 Worker 的填报对象，不得因附件标题、表单名称或段落位置而跳过。
+2. **先建立动态槽位清单**：逐个记录运行时返回的 DOM 路径、原文、字段标签、占位符类型和所在段落上下文。严禁凭固定段落序号、固定路径或预设字段顺序写入。
+3. **文字字段全量填报**：
+   - 对公司、人员、地址、联系方式、项目、日期、期限、盖章和签字等字段，从企业库、人员库和项目库动态检索真实值；
+   - 同一段落包含多个字段时，必须提交覆盖该段落的完整 `sentence_batch`，保留所有固定标签和原文，只替换空白槽位；
+   - 字段缺少真实数据时，写入动态生成的待补充标记并标记为人工补充，不得使用其他字段代替，不得捏造数据。
+4. **图片与文字协同填报**：
+   - 对明确要求提供证书、执照、许可证、身份证明或复印件的条款，调用 `query_company_qualification_tool` 动态检索匹配图片；
+   - 调用 `officecli_insert_image` 时必须同时提交当前条款的原文 `anchor_text`，图片只能插入该条款之后；
+   - 图片提案只能使用运行时获取的 `paraId` 或完整 DOM 路径，严禁使用固定段落编号；
+   - 严禁把图片物理路径写进正文，严禁把图片插入日期、落款或其他无关段落。
+5. **提交后必须闭环**：文字和图片提案提交后，主控必须重新读取 Word，逐项检查资格材料范围内的空白字段、字段错位、图片图注与条款锚点；任何一项未通过都不能报告本任务完成。"""
     elif is_deviation:
         role_title = "商务合规与技术响应专家"
-        domain_workflow = f"""【偏离表与实质性条款响应专项工作流 — 允许全量生成与覆盖重写】
-1. **扫描识别目标表格结构**：使用 `officecli_query_structure(selector='table', keyword_filter='{chapter_title}')` 获取表格路径与列定义。
+        if is_business_deviation:
+            domain_workflow = f"""【商务条款精准响应专项工作流 — 只提取对应商务条款】
+1. **限定检索范围**：只查找与当前表格逐项对应的商务条款，例如交货、付款、质保、售后、履约、合同、投标有效期、保证金、报价约束等；不得扩展提取技术参数、项目需求、设备明细或其它章节的内容。
+2. **按表格逐项匹配**：先读取当前表格的真实表头和已有条款线索，再使用 `search_bidding_document` 或 `get_full_chapter_text` 精准检索对应商务条款。只保留能与当前表格对应的条款，不要把整章原文全部搬入表格，也不要为了凑行数生成无关条款。
+3. **按实际表头动态装配**：逐列理解当前表格真实表头，将对应商务条款、承诺、响应状态、偏离说明等内容放入实际存在的列；不得假定固定列号、固定列名或固定列数。没有对应列时不要虚构数据；需要序号时可由工具自动生成。
+4. **完整提交且不留空列**：每一行必须按实际表格列数提交完整数据，缺少的字段应根据该列表头补充合理的商务响应，不能提交短行或空行。
+5. **一次性提交**：使用 `officecli_fill_table_rows(table_path, rows_json_str)` 一次性提交匹配后的二维矩阵；不得提交技术要求、实质性需求或与商务条款无关的额外记录。"""
+        else:
+            domain_workflow = f"""【偏离表与实质性条款响应专项工作流 — 允许全量生成与覆盖重写】
+1. **扫描识别目标表格结构**：若未预置表格定义，使用 `officecli_query_structure(selector='table')` 一次性获取本章表格路径与列定义（严禁使用关键词重复查询）。
 2. **原文件整章全量阅读与交叉检索**：
-   - **必须调用 `get_full_chapter_text('{document_id}', chapter_name)` 检索原招标文件对应章节全量原文**（如第四章项目需求、技术规格、合同条款或商务要求章节），获取全部条款与技术规格细节！
+   - **必须调用 `get_full_chapter_text('{document_id}', chapter_name)` 检索原招标文件对应章节全量原文**（如需求、技术规格、合同条款或商务要求章节），获取全部条款与技术规格细节！
 3. **【表格全量覆盖重写授权 (Full Table Matrix Overwrite)】**：
    - **全面重写与覆盖原表格数据行**：你有完全的权限使用 `officecli_fill_table_rows(table_path, rows_json_str)` 从序号 1 开始将所有梳理出的条款生成完整的二维矩阵，一次性覆写替换原表格的所有明细行！
    - **杜绝单点打补丁**：严禁受限于原模板历史残留的空行或部分行，必须从序号 1 到 N 全量生成整张完整规范的对照表！
@@ -394,21 +644,27 @@ def build_worker_prompt(
     else:
         role_title = "公文函件与表单填报专家"
         domain_workflow = f"""【法定公文函件与表单填报专项工作流 — 原位切片注入】
-1. **全形态槽位扫描识别（下划线 / 括号 / 纯空格留白）**：
-   - 使用 `officecli_query_structure(selector='all', keyword_filter='{chapter_title}')` 扫描章节内的所有待填槽位；
+1. **全形态槽位一键扫描识别（下划线 / 括号 / 纯空格留白）**：
+   - 使用 `officecli_query_structure(selector='all')` 一次性获取本章节内的所有待填槽位（单次即可获得全章所有节点，严禁使用关键词重复查询）；
    - **必须覆盖全部空白留白形态**：
      * **符号形态**：下划线 `______`、括号 `( )` 或 `[ ]`；
      * **空格留白形态**：属性标签或冒号后的**连续空格、制表符留白**（如 `通讯地址：              `、`联系电话：          `）；
      * **日期留白形态**：年月日之间的留白空格（如 `    年    月    日`）；
      凡是属于待填信息的空白区域，一律属于合法填报目标！
-2. **企业档案库精准检索与主体匹配**：
-   - 调用企业信息库（`query_company_basic_info`）、人员库（`query_company_personnel_tool`）、财务业绩库检索真实数据；
+2. **企业档案与项目信息装配**：
+   - 优先直接使用下方【已定向提取的企业主档案与项目关键元数据】；若个别生僻字段未涵盖，可调用企业信息库（`query_company_profile_tool`）或项目元数据库（`query_project_metadata_tool`）补齐；
    - 严格根据招标文件上下文区分收件单位（如致代理机构或采购人）、组织单位与投标方主体，准确填入官方全称。
-3. **原位原子写盘与纯数据提交**：
-   - 必须使用 `officecli_batch_fill_sentence(updates_json_str)` 或 `officecli_write_slot_value` 进行一次性原子更新；
+3. **全章槽位一次性批量写盘（严禁单个槽位多次重复调工具）**：
+   - **必须收集齐本章节所有待填字段后，优先调用 `officecli_batch_write_slots(slots_json_str)` 一次性提交全部槽位替换提案！**
+   - 绝对禁止针对每个槽位分别单独单次调用 `officecli_write_slot_value` 进行几十次工具往返！
    - 提交的数据必须是**纯数据值**（绝对不包含前缀标签），底层引擎会自动将冒号后的纯空格/下划线精准替换为该数据值并附带下划线。"""
 
-    system_prompt = f"""你是标书【{role_title}】，负责直接对 Word 标书文档的【{chapter_title}】章节进行深度信息检索与原位写盘操作。
+    system_prompt = f"""你是标书【{role_title}】，负责直接对 Word 标书文档的【{chapter_title}】填报范围进行深度信息检索与原位写盘操作。
+
+【格式样式识别工具 — 所有标书章节均可调用】
+- 当需要确认招标原文中被特别标记的强制性要求时，调用 `extract_text_by_style`，优先传入当前 `document_id`，并设置 `chapter_keyword` 为当前章节标题。
+- 支持 `italic_underline`（斜体且下划线）、`italic`（斜体）、`underline`（下划线）、`bold`（加粗）和 `bold_red`（红色加粗）。
+- 对“实质性要求响应对照表”、偏离表及其他要求清单，必须先核对原文样式标记，再生成响应内容；不得仅凭普通文本推断哪些条款属于重点要求。
 
 【最高铁律 — 原文零改动与高质量填报法则】
 1. **模板原文 100% 盲守**：绝对严禁删除、篡改、润色、删减或遗漏任何模板原文（包括前缀标签如“项目名称：”、“招标编号：”、“致：”、标点符号及授权声明等全部固定文本）！
@@ -425,7 +681,14 @@ def build_worker_prompt(
    若目标段落/槽位原文本包含字段属性名标签（例如 `"XXX名称：______"` 或 `"XXX编号：______"`），提交的替换数据 `value` **绝对禁止包含"XXX名称："等前缀标签，仅允许填入纯粹的数据值！**
    - 正确写法 (纯数据)：`value = "XXX内容值"`
 6. **查无结果立刻止步**：若 DB 工具返回 "未找到..."、"尚未录入" 或空记录，**严禁换用类似关键词重复循环调库**！应当立即将该槽位标记为 "[待补充: <字段名>]"，并直接完成该句/表单写盘。绝对严禁捏造假数据！
-7. **【严禁重复盲目查询 — 快速闭环铁律】**：当你从 Prompt 或 `officecli_query_structure` 已经明确当前章节的目标表格路径（如 `/body/tbl[N]`）及表头定义后，**绝对禁止使用各种同义词（如‘偏离表’、‘供货一览表’、‘开标一览表’等）重复调用 query 工具**！明确表格路径后，必须立即调用 `officecli_fill_table_rows` 或 `officecli_write_slot_value` 提交写盘提案并完成总结，迅速闭环！
+7. **【严禁重复盲目查询与批量提交铁律】**：
+   - 当前 Worker 负责{structure_scope_rule}，调用 `officecli_query_structure(selector='...')` 一次即可获得该填报范围 100% 完整的全部段落与表格 DOM 结构；
+   - **绝对禁止使用不同关键词多次重复调用 `officecli_query_structure`**；
+   - 若 User Prompt 中已预先注入了【文档中检测到的实际表格与真实表头定义】（包含 `/body/tbl[N]` 路径及真实表头列名），**严禁再次调用 `officecli_query_structure` 重复扫描结构**；
+   - **多槽位必须批量提交**：必须优先使用 `officecli_batch_write_slots` 或 `officecli_fill_table_rows` 一次性提交整章所有槽位/表格行，严禁对每个槽位单独单次调用工具！获取数据后迅速闭环！
+8. **【严禁在填报结果中添加任何说明性元数据或保留注释】**：
+   - **绝对禁止**在提议内容、扩写结果或总结表格中附加任何类似 `（原文无槽位，零改动保留）`、`（固定原文，零改动保留）`、`（模板固定原文）`、`（零改动）`、`（原样保留）` 等说明性注释！
+   - 对于无需修改的固定原文段落，保持原样即可，**严禁在总结表格中伪造扩写结果或将说明性括号写入提案**。
 
 {domain_workflow}
 
@@ -433,7 +696,7 @@ def build_worker_prompt(
 在完成所有读写工具调用后，请给出一份操作总结，**必须在总结末尾输出如下格式的 Markdown 明细表格**：
 | 序号 | DOM 节点路径 | 替换前模板原文 | 实际填入/扩写结果 | 提议类型 | 写盘状态 |
 - 第 3 列 (替换前模板原文)：填入替换前未修饰的原始模板文本（如 `"XXX属性：______"` 或表格单元格原文）；
-- 第 4 列 (实际填入/扩写结果)：【纯数据填充】如果提议类型是 `text`，仅允许填写纯数据值；如果是 `image`，填入图片绝对路径；如果是 `sentence_batch`，填入覆盖重写后的完整新段落。严禁使用 `**` 加粗标记；
+- 第 4 列 (实际填入/扩写结果)：【纯数据填充】如果提议类型是 `text`，仅允许填写纯数据值；如果是 `image`，填入图片绝对路径；如果是 `sentence_batch`，填入覆盖重写后的完整新段落。**绝对禁止附加任何说明性括号（如“（原文无槽位，零改动保留）”）**；无修改的固定段落无需写入提案表格。严禁使用 `**` 加粗标记；
 - 第 5 列 (提议类型)：必须严格填写以下之一："text"、"image"、"sentence_batch"。"""
 
     if extra_instructions:
@@ -450,16 +713,63 @@ def build_worker_prompt(
         system_prompt += f"""
 
 【专项修复紧急指令 — Supervisor 质量审核反馈】
-Supervisor 在上一轮审核中发现以下问题，请优先对该章节实施专项补救与重新写盘：
+Supervisor 在上一轮审核中发现以下问题。你必须先重新查询当前节点和章节上下文，再判断问题根因：
+1. 不得直接相信上一轮提案中的 expected value，也不得把 actual value 当作正确值；
+2. 必须重新核对招标原文、企业/项目数据源以及当前 Word 节点的行列语义；
+3. 如果目标路径正确但内容被覆盖，提交针对该路径的修复提案；如果目标路径错误，重新定位真实节点后再提交；
+4. 如果数据源无法证明应填具体值，保留 `[待补充: 字段]`，不得编造；
+5. 写入后必须再次查询目标节点确认实际落位，不能只依据工具返回的“提交成功”判断。
+
+【终审问题明细】
 {repair_instructions}"""
 
     tables_part = f"\n\n【文档中检测到的实际表格与真实表头定义】\n{tables_summary}" if tables_summary else ""
+
+    # 针对公文函件类与开标汇总类章节精准定向按需注入基础企业档案与项目元数据（避免无关章节产生 Token 浪费）
+    prefetched_context_part = ""
+    if (is_letter_or_form or is_pricing) and prefetched_metadata:
+        meta_items = []
+        if prefetched_metadata.get("company_name"):
+            meta_items.append(f"- 投标人全称: {prefetched_metadata['company_name']}")
+        if prefetched_metadata.get("credit_code"):
+            meta_items.append(f"- 统一社会信用代码: {prefetched_metadata['credit_code']}")
+        if prefetched_metadata.get("legal_person"):
+            meta_items.append(f"- 法定代表人: {prefetched_metadata['legal_person']}")
+        if prefetched_metadata.get("address"):
+            meta_items.append(f"- 注册/通讯地址: {prefetched_metadata['address']}")
+        if prefetched_metadata.get("postal_code"):
+            meta_items.append(f"- 邮政编码: {prefetched_metadata['postal_code']}")
+        if prefetched_metadata.get("phone"):
+            meta_items.append(f"- 联系电话: {prefetched_metadata['phone']}")
+        if prefetched_metadata.get("fax"):
+            meta_items.append(f"- 传真号码: {prefetched_metadata['fax']}")
+        if prefetched_metadata.get("email"):
+            meta_items.append(f"- 电子邮箱: {prefetched_metadata['email']}")
+        if prefetched_metadata.get("project_name"):
+            meta_items.append(f"- 投标项目名称: {prefetched_metadata['project_name']}")
+        if prefetched_metadata.get("project_code"):
+            meta_items.append(f"- 招标/项目编号: {prefetched_metadata['project_code']}")
+        if prefetched_metadata.get("total_price_str"):
+            w_str = f" (大写: {prefetched_metadata['total_price_words']})" if prefetched_metadata.get("total_price_words") else ""
+            meta_items.append(f"- 投标总报价: {prefetched_metadata['total_price_str']}{w_str}")
+        if prefetched_metadata.get("delivery_period"):
+            meta_items.append(f"- 承诺工期/交货期: {prefetched_metadata['delivery_period']}")
+        if prefetched_metadata.get("quality_standard"):
+            meta_items.append(f"- 质量标准承诺: {prefetched_metadata['quality_standard']}")
+
+        if meta_items:
+            prefetched_context_part = (
+                "\n\n【已定向提取的企业主档案与项目关键元数据 — 优先直接使用】\n"
+                + "\n".join(meta_items)
+                + "\n👉 核心指引：本章节待填的基础数据已在上方完整提供！"
+                + "请直接优先收集上方数据，调用 officecli_batch_write_slots 一次性批量提交所有槽位替换提案，无需重复调用数据库查询工具！"
+            )
 
     user_prompt = f"""【撰写任务】
 - 文档 ID: {document_id}
 - 章节标题: {chapter_title}
 - 任务类别: {category}
-- 映射标签: {mapping_hint or '通用'}{tables_part}
+- 映射标签: {mapping_hint or '通用'}{tables_part}{prefetched_context_part}
 
 【甲方原文模板】
 {template_text or '（按招标要求智能撰写）'}
@@ -488,12 +798,14 @@ def run_chapter_worker(
     content_hint: str = "",
     extra_instructions: str = "",
     repair_instructions: str = "",
+    prefetched_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     为单个章节创建独立 ReAct Agent 并直接执行读写 Word 盘块操作。
 
     :param extra_instructions: 用户自定义额外指令
     :param repair_instructions: Supervisor 质量审核反馈的专项修复指令
+    :param prefetched_metadata: 预读取的企业档案与项目元数据（定向按需注入）
     :return: {chapter_title, mapping_hint, status, summary, error}
     """
     cat = (category or "needs_fill").lower().strip()
@@ -516,7 +828,13 @@ def run_chapter_worker(
 
     try:
         chapter_collected_proposals: List[Dict[str, Any]] = []
-        worker_tools = _build_worker_tools(docx_temp_path=docx_temp_path, chapter_title=chapter_title, collected_proposals=chapter_collected_proposals)
+        worker_tools = _build_worker_tools(
+            docx_temp_path=docx_temp_path,
+            chapter_title=chapter_title,
+            collected_proposals=chapter_collected_proposals,
+            mapping_hint=mapping_hint,
+            category=cat
+        )
         system_prompt, user_prompt = build_worker_prompt(
             chapter_title=chapter_title, category=cat,
             template_text=template_text, content_hint=content_hint,
@@ -525,6 +843,7 @@ def run_chapter_worker(
             mapping_hint=mapping_hint,
             extra_instructions=extra_instructions,
             repair_instructions=repair_instructions,
+            prefetched_metadata=prefetched_metadata,
         )
 
 
@@ -540,7 +859,7 @@ def run_chapter_worker(
             f"🚀 [LLM Prompt 准备发送] [{chapter_title}] | System Prompt: {len(system_prompt)} 字符 | "
             f"User Prompt: {len(user_prompt)} 字符 | 工具集数量: {len(worker_tools)}"
         )
-        logger.info(f"   📋 [User Prompt 完整内容]:\n{user_prompt}")
+        logger.info(f"   📋 [User Prompt 完整内容]:\n{user_prompt[:100]}")
         if extra_instructions:
             logger.info(f"   🎯 [注入的微调提示词]: '{extra_instructions}'")
 
@@ -606,25 +925,22 @@ def run_chapter_worker(
 
         # 先合入文本提取的辅助提案
         for p in text_proposals:
-            p_path = str(p.get("path", "")).strip()
-            if p_path:
-                proposals_dict[p_path] = p
+            proposal_key = _proposal_merge_key(p)
+            if proposal_key:
+                proposals_dict[proposal_key] = p
 
         # 随后合入工具调用捕获的权威提案（具有最高优先级）
         for p in chapter_collected_proposals:
-            p_path = str(p.get("path", "")).strip()
-            if p_path:
-                proposals_dict[p_path] = p
-                # 仅当工具捕获了【整表 2D 矩阵提案】(/body/tbl[N]) 时，才清理文本提取的该表下行级/单元格级冗余提案
-                # 必须严格全字匹配 ^/body/tbl\[\d+\]$，严禁误删单单元格提案！
-                if p.get("type") == "table_rows" or re.match(r'^/body/tbl\[\d+\]$', p_path):
-                    m_tbl = re.match(r'^(/body/tbl\[\d+\])$', p_path)
-                    if m_tbl:
-                        tbl_prefix = m_tbl.group(1)
-                        to_del = [k for k in proposals_dict.keys() if k.startswith(tbl_prefix + "/") and k != p_path]
-                        for k in to_del:
-                            logger.info(f"   [Tool-First 保护] 工具已提供权威整表 {tbl_prefix} 提案，剔除文本提取的行级伪提案: {k}")
-                            proposals_dict.pop(k, None)
+            proposal_key = _proposal_merge_key(p)
+            if proposal_key:
+                proposals_dict[proposal_key] = p
+                # 不再因为存在整表矩阵就删除同表的单元格提案。
+                #
+                # Worker 可能只提交“剩余数据行”的局部矩阵，同时文本回复中仍包含
+                # 其它行的合法单元格提案。旧逻辑会把这些提案全部删掉，随后 DOM
+                # 写入器又会按局部矩阵清空后续行，最终形成“界面内容完整、Word 空格”的
+                # 数据丢失链路。整表提案仍然保留优先级，但单元格提案交由最终 DOM
+                # 写入阶段按路径覆盖，避免合法数据被提前丢弃。
 
         proposals = list(proposals_dict.values())
         logger.info(f"   [Worker 提案汇聚] [{chapter_title}] 工具捕获 {len(chapter_collected_proposals)} 条 + 文本解析 {len(text_proposals)} 条 -> 融合去重后共 {len(proposals)} 条有效写盘提案")
@@ -641,7 +957,7 @@ def run_chapter_worker(
         from app.services.audit_service import audit_service
         audit_service.log_event(
             action_type="llm_call_worker",
-            node_name=f"BidFillerWorker-{chapter_title[:30]}",
+            node_name=f"BidFillerWorker-{chapter_title}",
             inputs={"chapter_title": chapter_title, "category": cat, "document_id": document_id},
             outputs={
                 "proposals_count": n,
@@ -697,7 +1013,7 @@ def run_chapter_worker(
             from app.services.audit_service import audit_service
             audit_service.log_event(
                 action_type="llm_call_worker",
-                node_name=f"BidFillerWorker-{chapter_title[:30]}",
+                node_name=f"BidFillerWorker-{chapter_title}",
                 inputs={"chapter_title": chapter_title, "category": cat, "document_id": document_id},
                 outputs={
                     "summary": f"Worker 章节填报发生异常: {str(e)[:200]}",
@@ -716,10 +1032,12 @@ def run_chapter_worker(
 
 
 def _normalize_proposal_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """归一化单个提案对象，统一对齐 proposed_text 与 value 键名，并过滤虚假概括行"""
+    """归一化单个提案对象，统一对齐 proposed_text 与 value 键名，并过滤虚假概括行与零改动无操作提案"""
     if not isinstance(item, dict):
         return None
     import re
+    from app.agents.review_engine import clean_zero_change_annotations, is_zero_change_or_no_op_proposal
+
     path = str(item.get("path", "")).strip().replace("`", "")
     if not path:
         return None
@@ -737,8 +1055,19 @@ def _normalize_proposal_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         val = ""
 
     val_str = str(val).strip().replace("`", "").replace("**", "")
+    prop_type = str(item.get("type", "")).strip()
+
+    # 剥离说明性元数据注释
+    if prop_type != "image":
+        val_str = clean_zero_change_annotations(val_str)
+
+    # 过滤零改动无操作提案
+    orig_ctx = str(item.get("original_context", "")).strip()
+    if is_zero_change_or_no_op_proposal(val_str, orig_ctx, prop_type):
+        return None
+
     # 若内容为空且非特殊类型，丢弃
-    if not val_str and item.get("type") != "image":
+    if not val_str and prop_type != "image":
         return None
 
     res = dict(item)
@@ -920,7 +1249,14 @@ def _parse_proposals(raw_text: str) -> List[Dict[str, Any]]:
                     logger.warning(f"   [通用提案过滤] 拦截到伪拼接表达式文本，拒绝提取: path={path_val}, val={prop_val[:50]}")
                     continue
 
-                # 通用规则 2：过滤纯元数据状态词 (如状态标记、占位省略符)
+                # 通用规则 2：剥离零改动等说明性注释，并过滤纯元数据状态词或无操作行
+                from app.agents.review_engine import clean_zero_change_annotations, is_zero_change_or_no_op_proposal
+                if prop_type != "image":
+                    prop_val = clean_zero_change_annotations(prop_val)
+
+                if is_zero_change_or_no_op_proposal(prop_val, orig_val, prop_type):
+                    continue
+
                 if prop_val in ("—", "-", "--", "同上", "略", "无变更", "原样保留") or re.match(r'^(?:已|未)[^\s]{1,6}(?:队列|保护|修改|变更|填报)$', prop_val):
                     continue
 
@@ -981,7 +1317,7 @@ def _parse_proposals(raw_text: str) -> List[Dict[str, Any]]:
         logger.info(f"   [Worker 提案提炼成功] 归一化并融合产出 {len(normalized_list)} 条合法提案明细")
         return normalized_list
 
-    logger.warning(f"   [Worker] 无法解析提案 JSON ({len(raw_text)} 字符):\n{raw_text[:500]}...")
+    logger.warning(f"   [Worker] 无法解析提案 JSON ({len(raw_text)} 字符):\n{raw_text}...")
     return []
 
 
