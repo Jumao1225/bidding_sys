@@ -1,29 +1,59 @@
 fastapi>=0.109.2
 uvicorn[standard]>=0.27.1
+starlette>=0.36.3
 sqlalchemy>=2.0.25
 psycopg2-binary>=2.9.9
 pydantic>=2.6.1
 pydantic-settings>=2.1.0
+email-validator>=2.1.0
 alembic>=1.13.1
 python-multipart>=0.0.9
+python-dotenv>=1.0.1
 loguru>=0.7.2
+
+# 认证与安全
+bcrypt>=4.1.2
+PyJWT>=2.8.0
 
 # 异步队列与缓存中间件
 celery>=5.3.6
 redis>=5.0.1
+sse-starlette>=2.0.0
 
 # 文档解析与生成
 docling>=2.0.0
 pdfplumber>=0.10.4
 python-docx>=1.1.0
+PyMuPDF>=1.24.1
+lxml>=5.0.0
+requests>=2.31.0
 
 # AI 库
 openai>=1.12.0
 langchain>=0.1.7
+langchain-core>=0.1.23
 langchain-openai>=0.1.3
+langchain-text-splitters>=0.0.1
 langgraph>=0.1.8
 mcp>=1.0.0
 tenacity>=8.2.3
 pgvector>=0.2.5
 langchain-huggingface>=0.0.3
-PyMuPDF>=1.24.1
+
+# 本地 Embedding 模型
+torch>=2.0.0
+sentence-transformers>=2.6.1
+tqdm>=4.66.1
+
+# Ragas 评测链路
+ragas>=0.1.7
+datasets>=2.18.0
+
+# 测试依赖
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.26.0
+Pillow>=10.0.0
+
+# Windows 下 .doc 转 .docx 的 Microsoft Word COM 降级能力
+pywin32>=306; platform_system == "Windows"
