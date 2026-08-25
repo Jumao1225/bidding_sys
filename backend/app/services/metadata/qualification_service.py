@@ -74,7 +74,12 @@ class QualificationService(BaseMetadataService):
     def __init__(self):
         super().__init__(db_model_cls=QualificationMetadata)
 
-    def extract_metadata(self, context: str, document_id: str) -> QualificationSchema:
+    def extract_metadata(
+        self,
+        context: str,
+        document_id: str,
+        tenant_id: Optional[str] = None,
+    ) -> QualificationSchema:
         system_prompt = """
 你是资深的【招投标法务合规官与资质审核专家】。你的任务是从传入的招标文件上下文中，极为精准地提炼出**资格合规与资质门槛**相关的约束条件。
 下游的商务 Agent 将基于你的提取结果去公司资质库和业绩库中匹配原件，因此你的提取结果必须客观、精准。
@@ -92,6 +97,6 @@ class QualificationService(BaseMetadataService):
 请先在 `reasoning` 字段中简述你的推断过程，梳理各条件是属于“基本门槛”还是“加分项”，然后再严格按照 Schema 填充。
 如果上下文中没有任何关于某项的具体要求，对应字段置空或返回空列表。绝不可凭空捏造。
 """
-        return self.extract(context, QualificationSchema, system_prompt, document_id)
+        return self.extract(context, QualificationSchema, system_prompt, document_id, tenant_id=tenant_id)
 
 qualification_service = QualificationService()

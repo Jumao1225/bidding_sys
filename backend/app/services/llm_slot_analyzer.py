@@ -75,7 +75,10 @@ SLOT_ANALYZER_SYSTEM_PROMPT = """
 """
 
 
-def analyze_slots_with_llm(doc_structure_str: str) -> SlotAnalysisReport:
+def analyze_slots_with_llm(
+    doc_structure_str: str,
+    tenant_id: Optional[str] = None,
+) -> SlotAnalysisReport:
     """
     使用大模型纯自主识别 Word 结构文本中的全量空白槽位。
 
@@ -97,11 +100,15 @@ def analyze_slots_with_llm(doc_structure_str: str) -> SlotAnalysisReport:
     prompt = f"{SLOT_ANALYZER_SYSTEM_PROMPT}\n\n【待分析的 Word 文档 DOM 结构文本】:\n\"\"\"\n{doc_structure_str}\n\"\"\"\n"
 
     try:
+        from app.core.context import current_tenant_id
+
+        effective_tenant_id = tenant_id or current_tenant_id.get()
         logger.info("[LLM Slot Analyzer] 正在调用大模型生成结构化槽位识别报告...")
         report: SlotAnalysisReport = llm_service.generate_structured_output(
             prompt=prompt,
             schema_cls=SlotAnalysisReport,
-            temperature=0.1  # 低随机度，保证结构解析稳定
+            temperature=0.1,  # 低随机度，保证结构解析稳定
+            tenant_id=effective_tenant_id,
         )
 
         logger.info(f"[LLM Slot Analyzer] 大模型分析完成！共识别出 {report.total_slots_found} 个待填槽位。")

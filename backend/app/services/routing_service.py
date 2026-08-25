@@ -25,7 +25,12 @@ class RoutingService:
     分析用户提问或提取意图，结合标书大纲 (TOC)，动态返回最有可能包含答案的章节列表。
     """
     
-    def analyze_intent_and_route(self, document_id: str, query: str) -> RoutingDecision:
+    def analyze_intent_and_route(
+        self,
+        document_id: str,
+        query: str,
+        tenant_id: Optional[str] = None,
+    ) -> RoutingDecision:
         """
         根据 query 和 document_id，智能判断并返回路由决策（包含是否全局搜索以及目标章节）。
         """
@@ -33,11 +38,11 @@ class RoutingService:
         try:
             from app.core.context import current_user_id, current_tenant_id
             user_id = current_user_id.get()
-            tenant_id = current_tenant_id.get()
+            effective_tenant_id = tenant_id or current_tenant_id.get()
             
             # 如果 Context 中有用户身份，则使用严格的租户鉴权
-            if user_id and tenant_id:
-                document = document_crud.get_document_by_id(db, document_id, user_id, tenant_id)
+            if user_id and effective_tenant_id:
+                document = document_crud.get_document_by_id(db, document_id, user_id, effective_tenant_id)
             else:
                 # 兼容不需要权限校验的后台系统级调用
                 document = document_crud.get_document_by_id_system(db, document_id)
@@ -77,7 +82,8 @@ class RoutingService:
             decision: RoutingDecision = llm_service.generate_structured_output(
                 prompt=prompt,
                 schema_cls=RoutingDecision,
-                temperature=0.1
+                temperature=0.1,
+                tenant_id=effective_tenant_id,
             )
             
             logger.info(f"RoutingService: 意图 '{query}' 路由决策 -> 全局搜索: {decision.is_global_search}, 目标章节: {decision.target_chapters}")

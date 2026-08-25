@@ -14,6 +14,9 @@ def _extract_and_format(service, document_id: str, search_keywords: str, section
     try:
         from app.worker.tasks import emit_agent_log
         from app.agents.tools.security import validate_document_access
+        from app.core.context import current_tenant_id
+
+        tenant_id = current_tenant_id.get()
         
         if not validate_document_access(document_id):
             return f"拒绝访问：您无权提取文档 {document_id} 的信息。"
@@ -21,7 +24,11 @@ def _extract_and_format(service, document_id: str, search_keywords: str, section
         # 兜底补全逻辑：如果未传入限定章节，调用路由引擎进行动态意图识别
         if not section_title:
             emit_agent_log("info", "检测到未传入章节限定，正在启动 Routing 智能决策引擎...")
-            decision = routing_service.analyze_intent_and_route(document_id, search_keywords)
+            decision = routing_service.analyze_intent_and_route(
+                document_id,
+                search_keywords,
+                tenant_id=tenant_id,
+            )
             if decision.is_global_search:
                 emit_agent_log("info", "Routing 引擎决策为【全局搜索】，不限制特定章节。")
                 section_title = None
@@ -47,7 +54,7 @@ def _extract_and_format(service, document_id: str, search_keywords: str, section
         
         emit_agent_log("info", f"检索完成，开始进行大模型 {service.__class__.__name__} 结构化提取...")
         # 2. 专项领域提取与自动落盘
-        metadata_obj = service.extract_metadata(context, document_id)
+        metadata_obj = service.extract_metadata(context, document_id, tenant_id=tenant_id)
         
         emit_agent_log("success", f"✅ {service.__class__.__name__} 提取并落盘成功！")
         # 3. 格式化输出供大模型读取
@@ -109,6 +116,7 @@ def extract_engineering_info(document_id: str, search_keywords: str = "主要设
     try:
         from app.worker.tasks import emit_agent_log
         from app.agents.tools.security import validate_document_access
+        from app.core.context import current_tenant_id
         from app.db.session import SessionLocal
         from app.db.crud.document import document_crud
         import os
@@ -136,11 +144,17 @@ def extract_engineering_info(document_id: str, search_keywords: str = "主要设
         finally:
             db.close()
 
+        tenant_id = current_tenant_id.get()
+
         if not full_context:
             return _extract_and_format(engineering_service, document_id, search_keywords, section_title, context_mode="chapter")
 
         emit_agent_log("info", "开始进行工程元数据多表格并发结构化提取与宏观大类状态机归口...")
-        metadata_obj = engineering_service.extract_metadata(full_context, document_id)
+        metadata_obj = engineering_service.extract_metadata(
+            full_context,
+            document_id,
+            tenant_id=tenant_id,
+        )
         emit_agent_log("success", "✅ 工程量清单与技术工况元数据提取并落盘成功！")
         
         if hasattr(metadata_obj, "model_dump"):
@@ -164,6 +178,7 @@ def extract_evaluation_info(document_id: str, search_keywords: str = "评标办�
         import json
         from app.worker.tasks import emit_agent_log
         from app.agents.tools.security import validate_document_access
+        from app.core.context import current_tenant_id
         
         if not validate_document_access(document_id):
             return f"拒绝访问：您无权提取文档 {document_id} 的评标与罚则信息。"
@@ -171,7 +186,11 @@ def extract_evaluation_info(document_id: str, search_keywords: str = "评标办�
         if not section_title:
             emit_agent_log("info", "检测到未传入章节限定，正在启动 Routing 智能决策引擎进行导航...")
             # 仅针对“评标”部分进行意图识别，剥离罚则关键词，确保能够精确锁定评标章节
-            decision = routing_service.analyze_intent_and_route(document_id, "评标办法 评分标准 商务分 技术分 价格分 权重")
+            decision = routing_service.analyze_intent_and_route(
+                document_id,
+                "评标办法 评分标准 商务分 技术分 价格分 权重",
+                tenant_id=current_tenant_id.get(),
+            )
             if decision.is_global_search:
                 emit_agent_log("info", "Routing 引擎决策评标部分为【全局搜索】。")
                 section_title = None

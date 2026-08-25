@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Type, TypeVar, Any
+from typing import Type, TypeVar, Any, Optional
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -18,7 +18,14 @@ class BaseMetadataService:
         """
         self.db_model_cls = db_model_cls
 
-    def extract(self, context: str, schema_cls: Type[T], system_prompt: str, document_id: str) -> T:
+    def extract(
+        self,
+        context: str,
+        schema_cls: Type[T],
+        system_prompt: str,
+        document_id: str,
+        tenant_id: Optional[str] = None,
+    ) -> T:
         """
         基于传入的上下文 context，利用大模型提取出符合 schema_cls 结构的 JSON 数据，
         并将其持久化到数据库中（如果配置了 db_model_cls）。
@@ -40,7 +47,15 @@ class BaseMetadataService:
         
         # 调用大模型生成结构化对象 (带有 Fallback 的双轨兜底)
         try:
-            result_obj = llm_service.generate_structured_output(prompt=prompt, schema_cls=schema_cls, temperature=0.1)
+            from app.core.context import current_tenant_id
+
+            effective_tenant_id = tenant_id or current_tenant_id.get()
+            result_obj = llm_service.generate_structured_output(
+                prompt=prompt,
+                schema_cls=schema_cls,
+                temperature=0.1,
+                tenant_id=effective_tenant_id,
+            )
         except Exception as e:
             logger.exception(f"❌ 结构化元数据提取彻底失败 ({schema_cls.__name__}): {e}")
             raise ValueError(f"大模型提取失败: {e}") from e

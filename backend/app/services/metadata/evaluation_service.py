@@ -45,7 +45,12 @@ class EvaluationService(BaseMetadataService):
     def __init__(self):
         super().__init__(db_model_cls=EvaluationMetadata)
 
-    def extract_metadata(self, context: str, document_id: str) -> EvaluationSchema:
+    def extract_metadata(
+        self,
+        context: str,
+        document_id: str,
+        tenant_id: Optional[str] = None,
+    ) -> EvaluationSchema:
         system_prompt = """
 你是【资深评标专家与售后运维总监】。你的任务是从传入的招标文件（可能是文字段落、列表或Markdown表格形式的“评标办法”和“合同商务条款”部分）中，以**全局视角**穷尽式地提取出**评分权重分布、完整的评分细则树，以及售后硬性约束**。
 下游的 Service Worker（售后服务专家）和报价系统将完全依赖你的结构化解析，任何一项几分的遗漏都可能导致投标失利。
@@ -60,7 +65,7 @@ class EvaluationService(BaseMetadataService):
 请务必先在 `reasoning` 字段中写下你通盘梳理整个评分体系的逻辑脉络，然后再输出结构化 JSON。
 如果不包含某项内容，对应字段置空或返回空列表。绝不可主观推断或编造原文不存在的计分项。
 """
-        res = self.extract(context, EvaluationSchema, system_prompt, document_id)
+        res = self.extract(context, EvaluationSchema, system_prompt, document_id, tenant_id=tenant_id)
         if res:
             if not res.evaluation_method:
                 res.evaluation_method = "综合评分法"

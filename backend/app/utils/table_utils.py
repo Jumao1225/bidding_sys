@@ -699,7 +699,15 @@ def inspect_and_repair_table_blanks(doc, document_id: str = "") -> int:
 ]"""
 
         try:
-            llm_inst = llm_service.get_llm(temperature=0.1, json_mode=False)
+            from app.core.context import current_tenant_id
+
+            # 表格自愈也必须沿用当前租户配置，禁止在线程或后台任务中回退到 global。
+            tenant_id = current_tenant_id.get()
+            llm_inst = llm_service.get_llm(
+                temperature=0.1,
+                json_mode=False,
+                tenant_id=tenant_id,
+            )
             response = llm_inst.invoke(repair_prompt)
             raw_text = response.content if hasattr(response, 'content') else str(response)
 
@@ -1002,7 +1010,6 @@ def reset_chapter_to_template(
     except Exception as e:
         logger.warning(f"重置章节至模板状态异常: {e}")
         return False
-
 
 
 

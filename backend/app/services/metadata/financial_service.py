@@ -78,7 +78,12 @@ class FinancialService(BaseMetadataService):
     def __init__(self):
         super().__init__(db_model_cls=FinancialMetadata)
 
-    def extract_metadata(self, context: str, document_id: str) -> FinancialSchema:
+    def extract_metadata(
+        self,
+        context: str,
+        document_id: str,
+        tenant_id: Optional[str] = None,
+    ) -> FinancialSchema:
         system_prompt = """
 你是资深的【注册造价师与投融资财务专家】。你的任务是从传入的招标文件上下文中，极为精准地提炼出**财务与资金流**相关的核心约束条件。
 下游的 Cost Agent（报价计算引擎）将完全依赖你的结构化数据，特别是单价限价、不可竞争的暂列金以及各项比例，作为硬性数学约束。
@@ -99,6 +104,6 @@ class FinancialService(BaseMetadataService):
 请在 `reasoning` 字段中首先写下你的推导过程。如果发现多个金额冲突，必须在 reasoning 中明确指出两处的金额，并解释你采纳哪一个的理由。最后一步，你必须在 reasoning 中声明你已经核对了所有提取出的数字，确保与原文绝对一致。
 如果上下文中没有任何关于某项的财务指标，请严格将该字段输出为 null，绝对不可瞎编数字。
 """
-        return self.extract(context, FinancialSchema, system_prompt, document_id)
+        return self.extract(context, FinancialSchema, system_prompt, document_id, tenant_id=tenant_id)
 
 financial_service = FinancialService()

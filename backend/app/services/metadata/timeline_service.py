@@ -70,7 +70,12 @@ class TimelineService(BaseMetadataService):
     def __init__(self):
         super().__init__(db_model_cls=TimelineMetadata)
 
-    def extract_metadata(self, context: str, document_id: str) -> TimelineSchema:
+    def extract_metadata(
+        self,
+        context: str,
+        document_id: str,
+        tenant_id: Optional[str] = None,
+    ) -> TimelineSchema:
         system_prompt = """
 你是资深的【招投标项目经理与全局调度主管】。你的任务是从传入的《招标公告》和《投标人须知》中，提取出**招投标筹备期**的核心参数。
 下游的总控 Agent 将会拿着这些时间节点去初始化系统全局的项目倒排看板，所以你的提取绝对不能有差错。
@@ -87,6 +92,6 @@ class TimelineService(BaseMetadataService):
 请在 `reasoning` 字段中写下你的提炼和确认过程。
 如果上下文中没有任何关于某项的信息，请严格将该字段输出为 null。
 """
-        return self.extract(context, TimelineSchema, system_prompt, document_id)
+        return self.extract(context, TimelineSchema, system_prompt, document_id, tenant_id=tenant_id)
 
 timeline_service = TimelineService()

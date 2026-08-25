@@ -79,10 +79,19 @@ class EngineeringService(BaseMetadataService):
     def __init__(self):
         super().__init__(db_model_cls=EngineeringMetadata)
 
-    def extract_metadata(self, context: str, document_id: str) -> EngineeringSchema:
+    def extract_metadata(
+        self,
+        context: str,
+        document_id: str,
+        tenant_id: Optional[str] = None,
+    ) -> EngineeringSchema:
         from app.utils.table_utils import extract_equipment_tables_and_context
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import re
+        from app.core.context import current_tenant_id
+
+        # 在线程池中显式传递租户，避免 ContextVar 未继承时回退到 global 配置。
+        effective_tenant_id = tenant_id or current_tenant_id.get()
 
         # 智能表格靶向预过滤：从传入的大段混合文本中精准提取出所有的【标的物/设备材料清单表格】与关联标题，自动剔除纯文字噪音
         clean_context = extract_equipment_tables_and_context(context)
@@ -182,7 +191,13 @@ class EngineeringService(BaseMetadataService):
 
         if len(all_tables) <= 1 and len(clean_context) <= 6000:
             single_section = extract_section_title_from_heading(clean_context[:all_tables[0].start()]) if all_tables else None
-            res = self.extract(clean_context, EngineeringSchema, system_prompt, document_id)
+            res = self.extract(
+                clean_context,
+                EngineeringSchema,
+                system_prompt,
+                document_id,
+                tenant_id=effective_tenant_id,
+            )
             if res and res.main_equipment_list and single_section:
                 for eq in res.main_equipment_list:
                     if not eq.section_name:
@@ -234,7 +249,12 @@ class EngineeringService(BaseMetadataService):
 </当前分项工程量清单与技术要求>
 """
             try:
-                sub_res = llm_service.generate_structured_output(prompt=prompt, schema_cls=EngineeringSchema, temperature=0.1)
+                sub_res = llm_service.generate_structured_output(
+                    prompt=prompt,
+                    schema_cls=EngineeringSchema,
+                    temperature=0.1,
+                    tenant_id=effective_tenant_id,
+                )
                 return idx, sub_res
             except Exception as e:
                 logger.error(f"分块 {idx + 1} 提取失败: {e}")
