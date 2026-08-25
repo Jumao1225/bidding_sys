@@ -62,7 +62,10 @@ def analyze_bidding_doc(task_id: str, file_path: str, filename: str, company_qua
     """
     后台处理招标文件解析和 AI 分析
     """
-    logger.info(f"Task {task_id} started for file {filename}")
+    from app.core.context import current_user_id, current_tenant_id
+    current_user_id.set(user_id)
+    current_tenant_id.set(tenant_id)
+    logger.info(f"Task {task_id} started for file {filename} (tenant={tenant_id})")
     publish_progress(task_id, "开始处理", 10)
     
     from app.db.session import SessionLocal

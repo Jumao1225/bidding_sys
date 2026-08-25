@@ -71,6 +71,10 @@ def get_current_active_user(
 ) -> User:
     if not current_user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
+    # 将当前用户租户写入请求上下文，供 LLM、MinerU 和视觉模型选择租户配置。
+    from app.core.context import current_user_id, current_tenant_id
+    current_user_id.set(current_user.id)
+    current_tenant_id.set(current_user.tenant_id)
     return current_user
 
 def get_current_tenant(

@@ -138,15 +138,12 @@ class CompanyQualificationService:
             logger.error(f"读取图片文件失败: {e}")
             raise HTTPException(status_code=500, detail="读取图片文件失败")
 
+        from app.services.model_config_service import model_config_service
+        runtime_values = model_config_service.get_effective_values(tenant_id)
         provider = settings.VLM_PROVIDER
-        if provider == "ali":
-            api_base = settings.ALI_VLM_API_BASE
-            api_key = settings.ALI_VLM_API_KEY
-            model_name = settings.ALI_VLM_MODEL_NAME
-        else:
-            api_base = settings.LOCAL_VLM_API_BASE
-            api_key = settings.LOCAL_VLM_API_KEY
-            model_name = settings.LOCAL_VLM_MODEL_NAME
+        api_base = runtime_values["ALI_VLM_API_BASE"]
+        api_key = runtime_values["ALI_VLM_API_KEY"]
+        model_name = runtime_values["ALI_VLM_MODEL_NAME"]
 
         if not api_key:
             raise HTTPException(status_code=500, detail=f"未配置 {provider} 的 VLM API_KEY")

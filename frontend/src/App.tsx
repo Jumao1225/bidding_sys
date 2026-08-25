@@ -236,8 +236,8 @@ function App() {
                 <Route path="/price-book" element={<PriceBookCenter />} />
                 <Route path="/bid-scorer" element={<BidScorerLab />} />
                 <Route path="/agent-audit/:documentId?" element={<AgentAuditPage />} />
-                <Route path="/model-config" element={<EnvConfigPage />} />
-                <Route path="/admin/env" element={<EnvConfigPage />} />
+                <Route path="/model-config" element={<AdminRoute><EnvConfigPage /></AdminRoute>} />
+                <Route path="/admin/env" element={<AdminRoute><EnvConfigPage /></AdminRoute>} />
                 <Route path="/admin/*" element={
                   <AdminRoute>
                     <SystemAdmin />

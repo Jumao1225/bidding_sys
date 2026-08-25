@@ -123,13 +123,15 @@ export default function MainLayout({ children }: MainLayoutProps) {
             <span className={isActive('/qualifications') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>资质中心</span>
           </Link>
 
-          <Link to="/model-config" className={getLinkClass('/model-config')}>
-            {isActive('/model-config') && <div className="absolute inset-0 bg-indigo-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
-            <svg className={`w-5 h-5 mr-3 ${isActive('/model-config') ? 'text-indigo-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.75 3.75h4.5m-7.5 3h10.5m-12 3h13.5m-11.25 3h9m-6.75 3h4.5m-8.25 3h12.75" />
-            </svg>
-            <span className={isActive('/model-config') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>模型配置</span>
-          </Link>
+          {['admin', 'platform_admin', 'tenant_admin'].includes(user?.role || '') && (
+            <Link to="/model-config" className={getLinkClass('/model-config')}>
+              {isActive('/model-config') && <div className="absolute inset-0 bg-indigo-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+              <svg className={`w-5 h-5 mr-3 ${isActive('/model-config') ? 'text-indigo-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.75 3.75h4.5m-7.5 3h10.5m-12 3h13.5m-11.25 3h9m-6.75 3h4.5m-8.25 3h12.75" />
+              </svg>
+              <span className={isActive('/model-config') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>模型配置</span>
+            </Link>
+          )}
 
           {['admin', 'platform_admin', 'tenant_admin'].includes(user?.role || '') && (
             <>

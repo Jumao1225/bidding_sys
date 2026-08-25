@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 from typing import Optional, Dict, Any, Type, TypeVar
 from pydantic import BaseModel
@@ -23,11 +24,11 @@ class LLMService:
         return cls._instance
 
     def _initialize(self):
-        self.is_configured = bool(settings.OPENAI_API_KEY)
+        self._global_is_configured = bool(settings.OPENAI_API_KEY)
         self._llm_cache = {}
         self.embeddings = None
         
-        if self.is_configured:
+        if self._global_is_configured:
             # 初始化默认 LLM，兼容旧代码
             self.raw_llm = self.get_llm(temperature=0.3, json_mode=False)
             self.llm = self.get_llm(temperature=0.3, json_mode=True)
@@ -52,22 +53,85 @@ class LLMService:
         except Exception as e:
             logger.error(f"Embedding 初始化异常: {str(e)}")
 
+    def reload_runtime_config(self) -> None:
+        """清理 LLM 缓存并按最新运行时配置重建实例。"""
+        self._llm_cache.clear()
+        self._global_is_configured = bool(settings.OPENAI_API_KEY)
+        if not self._global_is_configured:
+            self._raw_llm = None
+            self._llm = None
+            logger.warning("模型配置热更新后未配置 OPENAI_API_KEY，LLM 暂不可用。")
+            return
+
+        self.raw_llm = self.get_llm(temperature=0.3, json_mode=False)
+        self.llm = self.get_llm(temperature=0.3, json_mode=True)
+        logger.info("LLM 配置已热更新: %s", settings.LLM_MODEL_NAME)
+
+    @property
+    def is_configured(self) -> bool:
+        """按当前请求租户判断 LLM 是否配置完成。"""
+        return bool(self._get_runtime_values().get("OPENAI_API_KEY"))
+
+    @property
+    def raw_llm(self):
+        """返回当前请求租户的普通 LLM，兼容已有 Agent 调用方式。"""
+        from app.core.context import current_tenant_id
+        if current_tenant_id.get():
+            return self.get_llm(temperature=0.3, json_mode=False)
+        return self._raw_llm
+
+    @raw_llm.setter
+    def raw_llm(self, value):
+        self._raw_llm = value
+
+    @property
+    def llm(self):
+        """返回当前请求租户的 JSON LLM。"""
+        from app.core.context import current_tenant_id
+        if current_tenant_id.get():
+            return self.get_llm(temperature=0.3, json_mode=True)
+        return self._llm
+
+    @llm.setter
+    def llm(self, value):
+        self._llm = value
+
+    def invalidate_tenant_cache(self, tenant_id: str) -> None:
+        """清除单个租户的 LLM 客户端缓存。"""
+        prefix = f"{tenant_id}:"
+        self._llm_cache = {
+            key: value for key, value in self._llm_cache.items() if not key.startswith(prefix)
+        }
+
+    def _get_runtime_values(self) -> Dict[str, str]:
+        """读取当前请求租户的有效模型配置。"""
+        from app.core.context import current_tenant_id
+        from app.services.model_config_service import model_config_service
+
+        return model_config_service.get_values(current_tenant_id.get())
+
     def get_llm(self, temperature: float = 0.3, json_mode: bool = False):
         """
         根据指定的 temperature 和 json_mode 返回缓存的大模型实例。
         如果不存在，则动态创建一个并缓存。
         """
-        if not self.is_configured:
+        runtime_values = self._get_runtime_values()
+        if not runtime_values.get("OPENAI_API_KEY"):
             return None
             
-        cache_key = f"{temperature}_{json_mode}"
+        from app.core.context import current_tenant_id
+        tenant_id = current_tenant_id.get() or "global"
+        config_fingerprint = hashlib.sha256(
+            f"{runtime_values['OPENAI_API_KEY']}\0{runtime_values['OPENAI_API_BASE']}\0{runtime_values['LLM_MODEL_NAME']}".encode()
+        ).hexdigest()[:16]
+        cache_key = f"{tenant_id}:{config_fingerprint}:{temperature}_{json_mode}"
         if cache_key not in self._llm_cache:
             try:
                 from langchain_openai import ChatOpenAI
                 llm = ChatOpenAI(
-                    model_name=settings.LLM_MODEL_NAME,
-                    api_key=settings.OPENAI_API_KEY,
-                    base_url=settings.OPENAI_API_BASE if settings.OPENAI_API_BASE else None,
+                    model_name=runtime_values["LLM_MODEL_NAME"],
+                    api_key=runtime_values["OPENAI_API_KEY"],
+                    base_url=runtime_values["OPENAI_API_BASE"] if runtime_values["OPENAI_API_BASE"] else None,
                     temperature=temperature,
                     request_timeout=300.0,  # 显式配置请求超时，防止网络卡死
                     max_retries=3,  # 显式配置底层 HTTP 瞬时网络错误自动重试
@@ -269,7 +333,10 @@ class LLMService:
         # 1. 尝试首选策略: Native Structured Outputs
         # 注意: DeepSeek API 目前不支持 response_format="json_schema"，强行调用会报 400 错误。
         # 因此，如果是 DeepSeek 模型，我们直接跳过原生调用，节省一次网络开销。
-        is_deepseek = "deepseek" in settings.LLM_MODEL_NAME.lower() or (settings.OPENAI_API_BASE and "deepseek" in settings.OPENAI_API_BASE.lower())
+        runtime_values = self._get_runtime_values()
+        is_deepseek = "deepseek" in runtime_values["LLM_MODEL_NAME"].lower() or (
+            runtime_values["OPENAI_API_BASE"] and "deepseek" in runtime_values["OPENAI_API_BASE"].lower()
+        )
         
         if not is_deepseek:
             llm_raw = self.get_llm(temperature=temperature, json_mode=False)

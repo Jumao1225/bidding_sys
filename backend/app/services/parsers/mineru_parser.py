@@ -27,8 +27,24 @@ class MinerUParser(BaseParser):
         self.api_token = settings.MINERU_API_TOKEN
         self.api_base_url = settings.MINERU_API_BASE_URL.rstrip("/")
 
+    def reload_runtime_config(self) -> None:
+        """同步 MinerU 单例配置，后续解析请求立即使用新值。"""
+        self.api_token = settings.MINERU_API_TOKEN
+        self.api_base_url = settings.MINERU_API_BASE_URL.rstrip("/")
+        logger.info("MinerU OCR 配置已热更新。")
+
+    @staticmethod
+    def _get_runtime_config() -> tuple[str, str]:
+        """按当前请求租户读取 MinerU 配置，避免单例在并发租户间串配置。"""
+        from app.core.context import current_tenant_id
+        from app.services.model_config_service import model_config_service
+
+        values = model_config_service.get_values(current_tenant_id.get())
+        return values["MINERU_API_TOKEN"], values["MINERU_API_BASE_URL"].rstrip("/")
+
     def check_availability(self) -> Dict[str, Any]:
-        has_token = bool(self.api_token and self.api_token.strip())
+        api_token, _ = self._get_runtime_config()
+        has_token = bool(api_token and api_token.strip())
         if has_token:
             return {
                 "is_installed": True,
@@ -70,7 +86,8 @@ class MinerUParser(BaseParser):
         model_version: str = "vlm",
         max_poll_seconds: int = 180
     ) -> Optional[str]:
-        if not self.api_token:
+        api_token, api_base_url = self._get_runtime_config()
+        if not api_token:
             logger.warning("未配置 MINERU_API_TOKEN，无法发起云端 HTTP 接口调用。")
             return None
 
@@ -79,14 +96,14 @@ class MinerUParser(BaseParser):
         sanitized_name = f"doc_{task_id[:8].replace('-', '')}{ext}"
         
         headers = {
-            "Authorization": f"Bearer {self.api_token}",
+            "Authorization": f"Bearer {api_token}",
             "Content-Type": "application/json"
         }
 
         session = self._get_http_session()
 
         try:
-            apply_url = f"{self.api_base_url}/file-urls/batch"
+            apply_url = f"{api_base_url}/file-urls/batch"
             apply_payload = {
                 "files": [{"name": sanitized_name, "data_id": task_id}],
                 "model_version": model_version,
@@ -116,7 +133,7 @@ class MinerUParser(BaseParser):
 
             logger.info(f"文件流直传成功，正在向 MinerU 轮询解析任务状态 (batch_id: {batch_id})，最高等待可容受 600s...")
 
-            query_url = f"{self.api_base_url}/extract-results/batch/{batch_id}"
+            query_url = f"{api_base_url}/extract-results/batch/{batch_id}"
             start_time = time.time()
             last_log_time = start_time
             full_zip_url: Optional[str] = None
@@ -127,7 +144,7 @@ class MinerUParser(BaseParser):
                     logger.info(f"⌛ 正在等待 MinerU 深度 OCR 解构与转换... 已经过 {elapsed_sec} 秒 / 上限 {max_poll_seconds} 秒")
                     last_log_time = time.time()
 
-                poll_res = session.get(query_url, headers={"Authorization": f"Bearer {self.api_token}"}, timeout=20)
+                poll_res = session.get(query_url, headers={"Authorization": f"Bearer {api_token}"}, timeout=20)
                 if poll_res.status_code == 200:
                     poll_data = poll_res.json()
                     if poll_data.get("code") == 0 and poll_data.get("data"):
@@ -380,5 +397,3 @@ class MinerUParser(BaseParser):
         }
 
 mineru_parser = MinerUParser()
-
-

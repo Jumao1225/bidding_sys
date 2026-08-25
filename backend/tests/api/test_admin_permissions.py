@@ -1,4 +1,5 @@
 import uuid
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -7,6 +8,7 @@ from app.db.crud import user as crud_user
 from app.db.session import SessionLocal
 from app.main import app
 from app.schemas.user import TenantCreate, UserCreate
+from app.services.model_config_service import MODEL_CONFIG_KEYS, model_config_service
 
 
 def _unique_email(prefix: str) -> str:
@@ -190,3 +192,60 @@ async def test_platform_admin_should_update_tenant_and_role_together(admin_test_
     assert response.status_code == 200
     assert response.json()["tenant_id"] == tenant_a.id
     assert response.json()["role"] == "tenant_admin"
+
+
+@pytest.mark.asyncio
+async def test_platform_admin_should_read_and_update_model_config_in_backend(admin_test_data):
+    """平台管理员读取和更新模型配置时应调用后端运行时配置服务。"""
+    tenant_a, _, platform_admin, _, _ = admin_test_data
+    config_values = {key: f"value-{key.lower()}" for key in MODEL_CONFIG_KEYS}
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        token = await _login(client, platform_admin.email)
+        headers = {"Authorization": f"Bearer {token}"}
+        with patch.object(model_config_service, "get_effective_values", return_value=config_values), patch.object(
+            model_config_service, "update_values", return_value=config_values
+        ) as update_mock:
+            read_response = await client.get(
+                f"/api/v1/admin/model-config?tenant_id={tenant_a.id}", headers=headers
+            )
+            update_response = await client.put(
+                f"/api/v1/admin/model-config?tenant_id={tenant_a.id}",
+                json=config_values,
+                headers=headers,
+            )
+
+    assert read_response.status_code == 200
+    assert read_response.json()["data"]["values"] == config_values
+    assert update_response.status_code == 200
+    assert update_response.json()["data"]["values"] == config_values
+    update_mock.assert_called_once_with(
+        tenant_id=tenant_a.id,
+        values=config_values,
+        updated_by_user_id=platform_admin.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tenant_admin_should_update_own_model_config_only(admin_test_data):
+    """租户管理员可以修改本租户模型配置，接口不允许切换到其他租户。"""
+    _, tenant_b, _, tenant_admin, _ = admin_test_data
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        token = await _login(client, tenant_admin.email)
+        config_values = {key: f"tenant-{key.lower()}" for key in MODEL_CONFIG_KEYS}
+        with patch.object(model_config_service, "update_values", return_value=config_values) as update_mock:
+            response = await client.put(
+                f"/api/v1/admin/model-config?tenant_id={tenant_b.id}",
+                json=config_values,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["tenant_id"] == tenant_admin.tenant_id
+    update_mock.assert_called_once_with(
+        tenant_id=tenant_admin.tenant_id,
+        values=config_values,
+        updated_by_user_id=tenant_admin.id,
+    )

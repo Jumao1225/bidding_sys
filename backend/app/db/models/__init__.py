@@ -12,6 +12,7 @@ from .metadata import (
     EvaluationMetadata,
 )
 from .bid_score import BidScoreResult, BidScoreItem
+from .model_config import TenantModelConfig
 
 __all__ = [
     "Base",
@@ -35,4 +36,5 @@ __all__ = [
     "EvaluationMetadata",
     "BidScoreResult",
     "BidScoreItem",
+    "TenantModelConfig",
 ]

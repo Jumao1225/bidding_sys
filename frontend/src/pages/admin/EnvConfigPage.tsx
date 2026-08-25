@@ -1,9 +1,7 @@
-import { useRef, useState } from 'react';
-import type { ChangeEvent } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   Check,
-  Download,
   Eye,
   EyeOff,
   FileCog,
@@ -12,8 +10,8 @@ import {
   ScanText,
   Save,
   Server,
-  Upload,
 } from 'lucide-react';
+import { apiFetch, API_BASE_URL } from '../../utils/api';
 
 const DRAFT_STORAGE_KEY = 'bidding_model_env_draft';
 
@@ -30,6 +28,19 @@ interface ModelFieldConfig {
   envKey: string;
   placeholder: string;
   secret?: boolean;
+}
+
+interface StoredUser {
+  id?: string | number;
+  email?: string;
+  username?: string;
+  tenant_id?: string;
+  role?: string;
+}
+
+interface TenantOption {
+  id: string;
+  name: string;
 }
 
 const MODEL_CONFIGS: ModelConfig[] = [
@@ -78,14 +89,21 @@ const DEFAULT_VALUES: Record<string, string> = {
   LOCAL_VLM_MODEL_NAME: 'minimax-m3-mxfp8',
 };
 
-export function getDraftStorageKey(): string {
-  let identity = 'anonymous';
+function readStoredUser(): StoredUser | null {
   try {
     const savedUser = localStorage.getItem('bidding_user');
-    if (savedUser) {
-      const user = JSON.parse(savedUser) as { id?: string | number; email?: string; username?: string };
-      identity = String(user.id ?? user.email ?? user.username ?? identity);
-    }
+    return savedUser ? JSON.parse(savedUser) as StoredUser : null;
+  } catch (error) {
+    console.warn('[模型配置] 读取当前用户信息失败。', error);
+    return null;
+  }
+}
+
+export function getDraftStorageKey(tenantId?: string): string {
+  let identity = 'anonymous';
+  try {
+    const user = readStoredUser();
+    identity = String(tenantId || user?.id || user?.email || user?.username || identity);
   } catch (error) {
     console.warn('[模型配置] 读取当前用户身份失败，将使用匿名草稿空间。', error);
   }
@@ -105,46 +123,78 @@ function readDraft(): Record<string, string> {
   }
 }
 
-export function parseEnvContent(content: string): Record<string, string> {
-  const values: Record<string, string> = {};
-  content.split(/\r?\n/).forEach((line) => {
-    const trimmedLine = line.trim();
-    if (!trimmedLine || trimmedLine.startsWith('#')) return;
-    const separatorIndex = trimmedLine.indexOf('=');
-    if (separatorIndex <= 0) return;
-
-    const key = trimmedLine.slice(0, separatorIndex).trim();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return;
-    let value = trimmedLine.slice(separatorIndex + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1).replaceAll('\\"', '"').replaceAll("\\'", "'");
-    }
-    values[key] = value;
-  });
-  return values;
-}
-
-export function serializeEnvContent(values: Record<string, string>): string {
-  const orderedKeys = [...MODEL_KEYS, ...Object.keys(values).filter((key) => !MODEL_KEYS.includes(key)).sort()];
-  return orderedKeys
-    .filter((key, index, keys) => keys.indexOf(key) === index && values[key] !== undefined)
-    .map((key) => `${key}=${formatEnvValue(values[key])}`)
-    .join('\n') + '\n';
-}
-
-function formatEnvValue(value: string): string {
-  if (!/[\s#"']/.test(value)) return value;
-  return `"${value.replaceAll('"', '\\"')}"`;
-}
-
 export function EnvConfigPage() {
+  const storedUser = readStoredUser();
+  const isPlatformAdmin = storedUser?.role === 'admin' || storedUser?.role === 'platform_admin';
   const [values, setValues] = useState<Record<string, string>>(readDraft);
   const [lastSavedValues, setLastSavedValues] = useState<Record<string, string>>(readDraft);
   const [visibleSecrets, setVisibleSecrets] = useState<Record<string, boolean>>({});
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [tenants, setTenants] = useState<TenantOption[]>([]);
+  const [targetTenantId, setTargetTenantId] = useState(isPlatformAdmin ? '' : (storedUser?.tenant_id ?? ''));
   const changedCount = MODEL_KEYS.filter((key) => values[key] !== lastSavedValues[key]).length;
+
+  useEffect(() => {
+    if (!isPlatformAdmin) return;
+    let isMounted = true;
+
+    const loadTenants = async () => {
+      try {
+        const response = await apiFetch(`${API_BASE_URL}/api/v1/admin/tenants`);
+        if (!response.ok) throw new Error(`租户列表请求失败: ${response.status}`);
+        const tenantValues = await response.json() as TenantOption[];
+        if (!isMounted) return;
+        setTenants(tenantValues);
+        setTargetTenantId((currentTenantId) => currentTenantId || tenantValues[0]?.id || '');
+      } catch (loadError) {
+        if (isMounted) setError('读取租户列表失败，无法选择模型配置租户');
+        console.error('[模型配置] 租户列表读取失败。', loadError);
+      }
+    };
+
+    void loadTenants();
+    return () => {
+      isMounted = false;
+    };
+  }, [isPlatformAdmin]);
+
+  useEffect(() => {
+    if (!targetTenantId) return;
+    let isMounted = true;
+
+    const loadBackendConfig = async () => {
+      try {
+        const query = `?tenant_id=${encodeURIComponent(targetTenantId)}`;
+        const response = await apiFetch(`${API_BASE_URL}/api/v1/admin/model-config${query}`);
+        if (!response.ok) {
+          if (isMounted && response.status === 403) {
+            setError('只有平台管理员可以读取和修改后端模型配置');
+          }
+          return;
+        }
+
+        const payload = await response.json() as { data?: { values?: Record<string, string> } };
+        const backendValues = payload.data?.values;
+        if (!isMounted || !backendValues) return;
+
+        setValues((currentValues) => ({ ...currentValues, ...backendValues }));
+        setLastSavedValues((currentValues) => ({ ...currentValues, ...backendValues }));
+        console.info('[模型配置] 已加载后端当前生效配置。');
+      } catch (loadError) {
+        if (isMounted) {
+          setError('读取后端模型配置失败，请确认后端服务已启动');
+        }
+        console.error('[模型配置] 后端配置读取失败。', loadError);
+      }
+    };
+
+    void loadBackendConfig();
+    return () => {
+      isMounted = false;
+    };
+  }, [targetTenantId]);
 
   const updateValue = (key: string, value: string) => {
     setValues((currentValues) => ({ ...currentValues, [key]: value }));
@@ -152,55 +202,43 @@ export function EnvConfigPage() {
     setError('');
   };
 
-  const handleSaveDraft = () => {
-    try {
-      localStorage.setItem(getDraftStorageKey(), JSON.stringify(values));
-      setLastSavedValues({ ...values });
-      setNotice('模型配置草稿已保存到当前浏览器');
-      console.info('[模型配置] 草稿保存成功。');
-    } catch (saveError) {
-      setError('草稿保存失败，请检查浏览器存储权限');
-      console.error('[模型配置] 草稿保存失败。', saveError);
-    }
-  };
-
-  const handleExport = () => {
-    const file = new Blob([serializeEnvContent(values)], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(file);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = '.env';
-    link.click();
-    URL.revokeObjectURL(url);
-    setNotice('已导出 .env，请将文件放置到项目根目录');
-    console.info('[模型配置] .env 文件导出成功。');
-  };
-
-  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    event.target.value = '';
-    if (!file) return;
+  const handleSaveBackend = async () => {
+    setIsSaving(true);
+    setNotice('');
+    setError('');
 
     try {
-      const importedValues = parseEnvContent(await file.text());
-      const importedModelValues = Object.fromEntries(MODEL_KEYS.filter((key) => importedValues[key] !== undefined).map((key) => [key, importedValues[key]]));
-      if (Object.keys(importedModelValues).length === 0) {
-        setError('文件中未找到模型 API、名称或地址配置');
+      const query = `?tenant_id=${encodeURIComponent(targetTenantId)}`;
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/admin/model-config${query}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        // 只提交当前页面管理的八个键，避免把本地缓存中的其他变量提交给后端。
+        body: JSON.stringify(Object.fromEntries(MODEL_KEYS.map((key) => [key, values[key] ?? '']))),
+      });
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => ({})) as { detail?: string };
+        setError(errorPayload.detail || '模型配置保存到后端失败');
         return;
       }
-      setValues((currentValues) => ({ ...currentValues, ...importedValues }));
-      setNotice(`已导入 ${Object.keys(importedModelValues).length} 项模型配置，请检查后保存或导出`);
-      setError('');
-      console.info('[模型配置] .env 文件导入成功。', { count: Object.keys(importedModelValues).length });
-    } catch (importError) {
-      setError('文件读取失败，请重新选择 .env 文件');
-      console.error('[模型配置] .env 文件读取失败。', importError);
+
+      const payload = await response.json() as { data?: { values?: Record<string, string> } };
+      const savedValues = payload.data?.values ?? values;
+      setValues((currentValues) => ({ ...currentValues, ...savedValues }));
+      setLastSavedValues((currentValues) => ({ ...currentValues, ...savedValues }));
+      localStorage.setItem(getDraftStorageKey(targetTenantId), JSON.stringify(savedValues));
+      setNotice('模型配置已保存到后端并立即生效');
+      console.info('[模型配置] 后端模型配置保存成功。');
+    } catch (saveError) {
+      setError('模型配置保存到后端失败，请检查网络连接');
+      console.error('[模型配置] 后端模型配置保存失败。', saveError);
+    } finally {
+      setIsSaving(false);
     }
   };
 
   const handleReset = () => {
     setValues({ ...DEFAULT_VALUES });
-    setNotice('已恢复为示例模型配置，尚未写入本地草稿');
+    setNotice('已恢复为示例模型配置，尚未保存到后端');
     setError('');
     console.info('[模型配置] 已恢复示例配置。');
   };
@@ -222,18 +260,18 @@ export function EnvConfigPage() {
                 <h1 className="bg-gradient-to-br from-slate-900 to-indigo-900 bg-clip-text text-3xl font-extrabold text-transparent">模型配置中心</h1>
               </div>
             </div>
+            {isPlatformAdmin && (
+              <div className="mt-4 flex items-center gap-3">
+                <label htmlFor="model-config-tenant" className="text-sm font-semibold text-slate-700">配置租户</label>
+                <select id="model-config-tenant" value={targetTenantId} onChange={(event) => setTargetTenantId(event.target.value)} className="min-w-56 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-indigo-400 focus:ring-4 focus:ring-indigo-500/10">
+                  <option value="" disabled>请选择租户</option>
+                  {tenants.map((tenant) => <option key={tenant.id} value={tenant.id}>{tenant.name}</option>)}
+                </select>
+              </div>
+            )}
             <p className="max-w-2xl text-sm leading-6 text-slate-500">只需填写模型 API Key、模型名称和 API 地址，即可完成当前系统的模型接入配置。</p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <input ref={fileInputRef} type="file" accept=".env,text/plain" aria-label="导入 .env 文件" onChange={handleFileChange} className="hidden" />
-            <button type="button" onClick={() => fileInputRef.current?.click()} className="inline-flex items-center rounded-xl border border-slate-200 bg-white/80 px-4 py-2.5 text-sm font-semibold text-slate-600 shadow-sm transition-all hover:-translate-y-0.5 hover:border-indigo-200 hover:text-indigo-700">
-              <Upload className="mr-2 h-4 w-4" />导入 .env
-            </button>
-            <button type="button" onClick={handleExport} className="inline-flex items-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-indigo-500/25 transition-all hover:-translate-y-0.5 hover:bg-indigo-700">
-              <Download className="mr-2 h-4 w-4" />导出 .env
-            </button>
-          </div>
         </div>
 
         {(notice || error) && (
@@ -252,11 +290,11 @@ export function EnvConfigPage() {
         <div className="mt-6 flex flex-col justify-between gap-4 rounded-3xl border border-slate-200/60 bg-white/75 p-5 shadow-xl shadow-slate-200/20 backdrop-blur-xl sm:flex-row sm:items-center md:p-6">
           <div className="flex items-start gap-3 text-xs leading-5 text-slate-400">
             <Info className="mt-0.5 h-4 w-4 shrink-0 text-indigo-500" />
-            <span>{changedCount > 0 ? `有 ${changedCount} 项修改尚未保存。` : '当前模型配置已保存。'} 导入原始 `.env` 后再导出，可以保留其他未展示的环境变量。</span>
+            <span>{changedCount > 0 ? `有 ${changedCount} 项修改尚未保存。` : '当前模型配置已同步到后端。'} 点击“保存到后端”后，配置才会写入后端并立即生效。</span>
           </div>
           <div className="flex shrink-0 flex-wrap gap-3">
             <button type="button" onClick={handleReset} className="inline-flex items-center rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700">恢复示例</button>
-            <button type="button" onClick={handleSaveDraft} className="inline-flex items-center rounded-xl bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-slate-900/15 transition-all hover:-translate-y-0.5 hover:bg-slate-800"><Save className="mr-2 h-4 w-4" />保存草稿</button>
+            <button type="button" onClick={handleSaveBackend} disabled={isSaving} className="inline-flex items-center rounded-xl bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-slate-900/15 transition-all hover:-translate-y-0.5 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"><Save className="mr-2 h-4 w-4" />{isSaving ? '正在保存…' : '保存到后端'}</button>
           </div>
         </div>
       </div>

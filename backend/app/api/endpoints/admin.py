@@ -5,10 +5,79 @@ from sqlalchemy.orm import Session
 from app.api import deps
 from app.db.crud import user as crud_user
 from app.schemas.user import Tenant, TenantCreate, User, UserCreate, UserUpdatePassword, UserUpdateTenant
+from app.schemas.model_config import ModelConfigResponse, ModelConfigUpdate
 from app.db.models.user import User as UserModel
+from app.schemas.response.common import ResponseModel, success_response
+from app.services.model_config_service import model_config_service
 from loguru import logger
 
 router = APIRouter()
+
+
+# -------------------------------------------------------------------
+# Model Runtime Configuration
+# -------------------------------------------------------------------
+
+def _resolve_model_config_tenant(
+    db: Session,
+    requested_tenant_id: str | None,
+    current_manager: UserModel,
+) -> str:
+    """解析模型配置目标租户，平台管理员可跨租户，租户管理员只能操作本租户。"""
+    if current_manager.role in deps.PLATFORM_ADMIN_ROLES:
+        if not requested_tenant_id:
+            raise HTTPException(status_code=400, detail="平台管理员读取模型配置时必须提供 tenant_id")
+        tenant = crud_user.tenant.get(db, id=requested_tenant_id)
+        if not tenant:
+            raise HTTPException(status_code=404, detail="目标租户不存在")
+        return requested_tenant_id
+
+    if requested_tenant_id and requested_tenant_id != current_manager.tenant_id:
+        logger.warning("租户管理员 {} 尝试访问其他租户模型配置", current_manager.id)
+    if not current_manager.tenant_id:
+        raise HTTPException(status_code=400, detail="当前用户未绑定租户")
+    return current_manager.tenant_id
+
+
+@router.get("/model-config", response_model=ResponseModel[ModelConfigResponse])
+def read_model_config(
+    db: Session = Depends(deps.get_db),
+    tenant_id: str | None = Query(default=None),
+    current_manager: UserModel = Depends(deps.get_current_user_manager),
+) -> ResponseModel[ModelConfigResponse]:
+    """读取指定租户当前生效的模型配置。"""
+    target_tenant_id = _resolve_model_config_tenant(db, tenant_id, current_manager)
+    config = ModelConfigResponse(
+        tenant_id=target_tenant_id,
+        values=model_config_service.get_effective_values(target_tenant_id),
+    )
+    return success_response(data=config, message="成功获取当前模型配置")
+
+
+@router.put("/model-config", response_model=ResponseModel[ModelConfigResponse])
+def update_model_config(
+    config_in: ModelConfigUpdate,
+    db: Session = Depends(deps.get_db),
+    tenant_id: str | None = Query(default=None),
+    current_manager: UserModel = Depends(deps.get_current_user_manager),
+) -> ResponseModel[ModelConfigResponse]:
+    """持久化指定租户模型配置，后续该租户请求立即使用新配置。"""
+    target_tenant_id = _resolve_model_config_tenant(db, tenant_id, current_manager)
+    try:
+        updated_values = model_config_service.update_values(
+            tenant_id=target_tenant_id,
+            values=config_in.model_dump(),
+            updated_by_user_id=current_manager.id,
+        )
+    except ValueError as config_error:
+        logger.warning("管理员 {} 提交了非法模型配置: {}", current_manager.id, config_error)
+        raise HTTPException(status_code=400, detail=str(config_error)) from config_error
+
+    logger.info("管理员 {} 已更新租户 {} 的模型运行配置。", current_manager.id, target_tenant_id)
+    return success_response(
+        data=ModelConfigResponse(tenant_id=target_tenant_id, values=updated_values),
+        message="模型配置已保存到后端并立即生效",
+    )
 
 # -------------------------------------------------------------------
 # Tenant Management
