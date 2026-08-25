@@ -5,6 +5,7 @@ import tempfile
 from decimal import Decimal
 
 from docx import Document
+from docx.enum.text import WD_COLOR_INDEX
 
 from app.agents.bid_filler_agent import (
     _normalize_table_path,
@@ -176,3 +177,108 @@ def test_blocked_docx_node_should_preserve_non_empty_working_copy():
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+def test_blocked_docx_node_should_restore_previous_value_and_highlight_problem():
+    """无法修复时应保留上一轮实际值，并对问题数据添加黄色高亮。"""
+    temp_path = _create_opening_summary_doc()
+    try:
+        doc = Document(temp_path)
+        doc.tables[0].rows[1].cells[0].text = "张三"
+        doc.save(temp_path)
+
+        result = blocked_docx_node(
+            {
+                "document_id": "test-highlight-doc",
+                "docx_temp_path": temp_path,
+                "audit_items": [],
+                "review_findings": [
+                    {
+                        "rule_id": "R5-PROPOSAL-WRITEBACK-MISMATCH",
+                        "severity": "error",
+                        "path": "/body/tbl[1]/tr[2]/tc[1]/p[1]",
+                        "description": "提案值未落到目标单元格，期望='四川石楠建设工程有限公司'，实际='张三'",
+                        "current_value": "张三",
+                        "expected_value": "四川石楠建设工程有限公司",
+                        "auto_fixable": False,
+                    }
+                ],
+            }
+        )
+
+        result_doc = Document(temp_path)
+        run = result_doc.tables[0].rows[1].cells[0].paragraphs[0].runs[0]
+        assert result_doc.tables[0].rows[1].cells[0].text == "张三"
+        assert run.font.highlight_color == WD_COLOR_INDEX.YELLOW
+        assert result["filled_docx_bytes"]
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_blocked_docx_node_should_restore_actual_value_when_working_cell_was_cleared():
+    """工作副本目标单元格被清空时，应从终审记录恢复上一轮实际值后标黄。"""
+    temp_path = _create_opening_summary_doc()
+    try:
+        doc = Document(temp_path)
+        doc.tables[0].rows[1].cells[0].text = ""
+        doc.save(temp_path)
+
+        result = blocked_docx_node(
+            {
+                "document_id": "test-restore-doc",
+                "docx_temp_path": temp_path,
+                "audit_items": [],
+                "review_findings": [
+                    {
+                        "rule_id": "R5-PROPOSAL-WRITEBACK-MISMATCH",
+                        "severity": "error",
+                        "path": "/body/tbl[1]/tr[2]/tc[1]/p[1]",
+                        "description": "提案值未落到目标单元格，期望='单位名称'，实际='张三'",
+                        "current_value": "",
+                        "expected_value": "单位名称",
+                        "auto_fixable": False,
+                    }
+                ],
+            }
+        )
+
+        result_doc = Document(temp_path)
+        cell = result_doc.tables[0].rows[1].cells[0]
+        assert cell.text == "张三"
+        assert any(
+            run.font.highlight_color == WD_COLOR_INDEX.YELLOW
+            for run in cell.paragraphs[0].runs
+        )
+        assert result["filled_docx_bytes"]
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_fill_docx_proposals_in_dom_should_preserve_fixed_bid_format_text():
+    """没有可填槽位的投标格式原文不得被短值提案覆盖。"""
+    doc = Document()
+    doc.add_paragraph("固定格式原文：投标人应严格按照招标文件要求编制投标文件。")
+    file_handle = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+    file_handle.close()
+    doc.save(file_handle.name)
+
+    try:
+        written_count = fill_docx_proposals_in_dom(
+            file_handle.name,
+            [
+                {
+                    "path": "/body/p[1]",
+                    "proposed_text": "张三",
+                    "original_context": "固定格式原文：投标人应严格按照招标文件要求编制投标文件。",
+                    "type": "sentence_batch",
+                }
+            ],
+        )
+        result_doc = Document(file_handle.name)
+        assert written_count == 0
+        assert result_doc.paragraphs[0].text == "固定格式原文：投标人应严格按照招标文件要求编制投标文件。"
+    finally:
+        if os.path.exists(file_handle.name):
+            os.remove(file_handle.name)

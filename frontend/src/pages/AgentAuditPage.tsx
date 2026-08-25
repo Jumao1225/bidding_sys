@@ -206,12 +206,21 @@ export const AgentAuditPage: React.FC = () => {
         if (typeof data.total_wall_time_ms === 'number' && data.total_wall_time_ms > 0) {
           setServerWallTimeMs(data.total_wall_time_ms);
         }
-        if (data.is_completed && data.worker_items && data.worker_items.length > 0 && data.worker_items.some((w: any) => w.status === 'success' || w.status === 'master_completed')) {
+        // 只有后端最终 Supervisor 终态才允许前端结束计时，Worker 完成不代表终审完成。
+        if (data.is_completed && data.pipeline_status === 'completed') {
           setFrozenDurationMs(prev => (liveTimerMs > 0 ? liveTimerMs : prev));
           setIsLivePolling(false);
           setIsGenerating(false);
           setLoading(false);
-          setNotice('✨ AI 团队自主撰写与原位写盘已全量收官！所有章节卡片均已更新。');
+          setNotice(`✨ ${data.pipeline_message || 'AI 团队自主撰写、终审与 Word 发布已完成。'}`);
+          es.close();
+        } else if (data.is_completed && data.pipeline_status === 'failed') {
+          setFrozenDurationMs(prev => (liveTimerMs > 0 ? liveTimerMs : prev));
+          setIsLivePolling(false);
+          setIsGenerating(false);
+          setLoading(false);
+          setError(data.pipeline_message || '后台标书填报流程异常结束，请查看审计日志。');
+          setNotice('⚠️ 后台流程已结束，但未成功完成最终发布。');
           es.close();
         }
       } catch (err) {

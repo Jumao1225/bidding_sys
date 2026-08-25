@@ -266,6 +266,114 @@ def test_fill_docx_proposals_in_dom_table_overwrite_and_auto_index():
             os.remove(temp_path)
 
 
+def test_fill_docx_proposals_in_dom_should_rebind_footer_after_detail_rows_expand():
+    """测试明细扩行后表尾提案仍写入原始总报价与交货期限行。"""
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    table = doc.add_table(rows=4, cols=3)
+    for index, header in enumerate(["序号", "标的物名称", "总价"]):
+        table.rows[0].cells[index].text = header
+    table.rows[1].cells[0].text = ""
+    table.rows[2].cells[0].text = "投标总报价："
+    table.rows[3].cells[0].text = "交货期限："
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as file_handle:
+        temp_path = file_handle.name
+
+    try:
+        doc.save(temp_path)
+        matrix = [
+            ["1", "二区标的物", "100.00"],
+            ["2", "四区标的物一", "200.00"],
+            ["3", "四区标的物二", "300.00"],
+        ]
+        proposals = [
+            {
+                "path": "/body/tbl[1]",
+                "proposed_text": json.dumps(matrix, ensure_ascii=False),
+                "type": "table_rows",
+            },
+            {
+                "path": "/body/tbl[1]/tr[3]/tc[1]",
+                "original_context": "投标总报价：",
+                "proposed_text": "陆佰元整",
+                "type": "text",
+            },
+            {
+                "path": "/body/tbl[1]/tr[4]/tc[1]",
+                "original_context": "交货期限：",
+                "proposed_text": "60日内完成",
+                "type": "text",
+            },
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+
+        result_table = Document(temp_path).tables[0]
+        assert count >= 5
+        assert len(result_table.rows) == 6
+        assert [result_table.rows[index].cells[1].text.strip() for index in range(1, 4)] == [
+            "二区标的物",
+            "四区标的物一",
+            "四区标的物二",
+        ]
+        assert "投标总报价：陆佰元整" in result_table.rows[-2].cells[0].text
+        assert "交货期限：60日内完成" in result_table.rows[-1].cells[0].text
+        assert "/tr[5]/tc[1]/" in proposals[1]["path"]
+        assert "/tr[6]/tc[1]/" in proposals[2]["path"]
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_fill_docx_proposals_in_dom_should_write_matrix_footer_after_all_details():
+    """测试矩阵自带表尾时按模板结构后置写入，且不追加重复表尾。"""
+    from docx import Document
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    table = doc.add_table(rows=4, cols=4)
+    for index, header in enumerate(["序号", "标的物", "单价", "总价"]):
+        table.rows[0].cells[index].text = header
+    table.rows[1].cells[0].text = ""
+    table.rows[2].cells[0].text = "投标总报价："
+    table.rows[2].cells[1].text = "大写：元"
+    table.rows[3].cells[0].text = "交货期限："
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as file_handle:
+        temp_path = file_handle.name
+
+    try:
+        doc.save(temp_path)
+        matrix = [
+            ["1", "标的物A", "单价A", "总价A"],
+            ["2", "标的物B", "单价B", "总价B"],
+            ["投标总报价：", "大写：报价值", "", ""],
+            ["交货期限：期限值", "", "", ""],
+        ]
+        proposals = [
+            {
+                "path": "/body/tbl[1]",
+                "proposed_text": json.dumps(matrix, ensure_ascii=False),
+                "type": "table_rows",
+            }
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+
+        result_table = Document(temp_path).tables[0]
+        assert count >= 4
+        assert len(result_table.rows) == 5
+        assert result_table.rows[1].cells[1].text.strip() == "标的物A"
+        assert "报价值" in result_table.rows[-2].cells[1].text
+        assert "期限值" in result_table.rows[-1].cells[0].text
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def test_parse_proposals_should_auto_expand_markdown_range_paths():
     """测试 Markdown 表格解析器：自动将连续的范围概括路径 (如 /body/tbl[6]/tr[2]~tr[19]) 展开为递增行号独立提案"""
     from app.agents.bid_filler_workers import _parse_proposals

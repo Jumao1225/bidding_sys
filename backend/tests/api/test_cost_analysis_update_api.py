@@ -27,7 +27,8 @@ async def test_update_cost_analysis_should_succeed():
                 "ref_price": 20000.0,
                 "matched_name": "并网柜",
                 "matched_brand": "正泰",
-                "match_quality": "精准匹配"
+                "match_quality": "精准匹配",
+                "remark": "含成套安装调试费"
             },
             {
                 "name": "现场施工人工费",
@@ -69,12 +70,14 @@ async def test_update_cost_analysis_should_succeed():
                 assert data["items"][1]["subtotal"] == 15000.0
                 assert data["items"][2]["name"] == "售后运维服务费"
                 assert data["items"][2]["subtotal"] == 5000.0
+                assert data["items"][0]["remark"] == "含成套安装调试费"
                 assert "可控" in data["budget_status"]
                 
                 # 验证 mock_doc 中的 parsed_metadata 正确持久化
                 saved_cost = mock_doc.parsed_metadata["cost_analysis"]
                 assert saved_cost["total_cost"] == 60000.0
                 assert len(saved_cost["items"]) == 3
+                assert saved_cost["items"][0]["remark"] == "含成套安装调试费"
     finally:
         app.dependency_overrides.clear()
 
@@ -364,7 +367,6 @@ async def test_update_cost_analysis_with_custom_brand_model_should_persist_field
                 assert saved_items[1]["matched_manufacturer"] == "某建筑设计研究院"
     finally:
         app.dependency_overrides.clear()
-
 
 
 

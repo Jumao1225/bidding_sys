@@ -262,6 +262,7 @@ class CostItemUpdateRequest(BaseModel):
     match_quality: str = Field(default="手动添加", description="匹配置信度")
     warning: str = Field(default="", description="提示说明")
     comparison_note: str = Field(default="", description="对比说明")
+    remark: str = Field(default="", description="BOM 清单备注，与投标配置及分项报价表备注列对齐")
     parent_item: Optional[str] = Field(default=None, description="所属直接父级设备名称")
     root_item: Optional[str] = Field(default=None, description="所属顶层主要标的物名称")
     tree_level: Optional[int] = Field(default=1, description="层级深度（1=顶层主要标的物, 2=二级成套分项, 3=三级元器件）")
@@ -489,7 +490,7 @@ async def update_cost_analysis(
                 per_set_qty=_optional_float(item.get("per_set_qty")),
                 per_set_quantity=_optional_float(item.get("per_set_quantity")),
                 section_name=normalize_section_name(item.get("section_name")),
-                remark=str(item.get("comparison_note") or item.get("warning") or "手动新增/调整项目"),
+                remark=str(item.get("remark") or "").strip() or None,
                 sort_order=sort_order,
             )
             db.add(est)

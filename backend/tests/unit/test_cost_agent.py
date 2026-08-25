@@ -71,6 +71,7 @@ def test_cost_node_execution_should_succeed(
     mock_price_ref.unit = "台"
     mock_price_ref.remark = "测试"
     mock_business_crud.get_all_price_references.return_value = [mock_price_ref]
+    mock_db.query.return_value.filter.return_value.all.return_value = [mock_price_ref]
     
     # 4. Mock RAG Text
     mock_rag.search_bidding_document.return_value = "采购清单：核心交换机 2台"
@@ -113,6 +114,7 @@ def test_cost_node_execution_should_succeed(
     assert "可控" in cost_data["budget_status"]
     assert len(cost_data["items"]) == 1
     assert cost_data["items"][0]["matched_brand"] == "华为"
+    assert cost_data["items"][0]["remark"] == "测试"
 
 @patch("app.agents.nodes.cost_agent.SessionLocal")
 @patch("app.agents.nodes.cost_agent.document_crud")
@@ -226,4 +228,3 @@ def test_filter_candidate_price_book_with_large_database():
     # 验证关键的变压器与断路器 100% 成功排在候选库前列
     assert "10kV油浸式变压器" in candidate_names
     assert "真空断路器" in candidate_names
-

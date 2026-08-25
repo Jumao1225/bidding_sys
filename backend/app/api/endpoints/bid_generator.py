@@ -34,6 +34,48 @@ from app.services.bid_format_extractor_service import bid_format_extractor_servi
 router = APIRouter()
 
 
+def _get_bid_fill_pipeline_state(logs: list) -> Dict[str, Any]:
+    """根据最终 Supervisor 终态日志判断整条标书填报流水线状态。"""
+    def _log_sort_key(log: Any) -> float:
+        """统一转换日志时间，兼容数据库时间对象和测试替身。"""
+        created_at = getattr(log, "created_at", None)
+        if hasattr(created_at, "timestamp"):
+            return float(created_at.timestamp())
+        if isinstance(created_at, (int, float)):
+            return float(created_at)
+        return 0.0
+
+    terminal_logs = [
+        log for log in logs
+        if getattr(log, "node_name", "") == "Supervisor-总控调度"
+        and getattr(log, "status", "") in {"master_completed", "failed", "error"}
+    ]
+    latest_terminal = max(
+        terminal_logs,
+        key=_log_sort_key,
+        default=None,
+    )
+    if latest_terminal is None:
+        return {
+            "pipeline_status": "processing" if logs else "idle",
+            "pipeline_message": "后台 Agent 正在执行章节填报与终审校验",
+            "is_completed": False,
+        }
+
+    status = getattr(latest_terminal, "status", "")
+    if status == "master_completed":
+        return {
+            "pipeline_status": "completed",
+            "pipeline_message": "后台填报、终审和最终 Word 发布流程已完成",
+            "is_completed": True,
+        }
+    return {
+        "pipeline_status": "failed",
+        "pipeline_message": "后台填报流程异常结束，请查看审计日志",
+        "is_completed": True,
+    }
+
+
 # ============================================================
 # 1. 静态及特定多层子路径 Endpoint (必须位于单层 {document_id} 之前)
 # ============================================================
@@ -128,12 +170,6 @@ async def get_bid_fill_worker_logs(
         worker_items = []
         seen_chapters = set()
 
-        # 检查是否已存在正式完成的 Supervisor 记录，以便过滤掉最初的 in_progress 占位日志
-        has_final_supervisor = any(
-            (log.node_name and "Supervisor" in log.node_name) and log.status in ("success", "master_completed")
-            for log in logs
-        )
-
         total_wall_time_ms = 0
         min_created_at = None
         max_created_at = None
@@ -144,10 +180,6 @@ async def get_bid_fill_worker_logs(
                     min_created_at = log.created_at
                 if max_created_at is None or log.created_at > max_created_at:
                     max_created_at = log.created_at
-
-            # 如果已有正式完成的 Supervisor 日志，则忽略最初纯占位的 in_progress 日志
-            if has_final_supervisor and log.node_name and "Supervisor" in log.node_name and log.status == "in_progress":
-                continue
 
             if log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
                 total_wall_time_ms = max(total_wall_time_ms, log.execution_time_ms)
@@ -187,12 +219,14 @@ async def get_bid_fill_worker_logs(
             if delta_ms > 0:
                 total_wall_time_ms = delta_ms
 
+        pipeline_state = _get_bid_fill_pipeline_state(logs)
         return {
             "document_id": document_id,
             "total_workers_count": len(worker_items),
             "worker_items": worker_items,
             "total_wall_time_ms": total_wall_time_ms,
-            "total_worker_time_ms": total_worker_time_ms
+            "total_worker_time_ms": total_worker_time_ms,
+            **pipeline_state,
         }
     except Exception as e:
         logger.exception(f"获取 Agent 运行日志出现异常: {e}")
@@ -249,11 +283,6 @@ async def stream_bid_fill_worker_logs(
                 worker_items = []
                 seen_chapters = set()
 
-                has_final_supervisor = any(
-                    (log.node_name and "Supervisor" in log.node_name) and log.status in ("success", "master_completed")
-                    for log in logs
-                )
-
                 total_wall_time_ms = 0
                 min_created_at = None
                 max_created_at = None
@@ -264,9 +293,6 @@ async def stream_bid_fill_worker_logs(
                             min_created_at = log.created_at
                         if max_created_at is None or log.created_at > max_created_at:
                             max_created_at = log.created_at
-
-                    if has_final_supervisor and log.node_name and "Supervisor" in log.node_name and log.status == "in_progress":
-                        continue
 
                     if log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
                         total_wall_time_ms = max(total_wall_time_ms, log.execution_time_ms)
@@ -307,21 +333,14 @@ async def stream_bid_fill_worker_logs(
                     if delta_ms > 0:
                         total_wall_time_ms = delta_ms
 
-                # 判断所有最新状态的节点中是否还有正在进行中的任务
-                has_in_progress = any(w.get("status") in ("in_progress", "running") for w in worker_items)
-
-                # 只有当日志非空、没有任何在途进行中的 Worker、且至少有一个成功节点时才判定为全量完成
-                all_completed = (
-                    bool(logs) and 
-                    not has_in_progress and 
-                    len(worker_items) > 0 and 
-                    any(w.get("status") in ("success", "master_completed") for w in worker_items)
-                )
-
+                pipeline_state = _get_bid_fill_pipeline_state(logs)
                 payload = {
                     "document_id": document_id,
                     "worker_items": worker_items,
-                    "is_completed": all_completed,
+                    # 只有后台最终 Supervisor 终态才能结束 SSE，不能用中间 Worker 成功状态代替。
+                    "is_completed": pipeline_state["is_completed"],
+                    "pipeline_status": pipeline_state["pipeline_status"],
+                    "pipeline_message": pipeline_state["pipeline_message"],
                     "total_wall_time_ms": total_wall_time_ms,
                     "total_worker_time_ms": total_worker_time_ms,
                     "timestamp": time.time()
@@ -336,7 +355,7 @@ async def stream_bid_fill_worker_logs(
                     same_count += 1
                     yield f": ping {int(time.time())}\n\n"
 
-                if all_completed and len(worker_items) > 0 and same_count >= 5:
+                if pipeline_state["is_completed"] and same_count >= 5:
                     break
 
             except Exception as e:

@@ -6,9 +6,12 @@ Bid Generator API 接口测试 (test_bid_generator_api.py)
 
 import pytest
 import httpx
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 from app.main import app
 from app.api.deps import get_current_active_user, get_db
+from app.api.endpoints.bid_generator import _get_bid_fill_pipeline_state
 
 
 @pytest.mark.asyncio
@@ -167,5 +170,43 @@ async def test_get_bid_fill_worker_logs_no_logs_should_return_empty_items():
     finally:
         app.dependency_overrides.clear()
 
+
+def test_bid_fill_pipeline_state_should_stay_processing_after_intermediate_supervisor_success():
+    """中间 Supervisor 成功但最终终态未写入时，不应提前判定整条流程完成。"""
+    now = datetime.now()
+    logs = [
+        SimpleNamespace(node_name="Supervisor-总控调度", status="in_progress", created_at=now),
+        SimpleNamespace(node_name="Supervisor-Orchestrator", status="success", created_at=now + timedelta(seconds=1)),
+        SimpleNamespace(node_name="BidFillerWorker-项目负责人", status="success", created_at=now + timedelta(seconds=2)),
+    ]
+
+    state = _get_bid_fill_pipeline_state(logs)
+
+    assert state["pipeline_status"] == "processing"
+    assert state["is_completed"] is False
+
+
+def test_bid_fill_pipeline_state_should_complete_only_after_final_supervisor_log():
+    """只有后台最终 Supervisor master_completed 才能结束前端轮询。"""
+    now = datetime.now()
+    logs = [
+        SimpleNamespace(node_name="Supervisor-Orchestrator", status="success", created_at=now),
+        SimpleNamespace(node_name="Supervisor-总控调度", status="master_completed", created_at=now + timedelta(seconds=3)),
+    ]
+
+    state = _get_bid_fill_pipeline_state(logs)
+
+    assert state["pipeline_status"] == "completed"
+    assert state["is_completed"] is True
+
+
+def test_bid_fill_pipeline_state_should_mark_failed_terminal_log():
+    """最终 Supervisor failed 时应结束轮询并向前端返回失败状态。"""
+    state = _get_bid_fill_pipeline_state([
+        SimpleNamespace(node_name="Supervisor-总控调度", status="failed", created_at=datetime.now())
+    ])
+
+    assert state["pipeline_status"] == "failed"
+    assert state["is_completed"] is True
 
 

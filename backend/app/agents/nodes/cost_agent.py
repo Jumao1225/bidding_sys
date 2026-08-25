@@ -63,6 +63,55 @@ class CostItem(BaseModel):
     match_quality: Optional[str] = Field(default="未匹配", description="匹配置信度: 精准匹配 | 模糊匹配 | 未匹配")
     warning: Optional[str] = Field(default="", description="提示或警告说明")
     comparison_note: Optional[str] = Field(default="", description="对比分析及计价说明")
+    remark: Optional[str] = Field(default="", description="匹配价格库中的 BOM 备注")
+
+
+def resolve_price_reference_remark(match_info: object, price_book: list[dict]) -> str:
+    """根据本地匹配结果回查价格库备注，避免由大模型臆造备注内容。"""
+    if match_info is None or not price_book:
+        return ""
+
+    def normalize(value: object) -> str:
+        return str(value or "").strip().casefold()
+
+    matched_name = normalize(getattr(match_info, "matched_name", ""))
+    if not matched_name:
+        return ""
+
+    matched_brand = normalize(getattr(match_info, "matched_brand", ""))
+    matched_model = normalize(getattr(match_info, "matched_model", ""))
+    matched_manufacturer = normalize(getattr(match_info, "matched_manufacturer", ""))
+    matched_price = getattr(match_info, "ref_price", 0.0) or 0.0
+
+    best_score = 0
+    best_remark = ""
+    for reference in price_book:
+        reference_name = normalize(reference.get("item_name"))
+        if reference_name == matched_name:
+            score = 8
+        elif matched_name in reference_name or reference_name in matched_name:
+            score = 4
+        else:
+            continue
+
+        if matched_brand and matched_brand == normalize(reference.get("brand")):
+            score += 2
+        if matched_model and matched_model == normalize(reference.get("model") or reference.get("spec")):
+            score += 3
+        if matched_manufacturer and matched_manufacturer == normalize(reference.get("manufacturer")):
+            score += 2
+
+        try:
+            if abs(float(reference.get("unit_price") or 0.0) - float(matched_price)) < 0.0001:
+                score += 2
+        except (TypeError, ValueError):
+            logger.warning(f"价格库单价格式异常，跳过备注匹配评分: {reference.get('unit_price')}")
+
+        if score > best_score:
+            best_score = score
+            best_remark = str(reference.get("remark") or "").strip()
+
+    return best_remark
 
 class CostAnalysisResult(BaseModel):
     items: List[CostItem] = Field(description="核算出的所有物品清单", default_factory=list)
@@ -403,6 +452,7 @@ def cost_node(state: BiddingState) -> dict:
                     "match_quality": getattr(m, "match_quality", "精准匹配") or "精准匹配",
                     "warning": getattr(m, "warning", "") or "",
                     "comparison_note": getattr(m, "comparison_note", "") or "",
+                    "remark": str(getattr(m, "remark", "") or "").strip() or resolve_price_reference_remark(m, price_book),
                 })
     else:
         for batch_idx, b_items in enumerate(raw_batches):
@@ -440,6 +490,11 @@ def cost_node(state: BiddingState) -> dict:
                 match_quality = match_info.match_quality if match_info else "未匹配"
                 note = match_info.comparison_note if match_info else ""
                 warning = match_info.warning if match_info else ""
+                remark = (
+                    str(getattr(match_info, "remark", "") or "").strip()
+                    if match_info
+                    else ""
+                ) or resolve_price_reference_remark(match_info, price_book)
 
                 # 3. 防重复打包计价置零安全保护
                 if ("不重复" in note and "计算" in note) or ("合并" in note and "计价" in note) or ("已包含" in note and "统价" in note) or ("已包含" in note and "打包" in note):
@@ -480,6 +535,7 @@ def cost_node(state: BiddingState) -> dict:
                     "match_quality": match_quality,
                     "warning": warning,
                     "comparison_note": note,
+                    "remark": remark,
                 }
                 calculated_items.append(item_dict)
 
@@ -575,7 +631,7 @@ def cost_node(state: BiddingState) -> dict:
                 per_set_qty=_optional_float(item.get("per_set_qty")),
                 per_set_quantity=_optional_float(item.get("per_set_quantity") or item.get("per_set_qty")),
                 section_name=str(item.get("section_name") or "") if item.get("section_name") else None,
-                remark=str(item.get("comparison_note") or item.get("warning") or ""),
+                remark=str(item.get("remark") or item.get("comparison_note") or item.get("warning") or "").strip() or None,
                 sort_order=sort_order,
             )
             db.add(est)

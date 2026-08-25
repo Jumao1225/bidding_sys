@@ -53,7 +53,7 @@ backend/*.sqlite3
 *.db-wal
 
 # AI Models & Heavy Artifacts
-models/
+/models/
 
 # Backend Uploads, Storage & Logs
 backend/logs/*

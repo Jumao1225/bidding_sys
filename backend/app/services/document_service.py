@@ -98,6 +98,7 @@ class DocumentService:
                     "match_quality": row.match_quality or "",
                     "warning": row.warning or "",
                     "comparison_note": row.comparison_note or "",
+                    "remark": row.remark or "",
                     "parent_item": row.parent_item,
                     "root_item": row.root_item,
                     "tree_level": row.tree_level or 1,

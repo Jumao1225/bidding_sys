@@ -20,12 +20,13 @@ import shutil
 import tempfile
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Any, List, Optional, Tuple, TypedDict
+from typing import Dict, Any, List, Optional, Sequence, Tuple, TypedDict
 from loguru import logger
 from sqlalchemy.orm import Session
 from docx import Document
 from docx.oxml import parse_xml
 from docx.oxml.ns import qn, nsdecls
+from docx.enum.text import WD_COLOR_INDEX
 import io
 
 from langchain_core.tools import tool
@@ -906,6 +907,8 @@ def validate_filled_docx_integrity(
                 "path": normalized_path,
                 "chapter": str(proposal.get("chapter_title", "产物回读校验")),
                 "snippet": f"提案值未落到目标单元格，期望='{expected_value}'，实际='{actual_value}'",
+                "expected_value": expected_value,
+                "current_value": actual_value,
             })
 
     for table_index, table in enumerate(doc.tables, start=1):
@@ -1078,6 +1081,319 @@ def _find_paragraph_by_path(doc: Document, path: str):
             return doc.paragraphs[p_idx]
 
     return None
+
+
+def _has_fillable_slot_marker(text: str) -> bool:
+    """判断文本中是否存在明确的可填槽位标记。"""
+    normalized = str(text or "")
+    return bool(re.search(
+        r"_{2,}|＿{2,}|\[[^\]]+\]|［[^］]+］|【[^】]+】|"
+        r"（[^）]*(?:姓名|名称|编号|日期|电话|地址)[^）]*）|"
+        r"(?:[:：])\s{2,}|\d*\s*年\s*\d*\s*月\s*\d*\s*日",
+        normalized,
+    ))
+
+
+def _is_protected_template_overwrite(
+    real_text: str,
+    original_context: str,
+    proposed_value: str,
+    proposal_type: str,
+) -> bool:
+    """拦截没有填报槽位依据的固定格式原文覆盖。"""
+    current = str(real_text or "").strip()
+    original = str(original_context or "").strip()
+    proposed = str(proposed_value or "").strip()
+    if not current or not proposed or proposal_type == "image":
+        return False
+    if proposed == current or proposed in current:
+        return False
+
+    # 当前节点或 Worker 保存的原始上下文只要明确含有槽位，就允许替换槽位数据。
+    if _has_fillable_slot_marker(current) or _has_fillable_slot_marker(original):
+        return False
+
+    # 没有槽位的非空节点视为投标格式固定原文，禁止被 Agent 的整句/短值提案覆盖。
+    return True
+
+
+def _highlight_paragraph_yellow(paragraph: Any) -> bool:
+    """将段落中已有的数据文字设置为 Word 黄色高亮。"""
+    runs = [run for run in paragraph.runs if str(run.text or "")]
+    if not runs and str(paragraph.text or "").strip():
+        runs = [paragraph.add_run(paragraph.text)]
+    for run in runs:
+        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+        # 同时写入底层 XML，确保新增 run 经安全保存后仍保留高亮属性。
+        run_properties = run._element.get_or_add_rPr()
+        highlight = run_properties.find(qn("w:highlight"))
+        if highlight is None:
+            highlight = parse_xml(r'<w:highlight %s w:val="yellow"/>' % nsdecls("w"))
+            run_properties.append(highlight)
+        else:
+            highlight.set(qn("w:val"), "yellow")
+    return bool(runs)
+
+
+def _shade_paragraph_yellow(paragraph: Any) -> None:
+    """当问题节点为空时，给其段落或单元格位置加黄色底纹提示。"""
+    element = paragraph._element
+    parent = element.getparent()
+    table_cell = None
+    while parent is not None:
+        if str(parent.tag).endswith("tc"):
+            table_cell = parent
+            break
+        parent = parent.getparent()
+
+    if table_cell is not None:
+        tc_pr = table_cell.get_or_add_tcPr()
+        shading = tc_pr.find(qn("w:shd"))
+        if shading is None:
+            shading = parse_xml(r'<w:shd %s w:fill="FFFF00" w:val="clear"/>' % nsdecls("w"))
+            tc_pr.append(shading)
+        else:
+            shading.set(qn("w:fill"), "FFFF00")
+        return
+
+    paragraph_pr = paragraph._p.get_or_add_pPr()
+    shading = paragraph_pr.find(qn("w:shd"))
+    if shading is None:
+        shading = parse_xml(r'<w:shd %s w:fill="FFFF00" w:val="clear"/>' % nsdecls("w"))
+        paragraph_pr.append(shading)
+    else:
+        shading.set(qn("w:fill"), "FFFF00")
+
+
+def _extract_previous_finding_value(finding: Dict[str, Any]) -> str:
+    """从审计记录中提取上一轮目标节点的实际值。"""
+    current_value = str(finding.get("current_value", "") or "").strip()
+    if current_value and not current_value.startswith("["):
+        return current_value
+
+    description = str(finding.get("description", "") or finding.get("snippet", "") or "")
+    matched = re.search(r"实际=['‘](.*?)['’]", description)
+    return matched.group(1).strip() if matched else ""
+
+
+def highlight_unresolved_docx_findings(
+    docx_path: str,
+    findings: Optional[List[Dict[str, Any]]],
+) -> int:
+    """保留问题节点已有数据，必要时恢复上一轮实际值并统一黄色标记。"""
+    if not docx_path or not os.path.exists(docx_path) or not findings:
+        return 0
+
+    try:
+        doc = Document(docx_path)
+    except Exception as exc:
+        logger.exception(f"读取 Word 产物以标记未修复问题失败: {exc}")
+        return 0
+
+    marked_paths = set()
+    marked_count = 0
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        path = _normalize_table_path(str(finding.get("path", "") or "").strip())
+        if not path or path == "N/A" or path in marked_paths:
+            continue
+        paragraph = _find_paragraph_by_path(doc, path)
+        if paragraph is None:
+            logger.warning(f"无法定位未修复问题节点，跳过黄色标记: {path}")
+            continue
+
+        previous_value = _extract_previous_finding_value(finding)
+        current_text = str(paragraph.text or "").strip()
+        if not current_text and previous_value:
+            paragraph.add_run(previous_value)
+            current_text = previous_value
+            logger.warning(f"[问题数据兜底] 节点 {path} 已恢复上一轮实际值并准备标黄")
+        elif current_text and previous_value and current_text.endswith((":", "：")):
+            paragraph.add_run(previous_value)
+            current_text = f"{current_text}{previous_value}"
+
+        if current_text:
+            _highlight_paragraph_yellow(paragraph)
+        else:
+            _shade_paragraph_yellow(paragraph)
+        marked_paths.add(path)
+        marked_count += 1
+
+    if marked_count:
+        try:
+            from app.agents.tools.bid_db_tools import _safe_save_doc
+            _safe_save_doc(doc, docx_path)
+        except (OSError, IOError) as exc:
+            logger.exception(f"保存未修复问题黄色标记失败: {exc}")
+            return 0
+        logger.warning(f"[问题数据黄色标记] 已保留并标记 {marked_count} 个未修复节点")
+    return marked_count
+
+
+def _snapshot_table_cell_targets(
+    doc: Document,
+    proposals: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """在动态表格扩行前保存单元格目标的真实 XML 节点。"""
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    table_path_pattern = re.compile(
+        r"^/body/tbl\[(\d+)\]/(?:tr|row)\[(\d+)\]/"
+        r"(?:tc|cell)\[(\d+)\](?:/p\[(\d+)\])?$"
+    )
+
+    for proposal in proposals:
+        raw_path = str(proposal.get("path", "")).strip()
+        normalized_path = _normalize_table_path(raw_path)
+        match = table_path_pattern.fullmatch(normalized_path)
+        if not match or normalized_path in snapshots:
+            continue
+
+        table_index, row_index, cell_index = (
+            int(match.group(1)) - 1,
+            int(match.group(2)) - 1,
+            int(match.group(3)) - 1,
+        )
+        paragraph_index = int(match.group(4) or "1") - 1
+        if not (0 <= table_index < len(doc.tables)):
+            continue
+
+        table = doc.tables[table_index]
+        if not (0 <= row_index < len(table.rows)):
+            continue
+
+        row = table.rows[row_index]
+        physical_cells = [
+            element
+            for element in row._tr.iterchildren()
+            if element.tag.endswith("tc")
+        ]
+        cell_element = physical_cells[cell_index] if cell_index < len(physical_cells) else None
+        if cell_element is None and cell_index < len(row.cells):
+            cell_element = row.cells[cell_index]._tc
+        if cell_element is None:
+            continue
+
+        paragraphs = [
+            element
+            for element in cell_element.iterchildren()
+            if element.tag.endswith("p")
+        ]
+        if not paragraphs:
+            continue
+        paragraph_element = paragraphs[min(paragraph_index, len(paragraphs) - 1)]
+
+        from docx.text.paragraph import Paragraph
+
+        snapshots[normalized_path] = {
+            "table": table,
+            "table_index": table_index,
+            "row_element": row._tr,
+            "cell_element": cell_element,
+            "paragraph_index": paragraph_index,
+            "paragraph_element": paragraph_element,
+            "paragraph": Paragraph(paragraph_element, table._parent),
+        }
+
+    if snapshots:
+        logger.info(
+            f"   [表格目标节点快照] 已锁定 {len(snapshots)} 个单元格目标，"
+            "后续扩行不会改变其真实写入位置"
+        )
+    return snapshots
+
+
+def _get_snapshot_paragraph(snapshot: Dict[str, Any]):
+    """获取快照单元格当前段落，兼容矩阵写入替换原段落节点的情况。"""
+    cell_element = snapshot.get("cell_element")
+    table = snapshot.get("table")
+    if cell_element is None or table is None:
+        return None
+
+    paragraph_elements = [
+        element
+        for element in cell_element.iterchildren()
+        if element.tag.endswith("p")
+    ]
+    if not paragraph_elements:
+        return None
+
+    paragraph_element = snapshot.get("paragraph_element")
+    if paragraph_element not in paragraph_elements:
+        paragraph_index = int(snapshot.get("paragraph_index", 0))
+        paragraph_element = paragraph_elements[min(paragraph_index, len(paragraph_elements) - 1)]
+        from docx.text.paragraph import Paragraph
+
+        snapshot["paragraph_element"] = paragraph_element
+        snapshot["paragraph"] = Paragraph(paragraph_element, table._parent)
+
+    return snapshot.get("paragraph")
+
+
+def _resolve_snapshot_path(snapshot: Dict[str, Any]) -> str:
+    """根据扩行后的真实 XML 节点反向生成当前有效的表格路径。"""
+    table = snapshot.get("table")
+    row_element = snapshot.get("row_element")
+    cell_element = snapshot.get("cell_element")
+    _get_snapshot_paragraph(snapshot)
+    paragraph_element = snapshot.get("paragraph_element")
+    if table is None or row_element is None or cell_element is None or paragraph_element is None:
+        return ""
+
+    row_index = next(
+        (index for index, row in enumerate(table.rows, start=1) if row._tr is row_element),
+        None,
+    )
+    if row_index is None:
+        return ""
+
+    physical_cells = [
+        element
+        for element in row_element.iterchildren()
+        if element.tag.endswith("tc")
+    ]
+    cell_index = next(
+        (index for index, element in enumerate(physical_cells, start=1) if element is cell_element),
+        None,
+    )
+    if cell_index is None:
+        return ""
+
+    paragraph_index = next(
+        (
+            index
+            for index, element in enumerate(cell_element.iterchildren(), start=1)
+            if element.tag.endswith("p") and element is paragraph_element
+        ),
+        None,
+    )
+    if paragraph_index is None:
+        return ""
+
+    table_index = int(snapshot.get("table_index", 0)) + 1
+    return f"/body/tbl[{table_index}]/tr[{row_index}]/tc[{cell_index}]/p[{paragraph_index}]"
+
+
+def _rebind_table_cell_proposal_paths(
+    proposals: List[Dict[str, Any]],
+    snapshots: Dict[str, Dict[str, Any]],
+) -> None:
+    """将动态扩行前的表格单元格路径更新为扩行后的真实路径。"""
+    for proposal in proposals:
+        normalized_path = _normalize_table_path(str(proposal.get("path", "")).strip())
+        snapshot = snapshots.get(normalized_path)
+        if snapshot is None:
+            continue
+
+        rebound_path = _resolve_snapshot_path(snapshot)
+        if not rebound_path or rebound_path == normalized_path:
+            continue
+
+        proposal["path"] = rebound_path
+        logger.info(
+            f"   [表格路径重绑定] {normalized_path} -> {rebound_path}，"
+            "确保表尾内容仍写入原始表尾节点"
+        )
 
 
 def _anchor_terms(value: str) -> List[str]:
@@ -1404,6 +1720,116 @@ def _is_table_footer_row(row, total_cols: int) -> bool:
         return False
 
 
+def _get_footer_row_profile(row: Any) -> Tuple[int, int]:
+    """提取模板表尾行的结构轮廓，不读取或依赖具体业务文字。"""
+    unique_cells = []
+    for cell in row.cells:
+        if not any(cell._tc is existing._tc for existing in unique_cells):
+            unique_cells.append(cell)
+    non_empty_count = sum(bool(str(cell.text or "").strip()) for cell in unique_cells)
+    return len(unique_cells), non_empty_count
+
+
+def _get_matrix_row_profile(row_data: Any) -> Tuple[int, int]:
+    """提取矩阵行的非空字段轮廓，用于和模板表尾结构进行匹配。"""
+    if not isinstance(row_data, (list, tuple)):
+        return 0, 0
+    non_empty_count = sum(bool(str(value or "").strip()) for value in row_data)
+    return len(row_data), non_empty_count
+
+
+def _split_matrix_footer_rows(
+    matrix: List[List[Any]],
+    table: Any,
+    template_footer_trs: Sequence[Any],
+) -> Tuple[List[List[Any]], List[List[Any]]]:
+    """
+    按模板表尾的结构轮廓拆分矩阵尾部行。
+
+    只处理与原模板表尾行数量、非空字段数量一致的连续尾部，避免把普通标的物
+    明细误判为表尾；整个过程不依赖字段名称、金额或期限等具体内容。
+    """
+    footer_count = len(template_footer_trs)
+    if footer_count == 0 or len(matrix) < footer_count:
+        return matrix, []
+
+    template_profiles = []
+    for footer_tr in template_footer_trs:
+        footer_row = next((row for row in table.rows if row._tr is footer_tr), None)
+        if footer_row is None:
+            return matrix, []
+        template_profiles.append(_get_footer_row_profile(footer_row))
+
+    candidate_rows = matrix[-footer_count:]
+    for candidate, (_, expected_non_empty_count) in zip(candidate_rows, template_profiles):
+        _, actual_non_empty_count = _get_matrix_row_profile(candidate)
+        if actual_non_empty_count != expected_non_empty_count:
+            return matrix, []
+
+    return matrix[:-footer_count], candidate_rows
+
+
+def _write_matrix_footer_row(table: Any, target_tr: Any, row_data: Sequence[Any]) -> bool:
+    """
+    将矩阵表尾行写入模板原有的表尾节点，并保留原有合并结构。
+
+    报价表尾通常是“标签单元格 + 内容单元格”或整行合并两种结构，不能按普通
+    明细行逐列写入，否则会把同一个合并单元格重复写成多个标签。
+    """
+    if target_tr is None or not isinstance(row_data, (list, tuple)):
+        return False
+
+    target_row = next((row for row in table.rows if row._tr is target_tr), None)
+    if target_row is None:
+        return False
+
+    values = [str(value or "").strip() for value in row_data]
+    non_empty_values = [value for value in values if value]
+    if not non_empty_values:
+        return False
+
+    unique_cells = []
+    for cell in target_row.cells:
+        if not any(cell._tc is existing._tc for existing in unique_cells):
+            unique_cells.append(cell)
+
+    if len(unique_cells) >= 2:
+        # 第一格保留表尾标签，第二格承接矩阵中标签之后的实际值。
+        unique_cells[0].text = values[0] or non_empty_values[0]
+        footer_value = next((value for value in values[1:] if value), "")
+        if footer_value:
+            unique_cells[1].text = footer_value
+    else:
+        # 交货期限等表尾通常是整行合并，直接写入完整的“标签+值”。
+        target_row.cells[0].text = " ".join(non_empty_values)
+
+    for cell in unique_cells or [target_row.cells[0]]:
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                _apply_run_style_xml(run, enable_underline=False, is_table=True)
+    return True
+
+
+def _is_footer_paragraph_target(doc: Document, paragraph: Any) -> bool:
+    """按表格行结构判断段落是否位于模板表尾，不依赖具体业务字段内容。"""
+    element = getattr(paragraph, "_element", None)
+    parent = element.getparent() if element is not None else None
+    row_element = None
+    while parent is not None:
+        if str(parent.tag).endswith("tr"):
+            row_element = parent
+            break
+        parent = parent.getparent()
+    if row_element is None:
+        return False
+
+    for table in doc.tables:
+        for row in table.rows:
+            if row._tr is row_element:
+                return _is_table_footer_row(row, len(table.columns))
+    return False
+
+
 def _is_full_paragraph_replacement(real_text: str, proposed_val: str, prop_type: str = "") -> bool:
     """
     智能判定提案是否为整段/整句完整覆盖替换（Full Paragraph Replacement），而非单槽位插值填空。
@@ -1703,6 +2129,10 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
         subtitle_removed = 0
         success_count = 0
 
+        # 动态表格写入可能在表尾之前插入多行，先锁定原始单元格节点，
+        # 防止“投标总报价/交货期限”等提案按旧行号落到新增标的物行。
+        table_cell_snapshots = _snapshot_table_cell_targets(doc, proposals)
+
         # 0. 跨章节表格路径冲突检测与智能重定向守卫 (Table Path Collision Guard)
         from app.utils.table_utils import get_doc_chapter_tables_mapping, get_chapter_specific_table_indices, detect_table_header_rows
         
@@ -1903,6 +2333,10 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
 
             if footer_start_idx < len(table.rows):
                 footer_anchor_tr = table.rows[footer_start_idx]._tr
+            template_footer_trs = [
+                table.rows[r_idx]._tr
+                for r_idx in range(footer_start_idx, len(table.rows))
+            ]
 
             # 3. 拆分 matrix: 将最后一行的合计行（如有）与前面的明细行拆分
             detail_matrix = []
@@ -1921,6 +2355,12 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                     summary_row_data = r_data
                 else:
                     detail_matrix.append(r_data)
+
+            detail_matrix, matrix_footer_rows = _split_matrix_footer_rows(
+                detail_matrix,
+                table,
+                template_footer_trs,
+            )
 
             # 商务/技术响应表的无序号 4 列矩阵，或从序号 1 开始的完整矩阵，
             # 表示模型提交的是整张表的最终结果。此时旧文件中可能已经残留
@@ -2043,7 +2483,16 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                                     _apply_run_style_xml(r_in_cell, enable_underline=False, is_table=True)
                 success_count += 1
 
-            # 6. 写入合计总价行 (summary_row_data)
+            # 6. 表尾行必须在全部明细扩行完成后写入原模板表尾节点。
+            # 矩阵提案可能同时携带“投标总报价/交货期限”两行，不能把它们当作普通
+            # 明细行追加到表格中，否则原有表尾会继续留空或出现重复表尾。
+            if matrix_footer_rows:
+                for footer_data, target_footer_tr in zip(matrix_footer_rows, template_footer_trs):
+                    if _write_matrix_footer_row(table, target_footer_tr, footer_data):
+                        success_count += 1
+                        logger.info("   [DOM 表尾后置写盘] 已在全部明细扩行后写入模板表尾节点")
+
+            # 7. 写入合计总价行 (summary_row_data)
             if summary_row_data is not None:
                 sum_vals = align_table_row_cells(summary_row_data, logical_cols_count, len(detail_matrix))
                 sum_label = sum_vals[1] if len(sum_vals) > 1 and sum_vals[1] else (summary_row_data[0] if summary_row_data else "合计总价")
@@ -2120,7 +2569,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                         f"   [响应表整表覆盖] 已清理矩阵之后的 {trim_end_idx - trim_start_idx} 行旧模板/重复数据"
                     )
 
-            # 7. 安全清理未使用的模板空行。
+            # 8. 安全清理未使用的模板空行。
             #
             # 旧逻辑会无条件清空矩阵末尾之后的所有行。对于“局部 table_rows
             # 矩阵 + 其它单元格提案”的合法场景，这会先擦掉后续行，再导致后续
@@ -2164,7 +2613,13 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
 
         for path, group_items in path_groups.items():
             clean_path = _normalize_table_path(path.replace("`", "").strip())
-            p_elem = _find_paragraph_by_path(doc, clean_path)
+            snapshot = table_cell_snapshots.get(clean_path)
+            p_elem = _get_snapshot_paragraph(snapshot) if snapshot else _find_paragraph_by_path(doc, clean_path)
+            if snapshot:
+                logger.info(
+                    f"   [稳定表格节点写入] 路径 {clean_path} 使用扩行前快照节点，"
+                    "避免按变化后的行号错写"
+                )
             if not p_elem:
                 continue
 
@@ -2196,6 +2651,20 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                 orig_ctx = str(p_item.get("original_context", "")).strip().replace("`", "")
                 
                 real_text = p_elem.text or ""
+                p_type = str(p_item.get("type", "")).strip()
+
+                # 投标格式中的固定原文没有可填槽位时，禁止被 Agent 的短值或整句提案覆盖。
+                # 已填写数据的修复必须携带含槽位的 original_context，才能证明它是数据替换而非格式改写。
+                if (
+                    not _is_footer_paragraph_target(doc, p_elem)
+                    and _is_protected_template_overwrite(real_text, orig_ctx, proposed_val, p_type)
+                ):
+                    logger.warning(
+                        f"[投标格式原文保护] 拦截无槽位覆盖提案: 节点={clean_path}, "
+                        f"原文='{real_text[:80]}', 提案='{proposed_val[:80]}'"
+                    )
+                    continue
+
                 use_underline = (not is_in_table)
 
                 if p_item.get("type") == "image":
@@ -2318,8 +2787,6 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
 
                 # 自动清理零改动注释、省略号与截断
                 from app.agents.review_engine import clean_zero_change_annotations, clean_all_ellipsis, is_zero_change_or_no_op_proposal
-                p_type = str(p_item.get("type", "")).strip()
-
                 if p_type != "image":
                     proposed_val = clean_zero_change_annotations(proposed_val)
                     proposed_val = clean_all_ellipsis(proposed_val)
@@ -2557,6 +3024,10 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
             # 每处修改地方均实时执行 R10 模板保留率校验与明细日志输出
             from app.agents.review_engine import check_and_rollback_single_node
             check_and_rollback_single_node(p_elem, real_text, path)
+
+        # 表格扩行后，提案中的物理行号可能已经变化；更新为真实节点当前路径，
+        # 供后续终审回读校验与修复轮继续准确定位。
+        _rebind_table_cell_proposal_paths(proposals, table_cell_snapshots)
 
         # 表格全自动留白自检与 LLM 动态自愈修复引擎（绝不删行，零业务硬编码）
         from app.utils.table_utils import inspect_and_repair_table_blanks
@@ -3206,8 +3677,8 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
             "severity": "error",
             "path": item.get("path", "N/A"),
             "description": item.get("snippet", "产物校验失败"),
-            "current_value": "",
-            "expected_value": "",
+            "current_value": item.get("current_value", ""),
+            "expected_value": item.get("expected_value", ""),
             "auto_fixable": False,
         }
         for item in unfilled_findings
@@ -3268,6 +3739,15 @@ def blocked_docx_node(state: BidFillerState) -> Dict[str, Any]:
         if original_docx:
             filled_docx_bytes = original_docx
             logger.warning("[阻断发布] 工作副本不可读，回退保留原始 Word 字节流")
+
+    # 修复轮无法确认的问题不应导致已有数据消失；保留当前工作副本并用黄色标记问题节点。
+    if docx_temp_path and os.path.exists(docx_temp_path):
+        highlight_unresolved_docx_findings(docx_temp_path, raw_findings)
+        try:
+            with open(docx_temp_path, "rb") as work_file:
+                filled_docx_bytes = work_file.read()
+        except (OSError, IOError) as read_error:
+            logger.exception(f"[阻断发布] 读取黄色标记后的工作副本失败: {read_error}")
 
     report = BidFillAuditReport(
         document_id=doc_id,

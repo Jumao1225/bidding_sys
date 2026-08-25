@@ -54,6 +54,5 @@ class CostEstimate(TenantBase):
     per_set_qty: Mapped[float | None] = mapped_column(Float, nullable=True, comment="单套定额数量")
     per_set_quantity: Mapped[float | None] = mapped_column(Float, nullable=True, comment="单套定额数量兼容字段")
     section_name: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="所属标段/区域/分项工程")
-    remark: Mapped[str | None] = mapped_column(Text, comment="对比分析或预警")
+    remark: Mapped[str | None] = mapped_column(Text, comment="BOM 清单备注，与投标报价表备注列对齐")
     sort_order: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True, comment="前端 BOM 原始顺序")
-

@@ -51,6 +51,7 @@ interface CostItemNode {
   match_quality?: string;
   warning?: string;
   comparison_note?: string;
+  remark?: string;
   parent_item?: string | null;
   root_item?: string | null;
   tree_level?: number;
@@ -109,6 +110,7 @@ export function CostTable({
   const [editModel, setEditModel] = useState('');
   const [editManufacturer, setEditManufacturer] = useState('');
   const [editSpec, setEditSpec] = useState('');
+  const [editRemark, setEditRemark] = useState('');
   const [editQty, setEditQty] = useState<number>(1);
   const [editUnit, setEditUnit] = useState('台');
   const [editPrice, setEditPrice] = useState<number>(0);
@@ -119,6 +121,7 @@ export function CostTable({
   const [newModel, setNewModel] = useState('');
   const [newManufacturer, setNewManufacturer] = useState('');
   const [newSpec, setNewSpec] = useState('');
+  const [newRemark, setNewRemark] = useState('');
   const [newQty, setNewQty] = useState<number>(1);
   const [newUnit, setNewUnit] = useState('项');
   const [newPrice, setNewPrice] = useState<number>(0);
@@ -466,6 +469,7 @@ export function CostTable({
     setEditModel(record.matched_model || record.model || '');
     setEditManufacturer(record.matched_manufacturer || record.manufacturer || '');
     setEditSpec(record.spec_requirement || '');
+    setEditRemark(record.remark || '');
     setEditQty(record.qty !== null && record.qty !== undefined ? Number(record.qty) : 1);
     setEditUnit(record.unit || '');
     setEditPrice(record.ref_price ? Number(record.ref_price) : 0);
@@ -480,6 +484,7 @@ export function CostTable({
     setEditModel('');
     setEditManufacturer('');
     setEditSpec('');
+    setEditRemark('');
   };
 
   // 确认修改单行价格、品牌、型号、厂商与数量并落盘
@@ -501,6 +506,7 @@ export function CostTable({
     targetItem.matched_manufacturer = mfgTrimmed;
     targetItem.manufacturer = mfgTrimmed;
     targetItem.spec_requirement = editSpec.trim() || targetItem.spec_requirement;
+    targetItem.remark = editRemark.trim();
     targetItem.qty = editQty > 0 ? editQty : 1;
     targetItem.unit = editUnit.trim() ? editUnit.trim() : null;
 
@@ -530,6 +536,7 @@ export function CostTable({
     const modelVal = newModel.trim();
     const mfgVal = newManufacturer.trim();
     const specVal = newSpec.trim();
+    const remarkVal = newRemark.trim();
 
     const noteParts: string[] = [];
     if (brandVal) noteParts.push(`品牌: ${brandVal}`);
@@ -553,6 +560,7 @@ export function CostTable({
       manufacturer: mfgVal,
       match_quality: '手动添加',
       comparison_note: comparisonNote,
+      remark: remarkVal,
       key_parameters: [],
       brand_requirements: brandVal,
       section_name: selectedSection !== 'ALL' ? selectedSection : null
@@ -566,6 +574,7 @@ export function CostTable({
     setNewModel('');
     setNewManufacturer('');
     setNewSpec('');
+    setNewRemark('');
     setNewQty(1);
     setNewUnit('项');
     setNewPrice(0);
@@ -619,6 +628,7 @@ export function CostTable({
             match_quality: item.match_quality || '手动添加',
             warning: item.warning || '',
             comparison_note: item.comparison_note || '',
+            remark: item.remark || '',
             parent_item: item.parent_item || null,
             root_item: item.root_item || null,
             tree_level: item.tree_level || 1,
@@ -1247,6 +1257,38 @@ export function CostTable({
       },
     },
     {
+      title: '备注',
+      dataIndex: 'remark',
+      key: 'remark',
+      width: 210,
+      render: (_: any, record: CostItemNode) => {
+        const isEditing = editingKey === record.key;
+
+        if (isEditing) {
+          return (
+            <Input.TextArea
+              value={editRemark}
+              onChange={(e) => setEditRemark(e.target.value)}
+              size="small"
+              rows={3}
+              maxLength={500}
+              showCount
+              placeholder="例如：含套装价、含安装调试"
+              className="text-xs"
+            />
+          );
+        }
+
+        return record.remark ? (
+          <div className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap" title={record.remark}>
+            {record.remark}
+          </div>
+        ) : (
+          <span className="text-slate-300 text-xs">--</span>
+        );
+      },
+    },
+    {
       title: '操作',
       key: 'action',
       width: 90,
@@ -1821,6 +1863,18 @@ export function CostTable({
                     value={newSpec}
                     onChange={(e) => setNewSpec(e.target.value)}
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white font-medium"
+                  />
+                </div>
+
+                <div className="md:col-span-6">
+                  <label className="block text-slate-500 font-bold mb-1">备注</label>
+                  <textarea
+                    rows={2}
+                    maxLength={500}
+                    placeholder="例如：含套装价、含安装调试、暂不计价"
+                    value={newRemark}
+                    onChange={(e) => setNewRemark(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white font-medium resize-y"
                   />
                 </div>
 
