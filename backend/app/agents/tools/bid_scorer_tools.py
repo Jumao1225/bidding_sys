@@ -21,7 +21,7 @@ from app.services.llm_service import llm_service
 # 1. 多级索引 RAG 检索封装 (章节结构索引 + 语义切片索引)
 # ============================================================
 
-def _extract_dynamic_keywords(items: List[Dict[str, Any]]) -> List[str]:
+def _extract_dynamic_keywords(items: List[Dict[str, Any]], tenant_id: Optional[str] = None) -> List[str]:
     """
     使用大模型 (LLM) 智能分析评分维度，预测并重写出在【投标文件】中可能出现的
     核心章节标题、服务专有名词及高精准度检索关键词，彻底替代规则抽取。
@@ -56,7 +56,7 @@ def _extract_dynamic_keywords(items: List[Dict[str, Any]]) -> List[str]:
 
     try:
         from app.services.llm_service import llm_service
-        res_json = llm_service.generate_structured_json(prompt, temperature=0.2)
+        res_json = llm_service.generate_structured_json(prompt, temperature=0.2, tenant_id=tenant_id)
         if isinstance(res_json, dict) and "keywords" in res_json and isinstance(res_json["keywords"], list):
             llm_keywords = [str(k).strip() for k in res_json["keywords"] if str(k).strip() and len(str(k).strip()) >= 2]
             if llm_keywords:
@@ -107,7 +107,8 @@ def subagent_select_target_chapters(
     category: str,
     subagent_type: str,
     items: List[Dict[str, Any]],
-    document_outline: List[str]
+    document_outline: List[str],
+    tenant_id: Optional[str] = None,
 ) -> List[str]:
     """
     专项子 Agent 自主决策：对比自身负责的评分标准与投标文件的实际目录树，
@@ -141,7 +142,7 @@ def subagent_select_target_chapters(
 
     try:
         from app.services.llm_service import llm_service
-        res = llm_service.generate_structured_json(prompt, temperature=0.1)
+        res = llm_service.generate_structured_json(prompt, temperature=0.1, tenant_id=tenant_id)
         if isinstance(res, dict) and "selected_chapters" in res and isinstance(res["selected_chapters"], list):
             selected = []
             for c in res["selected_chapters"]:
@@ -179,6 +180,7 @@ def retrieve_bid_content_for_category(
     top_k: int = 50,
     max_context_chars: int = 500000,
     category: str = "通用分类",
+    tenant_id: Optional[str] = None,
     subagent_type: str = "general_subagent",
 ) -> str:
     """
@@ -195,10 +197,11 @@ def retrieve_bid_content_for_category(
         subagent_type=subagent_type,
         items=items,
         document_outline=doc_outline,
+        tenant_id=tenant_id,
     )
 
     # 2. 动态生成补充关键词与向量查询文本
-    dynamic_keywords = _extract_dynamic_keywords(items)
+    dynamic_keywords = _extract_dynamic_keywords(items, tenant_id=tenant_id)
     search_queries = []
     for item in items:
         title = item.get("title", "")
@@ -441,6 +444,7 @@ def llm_score_batch(
     round_idx: int,
     category: str,
     user_instruction: Optional[str] = None,
+    tenant_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     执行单轮 LLM 结构化打分。
@@ -467,7 +471,7 @@ def llm_score_batch(
 
     try:
         # 调用 LLM 生成文本
-        result_text = llm_service.generate_text(prompt=prompt, temperature=0.1)
+        result_text = llm_service.generate_text(prompt=prompt, temperature=0.1, tenant_id=tenant_id)
 
         # 清理 markdown 代码块标记
         cleaned = result_text.strip()
@@ -748,4 +752,3 @@ def active_refine_context_with_keywords(
         logger.warning(f"⚠️ [Agentic Active RAG] 二次反查出现非致命异常: {e}")
 
     return bid_content
-

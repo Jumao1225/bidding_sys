@@ -72,6 +72,10 @@ class LLMService:
         """按当前请求租户判断 LLM 是否配置完成。"""
         return bool(self._get_runtime_values().get("OPENAI_API_KEY"))
 
+    def is_configured_for_tenant(self, tenant_id: Optional[str]) -> bool:
+        """显式判断指定租户是否配置了 LLM。"""
+        return bool(self._get_runtime_values(tenant_id).get("OPENAI_API_KEY"))
+
     @property
     def raw_llm(self):
         """返回当前请求租户的普通 LLM，兼容已有 Agent 调用方式。"""
@@ -103,31 +107,40 @@ class LLMService:
             key: value for key, value in self._llm_cache.items() if not key.startswith(prefix)
         }
 
-    def _get_runtime_values(self) -> Dict[str, str]:
-        """读取当前请求租户的有效模型配置。"""
+    def _get_runtime_values(self, tenant_id: Optional[str] = None) -> Dict[str, str]:
+        """读取指定租户的有效模型配置；未指定时才使用当前上下文租户。"""
         from app.core.context import current_tenant_id
         from app.services.model_config_service import model_config_service
 
-        return model_config_service.get_values(current_tenant_id.get())
+        effective_tenant_id = tenant_id or current_tenant_id.get()
+        return model_config_service.get_values(effective_tenant_id)
 
-    def get_llm(self, temperature: float = 0.3, json_mode: bool = False):
+    def get_llm(
+        self,
+        temperature: float = 0.3,
+        json_mode: bool = False,
+        tenant_id: Optional[str] = None,
+    ):
         """
-        根据指定的 temperature 和 json_mode 返回缓存的大模型实例。
+        根据指定的租户、temperature 和 json_mode 返回缓存的大模型实例。
         如果不存在，则动态创建一个并缓存。
         """
-        runtime_values = self._get_runtime_values()
+        from app.core.context import current_tenant_id
+
+        effective_tenant_id = tenant_id or current_tenant_id.get()
+        runtime_values = self._get_runtime_values(effective_tenant_id)
         if not runtime_values.get("OPENAI_API_KEY"):
             return None
-            
-        from app.core.context import current_tenant_id
-        tenant_id = current_tenant_id.get() or "global"
+
+        cache_tenant_id = effective_tenant_id or "global"
         config_fingerprint = hashlib.sha256(
             f"{runtime_values['OPENAI_API_KEY']}\0{runtime_values['OPENAI_API_BASE']}\0{runtime_values['LLM_MODEL_NAME']}".encode()
         ).hexdigest()[:16]
-        cache_key = f"{tenant_id}:{config_fingerprint}:{temperature}_{json_mode}"
+        cache_key = f"{cache_tenant_id}:{config_fingerprint}:{temperature}_{json_mode}"
         if cache_key not in self._llm_cache:
             try:
                 from langchain_openai import ChatOpenAI
+                self._log_runtime_config(cache_tenant_id, runtime_values)
                 llm = ChatOpenAI(
                     model_name=runtime_values["LLM_MODEL_NAME"],
                     api_key=runtime_values["OPENAI_API_KEY"],
@@ -147,6 +160,19 @@ class LLMService:
                 return None
                 
         return self._llm_cache[cache_key]
+
+    @staticmethod
+    def _log_runtime_config(tenant_id: str, runtime_values: Dict[str, str]) -> None:
+        """记录脱敏后的运行配置，禁止将完整 API Key 写入日志。"""
+        api_key = runtime_values.get("OPENAI_API_KEY", "")
+        key_suffix = api_key[-4:] if len(api_key) >= 4 else ("已配置" if api_key else "未配置")
+        logger.info(
+            "LLM 客户端配置已加载: tenant_id=%s, model=%s, base_url=%s, api_key_suffix=%s",
+            tenant_id,
+            runtime_values.get("LLM_MODEL_NAME", ""),
+            runtime_values.get("OPENAI_API_BASE", ""),
+            key_suffix,
+        )
 
     def _get_embeddings_model(self):
         """懒加载 Embedding 模型，仅在首次使用时加载以缩短应用启动时间"""
@@ -190,16 +216,21 @@ class LLMService:
         return self.embeddings
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
-    def generate_structured_json(self, prompt: str, temperature: float = 0.3) -> Dict[str, Any]:
+    def generate_structured_json(
+        self,
+        prompt: str,
+        temperature: float = 0.3,
+        tenant_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         发送 Prompt 并期望返回 JSON 格式的结构化数据。
         支持传入自定义温度 (默认 0.3)。
         如果未配置 API Key，直接抛出异常，不再提供 Mock 数据兜底。
         """
-        if not self.is_configured:
+        if not self._get_runtime_values(tenant_id).get("OPENAI_API_KEY"):
             raise ValueError("❌ 无法进行大模型解析：尚未配置有效的 OPENAI_API_KEY")
             
-        llm = self.get_llm(temperature=temperature, json_mode=True)
+        llm = self.get_llm(temperature=temperature, json_mode=True, tenant_id=tenant_id)
         if llm is None:
             raise ValueError("❌ 无法获取 LLM 实例")
             
@@ -221,7 +252,7 @@ class LLMService:
 
             exec_time_ms = int((end_time - start_time) * 1000)
             logger.info(
-                f"🤖 [LLM 调用完成] ({settings.LLM_MODEL_NAME}) | 耗时: {exec_time_ms}ms | "
+                f"🤖 [LLM 调用完成] ({self._get_runtime_values(tenant_id)['LLM_MODEL_NAME']}) | 耗时: {exec_time_ms}ms | "
                 f"Prompt: {prompt_tokens:,} | Completion: {completion_tokens:,} | Total: {prompt_tokens + completion_tokens:,}"
             )
                 
@@ -271,14 +302,19 @@ class LLMService:
     generate_json = generate_structured_json
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
-    def generate_text(self, prompt: str, temperature: float = 0.3) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        temperature: float = 0.3,
+        tenant_id: Optional[str] = None,
+    ) -> str:
         """
         发送 Prompt 并返回纯文本生成结果。
         """
-        if not self.is_configured:
+        if not self._get_runtime_values(tenant_id).get("OPENAI_API_KEY"):
             raise ValueError("❌ 无法进行大模型解析：尚未配置有效的 OPENAI_API_KEY")
 
-        llm = self.get_llm(temperature=temperature, json_mode=False)
+        llm = self.get_llm(temperature=temperature, json_mode=False, tenant_id=tenant_id)
         if llm is None:
             raise ValueError("❌ 无法获取 LLM 实例")
 
@@ -298,7 +334,7 @@ class LLMService:
 
             exec_time_ms = int((end_time - start_time) * 1000)
             logger.info(
-                f"🤖 [LLM 文本生成完成] ({settings.LLM_MODEL_NAME}) | 耗时: {exec_time_ms}ms | "
+                f"🤖 [LLM 文本生成完成] ({self._get_runtime_values(tenant_id)['LLM_MODEL_NAME']}) | 耗时: {exec_time_ms}ms | "
                 f"Prompt: {prompt_tokens:,} | Completion: {completion_tokens:,} | Total: {prompt_tokens + completion_tokens:,}"
             )
 
@@ -319,13 +355,19 @@ class LLMService:
 
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
-    def generate_structured_output(self, prompt: str, schema_cls: Type[BaseModel], temperature: float = 0.1) -> BaseModel:
+    def generate_structured_output(
+        self,
+        prompt: str,
+        schema_cls: Type[BaseModel],
+        temperature: float = 0.1,
+        tenant_id: Optional[str] = None,
+    ) -> BaseModel:
         """
         利用大模型原生的 Structured Outputs 能力直接生成校验过的 Pydantic 对象。
         如果当前模型(如某些兼容 API)不支持，则平滑降级到 json_mode 并手动反序列化，
         并具备智能外层包装节点 (Root Key Unwrap) 解包能力。
         """
-        if not self.is_configured:
+        if not self._get_runtime_values(tenant_id).get("OPENAI_API_KEY"):
             raise ValueError("❌ 无法进行大模型解析：尚未配置有效的 OPENAI_API_KEY")
             
         import time
@@ -333,13 +375,13 @@ class LLMService:
         # 1. 尝试首选策略: Native Structured Outputs
         # 注意: DeepSeek API 目前不支持 response_format="json_schema"，强行调用会报 400 错误。
         # 因此，如果是 DeepSeek 模型，我们直接跳过原生调用，节省一次网络开销。
-        runtime_values = self._get_runtime_values()
+        runtime_values = self._get_runtime_values(tenant_id)
         is_deepseek = "deepseek" in runtime_values["LLM_MODEL_NAME"].lower() or (
             runtime_values["OPENAI_API_BASE"] and "deepseek" in runtime_values["OPENAI_API_BASE"].lower()
         )
         
         if not is_deepseek:
-            llm_raw = self.get_llm(temperature=temperature, json_mode=False)
+            llm_raw = self.get_llm(temperature=temperature, json_mode=False, tenant_id=tenant_id)
             try:
                 structured_llm = llm_raw.with_structured_output(schema_cls)
                 start_time = time.time()
@@ -372,7 +414,11 @@ class LLMService:
             f"3. 确保所有的双引号、括号、逗号等符号完美匹配，数值字段必须为纯数字，不可附带文字单位。"
         )
         
-        extracted_dict = self.generate_structured_json(fallback_prompt, temperature=temperature)
+        extracted_dict = self.generate_structured_json(
+            fallback_prompt,
+            temperature=temperature,
+            tenant_id=tenant_id,
+        )
         
         # 3. 智能根节点解包 (Auto-Unwrap Root Key) 机制
         if isinstance(extracted_dict, dict):
@@ -407,16 +453,22 @@ class LLMService:
             raise ValueError(f"大模型提取格式不匹配 Schema ({schema_cls.__name__}): {val_err}") from val_err
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
-    def expand_query(self, query: str, num_variants: int = 3, temperature: float = 0.7) -> list[str]:
+    def expand_query(
+        self,
+        query: str,
+        num_variants: int = 3,
+        temperature: float = 0.7,
+        tenant_id: Optional[str] = None,
+    ) -> list[str]:
         """
         多路查询重写 (Query Expansion)。
         利用 LLM 将单一关键词扩展为多个相关的语义变体。
         使用较高的 temperature (默认 0.7) 来增加发散性。
         """
-        if not self.is_configured:
+        if not self._get_runtime_values(tenant_id).get("OPENAI_API_KEY"):
             return [query]
             
-        llm = self.get_llm(temperature=temperature, json_mode=True)
+        llm = self.get_llm(temperature=temperature, json_mode=True, tenant_id=tenant_id)
         if llm is None:
             return [query]
             
@@ -473,7 +525,12 @@ class LLMService:
             logger.warning(f"查询扩展失败，回退到原始查询: {str(e)}")
             return [query]
 
-    async def astream_chat(self, messages: list, temperature: float = 0.7):
+    async def astream_chat(
+        self,
+        messages: list,
+        temperature: float = 0.7,
+        tenant_id: Optional[str] = None,
+    ):
         """
         异步流式聊天接口，专为 ChatPanel 打字机效果设计。
         基于 LangChain astream() 逐 token 推送，DeepSeek 模型完全兼容。
@@ -485,11 +542,11 @@ class LLMService:
         Yields:
             str: 每次推送的 token 片段
         """
-        if not self.is_configured:
+        if not self._get_runtime_values(tenant_id).get("OPENAI_API_KEY"):
             raise ValueError("❌ 无法进行大模型调用：尚未配置有效的 OPENAI_API_KEY")
 
         # 聊天场景不需要 json_mode，使用普通 raw LLM 实例
-        llm = self.get_llm(temperature=temperature, json_mode=False)
+        llm = self.get_llm(temperature=temperature, json_mode=False, tenant_id=tenant_id)
         if llm is None:
             raise ValueError("❌ 无法获取 LLM 实例")
 

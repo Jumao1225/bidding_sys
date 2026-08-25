@@ -59,10 +59,12 @@ def master_agent_node(state: BiddingState) -> Dict[str, Any]:
         
         all_tools = METADATA_TOOLS
         
-        if not hasattr(llm_service, 'raw_llm'):
-            raise Exception("llm_service 尚未暴露出支持 Tool Calling 的 raw_llm，请检查初始化。")
-            
-        agent = create_react_agent(llm_service.raw_llm, all_tools)
+        supervisor_llm = llm_service.get_llm(temperature=0.3, json_mode=False, tenant_id=tenant_id)
+        if supervisor_llm is None:
+            raise ValueError("当前租户尚未配置可用的大模型")
+
+        logger.info("Master Agent 使用租户 %s 的模型配置初始化 Tool-Calling Agent", tenant_id)
+        agent = create_react_agent(supervisor_llm, all_tools)
         
         toc_str = ""
         if document.parsed_metadata and "table_of_contents" in document.parsed_metadata:

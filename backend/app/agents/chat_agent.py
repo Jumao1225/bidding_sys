@@ -89,7 +89,11 @@ class ChatAgent:
         all_tools = list(tools_dict.values())
         logger.info(f"ChatAgent 成功装载 {len(all_tools)} 个可用 Skill 与 Tool。")
 
-        agent = create_react_agent(llm_service.raw_llm, all_tools)
+        chat_llm = llm_service.get_llm(temperature=0.3, json_mode=False, tenant_id=tenant_id)
+        if chat_llm is None:
+            raise ValueError("当前租户尚未配置可用的大模型")
+        logger.info("ChatAgent 使用租户 %s 的模型配置初始化聊天 Agent", tenant_id)
+        agent = create_react_agent(chat_llm, all_tools)
 
         system_prompt = self._build_chat_system_prompt(document_id)
         

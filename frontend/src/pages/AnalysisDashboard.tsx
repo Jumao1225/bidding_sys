@@ -164,12 +164,12 @@ export function AnalysisDashboard() {
 
   const activeDocId = result?.document_id || result?.id || (id && id !== 'new' ? id : null) || localStorage.getItem('bidding_document_id') || undefined;
 
-  const handleReextract = async (domain: string) => {
+  const handleReextract = async (domain: string): Promise<boolean> => {
     const targetDocId = activeDocId || (id && id !== 'new' ? id : null) || localStorage.getItem('bidding_document_id');
     if (!targetDocId) {
       setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: '❌ 重新提取失败: 未找到有效文档，请先上传并解析标书文件。' }]);
       alert("未找到有效文档ID，请先上传并解析标书文件。");
-      return;
+      return false;
     }
 
     setRetryingDomain(domain);
@@ -207,20 +207,31 @@ export function AnalysisDashboard() {
           }
           const domainLabel = domain === 'cost_estimation' ? 'BOM 成本测算' : domain === 'writer' ? '标书起草' : domain;
           setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'success', content: `✅ ${domainLabel} 领域重新提取/计算成功！` }]);
+          return true;
         } else {
           const errMsg = json.data?.error || json.message || '系统错误';
           setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: ${errMsg}` }]);
+          return false;
         }
       } else {
         const json = await res.json().catch(() => ({ detail: `网络服务异常 (${res.status})` }));
         const errMsg = json.detail || json.message || `网络服务异常 (${res.status})`;
         setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: ${errMsg}` }]);
+        return false;
       }
     } catch (err: any) {
       setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取网络错误: ${err.message}` }]);
+      return false;
     } finally {
       setRetryingDomain(null);
     }
+  };
+
+  const handleReextractEquipmentAndCost = async () => {
+    // 先重新提取原文中的设备清单，成功后再使用最新清单执行成本核算。
+    const extractionSucceeded = await handleReextract('engineering');
+    if (!extractionSucceeded) return;
+    await handleReextract('cost_estimation');
   };
 
 
@@ -331,6 +342,7 @@ export function AnalysisDashboard() {
           financial={fin}
           costAnalysis={result?.cost_analysis || {}}
           onReextract={() => handleReextract('cost_estimation')}
+          onReextractEquipment={handleReextractEquipmentAndCost}
           onCostUpdated={(updatedCost) => {
             if (result) {
               setResult({
@@ -340,6 +352,7 @@ export function AnalysisDashboard() {
             }
           }}
           isRetrying={retryingDomain === 'cost_estimation'}
+          isExtractingEquipment={retryingDomain === 'engineering'}
         />
       </div>
     </div>

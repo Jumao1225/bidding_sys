@@ -97,7 +97,11 @@ class CompanyQualificationService:
         """
 
         try:
-            extracted_data_result = llm_service.generate_structured_output(prompt, QualificationExtractionResult)
+            extracted_data_result = llm_service.generate_structured_output(
+                prompt,
+                QualificationExtractionResult,
+                tenant_id=tenant_id,
+            )
             extracted_list = extracted_data_result.qualifications
         except Exception as e:
             logger.error(f"LLM extraction failed: {e}")

@@ -115,6 +115,7 @@ def test_cost_node_execution_should_succeed(
     assert len(cost_data["items"]) == 1
     assert cost_data["items"][0]["matched_brand"] == "华为"
     assert cost_data["items"][0]["remark"] == "测试"
+    assert mock_llm.generate_structured_output.call_args.kwargs["tenant_id"] == "tenant-123"
 
 @patch("app.agents.nodes.cost_agent.SessionLocal")
 @patch("app.agents.nodes.cost_agent.document_crud")

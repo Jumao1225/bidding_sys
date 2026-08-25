@@ -799,6 +799,7 @@ def run_chapter_worker(
     extra_instructions: str = "",
     repair_instructions: str = "",
     prefetched_metadata: Optional[Dict[str, Any]] = None,
+    tenant_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     为单个章节创建独立 ReAct Agent 并直接执行读写 Word 盘块操作。
@@ -806,6 +807,7 @@ def run_chapter_worker(
     :param extra_instructions: 用户自定义额外指令
     :param repair_instructions: Supervisor 质量审核反馈的专项修复指令
     :param prefetched_metadata: 预读取的企业档案与项目元数据（定向按需注入）
+    :param tenant_id: 当前任务所属租户 ID，必须显式传入以支持并发线程安全读取模型配置
     :return: {chapter_title, mapping_hint, status, summary, error}
     """
     cat = (category or "needs_fill").lower().strip()
@@ -821,7 +823,8 @@ def run_chapter_worker(
             "proposals": [], "summary": f"跳过 ({cat})",
         }
 
-    if not hasattr(llm_service, 'raw_llm') or llm_service.raw_llm is None:
+    worker_llm = llm_service.get_llm(temperature=0.3, json_mode=False, tenant_id=tenant_id)
+    if worker_llm is None:
         return {"chapter_title": chapter_title, "mapping_hint": mapping_hint,
                 "category": cat, "status": "failed", "proposals": [],
                 "error": "LLM not initialized"}
@@ -849,9 +852,20 @@ def run_chapter_worker(
 
         # [优化点1：零度确定性控制] 常规表单与表格清单填写必须无限强行死扣于 `temperature=0.0`；长文本限制于0.2
         target_temp = 0.0 if cat in ("needs_fill", "needs_data", "skip") else 0.2
-        worker_llm = llm_service.get_llm(temperature=target_temp, json_mode=False)
+        worker_llm = llm_service.get_llm(
+            temperature=target_temp,
+            json_mode=False,
+            tenant_id=tenant_id,
+        )
         if not worker_llm:
-            worker_llm = llm_service.raw_llm
+            return {
+                "chapter_title": chapter_title,
+                "mapping_hint": mapping_hint,
+                "category": cat,
+                "status": "failed",
+                "proposals": [],
+                "error": "当前租户未配置可用的大模型",
+            }
         logger.info(f"Worker [{chapter_title}] ({cat}) → 分配模型温度 (temperature={target_temp})")
 
         # 详细打印大模型初始输入（System Prompt 与 User Prompt 概况）

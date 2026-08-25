@@ -98,7 +98,7 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
       - reason: 评估原因或行动建议（如"我公司资质中心已具备[某证书全称]，满足要求。"）
     """
     
-    res = llm_service.generate_structured_json(prompt, temperature=0.0)
+    res = llm_service.generate_structured_json(prompt, temperature=0.0, tenant_id=tenant_id)
     
     summary = f"完成资质评估，得分 {res.get('match_score', 0)}"
     emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "strategy_qual", "status": "success", "summary": summary, "document_id": document_id})
@@ -121,6 +121,7 @@ def identify_risks_node(state: BiddingState) -> dict:
     from app.worker.tasks import emit_agent_log
     document_id = state.get("document_id")
     task_id = state.get("task_id")
+    tenant_id = state.get("tenant_id") or "default-tenant"
     emit_agent_log("info", "启动法务风控专家...", extra={"type": "worker_start", "worker": "strategy_risk"})
     
     db: Session = SessionLocal()
@@ -180,7 +181,7 @@ def identify_risks_node(state: BiddingState) -> dict:
     【重要提醒】：严禁凭空捏造，所有风险项的 exact_quote 必须来自上述上下文原文。若上下文中确无相关内容，该类风险不输出，不允许虚构原文。
     """
     
-    response = llm_service.generate_structured_json(prompt, temperature=0.0)
+    response = llm_service.generate_structured_json(prompt, temperature=0.0, tenant_id=tenant_id)
     
     if isinstance(response, list):
         risks = response

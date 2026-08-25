@@ -259,6 +259,7 @@ class BidScorerService:
         score_rate: float,
         cat_scores: Dict[str, Any],
         top_improvements: List[Dict[str, Any]],
+        tenant_id: Optional[str] = None,
     ) -> str:
         """使用 LLM 或专业模版合成连贯、流利的专家总体评价报告 (Overall Evaluation Report)"""
         try:
@@ -281,7 +282,7 @@ class BidScorerService:
 4. 末尾统一附带说明："⚠️ 本打分已结合评委微调规则实时刷新，仅供投标决策参考。"
 5. 直接输出自然语言报告正文，不要包含任何 markdown 标题或多余的引导词。
 """
-            response = llm_service.generate_text(prompt=prompt, temperature=0.3)
+            response = llm_service.generate_text(prompt=prompt, temperature=0.3, tenant_id=tenant_id)
             if response and len(response.strip()) > 30:
                 return response.strip()
         except Exception as e:
@@ -486,6 +487,7 @@ class BidScorerService:
             score_rate=score_rate,
             cat_scores=cat_scores,
             top_improvements=top_improvements,
+            tenant_id=tenant_id,
         )
 
         score_result.total_score = new_total_score

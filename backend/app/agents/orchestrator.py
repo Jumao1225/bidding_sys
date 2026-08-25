@@ -50,6 +50,7 @@ def supervisor_node(state: BiddingState) -> dict:
     running = state.get("running_steps", [])
     retry_counts = state.get("retry_counts", {})
     summaries = state.get("worker_summaries", [])
+    tenant_id = state.get("tenant_id")
 
     prompt = build_supervisor_prompt(completed, running, retry_counts, summaries, state)
     
@@ -57,7 +58,8 @@ def supervisor_node(state: BiddingState) -> dict:
     decision_obj = llm_service.generate_structured_output(
         prompt=prompt,
         schema_cls=SupervisorDecision,
-        temperature=0.5
+        temperature=0.5,
+        tenant_id=tenant_id,
     )
 
     next_workers = decision_obj.next

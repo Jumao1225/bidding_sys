@@ -196,6 +196,7 @@ def specialist_score_node(state: BidScorerState) -> dict:
     document_id = state.get("document_id", "")
     score_tree = state.get("score_tree", [])
     scoring_rounds = state.get("scoring_rounds", 3)
+    tenant_id = state.get("tenant_id")
 
     logger.info(
         f"📍 [Specialist Node 2/4] [{subagent_type}] 开始评分 category=[{category}]..."
@@ -216,6 +217,7 @@ def specialist_score_node(state: BidScorerState) -> dict:
         items=items,
         category=category,
         subagent_type=subagent_type,
+        tenant_id=tenant_id,
     )
 
     # 2. Agentic Active RAG 多轮结构化打分与自主反思追问
@@ -227,6 +229,7 @@ def specialist_score_node(state: BidScorerState) -> dict:
         bid_content=bid_content,
         round_idx=0,
         category=category,
+        tenant_id=tenant_id,
     )
     all_rounds.append(r1_result)
 
@@ -247,6 +250,7 @@ def specialist_score_node(state: BidScorerState) -> dict:
             bid_content=bid_content,
             round_idx=round_idx,
             category=category,
+            tenant_id=tenant_id,
         )
         all_rounds.append(round_result)
 
@@ -426,6 +430,7 @@ def supervisor_report_node(state: BidScorerState) -> dict:
         summary = llm_service.generate_text(
             prompt=_build_summary_prompt(state),
             temperature=0.3,
+            tenant_id=state.get("tenant_id"),
         )
         logger.info(f"✅ [supervisor_report_node] 报告生成完成 ({len(summary)} 字)")
     except Exception as e:
@@ -458,11 +463,9 @@ def _save_to_db(
     from app.db.crud.bid_score import bid_score_crud
     from app.services.llm_service import llm_service
 
-    model_name = "unknown"
-    if hasattr(llm_service, 'model_name'):
-        model_name = llm_service.model_name
-    elif hasattr(llm_service, 'raw_llm') and llm_service.raw_llm:
-        model_name = getattr(llm_service.raw_llm, 'model_name', 'unknown')
+    tenant_id = state.get("tenant_id")
+    score_llm = llm_service.get_llm(temperature=0.3, json_mode=False, tenant_id=tenant_id)
+    model_name = getattr(score_llm, "model_name", "unknown") if score_llm else "unknown"
 
     with SessionLocal() as db:
         try:

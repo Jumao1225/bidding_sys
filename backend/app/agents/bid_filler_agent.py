@@ -186,6 +186,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     支持在质量审核不达标时接收专项修复指令。
     """
     doc_id = state.get("document_id", "")
+    tenant_id = state.get("tenant_id") or "default-tenant"
     original_context = state.get("original_context", "")
     docx_temp_path = state.get("docx_temp_path")
     slot_analysis = state.get("slot_analysis")
@@ -220,10 +221,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     if category_hints:
         logger.info(f"   [Supervisor] 收到 {len(category_hints)} 条章节类别指令: {list(category_hints.keys())}")
 
-    if (
-        not hasattr(llm_service, 'raw_llm')
-        or llm_service.raw_llm is None
-    ) and not cached_repair_tasks:
+    if llm_service.get_llm(temperature=0.3, json_mode=False, tenant_id=tenant_id) is None and not cached_repair_tasks:
         logger.error("LLM 服务未初始化")
         return {"audit_items": audit_items}
     if not docx_temp_path or not os.path.exists(docx_temp_path):
@@ -281,7 +279,11 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 
 只输出 JSON 数组。"""
         try:
-            result = llm_service.generate_text(prompt=prompt, temperature=0.0)
+            result = llm_service.generate_text(
+                prompt=prompt,
+                temperature=0.0,
+                tenant_id=tenant_id,
+            )
             cleaned = result.strip()
             if "```" in cleaned:
                 cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
@@ -460,6 +462,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
                     extra_instructions=extra_instructions,
                     repair_instructions=ch_repair_inst,
                     prefetched_metadata=prefetched_metadata,
+                    tenant_id=tenant_id,
                 )
                 future_map[future] = ch_title
 
@@ -594,7 +597,14 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     sandbox = AgentSandbox(allowed_paths=[docx_temp_path] if docx_temp_path else None)
 
     # [优化点1：强制锁死温度零度采样] 保证主调大脑章节判定和工具决计逻辑无随机波动
-    supervisor_llm = llm_service.get_llm(temperature=0.0, json_mode=False) or llm_service.raw_llm
+    supervisor_llm = llm_service.get_llm(
+        temperature=0.0,
+        json_mode=False,
+        tenant_id=tenant_id,
+    )
+    if supervisor_llm is None:
+        logger.error("当前租户未配置可用的大模型，无法启动标书撰写 Supervisor")
+        return {"audit_items": audit_items}
     supervisor_agent = create_react_agent(supervisor_llm, supervisor_tools)
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -3601,8 +3611,13 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
 若发现任何未能对应需求或数据不匹配项，请列出具体的章节与错项；若全篇内容完美对应响应，请直接回复"REQUIREMENT_MATCHED"。"""
 
                 from app.services.llm_service import llm_service
-                if hasattr(llm_service, 'raw_llm') and llm_service.raw_llm is not None:
-                    audit_res = _sync(llm_service.raw_llm.ainvoke(audit_prompt))
+                audit_llm = llm_service.get_llm(
+                    temperature=0.3,
+                    json_mode=False,
+                    tenant_id=state.get("tenant_id") or "default-tenant",
+                )
+                if audit_llm is not None:
+                    audit_res = _sync(audit_llm.ainvoke(audit_prompt))
                     audit_content = getattr(audit_res, 'content', str(audit_res)).strip()
                     if "REQUIREMENT_MATCHED" not in audit_content and len(audit_content) > 10:
                         chapter_unfilled_count["全图需求响应对查"] += 1

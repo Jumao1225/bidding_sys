@@ -357,7 +357,8 @@ def cost_node(state: BiddingState) -> dict:
             batch_resp = llm_service.generate_structured_output(
                 prompt=batch_prompt,
                 schema_cls=BatchMatchResult,
-                temperature=0.0
+                temperature=0.0,
+                tenant_id=tenant_id,
             )
             matches = []
             summary = ""

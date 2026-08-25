@@ -77,6 +77,7 @@ class BidFormatExtractorService:
             raise FileNotFoundError("找不到原始招标文件记录或存储路径")
 
         file_path = doc_obj.file_path
+        effective_tenant_id = tenant_id or getattr(doc_obj, "tenant_id", None)
         file_ext = os.path.splitext(file_path)[1].lower()
         base_name = os.path.splitext(os.path.basename(doc_obj.filename))[0]
         export_filename = f"{base_name}_投标文件格式模板.docx"
@@ -330,9 +331,13 @@ class BidFormatExtractorService:
 }}
 """
         try:
-            if self.llm_service.is_configured:
+            if self.llm_service.is_configured_for_tenant(effective_tenant_id):
                 logger.info(f"🚀 [投标文件格式提取] 正在调用 LLM 结构化提取招标文件格式 (待分析切片长度: {len(target_text[:40000])} 字符)...")
-                parsed_json = self.llm_service.generate_structured_json(prompt, temperature=0.1)
+                parsed_json = self.llm_service.generate_structured_json(
+                    prompt,
+                    temperature=0.1,
+                    tenant_id=effective_tenant_id,
+                )
                 # 若大模型直接返回了 sections 数组，自动包装为字典对象
                 if isinstance(parsed_json, list):
                     parsed_json = {

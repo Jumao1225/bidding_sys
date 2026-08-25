@@ -19,6 +19,7 @@ import {
   EditOutlined, 
   DeleteOutlined, 
   PlusOutlined,
+  FileSearchOutlined,
   ReloadOutlined,
   DownOutlined,
   UpOutlined
@@ -73,8 +74,10 @@ interface CostTableProps {
   financial?: any;
   costAnalysis?: any;
   onReextract?: () => void;
+  onReextractEquipment?: () => void;
   onCostUpdated?: (updatedData: any) => void;
   isRetrying?: boolean;
+  isExtractingEquipment?: boolean;
 }
 
 /**
@@ -93,8 +96,10 @@ export function CostTable({
   financial = {},
   costAnalysis = {},
   onReextract,
+  onReextractEquipment,
   onCostUpdated,
-  isRetrying = false
+  isRetrying = false,
+  isExtractingEquipment = false
 }: CostTableProps) {
   const [items, setItems] = useState<any[]>(costAnalysis?.items || []);
   const [isAdding, setIsAdding] = useState(false);
@@ -125,6 +130,7 @@ export function CostTable({
   const [newQty, setNewQty] = useState<number>(1);
   const [newUnit, setNewUnit] = useState('项');
   const [newPrice, setNewPrice] = useState<number>(0);
+  const isBusy = isRetrying || isExtractingEquipment;
 
   // 当外部传入的 costAnalysis 发生重测算变化时更新本地 items
   useEffect(() => {
@@ -1368,11 +1374,13 @@ export function CostTable({
         },
       }}
     >
-      <div className={`bg-white/80 backdrop-blur-xl p-8 rounded-3xl shadow-sm border border-slate-200/60 transition-all hover:shadow-md col-span-2 relative ${isRetrying ? 'opacity-70 pointer-events-none' : ''}`}>
-        {isRetrying && (
+      <div className={`bg-white/80 backdrop-blur-xl p-8 rounded-3xl shadow-sm border border-slate-200/60 transition-all hover:shadow-md col-span-2 relative ${isBusy ? 'opacity-70 pointer-events-none' : ''}`}>
+        {isBusy && (
           <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-white/50 backdrop-blur-[2px] rounded-3xl gap-2">
             <svg className="animate-spin h-8 w-8 text-blue-600" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-            <span className="text-xs font-bold text-blue-600">正在重新对接价格库并计算成本...</span>
+            <span className="text-xs font-bold text-blue-600">
+              {isExtractingEquipment ? '正在重新提取设备清单并计算成本...' : '正在重新对接价格库并计算成本...'}
+            </span>
           </div>
         )}
 
@@ -1382,9 +1390,22 @@ export function CostTable({
             <h3 className="text-xl font-extrabold text-slate-800 flex items-center gap-2 mb-1">
               <span className="p-1.5 bg-blue-100 text-blue-600 rounded-lg text-sm">💰</span>
               智能 BOM 成本测算与对标匹配
+              {onReextractEquipment && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onReextractEquipment(); }}
+                  disabled={isBusy}
+                  className="inline-flex items-center gap-1.5 px-2 py-1 ml-1 text-xs font-semibold text-blue-600 hover:text-blue-700 hover:bg-blue-50 rounded-md transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+                  aria-label="重新提取设备清单"
+                  title="重新读取原文并提取设备清单，完成后自动重新核算成本"
+                >
+                  <FileSearchOutlined />
+                  <span>重新提取设备清单</span>
+                </button>
+              )}
               {onReextract && (
                 <button 
                   onClick={(e) => { e.stopPropagation(); onReextract(); }}
+                  disabled={isBusy}
                   className="p-1.5 ml-1 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors cursor-pointer"
                   title="重新对接价格库并测算成本"
                 >
