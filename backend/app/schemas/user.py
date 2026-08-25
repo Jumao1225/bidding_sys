@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 
 # Tenant Schemas
@@ -26,7 +26,8 @@ class Tenant(TenantBase):
 class UserBase(BaseModel):
     email: str
     full_name: Optional[str] = None
-    role: str = "user"
+    # 角色只允许使用系统定义的权限级别，避免通过接口写入未知角色。
+    role: Literal["user", "tenant_admin", "admin", "platform_admin"] = "user"
     is_active: bool = True
     tenant_id: str
 
@@ -43,6 +44,8 @@ class UserUpdatePassword(BaseModel):
 
 class UserUpdateTenant(BaseModel):
     tenant_id: str
+    # 该接口只允许平台管理员调整普通用户与租户管理员权限。
+    role: Optional[Literal["user", "tenant_admin"]] = None
 
 class User(UserBase):
     id: str

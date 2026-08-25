@@ -1,6 +1,6 @@
 from .base import Base, TenantBase
 from .user import Tenant, User
-from .business import CompanyQualification, MarketPriceReference
+from .business import CompanyQualification, CompanyProfileModel, MarketPriceReference
 from .project import Project, Document, DocChunk
 from .ai_analysis import QualificationMatch, RiskItem, CostEstimate
 from .audit import AgentAuditLog
@@ -19,6 +19,7 @@ __all__ = [
     "Tenant",
     "User",
     "CompanyQualification",
+    "CompanyProfileModel",
     "MarketPriceReference",
     "Project",
     "Document",
@@ -35,4 +36,3 @@ __all__ = [
     "BidScoreResult",
     "BidScoreItem",
 ]
-

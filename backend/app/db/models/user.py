@@ -26,7 +26,11 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[Optional[str]] = mapped_column(String(255))
-    role: Mapped[str] = mapped_column(String(50), default="user", comment="角色: admin, user等")
+    role: Mapped[str] = mapped_column(
+        String(50),
+        default="user",
+        comment="角色: user普通用户, tenant_admin租户管理员, admin/platform_admin平台管理员",
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

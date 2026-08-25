@@ -8,6 +8,7 @@ import { QualificationCenter } from './pages/QualificationCenter';
 import { PriceBookCenter } from './pages/PriceBookCenter';
 import { Login } from './pages/Login';
 import { SystemAdmin } from './pages/admin/SystemAdmin';
+import { EnvConfigPage } from './pages/admin/EnvConfigPage';
 
 import { CompanyProfilePage } from './pages/CompanyProfilePage';
 import { DocxDebuggerPage } from './pages/DocxDebuggerPage';
@@ -235,6 +236,8 @@ function App() {
                 <Route path="/price-book" element={<PriceBookCenter />} />
                 <Route path="/bid-scorer" element={<BidScorerLab />} />
                 <Route path="/agent-audit/:documentId?" element={<AgentAuditPage />} />
+                <Route path="/model-config" element={<EnvConfigPage />} />
+                <Route path="/admin/env" element={<EnvConfigPage />} />
                 <Route path="/admin/*" element={
                   <AdminRoute>
                     <SystemAdmin />

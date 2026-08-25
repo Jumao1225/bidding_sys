@@ -18,7 +18,8 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (path === '/qualifications') return location.pathname.startsWith('/qualifications');
     if (path === '/company-profile') return location.pathname.startsWith('/company-profile');
     if (path === '/price-book') return location.pathname.startsWith('/price-book');
-    if (path === '/admin') return location.pathname.startsWith('/admin');
+    if (path === '/admin') return location.pathname === '/admin';
+    if (path === '/model-config') return location.pathname.startsWith('/model-config') || location.pathname.startsWith('/admin/env');
     return false;
   };
 
@@ -28,6 +29,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (location.pathname.startsWith('/price-book')) return '成本报价知识库';
     if (location.pathname.startsWith('/bid-scorer')) return '智能标书评估与打分';
     if (location.pathname.startsWith('/agent-audit')) return 'Agent 运行履历与思维链控制台';
+    if (location.pathname.startsWith('/model-config') || location.pathname.startsWith('/admin/env')) return '模型配置中心';
     if (location.pathname.startsWith('/admin')) return '系统运维管理';
     if (location.pathname.startsWith('/analysis')) return '智能文档解析';
     return '系统总览';
@@ -121,7 +123,16 @@ export default function MainLayout({ children }: MainLayoutProps) {
             <span className={isActive('/qualifications') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>资质中心</span>
           </Link>
 
-          {user?.role === 'admin' && (
+          <Link to="/model-config" className={getLinkClass('/model-config')}>
+            {isActive('/model-config') && <div className="absolute inset-0 bg-indigo-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
+            <svg className={`w-5 h-5 mr-3 ${isActive('/model-config') ? 'text-indigo-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.75 3.75h4.5m-7.5 3h10.5m-12 3h13.5m-11.25 3h9m-6.75 3h4.5m-8.25 3h12.75" />
+            </svg>
+            <span className={isActive('/model-config') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>模型配置</span>
+          </Link>
+
+          {['admin', 'platform_admin', 'tenant_admin'].includes(user?.role || '') && (
+            <>
             <Link to="/admin" className={getLinkClass('/admin')}>
               {isActive('/admin') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
               <svg className={`w-5 h-5 mr-3 ${isActive('/admin') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -129,6 +140,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
               </svg>
               <span className={isActive('/admin') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>系统管理</span>
             </Link>
+            </>
           )}
         </nav>
 

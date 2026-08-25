@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Shield, Building2, Users, Plus, CheckCircle2, X } from 'lucide-react';
+import { Shield, Building2, Users, Plus, X } from 'lucide-react';
 import { apiFetch } from '../../utils/api';
+import { useAuth } from '../../contexts/AuthContext';
 
 interface Tenant {
   id: string;
@@ -24,7 +25,10 @@ interface User {
 }
 
 export function SystemAdmin() {
-  const [activeTab, setActiveTab] = useState<'tenants' | 'users'>('tenants');
+  const { user } = useAuth();
+  const isPlatformAdmin = user?.role === 'admin' || user?.role === 'platform_admin';
+  const isTenantAdmin = user?.role === 'tenant_admin';
+  const [activeTab, setActiveTab] = useState<'tenants' | 'users'>(isPlatformAdmin ? 'tenants' : 'users');
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -37,6 +41,7 @@ export function SystemAdmin() {
   const [newUserEmail, setNewUserEmail] = useState('');
   const [newUserPassword, setNewUserPassword] = useState('');
   const [newUserTenantId, setNewUserTenantId] = useState('');
+  const [newUserRole, setNewUserRole] = useState<'user' | 'tenant_admin'>('user');
 
   // Password reset modal
   const [showPasswordModal, setShowPasswordModal] = useState(false);
@@ -46,6 +51,7 @@ export function SystemAdmin() {
   // Tenant change modal
   const [showTenantChangeModal, setShowTenantChangeModal] = useState(false);
   const [resetTenantIdValue, setResetTenantIdValue] = useState('');
+  const [resetUserRole, setResetUserRole] = useState<'user' | 'tenant_admin' | null>(null);
 
   const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
 
@@ -57,7 +63,7 @@ export function SystemAdmin() {
     setIsLoading(true);
     setError('');
     try {
-      if (activeTab === 'tenants') {
+      if (activeTab === 'tenants' && isPlatformAdmin) {
         const res = await apiFetch(`${baseUrl}/api/v1/admin/tenants`);
         if (res.ok) {
           const data = await res.json();
@@ -95,7 +101,7 @@ export function SystemAdmin() {
         }
         
         // Also fetch tenants for user creation dropdown if not already fetched
-        if (tenants.length === 0) {
+        if (tenants.length === 0 && isPlatformAdmin) {
           const tRes = await apiFetch(`${baseUrl}/api/v1/admin/tenants`);
           if (tRes.ok) setTenants(await tRes.json());
         }
@@ -138,7 +144,7 @@ export function SystemAdmin() {
           email: newUserEmail, 
           password: newUserPassword, 
           tenant_id: newUserTenantId,
-          role: 'user',
+          role: newUserRole,
           is_active: true
         })
       });
@@ -147,6 +153,7 @@ export function SystemAdmin() {
         setNewUserEmail('');
         setNewUserPassword('');
         setNewUserTenantId('');
+        setNewUserRole('user');
         fetchData();
       } else {
         const data = await res.json().catch(() => ({}));
@@ -182,14 +189,19 @@ export function SystemAdmin() {
   const handleChangeTenant = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
+      const updatePayload = {
+        tenant_id: resetTenantIdValue,
+        ...(resetUserRole ? { role: resetUserRole } : {}),
+      };
       const res = await apiFetch(`${baseUrl}/api/v1/admin/users/${selectedUserId}/tenant`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenant_id: resetTenantIdValue })
+        body: JSON.stringify(updatePayload)
       });
       if (res.ok) {
         setShowTenantChangeModal(false);
         setResetTenantIdValue('');
+        setResetUserRole(null);
         setSelectedUserId('');
         fetchData();
         alert('租户变更成功');
@@ -212,10 +224,12 @@ export function SystemAdmin() {
             <Shield className="w-8 h-8 mr-3 text-indigo-600" />
             系统管理中心
           </h1>
-          <p className="text-slate-500 mt-2">管理全局租户、用户分配与系统级配置</p>
+            <p className="text-slate-500 mt-2">
+              {isPlatformAdmin ? '管理全局租户、用户分配与系统级配置' : '管理本租户的用户账号'}
+            </p>
         </div>
         <div className="flex bg-white/60 p-1.5 rounded-2xl border border-slate-200/60 shadow-sm backdrop-blur-sm">
-          <button
+          {isPlatformAdmin && <button
             onClick={() => setActiveTab('tenants')}
             className={`flex items-center px-6 py-2.5 rounded-xl font-medium transition-all ${
               activeTab === 'tenants' 
@@ -225,7 +239,7 @@ export function SystemAdmin() {
           >
             <Building2 className="w-4 h-4 mr-2" />
             租户管理
-          </button>
+          </button>}
           <button
             onClick={() => setActiveTab('users')}
             className={`flex items-center px-6 py-2.5 rounded-xl font-medium transition-all ${
@@ -321,9 +335,15 @@ export function SystemAdmin() {
               className="space-y-6"
             >
               <div className="flex justify-between items-center mb-4">
-                <h2 className="text-xl font-bold text-slate-800">全部账号</h2>
+                <h2 className="text-xl font-bold text-slate-800">{isTenantAdmin ? '本租户账号' : '全部账号'}</h2>
                 <button 
-                  onClick={() => setShowUserModal(true)}
+                  onClick={() => {
+                    if (isTenantAdmin) {
+                      setNewUserTenantId(user?.tenant_id || '');
+                    }
+                    setNewUserRole('user');
+                    setShowUserModal(true);
+                  }}
                   className="flex items-center px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl shadow-lg shadow-indigo-500/30 transition-all active:scale-95"
                 >
                   <Plus className="w-4 h-4 mr-2" />
@@ -352,8 +372,8 @@ export function SystemAdmin() {
                           {tenants.find(t => t.id === user.tenant_id)?.name || <span className="text-slate-400 font-mono text-xs">{user.tenant_id}</span>}
                         </td>
                         <td className="px-6 py-4">
-                          <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium ${user.role === 'admin' ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'}`}>
-                            {user.role}
+                          <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium ${user.role === 'admin' || user.role === 'platform_admin' ? 'bg-amber-100 text-amber-700' : user.role === 'tenant_admin' ? 'bg-violet-100 text-violet-700' : 'bg-blue-100 text-blue-700'}`}>
+                            {user.role === 'admin' || user.role === 'platform_admin' ? '平台管理员' : user.role === 'tenant_admin' ? '租户管理员' : '普通用户'}
                           </span>
                         </td>
                         <td className="px-6 py-4">
@@ -366,9 +386,10 @@ export function SystemAdmin() {
                             onClick={() => {
                               setSelectedUserId(user.id);
                               setResetTenantIdValue(user.tenant_id);
+                              setResetUserRole(user.role === 'user' || user.role === 'tenant_admin' ? user.role : null);
                               setShowTenantChangeModal(true);
                             }}
-                            className="text-emerald-600 hover:text-emerald-800 text-sm font-medium transition-colors"
+                            className={`${isPlatformAdmin ? 'text-emerald-600 hover:text-emerald-800' : 'hidden'} text-sm font-medium transition-colors`}
                           >
                             变更租户
                           </button>
@@ -475,13 +496,29 @@ export function SystemAdmin() {
                   <select 
                     value={newUserTenantId}
                     onChange={e => setNewUserTenantId(e.target.value)}
+                    disabled={isTenantAdmin}
                     className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 rounded-xl outline-none"
                     required
                   >
                     <option value="" disabled>-- 请选择 --</option>
-                    {tenants.map(t => (
+                    {isTenantAdmin && user?.tenant_id && (
+                      <option value={user.tenant_id}>当前租户</option>
+                    )}
+                    {isPlatformAdmin && tenants.map(t => (
                       <option key={t.id} value={t.id}>{t.name}</option>
                     ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-1">账号角色</label>
+                  <select
+                    value={newUserRole}
+                    onChange={e => setNewUserRole(e.target.value as 'user' | 'tenant_admin')}
+                    disabled={isTenantAdmin}
+                    className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 rounded-xl outline-none"
+                  >
+                    <option value="user">普通用户</option>
+                    {isPlatformAdmin && <option value="tenant_admin">租户管理员</option>}
                   </select>
                 </div>
                 <button type="submit" className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold mt-6">
@@ -557,8 +594,25 @@ export function SystemAdmin() {
                     ))}
                   </select>
                 </div>
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-1">权限角色</label>
+                  {resetUserRole ? (
+                    <select
+                      value={resetUserRole}
+                      onChange={e => setResetUserRole(e.target.value as 'user' | 'tenant_admin')}
+                      className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 rounded-xl outline-none"
+                    >
+                      <option value="user">普通用户</option>
+                      <option value="tenant_admin">租户管理员</option>
+                    </select>
+                  ) : (
+                    <p className="w-full px-4 py-2.5 bg-slate-100 border border-slate-200 text-slate-500 rounded-xl">
+                      平台管理员权限不可在此调整
+                    </p>
+                  )}
+                </div>
                 <button type="submit" className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold mt-6">
-                  确认变更
+                  确认变更租户与权限
                 </button>
               </form>
             </motion.div>

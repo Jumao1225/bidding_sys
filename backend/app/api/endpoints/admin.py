@@ -6,6 +6,7 @@ from app.api import deps
 from app.db.crud import user as crud_user
 from app.schemas.user import Tenant, TenantCreate, User, UserCreate, UserUpdatePassword, UserUpdateTenant
 from app.db.models.user import User as UserModel
+from loguru import logger
 
 router = APIRouter()
 
@@ -55,12 +56,18 @@ def read_users(
     skip: int = 0,
     limit: int = 100,
     tenant_id: str = Query(None, description="Filter by tenant ID"),
-    current_admin: UserModel = Depends(deps.get_current_admin_user),
+    current_manager: UserModel = Depends(deps.get_current_user_manager),
 ) -> Any:
     """
     Retrieve all users. Can be filtered by tenant_id. Requires admin privileges.
     """
-    users = crud_user.user.get_multi(db, skip=skip, limit=limit, tenant_id=tenant_id)
+    # 租户管理员只能看到自己租户的用户，忽略客户端传入的跨租户筛选条件。
+    effective_tenant_id = tenant_id
+    if current_manager.role == "tenant_admin":
+        effective_tenant_id = current_manager.tenant_id
+        if tenant_id and tenant_id != current_manager.tenant_id:
+            logger.warning("租户管理员 {} 尝试查询其他租户用户", current_manager.id)
+    users = crud_user.user.get_multi(db, skip=skip, limit=limit, tenant_id=effective_tenant_id)
     return users
 
 @router.post("/users", response_model=User)
@@ -68,7 +75,7 @@ def create_user(
     *,
     db: Session = Depends(deps.get_db),
     user_in: UserCreate,
-    current_admin: UserModel = Depends(deps.get_current_admin_user),
+    current_manager: UserModel = Depends(deps.get_current_user_manager),
 ) -> Any:
     """
     Create new user. Requires admin privileges.
@@ -85,7 +92,15 @@ def create_user(
             status_code=404,
             detail="The specified tenant does not exist.",
         )
+    if current_manager.role == "tenant_admin":
+        if user_in.tenant_id != current_manager.tenant_id:
+            logger.warning("租户管理员 {} 尝试向其他租户创建用户", current_manager.id)
+            raise HTTPException(status_code=403, detail="Tenant administrators can only manage their own tenant")
+        if user_in.role != "user":
+            logger.warning("租户管理员 {} 尝试创建角色 {}", current_manager.id, user_in.role)
+            raise HTTPException(status_code=403, detail="Tenant administrators can only create regular users")
     user = crud_user.user.create(db, obj_in=user_in)
+    logger.info("管理员 {} 在租户 {} 创建用户 {}，角色为 {}", current_manager.id, user.tenant_id, user.id, user.role)
     return user
 
 @router.put("/users/{user_id}/password", response_model=User)
@@ -94,7 +109,7 @@ def update_user_password(
     db: Session = Depends(deps.get_db),
     user_id: str,
     password_in: UserUpdatePassword,
-    current_admin: UserModel = Depends(deps.get_current_admin_user),
+    current_manager: UserModel = Depends(deps.get_current_user_manager),
 ) -> Any:
     """
     Update a user's password. Requires admin privileges.
@@ -105,6 +120,9 @@ def update_user_password(
             status_code=404,
             detail="The user with this ID does not exist in the system.",
         )
+    if current_manager.role == "tenant_admin" and user.tenant_id != current_manager.tenant_id:
+        logger.warning("租户管理员 {} 尝试修改其他租户用户密码", current_manager.id)
+        raise HTTPException(status_code=403, detail="Tenant administrators can only manage their own tenant")
     
     # Update password
     from app.core.security import get_password_hash
@@ -112,6 +130,7 @@ def update_user_password(
     db.add(user)
     db.commit()
     db.refresh(user)
+    logger.info("管理员 {} 修改了用户 {} 的密码", current_manager.id, user.id)
     return user
 
 @router.put("/users/{user_id}/tenant", response_model=User)
@@ -131,6 +150,11 @@ def update_user_tenant(
             status_code=404,
             detail="The user with this ID does not exist in the system.",
         )
+
+    # 平台管理员账号不能通过租户变更入口被降权，避免误操作导致平台失管。
+    if user.role in deps.PLATFORM_ADMIN_ROLES and tenant_in.role is not None:
+        logger.warning("平台管理员 {} 尝试通过租户变更入口修改平台账号 {} 的权限", current_admin.id, user.id)
+        raise HTTPException(status_code=400, detail="Platform administrator role cannot be changed here")
         
     tenant = crud_user.tenant.get(db, id=tenant_in.tenant_id)
     if not tenant:
@@ -139,11 +163,14 @@ def update_user_tenant(
             detail="The specified tenant does not exist.",
         )
     
-    # Update tenant
+    # 租户与业务角色在同一个事务中更新，确保界面上的“变更租户+权限”不会出现半成功状态。
     user.tenant_id = tenant_in.tenant_id
+    if tenant_in.role is not None:
+        user.role = tenant_in.role
     db.add(user)
     db.commit()
     db.refresh(user)
+    logger.info("平台管理员 {} 将用户 {} 调整到租户 {}，角色为 {}", current_admin.id, user.id, user.tenant_id, user.role)
     return user
 
 
@@ -265,4 +292,3 @@ def clean_office_processes(
         "message": f"成功解封句柄锁并强杀 {killed_count} 个悬挂的 Office 孤儿进程",
         "data": {"killed_count": killed_count}
     }
-

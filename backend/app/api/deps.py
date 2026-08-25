@@ -10,6 +10,12 @@ from app.db.session import SessionLocal
 from app.db.models.user import User
 from app.schemas.token import TokenPayload
 from app.db.crud import user as crud_user
+from loguru import logger
+
+
+# 保留 admin 作为历史平台管理员角色，新增 platform_admin 作为明确的语义角色。
+PLATFORM_ADMIN_ROLES = {"admin", "platform_admin"}
+TENANT_MANAGER_ROLES = PLATFORM_ADMIN_ROLES | {"tenant_admin"}
 
 reusable_oauth2 = OAuth2PasswordBearer(
     tokenUrl=f"{settings.API_V1_STR}/auth/login" if hasattr(settings, "API_V1_STR") else "/auth/login"
@@ -83,10 +89,23 @@ def get_current_admin_user(
     """
     Checks if the currently authenticated user has admin privileges.
     """
-    if current_user.role != "admin":
+    if current_user.role not in PLATFORM_ADMIN_ROLES:
+        logger.warning("用户 {} 尝试访问平台管理接口，角色为 {}", current_user.id, current_user.role)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="The user doesn't have enough privileges"
         )
     return current_user
 
+
+def get_current_user_manager(
+    current_user: User = Depends(get_current_active_user),
+) -> User:
+    """校验当前用户是否具备用户管理权限。"""
+    if current_user.role not in TENANT_MANAGER_ROLES:
+        logger.warning("用户 {} 尝试访问用户管理接口，角色为 {}", current_user.id, current_user.role)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The user doesn't have enough privileges",
+        )
+    return current_user

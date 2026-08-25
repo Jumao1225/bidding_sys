@@ -2,8 +2,7 @@ import uuid
 from sqlalchemy import String, Date, Float
 from sqlalchemy.orm import Mapped, mapped_column
 from datetime import date
-from .base import TenantBase
-from app.db.session import Base
+from .base import Base, TenantBase
 
 class CompanyQualification(TenantBase):
     __tablename__ = "company_qualifications"
@@ -37,7 +36,8 @@ class CompanyProfileModel(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    company_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 企业档案允许先创建空记录，待管理员在企业档案页面补充完整信息。
+    company_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     legal_representative: Mapped[str | None] = mapped_column(String(100))
     authorized_delegate: Mapped[str | None] = mapped_column(String(100))
     credit_code: Mapped[str | None] = mapped_column(String(100))
@@ -48,7 +48,6 @@ class CompanyProfileModel(Base):
     bank_account: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
-
 
 
 
