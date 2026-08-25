@@ -10,6 +10,11 @@ describe('EnvConfigPage', () => {
   it('应该展示配置分组并允许编辑后保存草稿', () => {
     render(<EnvConfigPage />);
 
+    expect(screen.getAllByRole('heading', { level: 2 })).toHaveLength(3);
+    expect(screen.getByText('文档 OCR 模型（MinerU）')).toBeInTheDocument();
+    expect(screen.getByText('视觉模型')).toBeInTheDocument();
+    expect(screen.queryByText('本地视觉模型')).not.toBeInTheDocument();
+
     const modelNameInput = screen.getByLabelText('模型名称', { selector: '#env-LLM_MODEL_NAME' });
     fireEvent.change(modelNameInput, { target: { value: 'gpt-4.1' } });
     fireEvent.click(screen.getByRole('button', { name: '保存草稿' }));
@@ -20,13 +25,14 @@ describe('EnvConfigPage', () => {
 
   it('应该导入合法变量并忽略注释、空行和非法行', async () => {
     render(<EnvConfigPage />);
-    const file = new File(['# comment\nLLM_MODEL_NAME=gpt-4.1\nINVALID LINE\nOPENAI_API_BASE="https://example.com/v1"\n'], '.env', { type: 'text/plain' });
+    const file = new File(['# comment\nLLM_MODEL_NAME=gpt-4.1\nMINERU_API_TOKEN=mineru-token\nINVALID LINE\nOPENAI_API_BASE="https://example.com/v1"\n'], '.env', { type: 'text/plain' });
 
     fireEvent.change(screen.getByLabelText('导入 .env 文件'), { target: { files: [file] } });
 
-    await waitFor(() => expect(screen.getByText('已导入 2 项模型配置，请检查后保存或导出')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('已导入 3 项模型配置，请检查后保存或导出')).toBeInTheDocument());
     expect(screen.getByLabelText('模型名称', { selector: '#env-LLM_MODEL_NAME' })).toHaveValue('gpt-4.1');
     expect(screen.getByLabelText('API 地址', { selector: '#env-OPENAI_API_BASE' })).toHaveValue('https://example.com/v1');
+    expect(screen.getByLabelText('API Token', { selector: '#env-MINERU_API_TOKEN' })).toHaveValue('mineru-token');
   });
 
   it('应该稳定序列化带空格和引号的变量值', () => {

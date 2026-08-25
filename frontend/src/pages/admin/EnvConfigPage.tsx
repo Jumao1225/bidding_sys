@@ -9,6 +9,7 @@ import {
   FileCog,
   Info,
   KeyRound,
+  ScanText,
   Save,
   Server,
   Upload,
@@ -21,45 +22,56 @@ interface ModelConfig {
   description: string;
   accent: string;
   icon: typeof Server;
-  keyName: string;
-  baseName: string;
-  modelName: string;
+  fields: ModelFieldConfig[];
+}
+
+interface ModelFieldConfig {
+  label: string;
+  envKey: string;
+  placeholder: string;
+  secret?: boolean;
 }
 
 const MODEL_CONFIGS: ModelConfig[] = [
   {
-    provider: 'OpenAI / 兼容服务',
-    description: '负责通用文本模型与 Agent 推理。',
+    provider: '招投标文件处理语言模型',
+    description: '负责招投标文件的结构化提取、评标分析与标书生成。',
     accent: 'from-blue-500 to-cyan-400',
     icon: Server,
-    keyName: 'OPENAI_API_KEY',
-    baseName: 'OPENAI_API_BASE',
-    modelName: 'LLM_MODEL_NAME',
+    fields: [
+      { label: 'API Key', envKey: 'OPENAI_API_KEY', placeholder: '请输入 API Key', secret: true },
+      { label: 'API 地址', envKey: 'OPENAI_API_BASE', placeholder: '请输入 API 地址' },
+      { label: '模型名称', envKey: 'LLM_MODEL_NAME', placeholder: '请输入模型名称' },
+    ],
   },
   {
-    provider: '阿里云视觉模型',
-    description: '用于招标文档中的图片与视觉内容解析。',
+    provider: '文档 OCR 模型（MinerU）',
+    description: '负责 PDF、扫描件和复杂版面的 OCR 与文档结构解析。',
+    accent: 'from-amber-500 to-orange-400',
+    icon: ScanText,
+    fields: [
+      { label: 'API Token', envKey: 'MINERU_API_TOKEN', placeholder: '请输入 MinerU API Token', secret: true },
+      { label: 'API 地址', envKey: 'MINERU_API_BASE_URL', placeholder: '请输入 MinerU API 地址' },
+    ],
+  },
+  {
+    provider: '视觉模型',
+    description: '负责图片、图纸和其他视觉内容的理解与信息提取。',
     accent: 'from-indigo-500 to-violet-400',
     icon: KeyRound,
-    keyName: 'ALI_VLM_API_KEY',
-    baseName: 'ALI_VLM_API_BASE',
-    modelName: 'ALI_VLM_MODEL_NAME',
-  },
-  {
-    provider: '本地视觉模型',
-    description: '用于接入内网或本地部署的视觉模型服务。',
-    accent: 'from-fuchsia-500 to-pink-400',
-    icon: FileCog,
-    keyName: 'LOCAL_VLM_API_KEY',
-    baseName: 'LOCAL_VLM_API_BASE',
-    modelName: 'LOCAL_VLM_MODEL_NAME',
+    fields: [
+      { label: 'API Key', envKey: 'ALI_VLM_API_KEY', placeholder: '请输入视觉模型 API Key', secret: true },
+      { label: 'API 地址', envKey: 'ALI_VLM_API_BASE', placeholder: '请输入视觉模型 API 地址' },
+      { label: '模型名称', envKey: 'ALI_VLM_MODEL_NAME', placeholder: '请输入视觉模型名称' },
+    ],
   },
 ];
 
-const MODEL_KEYS = MODEL_CONFIGS.flatMap((config) => [config.keyName, config.baseName, config.modelName]);
+const MODEL_KEYS = MODEL_CONFIGS.flatMap((config) => config.fields.map((field) => field.envKey));
 
 const DEFAULT_VALUES: Record<string, string> = {
   LLM_MODEL_NAME: 'gpt-4o',
+  MINERU_API_BASE_URL: 'https://mineru.net/api/v4',
   ALI_VLM_API_BASE: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   ALI_VLM_MODEL_NAME: 'qwen-vl-plus',
   LOCAL_VLM_API_BASE: 'http://127.0.0.1:8083/v1',
@@ -272,9 +284,19 @@ function ModelConfigCard({ config, values, visibleSecrets, onChange, onToggleSec
         </div>
       </div>
       <div className="space-y-4">
-        <ModelField label="API Key" envKey={config.keyName} value={values[config.keyName] ?? ''} placeholder="请输入 API Key" secret isVisible={visibleSecrets[config.keyName] ?? false} onToggleVisibility={() => onToggleSecret(config.keyName)} onChange={(value) => onChange(config.keyName, value)} />
-        <ModelField label="API 地址" envKey={config.baseName} value={values[config.baseName] ?? ''} placeholder="请输入 API 地址" onChange={(value) => onChange(config.baseName, value)} />
-        <ModelField label="模型名称" envKey={config.modelName} value={values[config.modelName] ?? ''} placeholder="请输入模型名称" onChange={(value) => onChange(config.modelName, value)} />
+        {config.fields.map((field) => (
+          <ModelField
+            key={field.envKey}
+            label={field.label}
+            envKey={field.envKey}
+            value={values[field.envKey] ?? ''}
+            placeholder={field.placeholder}
+            secret={field.secret}
+            isVisible={visibleSecrets[field.envKey] ?? false}
+            onToggleVisibility={() => onToggleSecret(field.envKey)}
+            onChange={(value) => onChange(field.envKey, value)}
+          />
+        ))}
       </div>
     </section>
   );
