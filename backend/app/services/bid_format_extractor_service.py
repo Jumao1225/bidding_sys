@@ -420,6 +420,19 @@ class BidFormatExtractorService:
             logger.warning("⚠️ [投标文件格式提取] 未定位到“投标文件格式/应答文件格式”标题，跳过 LLM 调用")
             return ""
 
+        # 优先使用目录中出现的章节身份（如“第九章”），再到正文查找同一章节，章节编号由原文动态决定。
+        toc_chapter_keys = self._find_toc_target_chapter_keys(lines)
+        if toc_chapter_keys:
+            toc_matched_candidates = [
+                index
+                for index in candidate_indices
+                if not self._is_toc_line(lines[index])
+                and self._chapter_identity_key(lines[index]) in toc_chapter_keys
+            ]
+            if toc_matched_candidates:
+                candidate_indices = toc_matched_candidates
+                logger.info(f"🔍 [投标文件格式提取] 根据目录动态锁定目标章节: {sorted(toc_chapter_keys)}")
+
         start_idx = max(candidate_indices, key=lambda index: self._score_text_chapter_candidate(lines, index))
         if self._is_toc_line(lines[start_idx]):
             logger.warning(f"⚠️ [投标文件格式提取] 目标标题仅命中目录行: '{lines[start_idx].strip()}'，跳过 LLM 调用")
@@ -453,6 +466,23 @@ class BidFormatExtractorService:
         score += min(marker_hits, 4) * 8
         # 同分时取靠后的候选，避免目录中的同名标题遮蔽正文标题。
         return score, index
+
+    def _chapter_identity_key(self, text: str) -> str:
+        """提取章节编号作为动态匹配键，不绑定具体的章号。"""
+        match = re.match(r'^[#\s\*]*(第\s*[一二三四五六七八九十\d]+\s*[章篇部分卷])', text.strip())
+        if not match:
+            return ""
+        return re.sub(r'\s+', '', match.group(1))
+
+    def _find_toc_target_chapter_keys(self, lines: List[str]) -> set[str]:
+        """从目录行中提取目标格式章节身份，供正文定位动态复用。"""
+        chapter_keys = {
+            self._chapter_identity_key(line)
+            for line in lines
+            if self._is_toc_line(line)
+            and any(pattern.search(line.strip()) for pattern in self.chapter_start_patterns)
+        }
+        return {key for key in chapter_keys if key}
 
     def _build_fallback_structure(self, filename: str) -> BidFormatStructure:
         """

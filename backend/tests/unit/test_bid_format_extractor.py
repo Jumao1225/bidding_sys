@@ -69,6 +69,29 @@ def test_slice_text_by_keywords_should_prefer_real_yingda_format_chapter_over_to
     assert "第四章 应答文件格式 ............................ 88" not in sliced_text
 
 
+def test_slice_text_by_keywords_should_follow_dynamic_toc_chapter_identity():
+    """测试章节编号变化时，根据目录条目动态匹配正文而非依赖固定章号。"""
+    sample_text = """
+目 录
+第九章 响应文件格式 ................................ 42
+第十章 合同条款 .................................... 56
+
+第一章 项目概况
+项目正文
+第九章 响应文件格式
+响应函
+报价明细表
+第十章 合同条款
+合同正文
+"""
+
+    sliced_text = bid_format_extractor_service._slice_text_by_keywords(sample_text)
+
+    assert "第九章 响应文件格式" in sliced_text
+    assert "响应函" in sliced_text
+    assert "合同正文" not in sliced_text
+
+
 def test_slice_text_by_keywords_should_return_empty_when_target_chapter_missing():
     """测试未定位到目标章节时返回空文本，禁止把整份文件交给 LLM 猜测。"""
     sample_text = "第一章 招标公告\n附件一：专用资质业绩要求\n评审办法前附表"
@@ -317,6 +340,5 @@ def test_slice_docx_natively_should_preserve_exact_word_elements(tmp_path):
     assert "第一章 招标公告" not in all_text
     assert "第七章 评标办法" not in all_text
     assert len(sliced_doc.tables) == 1
-
 
 
