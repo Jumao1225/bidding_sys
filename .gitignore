@@ -55,6 +55,12 @@ backend/*.sqlite3
 # AI Models & Heavy Artifacts
 /models/
 
+# Local Analysis Scripts and Generated Artifacts
+backend/scratch/
+backend/outputs/
+scripts/
+tmp/
+
 # Backend Uploads, Storage & Logs
 backend/logs/*
 !backend/logs/.gitkeep

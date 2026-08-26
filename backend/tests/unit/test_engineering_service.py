@@ -27,8 +27,8 @@ def test_engineering_extraction_should_pass_tenant_to_each_parallel_llm_call():
     assert all(call.kwargs["tenant_id"] == "tenant-a" for call in generate_mock.call_args_list)
 
 
-def test_engineering_extraction_with_empty_table_results_should_raise_error():
-    """检测到清单表格但所有分块为空时，应拒绝静默保存空结果。"""
+def test_engineering_extraction_with_empty_single_table_results_should_degrade_to_no_table():
+    """单表提取为空时，应按无可提取清单正常返回并落库。"""
     service = EngineeringService()
     mock_result = EngineeringSchema(main_equipment_list=[])
     source_context = (
@@ -40,10 +40,30 @@ def test_engineering_extraction_with_empty_table_results_should_raise_error():
         "app.services.metadata.engineering_service.llm_service.generate_structured_output",
         return_value=mock_result,
     ), patch.object(service, "_save_to_db") as save_mock:
-        with pytest.raises(ValueError, match="未产生设备明细"):
-            service.extract_metadata(source_context, "document-a")
+        result = service.extract_metadata(source_context, "document-a")
 
-    save_mock.assert_not_called()
+    assert result.main_equipment_list == []
+    save_mock.assert_called_once_with("document-a", result)
+
+
+def test_engineering_extraction_with_empty_multi_table_results_should_degrade_to_no_table():
+    """全部表格分块完成但均为空时，应停止处理并按无清单正常落库。"""
+    service = EngineeringService()
+    mock_result = EngineeringSchema(main_equipment_list=[])
+    source_context = (
+        "<table><tr><th>设备名称</th><th>数量</th></tr><tr><td>设备A</td><td>1</td></tr></table>"
+        "<table><tr><th>设备名称</th><th>数量</th></tr><tr><td>设备B</td><td>2</td></tr></table>"
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=mock_result,
+    ) as generate_mock, patch.object(service, "_save_to_db") as save_mock:
+        result = service.extract_metadata(source_context, "document-a")
+
+    assert generate_mock.call_count == 2
+    assert result.main_equipment_list == []
+    save_mock.assert_called_once_with("document-a", result)
 
 
 def test_engineering_schema_with_unknown_field_should_raise_validation_error():

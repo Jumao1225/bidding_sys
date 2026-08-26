@@ -290,10 +290,11 @@ class EngineeringService(BaseMetadataService):
                         eq.section_name = single_section
 
             if all_tables and (not res or not res.main_equipment_list):
-                logger.error(
-                    "[EngineeringService] 单表提取未产生设备明细，已拒绝保存空结果。"
+                # 单表已完成本次结构化调用仍无有效清单时，按无可提取表格正常降级，避免无意义重试阻塞任务。
+                logger.warning(
+                    "[EngineeringService] 单表提取未产生设备明细，已完成本次提取；"
+                    "按无可提取工程清单处理并继续保存其它工程元数据。"
                 )
-                raise ValueError("检测到工程清单表格，但未产生设备明细；已拒绝保存空结果。")
 
             if self.db_model_cls and document_id:
                 self._save_to_db(document_id, res)
@@ -426,14 +427,16 @@ class EngineeringService(BaseMetadataService):
                 f"成功返回空设备清单的分块: {empty_chunk_numbers}"
             )
 
-        # 检测到设备表格却没有任何设备项时，禁止用空结果覆盖历史有效元数据。
+        # 所有分块均已完成后仍未得到设备项，按无可提取工程清单正常降级，不进行额外循环重试。
         if all_tables and not merged_equipment_list:
             diagnostic = (
-                "检测到工程清单表格，但所有分块均未产生设备明细；"
+                "检测到工程清单候选表格，但所有分块均未产生设备明细；"
                 f"失败分块={failed_chunk_numbers or '无'}，空结果分块={empty_chunk_numbers or '无'}。"
             )
-            logger.error(f"[EngineeringService] {diagnostic} 已拒绝保存空结果。")
-            raise ValueError(diagnostic)
+            logger.warning(
+                f"[EngineeringService] {diagnostic} "
+                "已完成全部分块处理，按无可提取工程清单继续保存其它工程元数据。"
+            )
 
         final_schema = EngineeringSchema(
             main_equipment_list=merged_equipment_list,

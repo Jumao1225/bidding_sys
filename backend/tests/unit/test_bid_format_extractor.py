@@ -42,6 +42,40 @@ def test_slice_text_by_keywords_should_locate_bid_format_chapter():
     assert "第一章 招标公告" not in sliced_text
 
 
+def test_slice_text_by_keywords_should_prefer_real_yingda_format_chapter_over_toc():
+    """测试目录与正文均出现标题时，只截取正文“第四章 应答文件格式”范围。"""
+    sample_text = """
+目 录
+第一章 招标公告 ................................ 1
+第四章 应答文件格式 ............................ 88
+第五章 评审办法 ................................ 90
+
+第一章 招标公告
+公告正文
+第四章 应答文件格式
+第一册 技术标
+有效认证证书
+第二册 商务标
+法定代表人身份证明
+第五章 评审办法
+评审正文
+"""
+
+    sliced_text = bid_format_extractor_service._slice_text_by_keywords(sample_text)
+
+    assert "第一册 技术标" in sliced_text
+    assert "第二册 商务标" in sliced_text
+    assert "评审正文" not in sliced_text
+    assert "第四章 应答文件格式 ............................ 88" not in sliced_text
+
+
+def test_slice_text_by_keywords_should_return_empty_when_target_chapter_missing():
+    """测试未定位到目标章节时返回空文本，禁止把整份文件交给 LLM 猜测。"""
+    sample_text = "第一章 招标公告\n附件一：专用资质业绩要求\n评审办法前附表"
+
+    assert bid_format_extractor_service._slice_text_by_keywords(sample_text) == ""
+
+
 def test_is_toc_line_should_correctly_identify_table_of_contents_lines():
     """测试 _is_toc_line 能否精准判断带-3- / -55- 及第一卷等目录连点页码行，防止误杀切片"""
     toc_line_1 = "第六章 投标文件格式 .................... 40"
@@ -176,6 +210,35 @@ def test_extract_with_llm_and_rebuild_with_mocked_llm_json(monkeypatch):
     assert mock_llm_service.generate_structured_json.call_args.kwargs["tenant_id"] == "tenant-bid-format"
 
 
+def test_extract_with_llm_should_skip_call_when_target_chapter_missing(monkeypatch):
+    """测试目标章节缺失时直接降级，避免将其他章节误交给 LLM。"""
+    from unittest.mock import MagicMock
+
+    mock_doc = MagicMock()
+    mock_doc.id = "test-missing-format-doc-id"
+    mock_doc.filename = "缺少格式章节项目.pdf"
+    mock_doc.tenant_id = "tenant-bid-format"
+    mock_doc.parsed_metadata = {"md_file_path": ""}
+
+    mock_db = MagicMock()
+    mock_chunk = MagicMock()
+    mock_chunk.content = "第一章 招标公告\n附件一：专用资质业绩要求\n评审办法前附表"
+    monkeypatch.setattr(
+        "app.services.bid_format_extractor_service.document_crud.get_document_chunks",
+        lambda db, doc_id: [mock_chunk],
+    )
+
+    mock_llm_service = MagicMock()
+    mock_llm_service.is_configured_for_tenant.return_value = True
+    monkeypatch.setattr(bid_format_extractor_service, "llm_service", mock_llm_service)
+
+    docx_bytes, mode = bid_format_extractor_service._extract_with_llm_and_rebuild(mock_db, mock_doc)
+
+    assert docx_bytes
+    assert mode == "fallback_template"
+    mock_llm_service.generate_structured_json.assert_not_called()
+
+
 def test_extract_with_llm_exception_should_log_and_return_fallback_mode(monkeypatch):
     """测试当 LLM 出现网络/解析异常时，正确记录异常堆栈并降级返回 fallback_template 模式"""
     from unittest.mock import MagicMock
@@ -254,7 +317,6 @@ def test_slice_docx_natively_should_preserve_exact_word_elements(tmp_path):
     assert "第一章 招标公告" not in all_text
     assert "第七章 评标办法" not in all_text
     assert len(sliced_doc.tables) == 1
-
 
 
 

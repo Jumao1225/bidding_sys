@@ -40,15 +40,32 @@ class BidFormatExtractorService:
 
         # 匹配“投标文件格式”大章标题正则表达式探照灯 (兼容 Markdown # / ** / ## 标记与内部空格)
         self.chapter_start_patterns = [
-            re.compile(r'^[#\s\*]*第\s*[一二三四五六七八九十\d]+\s*[章篇部分卷节][\s\:\、\.\*]*(投标文件格式|响应文件格式|投标文件组成|格式及附件|投标文件格式要求|投标格式|响应格式)'),
-            re.compile(r'^[#\s\*]*(投标文件格式|响应文件格式|投标文件格式及附件|投标格式及要求)[\s\*]*$'),
-            re.compile(r'^[#\s\*]*附\s*[件录][\s\:\、\.\*]*(投标文件格式|响应文件格式|投标文件组成|投标格式)'),
+            re.compile(r'^[#\s\*]*第\s*[一二三四五六七八九十\d]+\s*[章篇部分卷节][\s\:\、\.\*]*(投标文件格式|应答文件格式|响应文件格式|投标文件组成|应答文件组成|格式及附件|投标文件格式要求|投标格式|响应格式)'),
+            re.compile(r'^[#\s\*]*(投标文件格式|应答文件格式|响应文件格式|投标文件格式及附件|投标格式及要求)[\s\*]*$'),
+            re.compile(r'^[#\s\*]*附\s*[件录][\s\:\、\.\*]*(投标文件格式|应答文件格式|响应文件格式|投标文件组成|投标格式)'),
         ]
 
         # 匹配下一个大章（用于判定“投标文件格式”章节的终止界限，兼容 Markdown # / ** 标记）
         self.chapter_next_patterns = [
             re.compile(r'^[#\s\*]*第\s*[一二三四五六七八九十\d]+\s*[章篇部分卷]'),
         ]
+
+        # 章节正文特征仅用于区分目录与正文，不依赖固定章节编号或固定“三册”结构。
+        self.format_body_markers = (
+            "投标函",
+            "应答函",
+            "报价函",
+            "授权委托",
+            "法定代表人",
+            "偏离表",
+            "报价明细",
+            "报价表",
+            "承诺书",
+            "资格审查",
+            "商务响应",
+            "技术响应",
+            "格式附件",
+        )
 
     def extract_and_export_bid_format(
         self, 
@@ -315,6 +332,10 @@ class BidFormatExtractorService:
 
         # 正则快速定位文本范围
         target_text = self._slice_text_by_keywords(doc_text)
+        if not target_text.strip():
+            logger.warning("⚠️ [投标文件格式提取] 未截取到目标章节，跳过 LLM 调用并使用托底模板")
+            structure = self._build_fallback_structure(doc_obj.filename)
+            return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
 
         # 构建 Prompt 引导 LLM 输出结构化数据
         prompt = f"""你是一名资深招投标专家。请分析以下招标文件中的“投标文件格式/响应格式”部分文本，严格依据原文提取出完整的格式附件目录与样张模版。
@@ -324,6 +345,7 @@ class BidFormatExtractorService:
 2. 提取文本中出现的全部格式附件标题（如各类格式、附件、声明、承诺、样张等，严格以原文实际标题为准）。
 3. 原文中的表格（无论以 Markdown 表格还是 HTML <table> 形式出现）必须完整保留其行列表格结构（转换为标准 Markdown 表格输出），原文中的填空下划线 `______` 必须完整保留。
 4. 必须将原文中每个格式附件的完整正文、填空要素和表格内容原原本本提取并放入 `body_markdown`，严禁输出“原文未提供样张”等概括性文字。
+5. 系统已将【待分析文本】严格截取在原文识别出的目标格式章节标题至下一独立大章之间，章节编号和标题以原文为准，禁止引入评审办法、收费标准、资格要求或合同附件等章节内容。
 
 【待分析文本】:
 {target_text[:40000]}
@@ -379,33 +401,58 @@ class BidFormatExtractorService:
 
     def _slice_text_by_keywords(self, full_text: str) -> str:
         """
-        在纯文本中截取“投标文件格式”章节（自动排除目录 TOC 行，并截取至下一个独立大章之前）
+        在纯文本中截取“投标文件格式/应答文件格式”章节。
+
+        先从所有同名标题中选择最像正文的候选项，再截取至下一个独立大章。
+        未定位到目标章节时返回空字符串，禁止把整份招标文件交给 LLM 猜测。
         """
-        lines = full_text.split('\n')
-        start_idx = -1
-        for i, l in enumerate(lines):
-            if any(pat.search(l) for pat in self.chapter_start_patterns):
-                if not self._is_toc_line(l):
-                    start_idx = i
-                    break
+        if not full_text or not full_text.strip():
+            logger.warning("⚠️ [投标文件格式提取] 输入文本为空，无法定位目标章节")
+            return ""
 
-        if start_idx != -1:
-            end_idx = len(lines)
-            for j in range(start_idx + 1, len(lines)):
-                line_str = lines[j].strip()
-                if self._is_real_next_main_chapter(line_str):
-                    end_idx = j
-                    logger.info(f"🔍 [投标文件格式提取] 定位到下一个独立大章终止行 (第 {j + 1} 行): '{line_str[:50]}'")
-                    break
+        lines = full_text.splitlines()
+        candidate_indices = [
+            index
+            for index, line in enumerate(lines)
+            if any(pattern.search(line.strip()) for pattern in self.chapter_start_patterns)
+        ]
+        if not candidate_indices:
+            logger.warning("⚠️ [投标文件格式提取] 未定位到“投标文件格式/应答文件格式”标题，跳过 LLM 调用")
+            return ""
 
-            slice_lines = lines[start_idx:end_idx]
-            while slice_lines and self._is_toc_line(slice_lines[0]):
-                slice_lines.pop(0)
-            logger.info(f"🔍 [投标文件格式提取] 成功定位到正文起始行 (第 {start_idx + 1} 行), 切片行数: {len(slice_lines)}")
-            return "\n".join(slice_lines)
-        
-        logger.warning("⚠️ [投标文件格式提取] 未在 Markdown 中匹配到明确的'投标文件格式'章节起止标记，将截取文档前 30,000 字符交给大模型识别")
-        return full_text
+        start_idx = max(candidate_indices, key=lambda index: self._score_text_chapter_candidate(lines, index))
+        if self._is_toc_line(lines[start_idx]):
+            logger.warning(f"⚠️ [投标文件格式提取] 目标标题仅命中目录行: '{lines[start_idx].strip()}'，跳过 LLM 调用")
+            return ""
+
+        end_idx = len(lines)
+        for index in range(start_idx + 1, len(lines)):
+            line_str = lines[index].strip()
+            if self._is_real_next_main_chapter(line_str):
+                end_idx = index
+                logger.info(f"🔍 [投标文件格式提取] 定位到下一个独立大章终止行 (第 {index + 1} 行): '{line_str[:50]}'")
+                break
+
+        slice_lines = lines[start_idx:end_idx]
+        while slice_lines and self._is_toc_line(slice_lines[0]):
+            slice_lines.pop(0)
+        logger.info(f"🔍 [投标文件格式提取] 成功定位正文起始行 (第 {start_idx + 1} 行), 切片行数: {len(slice_lines)}")
+        return "\n".join(slice_lines)
+
+    def _score_text_chapter_candidate(self, lines: List[str], index: int) -> tuple[int, int]:
+        """为章节标题候选项评分，优先选择包含格式正文特征的正文而非目录。"""
+        line = lines[index].strip()
+        context_before = "\n".join(lines[max(0, index - 8):index + 1])
+        context_after = "\n".join(lines[index + 1:index + 36])
+        score = 0
+        if self._is_toc_line(line):
+            score -= 100
+        if re.search(r'目录|contents', context_before, re.IGNORECASE):
+            score -= 30
+        marker_hits = sum(marker in context_after for marker in self.format_body_markers)
+        score += min(marker_hits, 4) * 8
+        # 同分时取靠后的候选，避免目录中的同名标题遮蔽正文标题。
+        return score, index
 
     def _build_fallback_structure(self, filename: str) -> BidFormatStructure:
         """
@@ -414,7 +461,7 @@ class BidFormatExtractorService:
         base_title = os.path.splitext(filename)[0]
         return BidFormatStructure(
             document_title=f"{base_title} - 投标文件格式",
-            source_chapter_name="第六章 投标文件格式",
+            source_chapter_name="应答文件格式",
             sections=[
                 BidFormatSection(
                     section_title="附件一：投标函",
