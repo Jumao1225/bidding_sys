@@ -1,4 +1,4 @@
-import { useMemo, useState, memo } from 'react';
+import { useEffect, useMemo, useState, memo } from 'react';
 import DocViewer, { DocViewerRenderers } from "@cyntler/react-doc-viewer";
 import "@cyntler/react-doc-viewer/dist/index.css";
 import { LocalDocxRenderer } from './LocalDocxRenderer';
@@ -27,6 +27,13 @@ type PdfFileSource = string | {
   };
 };
 
+// 静态资源由 Vite 配置在开发与生产环境中统一发布。
+export const PDF_DOCUMENT_OPTIONS = {
+  cMapUrl: '/cmaps/',
+  cMapPacked: true,
+  standardFontDataUrl: '/standard_fonts/',
+};
+
 /**
  * 根据文档地址和登录令牌生成 PDF 源配置。
  */
@@ -53,6 +60,12 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents, zoomLeve
     [document_uri, token],
   );
 
+  useEffect(() => {
+    // 切换文档时重置上一次的加载状态，避免错误状态遗留为白屏。
+    setNumPages(0);
+    setPdfError('');
+  }, [document_uri]);
+
   if (!doc) {
     return <div className="flex items-center justify-center h-full text-slate-400">无文件</div>;
   }
@@ -63,16 +76,33 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents, zoomLeve
   if (isPdf) {
     const targetWidth = Math.round(850 * scale);
 
+    if (pdfError) {
+      return (
+        <div className="flex-1 w-full h-full bg-[#f3f4f6] flex flex-col items-center justify-center gap-3 p-8 text-center">
+          <p className="font-semibold text-red-600">原文件 PDF 加载失败</p>
+          <p className="max-w-full break-words text-sm text-slate-500">{pdfError}</p>
+          <p className="text-xs text-slate-400">请检查原文件是否存在、下载接口是否返回 PDF 文件，以及浏览器控制台中的请求状态。</p>
+        </div>
+      );
+    }
+
     return (
       <div className="flex-1 w-full h-full bg-[#f3f4f6] overflow-auto custom-scrollbar">
         <Document
           file={pdf_file}
           onLoadSuccess={({ numPages }) => setNumPages(numPages)}
-          onLoadError={(error) => setPdfError(error.message)}
+          onLoadError={(error) => {
+            console.error('原文件 PDF 加载失败', { document_uri, error });
+            setPdfError(error.message);
+          }}
+          onSourceError={(error) => {
+            console.error('原文件 PDF 下载失败', { document_uri, error });
+            setPdfError(error.message);
+          }}
+          options={PDF_DOCUMENT_OPTIONS}
           className="h-full w-full flex flex-col"
           loading={<div className="p-10 text-slate-500 text-center w-full font-medium">🚀 正在加载极速 PDF 引擎...</div>}
         >
-          {pdfError && <div className="p-10 text-red-500 text-center">PDF 加载失败: {pdfError}</div>}
           {numPages > 0 && (
             <Virtuoso
               style={{ height: '100%', width: '100%' }}

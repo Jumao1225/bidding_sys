@@ -16,6 +16,22 @@ export interface UploadBoxProps {
   onWorkerStatusChange?: (worker: string, status: string, summary?: string, documentId?: string) => void;
 }
 
+interface AnalysisDocumentReference {
+  document_id?: string;
+  id?: string;
+}
+
+/**
+ * 优先使用持久化文档 ID，避免任务临时 ID 在原文件预览接口中无法定位文件。
+ */
+export function get_original_file_preview_id(
+  task_id: string | null | undefined,
+  result: AnalysisDocumentReference | null | undefined,
+  initial_task_id: string | null | undefined,
+): string | null {
+  return result?.document_id || result?.id || task_id || initial_task_id || null;
+}
+
 // 高亮组件
 const HighlightText = React.memo(({ text, resultData, targetQuote }: { text: string, resultData: any, targetQuote?: string | null }) => {
   const virtuosoRef = useRef<any>(null);
@@ -427,7 +443,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     if (onAnalysisSuccess) onAnalysisSuccess(null);
   };
 
-  const activeDocOrTaskId = taskId || (result && (result.document_id || result.id)) || initialTaskId;
+  const activeDocOrTaskId = get_original_file_preview_id(taskId, result, initialTaskId);
 
   const viewerDocuments = useMemo(() => {
     if (!activeDocOrTaskId) return [];

@@ -19,7 +19,7 @@ vi.mock('react-virtuoso', () => ({
   Virtuoso: () => null,
 }));
 
-import { build_pdf_file_source } from './SmartDocViewer';
+import { build_pdf_file_source, PDF_DOCUMENT_OPTIONS } from './SmartDocViewer';
 
 describe('build_pdf_file_source', () => {
   it('存在登录令牌时应生成携带鉴权头的 PDF 源配置', () => {
@@ -33,5 +33,13 @@ describe('build_pdf_file_source', () => {
     expect(build_pdf_file_source('/api/v1/analysis/download/document-1', null)).toBe(
       '/api/v1/analysis/download/document-1',
     );
+  });
+
+  it('应为特殊编码 PDF 配置本地字符映射与标准字体资源', () => {
+    expect(PDF_DOCUMENT_OPTIONS).toEqual({
+      cMapUrl: '/cmaps/',
+      cMapPacked: true,
+      standardFontDataUrl: '/standard_fonts/',
+    });
   });
 });

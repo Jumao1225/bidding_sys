@@ -485,15 +485,15 @@ export const AgentAuditPage: React.FC = () => {
   );
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-purple-500 selection:text-white">
+    <div className="min-h-screen min-w-0 bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-purple-500 selection:text-white">
       {/* 顶栏 Header */}
-      <header className="h-16 border-b border-slate-800 bg-slate-900/90 backdrop-blur-md px-6 flex items-center justify-between shrink-0 sticky top-0 z-20">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-3">
+      <header className="min-h-16 border-b border-slate-800 bg-slate-900/90 backdrop-blur-md px-4 py-3 flex flex-col items-stretch gap-3 shrink-0 sticky top-0 z-20 2xl:h-16 2xl:flex-row 2xl:items-center 2xl:justify-between 2xl:px-6 2xl:py-0">
+        <div className="min-w-0 flex items-center gap-4">
+          <div className="min-w-0 flex flex-1 items-center gap-3">
             <span className="p-1.5 bg-gradient-to-tr from-purple-600 to-indigo-600 text-white rounded-lg text-base shadow-sm">🚀</span>
-            <div>
+            <div className="min-w-0">
               <h1 className="font-bold text-sm text-white">标书智能生成与 Agent 控制台</h1>
-              <div className="flex items-center gap-2 mt-0.5">
+              <div className="flex flex-wrap items-center gap-2 mt-0.5">
                 <span className="text-[11px] text-purple-300 font-bold shrink-0">📄 选择目标招标文件:</span>
                 <select
                   value={activeDocId}
@@ -503,7 +503,7 @@ export const AgentAuditPage: React.FC = () => {
                     localStorage.setItem('bidding_document_id', selectedId);
                     navigate(`/agent-audit/${selectedId}`);
                   }}
-                  className="bg-slate-950 border border-purple-800/60 text-purple-200 font-medium text-[11px] rounded-lg px-2.5 py-0.5 focus:outline-none focus:border-purple-400 cursor-pointer max-w-[340px] truncate shadow-inner"
+                  className="min-w-0 flex-1 bg-slate-950 border border-purple-800/60 text-purple-200 font-medium text-[11px] rounded-lg px-2.5 py-0.5 focus:outline-none focus:border-purple-400 cursor-pointer truncate shadow-inner 2xl:max-w-[340px]"
                 >
                   {docList.length > 0 ? (
                     docList.map((doc) => (
@@ -532,7 +532,7 @@ export const AgentAuditPage: React.FC = () => {
         </div>
 
         {/* 顶部右侧核心触发操作 */}
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3 2xl:justify-end">
 
           <button
             type="button"
@@ -594,8 +594,8 @@ export const AgentAuditPage: React.FC = () => {
 
       {/* 通知与状态栏 */}
       {notice && (
-        <div className="bg-purple-950/80 border-b border-purple-800/80 px-6 py-2.5 text-xs text-purple-200 flex items-center justify-between font-medium animate-fade-in">
-          <div className="flex items-center gap-2">
+        <div className="bg-purple-950/80 border-b border-purple-800/80 px-4 py-2.5 text-xs text-purple-200 flex items-center justify-between gap-3 font-medium animate-fade-in 2xl:px-6">
+          <div className="min-w-0 flex items-center gap-2">
             <span>💡</span>
             <span>{notice}</span>
           </div>
@@ -606,8 +606,8 @@ export const AgentAuditPage: React.FC = () => {
       )}
 
       {error && (
-        <div className="bg-rose-950/90 border-b border-rose-800 px-6 py-2.5 text-xs text-rose-200 flex items-center justify-between font-medium animate-fade-in">
-          <div className="flex items-center gap-2">
+        <div className="bg-rose-950/90 border-b border-rose-800 px-4 py-2.5 text-xs text-rose-200 flex items-center justify-between gap-3 font-medium animate-fade-in 2xl:px-6">
+          <div className="min-w-0 flex items-center gap-2">
             <span>❌</span>
             <span>{error}</span>
           </div>
@@ -618,16 +618,16 @@ export const AgentAuditPage: React.FC = () => {
       )}
 
       {/* 顶部指令配置 & 指标统计区 */}
-      <div className="bg-slate-900/70 border-b border-slate-800 px-6 py-4 space-y-4 shrink-0">
+      <div className="bg-slate-900/70 border-b border-slate-800 px-4 py-4 space-y-4 shrink-0 2xl:px-6">
         {/* 自定义撰写指令控制条 */}
-        <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-3 flex items-center gap-3">
+        <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-3 flex flex-wrap items-center gap-3">
           <span className="text-sm p-1.5 bg-purple-500/10 text-purple-400 rounded-lg shrink-0">✍️</span>
           <input
             type="text"
             placeholder="自定义全局撰写指令（如：“商务偏离表统一填无偏离，付款节点填30%预付款，项目经理指定张三”）..."
             value={customInstruction}
             onChange={(e) => setCustomInstruction(e.target.value)}
-            className="flex-1 bg-transparent text-xs text-slate-100 placeholder-slate-500 focus:outline-none"
+            className="min-w-48 flex-1 bg-transparent text-xs text-slate-100 placeholder-slate-500 focus:outline-none"
           />
           <button
             type="button"
@@ -640,7 +640,7 @@ export const AgentAuditPage: React.FC = () => {
         </div>
 
         {/* 4 大核心统计指标 */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 2xl:grid-cols-4 gap-4">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-purple-500/10 text-purple-400 border border-purple-500/20 flex items-center justify-center font-bold text-lg">
               🤖
@@ -701,9 +701,9 @@ export const AgentAuditPage: React.FC = () => {
       </div>
 
       {/* 主工作台面板：左侧 Worker 列表 + 右侧思考与提案可视化 */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 min-h-0 flex flex-col overflow-visible 2xl:flex-row 2xl:overflow-hidden">
         {/* 左侧边栏 Worker 列表 */}
-        <div className="w-80 border-r border-slate-800 bg-slate-900/60 flex flex-col shrink-0">
+        <div className="w-full max-h-64 border-b border-slate-800 bg-slate-900/60 flex flex-col shrink-0 2xl:w-80 2xl:max-h-none 2xl:border-r 2xl:border-b-0">
           <div className="p-3.5 border-b border-slate-800">
             <input
               type="text"
@@ -778,19 +778,19 @@ export const AgentAuditPage: React.FC = () => {
         </div>
 
         {/* 右侧主内容区域 */}
-        <div className="flex-1 bg-slate-950 flex flex-col overflow-hidden">
+        <div className="flex-1 min-w-0 min-h-[34rem] bg-slate-950 flex flex-col overflow-hidden 2xl:min-h-0">
           {selectedWorker ? (
             <>
               {/* Active Worker Header */}
-              <div className="p-4 border-b border-slate-800 bg-slate-900/40 flex items-center justify-between shrink-0">
-                <div>
-                  <div className="flex items-center gap-3">
-                    <h2 className="font-bold text-base text-white">{selectedWorker.chapter_title}</h2>
+              <div className="p-4 border-b border-slate-800 bg-slate-900/40 flex flex-col items-stretch gap-3 shrink-0 2xl:flex-row 2xl:items-center 2xl:justify-between">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <h2 className="font-bold text-base text-white break-words">{selectedWorker.chapter_title}</h2>
                     <span className="px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 text-xs font-mono border border-purple-500/30">
                       {selectedWorker.node_name}
                     </span>
                   </div>
-                  <div className="flex items-center gap-4 text-xs text-slate-400 mt-1 font-mono">
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400 mt-1 font-mono">
                     <span>类别: {selectedWorker.category}</span>
                     <span>耗时: {(selectedWorker.execution_time_ms / 1000).toFixed(1)} 秒</span>
                     <span>Prompt: {selectedWorker.prompt_tokens.toLocaleString()}</span>
@@ -800,7 +800,7 @@ export const AgentAuditPage: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3 2xl:justify-end">
                   {/* 单章节微调按钮 */}
                   {!selectedWorker.category?.includes('supervisor') && !selectedWorker.node_name.includes('Supervisor') && (
                     <button
@@ -824,7 +824,7 @@ export const AgentAuditPage: React.FC = () => {
                   )}
 
                   {/* Tab Switcher */}
-                  <div className="flex bg-slate-900 p-1 rounded-xl border border-slate-800">
+                  <div className="flex flex-wrap bg-slate-900 p-1 rounded-xl border border-slate-800">
                     <button
                       type="button"
                       onClick={() => setActiveTab('details')}
@@ -863,7 +863,7 @@ export const AgentAuditPage: React.FC = () => {
                         <span>🛠️</span>
                         <span>Agent 调用的技能工具集 (Tools Invoked)</span>
                       </h4>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="grid grid-cols-1 2xl:grid-cols-2 gap-3">
                         <div className="bg-slate-950/80 border border-purple-900/30 rounded-xl p-3 flex items-start gap-3">
                           <div className="w-8 h-8 rounded-lg bg-purple-600/20 text-purple-400 flex items-center justify-center shrink-0 font-bold">⚡</div>
                           <div>
@@ -1244,7 +1244,7 @@ export const AgentAuditPage: React.FC = () => {
             </div>
 
             {/* Modal List Grid */}
-            <div className="flex-1 p-5 overflow-y-auto custom-scrollbar grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="flex-1 p-5 overflow-y-auto custom-scrollbar grid grid-cols-1 2xl:grid-cols-2 gap-4">
               {filteredDocList.length > 0 ? (
                 filteredDocList.map((doc) => {
                   const isCurrent = doc.id === activeDocId;

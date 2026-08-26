@@ -25,6 +25,13 @@ router = APIRouter()
 from app.db.models.user import User
 from app.api import deps
 
+
+def _find_task_upload_file(upload_dir: Path, task_id: str) -> Optional[str]:
+    """在上传根目录及其业务子目录中定位指定任务保存的原文件。"""
+    pattern = str(upload_dir / "**" / f"{task_id}_*")
+    matched_files = sorted(glob.glob(pattern, recursive=True))
+    return next((path for path in matched_files if os.path.isfile(path)), None)
+
 @router.post("/upload-and-analyze", response_model=ResponseModel[dict])
 async def upload_and_analyze(
     background_tasks: BackgroundTasks,
@@ -667,14 +674,12 @@ async def download_original_file(
             content_disposition_type="inline"
         )
     
-    # 2. 查找匹配 task_id 的临时上传文件
+    # 2. 查找匹配 task_id 的上传文件，兼容 uploads/tenders 等业务子目录
     base_dir = Path(__file__).resolve().parent.parent.parent.parent
-    upload_dir = os.path.join(base_dir, "uploads")
-    pattern = os.path.join(upload_dir, f"{task_id}_*")
-    matched_files = glob.glob(pattern)
-    if matched_files and os.path.exists(matched_files[0]):
-        file_path = matched_files[0]
-        filename = os.path.basename(file_path).replace(f"{task_id}_", "")
+    upload_dir = base_dir / "uploads"
+    file_path = _find_task_upload_file(upload_dir, task_id)
+    if file_path:
+        filename = os.path.basename(file_path).removeprefix(f"{task_id}_")
         target_path, target_filename = _get_preview_file_and_name(file_path, filename)
         return FileResponse(
             path=target_path, 
@@ -696,4 +701,5 @@ async def download_original_file(
                     content_disposition_type="inline"
                 )
 
+    logger.warning("原文件预览未找到文件: task_or_document_id={}", task_id)
     raise HTTPException(status_code=404, detail="未找到对应的原文件")

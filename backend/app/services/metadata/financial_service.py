@@ -1,4 +1,8 @@
+import re
 from typing import Optional, Dict
+
+from loguru import logger
+from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel, Field
 
 from .base import BaseMetadataService
@@ -74,6 +78,66 @@ class FinancialSchema(BaseModel):
     reasoning: Optional[str] = Field(None, description="CoT 推导过程（不落库）")
 
 
+DIRECT_BUDGET_TERMS = ("采购总预算", "采购预算")
+GENERIC_BUDGET_TERMS = ("预算金额", "项目总预算", "项目预算", "资金预算")
+MAX_PRICE_LIMIT_TERMS = ("最高投标限价", "最高限价", "招标控制价", "投标控制价")
+MONEY_VALUE_PATTERN = re.compile(
+    r"(?:人民币\s*)?[¥￥]?\s*(?P<amount>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?P<unit>万元|万|元)?"
+)
+
+
+def _find_money_after_terms(context: str, terms: tuple[str, ...]) -> Optional[float]:
+    """从术语所在行提取紧邻金额，避免将后续无关金额误关联到字段。"""
+    if not context:
+        return None
+
+    term_pattern = "|".join(re.escape(term) for term in terms)
+    for term_match in re.finditer(term_pattern, context):
+        line_end = context.find("\n", term_match.end())
+        candidate_text = context[term_match.end():line_end if line_end >= 0 else None]
+        money_match = MONEY_VALUE_PATTERN.search(candidate_text)
+        if not money_match:
+            continue
+
+        try:
+            amount = float(money_match.group("amount").replace(",", ""))
+        except ValueError:
+            logger.warning("财务定向金额解析失败，术语: {}，文本: {}", term_match.group(), candidate_text[:80])
+            continue
+
+        # 无币种和单位的小数字通常是条款编号，不得误判为金额。
+        raw_digits = money_match.group("amount").replace(",", "").split(".", 1)[0]
+        if not money_match.group("unit") and not candidate_text[:money_match.end()].strip().startswith(("人民币", "¥", "￥")) and len(raw_digits) < 4:
+            continue
+
+        if money_match.group("unit") in ("万", "万元"):
+            amount *= 10000
+        return amount
+
+    return None
+
+
+def reconcile_core_financial_amounts(result: FinancialSchema, context: str) -> FinancialSchema:
+    """以原文中的明确术语校正预算与最高限价，阻止模型跨字段复用金额。"""
+    # 明确“采购预算”的业务含义强于泛称“预算金额”，仅在前者缺失时才回退。
+    budget_amount = _find_money_after_terms(context, DIRECT_BUDGET_TERMS)
+    if budget_amount is None:
+        budget_amount = _find_money_after_terms(context, GENERIC_BUDGET_TERMS)
+    max_price_limit_amount = _find_money_after_terms(context, MAX_PRICE_LIMIT_TERMS)
+
+    if budget_amount is not None:
+        if not result.budget or result.budget.amount != budget_amount:
+            logger.info("使用原文明确采购预算校正结构化金额: {} 元", budget_amount)
+        result.budget = MoneyAmount(amount=budget_amount)
+
+    if max_price_limit_amount is not None:
+        if not result.max_price_limit or result.max_price_limit.amount != max_price_limit_amount:
+            logger.info("使用原文明确最高限价校正结构化金额: {} 元", max_price_limit_amount)
+        result.max_price_limit = MoneyAmount(amount=max_price_limit_amount)
+
+    return result
+
+
 class FinancialService(BaseMetadataService):
     def __init__(self):
         super().__init__(db_model_cls=FinancialMetadata)
@@ -96,6 +160,10 @@ class FinancialService(BaseMetadataService):
    - **两者的关系**：最高限价 **永远小于或等于** 预算。在同一份标书中出现这两个不同的金额是**完全正常**的，**绝不是冲突或笔误！** 
    - 提取策略：如果文中既写了“采购预算为XXX金额（总资金池）”，又在投标邀请或评标办法中写了“最高投标限价为YYY金额（最高限价上限，例如限价打折）”，请将对应的 XXX金额 准确填入 `budget`，将 YYY金额 准确填入 `max_price_limit`。绝对不可以为了数字表面整齐而抹杀弃置其中任何一个！
    - 只有当同一概念（如两个地方都宣称是“最高限价”）出现不同金额时，才适用“优先大写金额、优先核心章节”的冲突处理规则。
+   - **逐项回填要求**：必须独立检查并填写 `budget` 与 `max_price_limit`。即使其中一个字段已找到，也绝不能停止查找另一个字段；不得用采购预算填充最高投标限价，也不得用最高投标限价填充采购预算。
+   - **同义表述识别**：`采购总预算`、`采购预算`、`项目预算`、`预算金额` 均属于 `budget`；`最高投标限价`、`最高限价`、`招标控制价`、`投标控制价` 均属于 `max_price_limit`。必须以紧邻金额的原文语义为准。
+   - **定向证据优先**：上下文中带有“预算/限价定向证据”标识的片段是系统从原文精确定位的关键证据。只要其中出现明确金额，必须优先完成相应字段的提取；两个字段可以来自不同章节。
+   - **冲突消解**：当“采购预算/采购总预算”与泛称“预算金额”出现不同金额时，`budget` 必须优先采用带有“采购预算/采购总预算”的明确表述；`max_price_limit` 只能采用紧邻最高限价、最高投标限价、招标控制价或投标控制价的金额，绝不允许复制预算金额。
 3. **警惕暂列金与单价控制价**：必须找出文中所有“暂估价”、“暂列金额”，剥离到 provisional_sum。同时关注单价限制（如：综合单价不得超过XXX金额/元），填入 unit_price_limits。
 4. **资金形式量化**：对于三大保证金，提取其金额或比例描述，计算出纯数字（如果原文给了基数的话），并明确支持的缴纳形式（如：电汇、电子保函）。
 5. **数字转化与核对**：将百分比全部转化为浮点数（如 10% 存为 10.0）。确保 `amount` 统一单位为“元”（如原为万元须精确换算折抵至元单位）。在落库前，你必须在心里复核一遍数字是否与原文绝对一致。
@@ -104,6 +172,22 @@ class FinancialService(BaseMetadataService):
 请在 `reasoning` 字段中首先写下你的推导过程。如果发现多个金额冲突，必须在 reasoning 中明确指出两处的金额，并解释你采纳哪一个的理由。最后一步，你必须在 reasoning 中声明你已经核对了所有提取出的数字，确保与原文绝对一致。
 如果上下文中没有任何关于某项的财务指标，请严格将该字段输出为 null，绝对不可瞎编数字。
 """
-        return self.extract(context, FinancialSchema, system_prompt, document_id, tenant_id=tenant_id)
+        result = self.extract(
+            context,
+            FinancialSchema,
+            system_prompt,
+            document_id,
+            tenant_id=tenant_id,
+            persist=False,
+        )
+        result = reconcile_core_financial_amounts(result, context)
+
+        if document_id:
+            try:
+                self._save_to_db(document_id, result)
+            except SQLAlchemyError:
+                logger.exception("财务元数据校正后落库失败，文档ID: {}", document_id)
+
+        return result
 
 financial_service = FinancialService()

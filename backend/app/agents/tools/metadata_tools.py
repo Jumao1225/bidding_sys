@@ -1,5 +1,10 @@
 from langchain_core.tools import tool
 import json
+from typing import Any, Callable, Optional, Sequence
+
+from loguru import logger
+from sqlalchemy import or_
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.services.rag_service import rag_service
 from app.services.metadata.qualification_service import qualification_service
@@ -9,7 +14,93 @@ from app.services.metadata.engineering_service import engineering_service
 from app.services.metadata.evaluation_service import evaluation_service
 from app.services.routing_service import routing_service
 
-def _extract_and_format(service, document_id: str, search_keywords: str, section_title: str = None, context_mode: str = "window") -> str:
+FINANCIAL_BUDGET_KEYWORDS = (
+    "采购总预算", "采购预算", "项目总预算", "项目预算", "预算金额", "资金预算",
+)
+FINANCIAL_LIMIT_KEYWORDS = (
+    "最高投标限价", "最高限价", "招标控制价", "投标控制价", "最高报价限价",
+)
+FINANCIAL_FALLBACK_KEYWORDS = ("预算", "限价", "控制价")
+FINANCIAL_CORE_MATCH_LIMIT = 4
+
+
+def _select_financial_core_chunks(chunks: Sequence[Any]) -> list[Any]:
+    """筛选包含预算或最高限价原文证据的分块，并补齐相邻上下文。"""
+    if not chunks:
+        return []
+
+    sorted_chunks = sorted(chunks, key=lambda chunk: getattr(chunk, "chunk_index", 0))
+
+    def find_matches(keywords: tuple[str, ...]) -> list[int]:
+        """按关键词定位原文分块索引，保留文档中的自然顺序。"""
+        return [
+            index
+            for index, chunk in enumerate(sorted_chunks)
+            if any(keyword in str(getattr(chunk, "content", "")) for keyword in keywords)
+        ]
+
+    budget_matches = find_matches(FINANCIAL_BUDGET_KEYWORDS)
+    limit_matches = find_matches(FINANCIAL_LIMIT_KEYWORDS)
+    # 仅在未命中准确术语时采用宽泛词，避免大量普通“预算”描述挤掉核心金额证据。
+    fallback_matches = find_matches(FINANCIAL_FALLBACK_KEYWORDS)
+    target_matches = (budget_matches or fallback_matches)[:FINANCIAL_CORE_MATCH_LIMIT]
+    target_matches += (limit_matches or fallback_matches)[:FINANCIAL_CORE_MATCH_LIMIT]
+
+    selected_indexes: set[int] = set()
+    for index in target_matches:
+        selected_indexes.add(index)
+        if index > 0:
+            selected_indexes.add(index - 1)
+        if index < len(sorted_chunks) - 1:
+            selected_indexes.add(index + 1)
+
+    return [chunk for index, chunk in enumerate(sorted_chunks) if index in selected_indexes]
+
+
+def _build_financial_core_context(document_id: str, tenant_id: Optional[str]) -> str:
+    """从原文分块中定向补充预算与限价证据，避免通用 RAG 召回遗漏核心金额。"""
+    from app.db.models.project import DocChunk
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        query = db.query(DocChunk).filter(
+            DocChunk.document_id == document_id,
+            or_(DocChunk.content_type.is_(None), DocChunk.content_type != "toc_block"),
+        )
+        if tenant_id:
+            query = query.filter(DocChunk.tenant_id == tenant_id)
+
+        selected_chunks = _select_financial_core_chunks(query.order_by(DocChunk.chunk_index).all())
+        if not selected_chunks:
+            logger.info("财务定向上下文未匹配到预算或限价关键词，文档ID: {}", document_id)
+            return ""
+
+        context_blocks = []
+        for chunk in selected_chunks:
+            section_title = getattr(chunk, "section_title", None) or "正文"
+            page_num = getattr(chunk, "page_num", None) or "未知"
+            content = str(getattr(chunk, "content", "")).strip()
+            if content:
+                context_blocks.append(f"【预算/限价定向证据】(来源章节: {section_title}, 第 {page_num} 页)\n内容: {content}")
+
+        logger.info("财务定向上下文补充 {} 个分块，文档ID: {}", len(context_blocks), document_id)
+        return "\n\n".join(context_blocks)
+    except SQLAlchemyError as exc:
+        logger.exception("读取财务定向上下文失败，文档ID: {}，将继续使用通用 RAG", document_id)
+        return ""
+    finally:
+        db.close()
+
+
+def _extract_and_format(
+    service,
+    document_id: str,
+    search_keywords: str,
+    section_title: str = None,
+    context_mode: str = "window",
+    context_enricher: Optional[Callable[[str, Optional[str]], str]] = None,
+) -> str:
     """内部通用辅助方法：执行RAG并提取元数据"""
     try:
         from app.worker.tasks import emit_agent_log
@@ -51,6 +142,11 @@ def _extract_and_format(service, document_id: str, search_keywords: str, section
             context_mode=context_mode,
             query_mode="split"
         )
+
+        if context_enricher:
+            enriched_context = context_enricher(document_id, tenant_id)
+            if enriched_context:
+                context = f"{enriched_context}\n\n===== 通用财务检索上下文 =====\n{context}"
         
         emit_agent_log("info", f"检索完成，开始进行大模型 {service.__class__.__name__} 结构化提取...")
         # 2. 专项领域提取与自动落盘
@@ -89,7 +185,13 @@ def extract_financial_info(document_id: str, search_keywords: str = "最高限�
       - search_keywords: 默认自带财务相关关键词，你可以根据需要补充
       - section_title: 可选，如果你知道财务要求在哪个具体章节，请填入以缩小检索范围，防止幻觉
     """
-    return _extract_and_format(financial_service, document_id, search_keywords, section_title)
+    return _extract_and_format(
+        financial_service,
+        document_id,
+        search_keywords,
+        section_title,
+        context_enricher=_build_financial_core_context,
+    )
 
 @tool
 def extract_timeline_info(document_id: str, search_keywords: str = "项目编号 投标截止时间 开标时间 答疑截止 工期 交付时间 标书份数", section_title: str = None) -> str:
