@@ -28,7 +28,8 @@ class RAGService:
         top_k: int = 5,
         disable_expansion: bool = False,
         context_mode: str = "chapter",
-        query_mode: str = "combined"
+        query_mode: str = "combined",
+        tenant_id: typing.Optional[str] = None,
     ) -> str:
         """
         根据 query，在指定的 document_id 中进行向量检索与关键字混合检索。
@@ -64,7 +65,11 @@ class RAGService:
                 hit_chunk_ids = set()
                 
                 # 预加载当前文档的所有 chunks 以便进行上下文滑窗
-                all_chunks = db.query(DocChunk).filter(DocChunk.document_id == document_id).order_by(DocChunk.chunk_index).all()
+                document_filter = [DocChunk.document_id == document_id]
+                if tenant_id:
+                    document_filter.append(DocChunk.tenant_id == tenant_id)
+
+                all_chunks = db.query(DocChunk).filter(*document_filter).order_by(DocChunk.chunk_index).all()
                 chunk_list = [c for c in all_chunks]
                 chunk_id_to_idx = {c.id: idx for idx, c in enumerate(chunk_list)}
                 
@@ -74,6 +79,8 @@ class RAGService:
                     DocChunk.chunk_index > 0,
                     DocChunk.content_type != "toc_block"
                 )
+                if tenant_id:
+                    base_query = base_query.filter(DocChunk.tenant_id == tenant_id)
                 if section_title:
                     if isinstance(section_title, str) and section_title.strip():
                         clean_sec = section_title.strip()
@@ -318,4 +325,3 @@ class RAGService:
 
 
 rag_service = RAGService()
-

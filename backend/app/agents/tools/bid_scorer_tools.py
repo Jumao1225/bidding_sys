@@ -79,7 +79,7 @@ def _extract_dynamic_keywords(items: List[Dict[str, Any]], tenant_id: Optional[s
     return list(fallback_words)[:10]
 
 
-def get_bid_document_outline(document_id: str) -> List[str]:
+def get_bid_document_outline(document_id: str, tenant_id: Optional[str] = None) -> List[str]:
     """获取投标文件的所有真实章节大纲路径列表 (例如: '七、设计方案、服务方案 > 第四章 服务响应方案情况')"""
     if not document_id:
         return []
@@ -88,10 +88,14 @@ def get_bid_document_outline(document_id: str) -> List[str]:
         from app.db.models.project import DocChunk
 
         with SessionLocal() as db:
-            chunks = db.query(DocChunk.section_title).filter(
+            filters = [
                 DocChunk.document_id == document_id,
-                DocChunk.chunk_index > 0
-            ).distinct().all()
+                DocChunk.chunk_index > 0,
+            ]
+            if tenant_id:
+                filters.append(DocChunk.tenant_id == tenant_id)
+
+            chunks = db.query(DocChunk.section_title).filter(*filters).distinct().all()
 
             titles = []
             for (st,) in chunks:
@@ -191,7 +195,7 @@ def retrieve_bid_content_for_category(
     4. 融合【语义向量索引】辅助召回全局零星条款
     """
     # 1. 提取投标文件的实际目录大纲并由子 Agent 自主决策目标章节
-    doc_outline = get_bid_document_outline(document_id)
+    doc_outline = get_bid_document_outline(document_id, tenant_id=tenant_id)
     subagent_selected_chapters = subagent_select_target_chapters(
         category=category,
         subagent_type=subagent_type,
@@ -222,6 +226,7 @@ def retrieve_bid_content_for_category(
         query=combined_query,
         top_k=top_k,
         context_mode="chapter",
+        tenant_id=tenant_id,
     )
     vector_content = _clean_markdown_images(vector_raw)
 
@@ -246,15 +251,15 @@ def retrieve_bid_content_for_category(
 
                 if conditions:
                     # 1. 查找初步命中的种子切片
-                    seed_chunks = (
+                    seed_query = (
                         db.query(DocChunk)
                         .filter(DocChunk.document_id == document_id)
                         .filter(DocChunk.chunk_index > 0)  # 剔除 0 号目录页
                         .filter(or_(*conditions))
-                        .order_by(DocChunk.chunk_index)
-                        .limit(20)
-                        .all()
                     )
+                    if tenant_id:
+                        seed_query = seed_query.filter(DocChunk.tenant_id == tenant_id)
+                    seed_chunks = seed_query.order_by(DocChunk.chunk_index).limit(20).all()
 
                     # 2. 从种子切片与子 Agent 自主选定的目标章节提取“章节前缀家族”
                     family_prefixes = set(subagent_selected_chapters or [])
@@ -270,15 +275,15 @@ def retrieve_bid_content_for_category(
                     matched_chunks = []
                     if family_prefixes:
                         family_conditions = [DocChunk.section_title.ilike(f"{pref}%") for pref in family_prefixes]
-                        family_chunks = (
+                        family_query = (
                             db.query(DocChunk)
                             .filter(DocChunk.document_id == document_id)
                             .filter(DocChunk.chunk_index > 0)
                             .filter(or_(*family_conditions))
-                            .order_by(DocChunk.chunk_index)
-                            .limit(100)
-                            .all()
                         )
+                        if tenant_id:
+                            family_query = family_query.filter(DocChunk.tenant_id == tenant_id)
+                        family_chunks = family_query.order_by(DocChunk.chunk_index).limit(100).all()
                         matched_chunks.extend(family_chunks)
 
                     # 兜底补充种子切片
@@ -700,6 +705,7 @@ def active_refine_context_with_keywords(
     document_id: str,
     bid_content: str,
     missing_keywords: List[str],
+    tenant_id: Optional[str] = None,
 ) -> str:
     """
     拿着 Agentic 追问提取出的 missing_keywords，去数据库中执行二次定向反查，
@@ -726,15 +732,15 @@ def active_refine_context_with_keywords(
             if not conditions:
                 return bid_content
 
-            extra_chunks = (
+            extra_query = (
                 db.query(DocChunk)
                 .filter(DocChunk.document_id == document_id)
                 .filter(DocChunk.chunk_index > 0)
                 .filter(or_(*conditions))
-                .order_by(DocChunk.chunk_index)
-                .limit(20)
-                .all()
             )
+            if tenant_id:
+                extra_query = extra_query.filter(DocChunk.tenant_id == tenant_id)
+            extra_chunks = extra_query.order_by(DocChunk.chunk_index).limit(20).all()
 
             new_blocks = []
             for c in extra_chunks:

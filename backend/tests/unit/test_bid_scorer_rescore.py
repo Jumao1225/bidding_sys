@@ -94,3 +94,57 @@ def test_rescore_category_service_flow(mock_rag, mock_llm):
     assert res is not None
     assert mock_item.ai_score == 30.0
     assert mock_result.total_score == 30.0
+    assert mock_rag.call_args.kwargs["tenant_id"] == "tenant_default"
+    assert mock_llm.call_args.kwargs["tenant_id"] == "tenant_default"
+
+
+def test_validate_scoring_documents_wrong_tenant_should_raise_error():
+    """异常场景：投标文档不属于当前租户时，启动评分前应拒绝访问。"""
+    mock_db = MagicMock()
+    mock_db.query.return_value.filter.return_value.first.return_value = None
+
+    mock_session = MagicMock()
+    mock_session.__enter__.return_value = mock_db
+    with patch("app.db.session.SessionLocal", return_value=mock_session):
+        with pytest.raises(ValueError, match="投标文件不存在或无权访问"):
+            bid_scorer_service._validate_scoring_documents(
+                document_id="bid_other_tenant",
+                source_doc_id="source_001",
+                user_id="user_001",
+                tenant_id="tenant_current",
+            )
+
+
+def test_validate_scoring_documents_without_chunks_should_raise_error():
+    """边界场景：租户和评分大纲合法但没有切片时，应拒绝启动评分。"""
+    mock_db = MagicMock()
+    mock_bid_document = MagicMock()
+    mock_source_document = MagicMock()
+    mock_eval_meta = MagicMock(score_tree=[{"category": "技术分"}])
+
+    query_results = [
+        mock_bid_document,
+        mock_source_document,
+        mock_eval_meta,
+    ]
+
+    def query_side_effect(model):
+        query = MagicMock()
+        if query_results:
+            query.filter.return_value.first.return_value = query_results.pop(0)
+        else:
+            query.filter.return_value.count.return_value = 0
+        return query
+
+    mock_db.query.side_effect = query_side_effect
+
+    mock_session = MagicMock()
+    mock_session.__enter__.return_value = mock_db
+    with patch("app.db.session.SessionLocal", return_value=mock_session):
+        with pytest.raises(ValueError, match="尚未完成向量化解析"):
+            bid_scorer_service._validate_scoring_documents(
+                document_id="bid_001",
+                source_doc_id="source_001",
+                user_id="user_001",
+                tenant_id="tenant_current",
+            )

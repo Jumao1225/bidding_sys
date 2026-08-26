@@ -224,6 +224,9 @@ async def score_bid(
 
         return success_response(data=result, message="AI 打分完成")
 
+    except ValueError as e:
+        logger.warning(f"⚠️ [API] 打分前置校验失败: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception(f"❌ [API] 打分异常: {e}")
         raise HTTPException(status_code=500, detail=f"打分过程异常: {str(e)}")
@@ -455,7 +458,12 @@ async def evaluate_ragas_for_result(
     try:
         from app.services.ragas_eval_service import ragas_eval_service
         logger.info(f"📊 [API] 触发 Ragas 开源评估: result_id={result_id}")
-        eval_summary = await run_in_threadpool(ragas_eval_service.evaluate_score_result, db=db, score_result_id=result_id)
+        eval_summary = await run_in_threadpool(
+            ragas_eval_service.evaluate_score_result,
+            db=db,
+            score_result_id=result_id,
+            tenant_id=current_user.tenant_id,
+        )
         return success_response(data=eval_summary, message="Ragas 开源指标评估计算完成")
     except ValueError as e:
         raise HTTPException(status_code=44, detail=str(e))
@@ -544,4 +552,3 @@ async def rescore_category(
     except Exception as e:
         logger.exception(f"❌ 微调重算异常: {e}")
         raise HTTPException(status_code=500, detail=f"微调重算失败: {str(e)}")
-

@@ -109,6 +109,7 @@ def supervisor_load_node(state: BidScorerState) -> dict:
 
     source_doc_id = state.get("source_doc_id", "")
     document_id = state.get("document_id", "")
+    tenant_id = state.get("tenant_id", "")
 
     if not source_doc_id or not document_id:
         logger.error("❌ 缺少 document_id 或 source_doc_id")
@@ -123,6 +124,7 @@ def supervisor_load_node(state: BidScorerState) -> dict:
         with SessionLocal() as db:
             eval_meta = db.query(EvaluationMetadata).filter(
                 EvaluationMetadata.document_id == source_doc_id,
+                EvaluationMetadata.tenant_id == tenant_id,
             ).first()
 
             if not eval_meta:
@@ -146,6 +148,7 @@ def supervisor_load_node(state: BidScorerState) -> dict:
             # 验证切片数据
             chunk_count = db.query(func.count(DocChunk.id)).filter(
                 DocChunk.document_id == document_id,
+                DocChunk.tenant_id == tenant_id,
             ).scalar()
 
             if not chunk_count or chunk_count == 0:
@@ -241,6 +244,7 @@ def specialist_score_node(state: BidScorerState) -> dict:
             document_id=document_id,
             bid_content=bid_content,
             missing_keywords=missing_kws,
+            tenant_id=tenant_id,
         )
 
     # 第 2~N 轮：基于（可能已扩充）的最新上下文执行终审评估

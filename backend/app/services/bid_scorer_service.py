@@ -56,8 +56,16 @@ class BidScorerService:
 
         # 1. 验证 source_doc_id 的 evaluation_metadata 存在且 score_tree 非空
         # 以唯一的 UUID (source_doc_id) 为准查询对应的评分分析字典，兼容存量历史和缺省租户记录
+        source_document = db.query(Document).filter(
+            Document.id == source_doc_id,
+            Document.tenant_id == tenant_id,
+        ).first()
+        if not source_document:
+            raise ValueError("关联的招标文件不存在或无权访问")
+
         eval_meta = db.query(EvaluationMetadata).filter(
             EvaluationMetadata.document_id == source_doc_id,
+            EvaluationMetadata.tenant_id == tenant_id,
         ).first()
 
         if not eval_meta:
@@ -197,6 +205,13 @@ class BidScorerService:
             f"scoring_rounds={scoring_rounds}"
         )
 
+        self._validate_scoring_documents(
+            document_id=document_id,
+            source_doc_id=source_doc_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+
         from app.agents.bid_scorer_agent import bid_scorer_graph
 
         # 构建初始状态
@@ -249,6 +264,57 @@ class BidScorerService:
             "status": final_state.get("status", ""),
             "error": final_state.get("error", ""),
         }
+
+    @staticmethod
+    def _validate_scoring_documents(
+        document_id: str,
+        source_doc_id: str,
+        user_id: str,
+        tenant_id: str,
+    ) -> None:
+        """在启动评分图前校验文档、评分元数据和切片的租户归属。"""
+        from app.db.session import SessionLocal
+
+        with SessionLocal() as db:
+            bid_document = db.query(Document).filter(
+                Document.id == document_id,
+                Document.tenant_id == tenant_id,
+                Document.user_id == user_id,
+            ).first()
+            if not bid_document:
+                logger.warning(
+                    "⚠️ [BidScorerService] 投标文档无权访问: document_id={}, tenant_id={}, user_id={}",
+                    document_id,
+                    tenant_id,
+                    user_id,
+                )
+                raise ValueError("投标文件不存在或无权访问")
+
+            source_document = db.query(Document).filter(
+                Document.id == source_doc_id,
+                Document.tenant_id == tenant_id,
+            ).first()
+            if not source_document:
+                logger.warning(
+                    "⚠️ [BidScorerService] 招标文档无权访问: source_doc_id={}, tenant_id={}",
+                    source_doc_id,
+                    tenant_id,
+                )
+                raise ValueError("关联的招标文件不存在或无权访问")
+
+            eval_meta = db.query(EvaluationMetadata).filter(
+                EvaluationMetadata.document_id == source_doc_id,
+                EvaluationMetadata.tenant_id == tenant_id,
+            ).first()
+            if not eval_meta or not eval_meta.score_tree:
+                raise ValueError("关联的招标文件尚未提取评分维度")
+
+            chunk_count = db.query(DocChunk).filter(
+                DocChunk.document_id == document_id,
+                DocChunk.tenant_id == tenant_id,
+            ).count()
+            if not chunk_count:
+                raise ValueError("投标文件尚未完成向量化解析")
 
     def _generate_rescore_expert_summary(
         self,
@@ -345,7 +411,8 @@ class BidScorerService:
 
         # 查找关联招标文档的 score_tree
         eval_meta = db.query(EvaluationMetadata).filter(
-            EvaluationMetadata.document_id == source_doc_id
+            EvaluationMetadata.document_id == source_doc_id,
+            EvaluationMetadata.tenant_id == tenant_id,
         ).first()
 
         if not eval_meta or not eval_meta.score_tree:
@@ -379,7 +446,12 @@ class BidScorerService:
         )
 
         # 1. 执行多级 RAG 检索
-        bid_content = retrieve_bid_content_for_category(document_id, items_to_score)
+        bid_content = retrieve_bid_content_for_category(
+            document_id=document_id,
+            items=items_to_score,
+            category=category,
+            tenant_id=tenant_id,
+        )
 
         # 2. Agentic Active RAG：第 1 轮初审 + 缺项反思二次提问追问
         round_results = []
@@ -389,6 +461,7 @@ class BidScorerService:
             round_idx=0,
             category=category,
             user_instruction=user_instruction,
+            tenant_id=tenant_id,
         )
         round_results.append(r1_result)
 
@@ -400,6 +473,7 @@ class BidScorerService:
                 document_id=document_id,
                 bid_content=bid_content,
                 missing_keywords=missing_kws,
+                tenant_id=tenant_id,
             )
 
         # 第 2~N 轮：基于（可能已扩充）的最新上下文执行终审评估
@@ -410,6 +484,7 @@ class BidScorerService:
                 round_idx=r_idx,
                 category=category,
                 user_instruction=user_instruction,
+                tenant_id=tenant_id,
             )
             round_results.append(batch_result)
 

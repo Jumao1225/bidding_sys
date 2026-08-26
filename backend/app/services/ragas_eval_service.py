@@ -28,15 +28,22 @@ class RagasEvalService:
         self,
         db: Session,
         score_result_id: str,
+        tenant_id: str,
     ) -> Dict[str, Any]:
         """
         针对指定打分结果 ID 运行全量 Ragas 指标评估
         """
-        result = db.query(BidScoreResult).filter(BidScoreResult.id == score_result_id).first()
+        result = db.query(BidScoreResult).filter(
+            BidScoreResult.id == score_result_id,
+            BidScoreResult.tenant_id == tenant_id,
+        ).first()
         if not result:
             raise ValueError(f"未找到打分结果: {score_result_id}")
             
-        items = db.query(BidScoreItem).filter(BidScoreItem.score_result_id == score_result_id).all()
+        items = db.query(BidScoreItem).filter(
+            BidScoreItem.score_result_id == score_result_id,
+            BidScoreItem.tenant_id == tenant_id,
+        ).all()
         if not items:
             raise ValueError(f"打分结果中无明细项: {score_result_id}")
             
@@ -60,7 +67,8 @@ class RagasEvalService:
                     "sub_category": item.sub_category or "",
                     "scoring_criteria": item.title
                 }],
-                top_k=5
+                top_k=5,
+                tenant_id=tenant_id,
             )
             
             ai_ans = (
