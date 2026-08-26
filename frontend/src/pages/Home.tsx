@@ -3,13 +3,33 @@ import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { apiFetch } from '../utils/api';
 
-interface DocumentRecord {
+export interface DocumentRecord {
   id: string;
   filename: string;
   doc_type?: string;
   file_path?: string;
   status: string;
   created_at: string | null;
+}
+
+/**
+ * 按文档主键去重，避免异常接口数据导致 React 列表 key 冲突。
+ */
+export function deduplicate_documents(documents: DocumentRecord[]): DocumentRecord[] {
+  const seen_document_ids = new Set<string>();
+
+  return documents.filter((document) => {
+    if (seen_document_ids.has(document.id)) {
+      console.warn('文档列表返回重复 ID，已忽略重复记录', {
+        document_id: document.id,
+        filename: document.filename,
+      });
+      return false;
+    }
+
+    seen_document_ids.add(document.id);
+    return true;
+  });
 }
 
 export function Home() {
@@ -25,8 +45,8 @@ export function Home() {
         const res = await apiFetch(`${baseUrl}/api/v1/documents/`);
         if (res.ok) {
           const json = await res.json();
-          if (json.code === 200 && json.data) {
-            setDocuments(json.data);
+          if (json.code === 200 && Array.isArray(json.data)) {
+            setDocuments(deduplicate_documents(json.data));
           }
         }
       } catch (err) {

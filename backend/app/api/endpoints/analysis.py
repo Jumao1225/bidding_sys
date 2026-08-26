@@ -244,14 +244,30 @@ async def reextract_domain(
         logger.exception(f"重新提取 {domain} 异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"重新提取异常: {str(e)}")
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _normalize_cost_text(value: Any) -> Any:
+    """将历史结构化字段转换为接口可接受的文本，兼容旧版 {type, input} 数据。"""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in ("input", "text", "value", "content"):
+            if key in value:
+                nested_value = _normalize_cost_text(value[key])
+                if nested_value:
+                    return nested_value
+        return str(value)
+    return str(value)
 
 class CostItemUpdateRequest(BaseModel):
     item_code: Optional[str] = Field(default=None, description="表格多级序号编码")
     name: str = Field(..., description="项目/设备名称")
     spec_requirement: str = Field(default="", description="规格或说明")
     qty: Optional[float] = Field(default=1.0, description="数量")
-    unit: str = Field(default="项", description="单位")
+    unit: Optional[str] = Field(default="项", description="单位")
     ref_price: float = Field(default=0.0, description="参考单价")
     matched_name: str = Field(default="", description="匹配设备名称")
     matched_brand: str = Field(default="", description="匹配品牌")
@@ -272,6 +288,27 @@ class CostItemUpdateRequest(BaseModel):
     model: Optional[str] = Field(default=None, description="规格型号")
     manufacturer: Optional[str] = Field(default=None, description="生产厂商")
     section_name: Optional[str] = Field(default=None, description="所属分标段/分区域/分项工程名称")
+
+    @field_validator(
+        "item_code", "name", "spec_requirement", "unit", "matched_name",
+        "matched_brand", "matched_model", "matched_manufacturer",
+        "brand_requirements", "match_quality", "warning", "comparison_note",
+        "remark", "parent_item", "root_item", "brand", "model", "manufacturer",
+        "section_name", mode="before"
+    )
+    @classmethod
+    def normalize_text_fields(cls, value: Any) -> Any:
+        """兼容历史解析结果中的结构化文本，避免单个异常字段导致整单 422。"""
+        return _normalize_cost_text(value)
+
+    @field_validator("key_parameters", mode="before")
+    @classmethod
+    def normalize_key_parameters(cls, value: Any) -> List[str]:
+        """将关键参数统一为字符串列表，保证前端展示和后续持久化稳定。"""
+        if value is None:
+            return []
+        values = value if isinstance(value, list) else [value]
+        return [text for item in values if (text := _normalize_cost_text(item))]
 
 class CostAnalysisUpdateRequest(BaseModel):
     items: List[CostItemUpdateRequest] = Field(..., description="BOM成本分项列表")

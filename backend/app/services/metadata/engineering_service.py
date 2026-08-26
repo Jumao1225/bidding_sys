@@ -1,6 +1,6 @@
 import logging
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .base import BaseMetadataService
 from app.db.models.metadata import EngineeringMetadata
@@ -10,24 +10,30 @@ logger = logging.getLogger(__name__)
 
 class EquipmentItem(BaseModel):
     """设备/软件/材料清单明细（支持生成技术偏离表与多级精细化 BOM 成本核算）"""
-    item_code: Optional[str] = Field(None, description="招标文件工程量清单表格【第一列序号】中的原始层级编码（如'(一)'、'1'、'1.1'、'1.2'等，必须 100% 原样摘录，严禁私自篡改）")
+    # 禁止模型返回未定义字段，避免字段名写错后被静默丢弃。
+    model_config = ConfigDict(extra="forbid")
+
+    item_code: Optional[str] = Field(None, description="招标文件工程量清单表格【第一列序号】中的原始编码（如'(一)'、'1'、'1.1'、'1.2'等，必须 100% 原样摘录；编码中的点号仅表示清单编号，不得单独据此推断 BOM 父子层级）")
     item_name: str = Field(..., description="设备/软件/材料/元器件名称")
     specifications: Optional[str] = Field(None, description="规格型号或详细技术参数要求")
-    quantity: Optional[float] = Field(None, description="项目物理总采购需求量，纯数字。若为多级嵌套子项，必须严格按照穿透连乘公式计算：顶层采购套数 * 各层级单套定额！若原文仅给出计价单位而未写明具体采购数量，必须输出 null！绝对禁止脑补填 1！")
+    quantity: Optional[float] = Field(None, description="项目总采购数量或工程量，纯数字。对于设备/材料表示物理采购数量，对于施工/服务项目表示原文工程量或服务次数。若为多级嵌套子项，必须严格按照穿透连乘公式计算：顶层数量 * 各层级单套定额！若原文仅给出计价单位而未写明具体数量，必须输出 null！绝对禁止脑补填 1！")
     unit: Optional[str] = Field(None, description="物理/计价单位（如：平方米、块、台、套、面、组、只、人月）")
     brand_requirements: Optional[str] = Field(None, description="品牌或产地要求（如：'进口原装'、'指定某品牌/某品牌或同等及以上品牌'、'国产自主可控'）")
     key_parameters: Optional[list[str]] = Field(
         default_factory=list, 
         description="招标文件明确要求的核心技术指标/关键星号(*)参数"
     )
-    parent_item: Optional[str] = Field(None, description="直接父级设备/总成名称（若本条目为某组件内部的分项/元器件，填入直接上一级父设备名称；独立顶层设备填 null）")
-    root_item: Optional[str] = Field(None, description="所属顶层主要标的物名称（若本条目为某复合标的物名下的多级子项，填入最顶层标的物名称；自身即为顶层主标的填 null 或自身名称）")
-    tree_level: Optional[int] = Field(1, description="层级深度：1=顶层主要标的物, 2=二级成套子系统/总成, 3=三级核心元器件/配件, 4+=更细分末级项")
-    per_set_quantity: Optional[float] = Field(None, description="上一级组件内部单套定额/每套包含数量（若为成套内部子项，记录每套包含的数量；独立顶层设备填 null）")
+    parent_item: Optional[str] = Field(None, description="直接父级设备/总成名称。只有原文明确存在真实的成套设备/总成父项，且当前行是该父项内部的组件时才填写；普通工程量清单中的分组标题、编号前缀和相邻行都不能作为父项，独立计价行填 null")
+    root_item: Optional[str] = Field(None, description="真实 BOM 父子关系中的顶层主要标的物名称；普通扁平工程量清单行填 null")
+    tree_level: Optional[int] = Field(1, description="真实 BOM 层级深度；普通扁平工程量清单（包括 2.6.1、2.6.2 这类同级编号行）统一为 1，不能按编号点号数量直接计算")
+    per_set_quantity: Optional[float] = Field(None, description="真实成套父项内部的单套定额；普通工程量清单行或仅因编号产生的伪子项填 null")
     section_name: Optional[str] = Field(None, description="所属分标段/分区域/分项工程/子系统名称（如'标段一'、'一期工程'、'某厂区/某地块'，若全文未划分区域则为 null）")
 
 class TechValidationRequirement(BaseModel):
     """技术验证、样品与演示要求（一票否决/高分项）"""
+    # 严格限制结构化输出字段，便于及时发现模型输出协议漂移。
+    model_config = ConfigDict(extra="forbid")
+
     sample_required: Optional[bool] = Field(False, description="开标现场是否需要提供物理样品/样机")
     sample_description: Optional[str] = Field(None, description="样品/样机送达与封样要求")
     poc_demo_required: Optional[bool] = Field(False, description="是否需要现场 POC 演示或软件系统功能答辩")
@@ -37,10 +43,13 @@ class TechValidationRequirement(BaseModel):
     )
 
 class EngineeringSchema(BaseModel):
+    # 顶层字段必须严格匹配 EngineeringSchema，禁止错误字段名被忽略后变成默认空数组。
+    model_config = ConfigDict(extra="forbid")
+
     # --- 1. 主要标的物与设备清单 (生成《技术偏离表》与精细化 BOM) ---
-    main_equipment_list: Optional[list[EquipmentItem]] = Field(
+    main_equipment_list: list[EquipmentItem] = Field(
         default_factory=list, 
-        description="主要设备、材料或软件标的物配置清单明细"
+        description="设备、材料以及有明确计价依据的施工/服务工程量清单明细"
     )
 
     # --- 2. 施工工况与技术实施难点 (检索工艺知识库) ---
@@ -79,6 +88,67 @@ class EngineeringService(BaseMetadataService):
     def __init__(self):
         super().__init__(db_model_cls=EngineeringMetadata)
 
+    @staticmethod
+    def _normalize_boq_hierarchy(items: list[EquipmentItem]) -> list[EquipmentItem]:
+        """清理工程量清单中由分组编号造成的伪 BOM 层级。"""
+        if not items:
+            return []
+
+        import re
+
+        # 先建立原始编号索引，后续以清单编号校验模型给出的父项，而不是相信相邻行推断。
+        item_by_code = {
+            str(item.item_code).strip(): item
+            for item in items
+            if item.item_code and str(item.item_code).strip()
+        }
+        normalized_items: list[EquipmentItem] = []
+        dropped_group_count = 0
+        repaired_hierarchy_count = 0
+
+        for item in items:
+            item_code = str(item.item_code or "").strip()
+
+            # 没有数量和单位的行通常只是“接地”“预埋管”“乙供设备及材料”等分组标题，
+            # 不应进入可计价设备清单，也不能成为其它行的 BOM 父项。
+            if item.quantity is None and not item.unit:
+                dropped_group_count += 1
+                continue
+
+            parent_item = str(item.parent_item or "").strip()
+            if parent_item and re.fullmatch(r"\d+(?:\.\d+)+", item_code):
+                expected_parent_code = item_code.rsplit(".", 1)[0]
+                expected_parent = item_by_code.get(expected_parent_code)
+
+                if expected_parent:
+                    expected_parent_name = expected_parent.item_name.strip()
+                    parent_is_non_priced_group = (
+                        expected_parent.quantity is None and not expected_parent.unit
+                    )
+
+                    if parent_is_non_priced_group:
+                        # 例如 2.6 是“接地”分组标题，2.6.1～2.6.6 是同级计价行。
+                        item.parent_item = None
+                        item.root_item = None
+                        item.tree_level = 1
+                        item.per_set_quantity = None
+                        repaired_hierarchy_count += 1
+                    elif parent_item != expected_parent_name:
+                        # 编号明确给出直接父项时，以编号层级修复模型把兄弟行串成链的问题。
+                        item.parent_item = expected_parent_name
+                        item.root_item = expected_parent.root_item or expected_parent_name
+                        item.tree_level = (expected_parent.tree_level or 1) + 1
+                        repaired_hierarchy_count += 1
+
+            normalized_items.append(item)
+
+        if dropped_group_count or repaired_hierarchy_count:
+            logger.info(
+                "[EngineeringService] BOQ 层级归一化完成："
+                f"移除非计价分组行={dropped_group_count}，修复伪父子关系={repaired_hierarchy_count}"
+            )
+        return normalized_items
+
     def extract_metadata(
         self,
         context: str,
@@ -97,20 +167,32 @@ class EngineeringService(BaseMetadataService):
         clean_context = extract_equipment_tables_and_context(context)
 
         system_prompt = r"""
-你是资深的【项目总工与现场施工技术专家】。你的任务是从传入的技术图纸说明、工程量清单、《项目需求》、《技术规格书》、《货物需求一览表》及《评标办法》中，提取出**核心设备指标与非标施工/合规难点**。
+你是资深的【项目总工与工程造价清单专家】。你的任务是从传入的技术图纸说明、工程量清单、《项目需求》、《技术规格书》和《货物需求一览表》中，提取出**设备、材料以及有明确计价依据的施工/服务 BOQ 行项目**。
 
 【零容忍数字幻觉（最高指令）】
 系统对参数极为严格，你提取的任何设备数量、技术指标必须在原文中有明确的出处。**绝对禁止**进行毫无根据的猜测、篡改或臆想。
 - **关于数量 `quantity`**：若标书原文中仅给出了计价单位（如“平方米”、“米”），但未标注具体物理采购数量，`quantity` 必须输出为 null，绝对禁止脑补填 1！
 
 【提取指南】
-1. **主材配置与硬性技术指标（偏离表与 BOM 核心）**：核心设备的名称、规格、数量、品牌要求必须结构化提取。数量必须是纯数字。
+1. **完整工程量清单行项目提取（最高优先级）**：
+   - 当前任务目标是提取完整但**可计价**的 BOM/BOQ 清单，不仅是核心设备和可采购材料。表格中代表设备、材料、安装、施工、运输、调试、检测或其他服务的有效计价行，必须逐行输出为一个 `EquipmentItem`。
+   - **计价依据门槛（必须同时检查）**：除有明确子项的父级分部行外，只有当原文表格明确提供了数量/工程量，并且提供了单位、单价、合价、定额或其他计价字段之一时，才允许输出该行。若只有一段工作要求、制度说明或技术描述，没有数量/工程量和计价依据，必须排除，不能自行把 `quantity` 填成 1。
+   - 对于满足计价依据门槛的施工/服务行，即使单位是“项”“批”“次”“日”“人月”，或名称看起来像施工工序，也必须保留。比如工程量表中的“电缆直埋”“电缆直埋（过河、沟）”“交通工程”“安装调试”“运输服务”等，均属于合法 BOQ 行项目。
+   - 表格中的无数量、无单位、无单价的分组标题/分类行（如“接地”“预埋管”“乙供设备及材料”）不是可计价清单项，不得输出为 `EquipmentItem`，也不得作为 `parent_item`。只有父行自身也是明确的可计价成套设备/总成，且原文明确展示其内部组成关系时，才允许保留父子关系。
+   - **明确排除非计价叙述**：安全生产制度、文明施工要求、岗位职责、人员分工、作业票要求、风险提示、违章分类、施工方法、管理流程、培训要求、验收说明、处罚条款、评标规则、合规承诺和一般技术规范，均不得作为 BOM/BOQ 项目；除非它们在工程量/报价表中拥有明确的数量、单位和计价依据。
+   - 只有表头、空白行、纯注释、纯说明、合计/小计行（且不代表实际工作内容）可以不作为清单项输出。禁止把“在某区域内使用某种作业票”“工作负责人不在现场”“满足某安全要求”等句子提取为项目。
+   - 设备、材料、施工和服务项目统一使用同一套 `EquipmentItem` 结构：项目名称或工作内容填入 `item_name`，原文技术要求/施工内容/服务范围填入 `specifications`，原文数量填入 `quantity`，原文单位填入 `unit`。数量必须是纯数字；原文没有数量时必须为 `null`。
+   - **完整保留表格上下文**：必须结合当前表格的全部列、跨行表头、合并单元格内容、表格前后的章节标题和技术说明判断每一行含义；不得只依据“设备名称”列筛选，也不得因为某行名称与设备无关而跳过。
    - **【主要标的物聚焦与宏观大类归口原则（最高指令）】**：
-     - 清单提取应紧紧围绕招标文件中的《货物需求一览表》、《工程量清单》与核心设备材料表，聚焦于具有明确供货实体的**核心设备、材料、元器件与成套总成**，过滤掉纯现场操作工序或行政告知文字。
+     - 清单提取应紧紧围绕招标文件中的《货物需求一览表》、《工程量清单》、《采购清单》、《报价清单》和核心设备材料表；其他章节只作为技术上下文，不能仅凭其中的要求、制度或说明生成 BOM 项目。
      - **关于 `section_name`（所属主要部分/分标段名称）**：
        - `section_name` **必须且仅能填入项目最顶层的宏观分标段/主要大类部分名称**（即招标文件目录中划分的一级/二级大章节标题，通常全项目仅有 3~6 个顶层主要大类部分）。
        - **绝对严禁将表格上方的微观子系统小标题、装置功能小节名称或细分测试步骤当成 `section_name`**！若当前表格属于某顶层大类名下的细分子节，其 `section_name` **必须向上归口继承该顶层大类名称**。
        - 若整个招标文件仅有一张单体表格且全文未划分宏观大类/标段，则 `section_name` 统一填 null。
+   - **【真实 BOM 层级与工程量清单编号严格区分（最高优先级）】**：
+     - 工程量清单中的 `2.6`、`2.6.1`、`2.6.2`、`2.6.3` 等点号编号只是工作分解/清单行号，不代表 BOM 父子关系；同一分组下的 `2.6.1`～`2.6.6` 应视为平级计价行，统一输出 `parent_item=null`、`root_item=null`、`tree_level=1`、`per_set_quantity=null`。
+     - 绝对禁止因为编号点号层数、行号连续、名称相似或前一行刚好出现，就把同级清单行串成父子链；例如 `2.6.2` 不能因为紧邻 `2.6.1` 就挂到 `2.6.1` 下。
+     - 只有同时满足以下条件才建立 BOM 父子关系：父行自身有明确数量/单位或成套计价依据；原文存在“含有/配置/组成/配套”等明确组成语义，或存在可确认的视觉缩进、合并单元格、独立物料清单结构；且当前行确实是该父项内部组件。仅有编号层级时按扁平清单处理。
    - **【任意深度多级嵌套 BOM 设备树（Multi-Level BOM 任意 N 级递归穿透提取，最高指令）】**：
      - 当工程量清单表格中出现包含任意多层嵌套缩进、层级递进编号（如顶层复合系统 $\\rightarrow$ 二级总成 $\\rightarrow$ 三级组件 $\\rightarrow$ 四级模块 $\\rightarrow$ 五级元器件等任意 $N$ 级树状结构）时，必须严格按以下【通用递归归纳法则】逐级完整拆解：
      
@@ -121,7 +203,7 @@ class EngineeringService(BaseMetadataService):
      - **【通用 N 级递归字段赋值与连乘规则（数学归纳法）】**：
        1. **层级深度判定 (`tree_level`)**：
           - 设最顶层主要标的物为 Level 1（`tree_level = 1`）；
-          - 依据序号编码层级（如序号点号数量加 1，或视觉缩进关系）自动确定当前节点所处的层级深度 $L$（`tree_level = L`，其中 $L \\ge 1$）。
+          - 依据真实的父项组成语义、视觉缩进、合并单元格或独立 BOM 结构确定当前节点层级；序号点号数量只能作为辅助线索，不能单独决定 `tree_level`。
        2. **直接父级绑定 (`parent_item`)**：
           - 若 $L = 1$（顶层根节点），`parent_item` 必须为 null；
           - 若 $L \\ge 2$（任意子项/孙项节点），`parent_item` **必须且仅能严格指向其直接所属的上一级（Level $L-1$）父节点的完整名称**。
@@ -130,14 +212,14 @@ class EngineeringService(BaseMetadataService):
        4. **单台配置定额 (`per_set_quantity`)**：
           - 若 $L = 1$，`per_set_quantity` 填 null；
           - 若 $L \\ge 2$，`per_set_quantity` **必须准确填入在单台直接父级（Level $L-1$ 设备）中的物理配置数量**（纯数字 $q_L$）。
-       5. **项目物理总需求量递归穿透连乘换算 (`quantity`)**：
-          - 若 $L = 1$，`quantity` 填该顶层标的物在整个项目中的总采购套数（纯数字 $Q_1$）；
-          - 若 $L \ge 2$，当前物料在整个项目中的物理总需求量 **必须通过从顶层至当前层级的全链路单套定额递归连乘公式准确换算**：
+       5. **项目总需求量/工程量递归穿透连乘换算 (`quantity`)**：
+          - 若 $L = 1$，`quantity` 填该顶层标的物、施工项目或服务项目在整个项目中的原文总数量/工程量（纯数字 $Q_1$）；
+          - 若 $L \ge 2$，当前子项在整个项目中的总需求量或工程量 **必须通过从顶层至当前层级的全链路单套定额递归连乘公式准确换算**：
             $$\text{quantity} = Q_1 \times q_2 \times q_3 \times \dots \times q_L$$
             （即：顶层总套数 $Q_1$ 乘以该分支路径上各级单套定额的乘积）。
        6. **规格与技术参数 (`specifications`)**：
           - 每一个节点（无论处于哪一层级）的 `specifications` **仅摘录其自身的物理型号、尺寸、电气指标与材质参数**，严禁掺杂下级子部件清单文字。
-     - 若清单为普通扁平表格（无嵌套层级关系），则所有条目的 `parent_item`、`root_item` 和 `per_set_quantity` 统一输出为 null，`tree_level` 统一填 1，`quantity` 为原文物理采购数量。
+     - 若清单为普通扁平表格，或无法确认真实组成关系，则所有条目的 `parent_item`、`root_item` 和 `per_set_quantity` 统一输出为 null，`tree_level` 统一填 1，`quantity` 为原文物理采购数量/工程量。
    - **【明细表格精确数值优先原则】**：当清单表格中列出的具体型号或精确数量与前言概述文字存在出入时，**一律以明细表格中的精确数值为准**。
    - **关于 `specifications`（规格参数要求）**：**必须 100% 原汁原味完整摘录标书原文中的详细技术参数描述**（包含所有型号参数、材质、尺寸、物理/电气指标等）。
    - **拒绝“详见XXX”废话（最高指令）**：若清单表格中写有“详见技术规格”、“详见项目需求”、“详见第五章”等引用说明，**绝不能直接把“详见XXX”当作规格参数！你必须从后文《技术规格书/项目需求》章节中找到该设备真实的详细规格与技术要求完整摘录填入！**
@@ -197,11 +279,24 @@ class EngineeringService(BaseMetadataService):
                 system_prompt,
                 document_id,
                 tenant_id=effective_tenant_id,
+                # 单表路径先完成结果校验，避免空结果在基类中提前落库。
+                persist=False,
             )
+            if res:
+                res.main_equipment_list = self._normalize_boq_hierarchy(res.main_equipment_list)
             if res and res.main_equipment_list and single_section:
                 for eq in res.main_equipment_list:
                     if not eq.section_name:
                         eq.section_name = single_section
+
+            if all_tables and (not res or not res.main_equipment_list):
+                logger.error(
+                    "[EngineeringService] 单表提取未产生设备明细，已拒绝保存空结果。"
+                )
+                raise ValueError("检测到工程清单表格，但未产生设备明细；已拒绝保存空结果。")
+
+            if self.db_model_cls and document_id:
+                self._save_to_db(document_id, res)
             return res
 
         chunks = []
@@ -255,10 +350,24 @@ class EngineeringService(BaseMetadataService):
                     temperature=0.1,
                     tenant_id=effective_tenant_id,
                 )
-                return idx, sub_res
             except Exception as e:
-                logger.error(f"分块 {idx + 1} 提取失败: {e}")
+                # 保留完整堆栈，避免并发分块失败后只剩下一个无法定位的空结果。
+                logger.exception(f"分块 {idx + 1} 提取失败: {e}")
                 return idx, None
+
+            item_count = len(sub_res.main_equipment_list or [])
+            item_names = [item.item_name for item in sub_res.main_equipment_list[:5]]
+            logger.info(
+                f"[EngineeringService] 分块 {idx + 1} 结构化结果: "
+                f"设备明细={item_count}，示例={item_names}，输入字符数={len(chunk_text)}"
+            )
+            if not item_count:
+                # 空结果仍允许参与其它字段汇总，但最终会在落库前统一拦截。
+                logger.warning(
+                    f"[EngineeringService] 分块 {idx + 1} 未提取到设备明细，"
+                    "请检查该分块是否只包含表头、表格行是否被 RAG 截断或模型字段是否错配。"
+                )
+            return idx, sub_res
 
         chunk_results = [None] * len(chunks)
         with ThreadPoolExecutor(max_workers=min(5, len(chunks))) as executor:
@@ -302,6 +411,29 @@ class EngineeringService(BaseMetadataService):
                         safety_requirements.append(sf)
             if schema_item.reasoning:
                 reasoning_list.append(schema_item.reasoning)
+
+        merged_equipment_list = self._normalize_boq_hierarchy(merged_equipment_list)
+
+        failed_chunk_numbers = [idx + 1 for idx, item in enumerate(chunk_results) if item is None]
+        empty_chunk_numbers = [
+            idx + 1
+            for idx, item in enumerate(chunk_results)
+            if item is not None and not item.main_equipment_list
+        ]
+        if failed_chunk_numbers:
+            logger.error(
+                f"[EngineeringService] 分块提取失败清单: {failed_chunk_numbers}，"
+                f"成功返回空设备清单的分块: {empty_chunk_numbers}"
+            )
+
+        # 检测到设备表格却没有任何设备项时，禁止用空结果覆盖历史有效元数据。
+        if all_tables and not merged_equipment_list:
+            diagnostic = (
+                "检测到工程清单表格，但所有分块均未产生设备明细；"
+                f"失败分块={failed_chunk_numbers or '无'}，空结果分块={empty_chunk_numbers or '无'}。"
+            )
+            logger.error(f"[EngineeringService] {diagnostic} 已拒绝保存空结果。")
+            raise ValueError(diagnostic)
 
         final_schema = EngineeringSchema(
             main_equipment_list=merged_equipment_list,

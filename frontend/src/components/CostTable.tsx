@@ -81,12 +81,88 @@ interface CostTableProps {
 }
 
 /**
+ * 将接口或历史数据中的结构化值安全转换为可展示文本。
+ * 兼容 {type, input} 等旧版结构化输出，避免 React 直接渲染对象。
+ */
+export function normalizeCostText(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value.map(normalizeCostText).filter(Boolean).join('；');
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    for (const key of ['input', 'text', 'value', 'content']) {
+      if (key in record) {
+        const nestedText = normalizeCostText(record[key]);
+        if (nestedText) return nestedText;
+      }
+    }
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      console.warn('成本分析字段序列化失败，已使用空文本兜底。', error);
+      return '';
+    }
+  }
+  return String(value);
+}
+
+/**
+ * 归一化关键参数数组，保证展示和保存时始终符合后端 List[str] 契约。
+ */
+export function normalizeCostTextList(value: unknown): string[] {
+  if (value === null || value === undefined) return [];
+  const values = Array.isArray(value) ? value : [value];
+  return values.map(normalizeCostText).filter(Boolean);
+}
+
+/**
+ * 清理成本明细中的历史异常值，统一前端渲染和请求边界的数据类型。
+ */
+export function normalizeCostItem(item: unknown): Record<string, any> {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return {};
+
+  const normalized = { ...(item as Record<string, unknown>) } as Record<string, any>;
+  if (!normalized.name && normalized.item_name) {
+    normalized.name = normalized.item_name;
+  }
+  const textFields = [
+    'item_code', 'name', 'spec_requirement', 'unit', 'matched_name',
+    'matched_brand', 'matched_model', 'matched_manufacturer',
+    'brand_requirements', 'match_quality', 'warning', 'comparison_note',
+    'remark', 'parent_item', 'root_item', 'section_name', 'brand', 'model',
+    'manufacturer'
+  ];
+  textFields.forEach((field) => {
+    if (field in normalized && normalized[field] !== null && normalized[field] !== undefined) {
+      normalized[field] = normalizeCostText(normalized[field]);
+    }
+  });
+  normalized.key_parameters = normalizeCostTextList(normalized.key_parameters);
+  return normalized;
+}
+
+/**
+ * 归一化成本清单，过滤无法作为表格行使用的异常值并记录诊断信息。
+ */
+export function normalizeCostItems(value: unknown): any[] {
+  if (!Array.isArray(value)) {
+    if (value !== null && value !== undefined) {
+      console.warn('成本分析 items 不是数组，已按空清单处理。');
+    }
+    return [];
+  }
+  return value.map(normalizeCostItem).filter((item) => Boolean(item.name));
+}
+
+/**
  * 分部/工程大类规范化函数 (Section Normalization)
  * 忠实保留标书提取的原始 section_name，去除多余空白，杜绝任何硬编码与人为破坏性截断。
  */
-export function normalizeSectionName(rawSec: string | null | undefined): string | null {
-  if (!rawSec || typeof rawSec !== 'string') return null;
-  const s = rawSec.trim();
+export function normalizeSectionName(rawSec: unknown): string | null {
+  const s = normalizeCostText(rawSec).trim();
   return s || null;
 }
 
@@ -101,7 +177,7 @@ export function CostTable({
   isRetrying = false,
   isExtractingEquipment = false
 }: CostTableProps) {
-  const [items, setItems] = useState<any[]>(costAnalysis?.items || []);
+  const [items, setItems] = useState<any[]>(() => normalizeCostItems(costAnalysis?.items));
   const [isAdding, setIsAdding] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -135,7 +211,7 @@ export function CostTable({
   // 当外部传入的 costAnalysis 发生重测算变化时更新本地 items
   useEffect(() => {
     if (costAnalysis && costAnalysis.items) {
-      setItems(costAnalysis.items);
+      setItems(normalizeCostItems(costAnalysis.items));
     }
   }, [costAnalysis]);
 
@@ -438,7 +514,7 @@ export function CostTable({
   // 实时计算预算与超额状态
   let isRealTimeExceeded = false;
   let isRealTimeWarning = false;
-  let dynamicStatusText = costAnalysis.budget_status || '';
+  let dynamicStatusText = normalizeCostText(costAnalysis.budget_status);
   let overrunAmount = 0;
   let usageRatio = 0;
 
@@ -616,33 +692,33 @@ export function CostTable({
         },
         body: JSON.stringify({
           items: currentItems.map(item => ({
-            item_code: item.item_code || null,
-            name: item.name,
-            spec_requirement: item.spec_requirement || '',
+            item_code: normalizeCostText(item.item_code) || null,
+            name: normalizeCostText(item.name),
+            spec_requirement: normalizeCostText(item.spec_requirement),
             qty: item.qty !== null && item.qty !== undefined ? item.qty : 1,
-            unit: item.unit || null,
+            unit: normalizeCostText(item.unit) || '项',
             ref_price: item.ref_price || 0,
-            matched_name: item.matched_name || item.name,
-            matched_brand: item.matched_brand || item.brand || '',
-            matched_model: item.matched_model || item.model || '',
-            matched_manufacturer: item.matched_manufacturer || item.manufacturer || '',
-            brand: item.brand || item.matched_brand || '',
-            model: item.model || item.matched_model || '',
-            manufacturer: item.manufacturer || item.matched_manufacturer || '',
-            key_parameters: item.key_parameters || [],
-            brand_requirements: item.brand_requirements || item.brand || '',
-            match_quality: item.match_quality || '手动添加',
-            warning: item.warning || '',
-            comparison_note: item.comparison_note || '',
-            remark: item.remark || '',
-            parent_item: item.parent_item || null,
-            root_item: item.root_item || null,
+            matched_name: normalizeCostText(item.matched_name || item.name),
+            matched_brand: normalizeCostText(item.matched_brand || item.brand),
+            matched_model: normalizeCostText(item.matched_model || item.model),
+            matched_manufacturer: normalizeCostText(item.matched_manufacturer || item.manufacturer),
+            brand: normalizeCostText(item.brand || item.matched_brand),
+            model: normalizeCostText(item.model || item.matched_model),
+            manufacturer: normalizeCostText(item.manufacturer || item.matched_manufacturer),
+            key_parameters: normalizeCostTextList(item.key_parameters),
+            brand_requirements: normalizeCostText(item.brand_requirements || item.brand),
+            match_quality: normalizeCostText(item.match_quality) || '手动添加',
+            warning: normalizeCostText(item.warning),
+            comparison_note: normalizeCostText(item.comparison_note),
+            remark: normalizeCostText(item.remark),
+            parent_item: normalizeCostText(item.parent_item) || null,
+            root_item: normalizeCostText(item.root_item) || null,
             tree_level: item.tree_level || 1,
             per_set_qty: item.per_set_qty || item.per_set_quantity || null,
             per_set_quantity: item.per_set_quantity || item.per_set_qty || null,
-            section_name: item.section_name || null
+            section_name: normalizeSectionName(item.section_name)
           })),
-          analysis_summary: costAnalysis.analysis_summary || '已手动调整 BOM 成本报价项与指导单价。'
+          analysis_summary: normalizeCostText(costAnalysis.analysis_summary) || '已手动调整 BOM 成本报价项与指导单价。'
         })
       });
 
@@ -1461,9 +1537,9 @@ export function CostTable({
                     </span>
                   )}
                 </div>
-              ) : (costAnalysis.budget_limit && (
+              ) : (normalizeCostText(costAnalysis.budget_limit) && (
                 <div className="text-xs text-slate-400 font-medium mt-0.5">
-                  预算限额: {costAnalysis.budget_limit}
+                  预算限额: {normalizeCostText(costAnalysis.budget_limit)}
                 </div>
               ))}
             </div>
@@ -1487,12 +1563,12 @@ export function CostTable({
         )}
 
         {/* 专家评估总结 */}
-        {costAnalysis.analysis_summary && (
+        {normalizeCostText(costAnalysis.analysis_summary) && (
           <div className="mb-4 p-3.5 bg-blue-50/60 rounded-2xl border border-blue-100 text-xs text-slate-700 leading-relaxed font-medium flex items-start gap-2">
             <span className="text-blue-500 text-sm">💡</span>
             <div>
               <span className="font-bold text-blue-900 mr-1">专家评估推导:</span>
-              {costAnalysis.analysis_summary}
+              {normalizeCostText(costAnalysis.analysis_summary)}
             </div>
           </div>
         )}

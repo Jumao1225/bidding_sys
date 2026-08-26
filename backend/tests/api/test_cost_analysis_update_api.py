@@ -369,4 +369,39 @@ async def test_update_cost_analysis_with_custom_brand_model_should_persist_field
         app.dependency_overrides.clear()
 
 
+@pytest.mark.asyncio
+async def test_update_cost_analysis_with_legacy_structured_key_parameter_should_succeed():
+    """测试历史 {type,input} 关键参数与空单位不会再导致成本保存接口 422。"""
+    mock_user = MagicMock()
+    mock_user.id = "user-test-999"
+    mock_user.tenant_id = "tenant-test-888"
+    app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+    mock_doc = MagicMock()
+    mock_doc.project_id = "proj-123"
+    mock_doc.parsed_metadata = {}
+    payload = {
+        "items": [{
+            "name": "并网柜",
+            "unit": None,
+            "qty": 1,
+            "ref_price": 100,
+            "key_parameters": [{"type": "text", "input": "10kV"}],
+            "match_quality": "精准匹配"
+        }]
+    }
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("sqlalchemy.orm.attributes.flag_modified"):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.put("/api/v1/analysis/doc-legacy-cost/cost-analysis", json=payload)
+
+        assert res.status_code == 200
+        data = res.json()["data"]
+        assert data["items"][0]["key_parameters"] == ["10kV"]
+    finally:
+        app.dependency_overrides.clear()
+
 

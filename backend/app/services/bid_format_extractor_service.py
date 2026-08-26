@@ -99,7 +99,11 @@ class BidFormatExtractorService:
 
         # 3. 回退模式 / PDF 模式：利用 ExtractorService 与 LLM 重建标准 Word
         logger.info(f"使用 LLM 结构化提取模式处理文件: {file_path}")
-        docx_bytes, mode = self._extract_with_llm_and_rebuild(db, doc_obj)
+        docx_bytes, mode = self._extract_with_llm_and_rebuild(
+            db,
+            doc_obj,
+            tenant_id=effective_tenant_id,
+        )
         return docx_bytes, export_filename, mode
 
     def _is_toc_line(self, text: str, element=None) -> bool:
@@ -273,11 +277,21 @@ class BidFormatExtractorService:
         output.seek(0)
         return output.getvalue()
 
-    def _extract_with_llm_and_rebuild(self, db: Session, doc_obj) -> Tuple[bytes, str]:
+    def _extract_with_llm_and_rebuild(
+        self,
+        db: Session,
+        doc_obj,
+        tenant_id: Optional[str] = None,
+    ) -> Tuple[bytes, str]:
         """
         LLM 提取模式：结合 ExtractorService 与 LLM 提取文本，并用 DocxExporterService 渲染 Word。
+
+        :param tenant_id: 调用方显式传入的租户 ID；未传入时回退使用文档所属租户。
         :return: (docx_bytes, actual_mode) 其中 actual_mode 为 "llm_rebuilt" 或 "fallback_template"
         """
+        # 显式保留租户上下文，避免线程池调用时 ContextVar 丢失而回退到全局模型配置。
+        effective_tenant_id = tenant_id or getattr(doc_obj, "tenant_id", None)
+
         # 读取文本
         md_file_path = (
             doc_obj.parsed_metadata.get("md_file_path", "")

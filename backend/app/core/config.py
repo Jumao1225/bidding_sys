@@ -63,6 +63,9 @@ class Settings(BaseSettings):
 
     # Multi-Agent 标书起草长流程开关 (false: 开启; true: 跳过)
     SKIP_BID_FILLER: bool = os.getenv("SKIP_BID_FILLER", "false").lower() in ("true", "1", "yes")
+    # 标书撰写由 Celery 独立进程执行，默认同时只处理一份以保护数据库与 Word 写盘资源。
+    BID_FILL_MAX_CONCURRENCY: int = int(os.getenv("BID_FILL_MAX_CONCURRENCY", 1))
+    BID_FILL_LOCK_TTL_SECONDS: int = int(os.getenv("BID_FILL_LOCK_TTL_SECONDS", 14400))
 
 
     class Config:

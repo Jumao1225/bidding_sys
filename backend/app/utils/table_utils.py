@@ -754,9 +754,9 @@ def inspect_and_repair_table_blanks(doc, document_id: str = "") -> int:
 
 def extract_equipment_tables_and_context(raw_text: str) -> str:
     """
-    智能靶向过滤（全量无截断）：
-    精准提取所有【标的物/设备材料清单表格】、关联章节标题以及技术工况/关键技术要求段落，
-    仅剔除无关的纯行政人事表（人员社保、执业证书、财务审计等），绝不进行字符截断以保证上下文 100% 完整。
+    智能靶向过滤：
+    仅提取工程量、采购、报价、设备材料清单表格及其邻近标题，
+    不再把最后一个表格后的整段正文拼入上下文，避免安全制度、岗位职责和风险条款污染 BOM/BOQ 提取。
     """
     if not raw_text:
         return ""
@@ -777,24 +777,63 @@ def extract_equipment_tables_and_context(raw_text: str) -> str:
         # 若没有识别出表格，完整保留原文，绝不截断
         return raw_text
 
-    # 纯通用清单表格特征词（严格杜绝任何具体设备或行业特定名词硬编码）
-    EQUIPMENT_KEYWORDS = ["设备", "标的", "货物", "材料", "物资", "产品", "服务", "工程量", "清单", "规格", "型号", "参数", "指标", "数量", "单位", "单价", "合价", "总价", "定额"]
-    EXCLUDE_KEYWORDS = ["近三年财务", "财务审计", "营业额", "社保缴纳", "人员资质", "执业证书", "身份证", "评分细则", "评分标准"]
+    # 采用“名称列 + 计量/计价列”双重门槛，避免仅凭“工程/服务/项目”等宽泛词命中安全管理表。
+    NAME_COLUMN_KEYWORDS = ["项目名称", "货物名称", "设备名称", "材料名称", "物资名称", "标的名称", "工作内容", "服务名称"]
+    MEASURE_COLUMN_KEYWORDS = ["工程量", "数量", "单位", "单价", "合价", "总价", "定额", "计量"]
+    BOQ_CONTEXT_KEYWORDS = ["工程量清单", "采购清单", "报价清单", "分项报价", "货物需求", "设备材料", "主要标的物", "供货范围"]
+    NON_BOQ_KEYWORDS = [
+        "安全生产", "安全文明施工", "违章", "作业票", "岗位职责", "人员分工", "风险管理",
+        "风险辨识", "应急预案", "管理制度", "培训要求", "处罚条款", "评标办法", "评分标准",
+        "验收说明", "合规承诺", "施工规范"
+    ]
+    BOQ_CONTINUATION_STOP_KEYWORDS = [
+        "设备材料品牌表", "项目安全协议", "安全文明施工违章库", "常规施工风险", "工程结算单"
+    ]
+
+    def extract_table_header_text(table_content: str) -> str:
+        """仅提取表头行，避免正文描述中的关键词误判表格类型。"""
+        if re.search(r"<table", table_content, re.IGNORECASE):
+            first_row = re.search(r"<tr[\s\S]*?</tr>", table_content, re.IGNORECASE)
+            if not first_row:
+                return ""
+            cells = re.findall(r"<(?:th|td)[^>]*>([\s\S]*?)</(?:th|td)>", first_row.group(0), re.IGNORECASE)
+            return re.sub(r"<[^>]+>", " ", " ".join(cells)).strip().lower()
+
+        lines = [line.strip() for line in table_content.splitlines() if line.strip()]
+        if not lines:
+            return ""
+        return re.sub(r"\s+", " ", lines[0]).strip().lower()
 
     filtered_sections = []
     last_end = 0
+    active_boq_table = False
 
     for start, end, t_type, tbl_content in table_spans:
-        plain_tbl = re.sub(r'<[^>]+>', ' ', tbl_content).lower()
-        is_equipment_table = any(kw in plain_tbl for kw in EQUIPMENT_KEYWORDS)
-        is_excluded = any(kw in plain_tbl for kw in EXCLUDE_KEYWORDS) and not any(k in plain_tbl for k in ["采购清单", "主要标的物", "设备名称", "货物名称"])
-
+        header_text = extract_table_header_text(tbl_content)
         preceding_text = raw_text[last_end:start].strip()
+        preceding_lines = [l.strip() for l in preceding_text.split('\n') if l.strip()]
+        nearby_text = "\n".join(preceding_lines[-15:]).lower()
+
+        has_name_column = any(kw in header_text for kw in NAME_COLUMN_KEYWORDS)
+        has_measure_column = any(kw in header_text for kw in MEASURE_COLUMN_KEYWORDS)
+        has_boq_context = any(kw in nearby_text for kw in BOQ_CONTEXT_KEYWORDS)
+        # 续表首行通常是上一张清单的第一条数据，描述字段可能包含“施工规范”等词，
+        # 不能把这类数据内容误当成非清单表头；只有尚未进入清单上下文时才检查表头。
+        has_non_boq_context = any(kw in nearby_text for kw in NON_BOQ_KEYWORDS)
+        if not active_boq_table:
+            has_non_boq_context = has_non_boq_context or any(kw in header_text for kw in NON_BOQ_KEYWORDS)
+        has_continuation_stop = any(kw in nearby_text for kw in BOQ_CONTINUATION_STOP_KEYWORDS)
+        is_new_boq_table = (
+            (has_name_column and has_measure_column)
+            or (has_boq_context and has_measure_column)
+        ) and not (has_non_boq_context and not has_boq_context)
+        # 工程量清单经常跨页拆成多个无表头续表，继承上一张清单表的上下文。
+        is_continuation_table = active_boq_table and not has_continuation_stop and not has_non_boq_context
+        is_boq_table = is_new_boq_table or is_continuation_table
         
-        if is_equipment_table and not is_excluded:
+        if is_boq_table:
             # 提取紧随该设备表格前方的章节大标题或说明（如 "第X标段/分部工程清单"）
-            if preceding_text:
-                preceding_lines = [l.strip() for l in preceding_text.split('\n') if l.strip()]
+            if preceding_lines and not is_continuation_table:
                 # 倒序向上查找最近的各级标题行与技术说明（扩大探测窗口至 15 行），确保大标题 100% 完整保留
                 headers = []
                 for l in reversed(preceding_lines[-15:]):
@@ -803,24 +842,19 @@ def extract_equipment_tables_and_context(raw_text: str) -> str:
                     elif any(c in l for c in ['表', '清单', '需求', '规格', '标段', '工程', '部分', '系统', '一览表']):
                         headers.append(l)
                 headers = list(reversed(headers))
-                if not headers and preceding_lines:
-                    headers = preceding_lines[-3:]
                 if headers:
                     filtered_sections.append("\n".join(headers))
             filtered_sections.append(tbl_content)
+            active_boq_table = True
         else:
             # 若是非设备表格（如人员资质表、财务表），跳过该表格及其紧贴标题
-            pass
+            if has_continuation_stop or has_non_boq_context:
+                active_boq_table = False
         
         last_end = end
 
-    # 处理最后一个表格后面的剩余文本（保留特殊工况、现场施工要求、技术门槛等完整说明，绝不截断）
-    remaining_text = raw_text[last_end:].strip()
-    if remaining_text:
-        filtered_sections.append(remaining_text)
-
     if not filtered_sections:
-        return raw_text
+        return ""
 
     return "\n\n".join(filtered_sections)
 
@@ -1010,8 +1044,4 @@ def reset_chapter_to_template(
     except Exception as e:
         logger.warning(f"重置章节至模板状态异常: {e}")
         return False
-
-
-
-
 

@@ -1,4 +1,4 @@
-import React, { useState, memo } from 'react';
+import { useMemo, useState, memo } from 'react';
 import DocViewer, { DocViewerRenderers } from "@cyntler/react-doc-viewer";
 import "@cyntler/react-doc-viewer/dist/index.css";
 import { LocalDocxRenderer } from './LocalDocxRenderer';
@@ -20,10 +20,38 @@ export interface SmartDocViewerProps {
 
 const RENDERERS = [LocalDocxRenderer, ...DocViewerRenderers];
 
+type PdfFileSource = string | {
+  url: string;
+  httpHeaders: {
+    Authorization: string;
+  };
+};
+
+/**
+ * 根据文档地址和登录令牌生成 PDF 源配置。
+ */
+export function build_pdf_file_source(uri: string, token: string | null): PdfFileSource {
+  if (!token) {
+    return uri;
+  }
+
+  return {
+    url: uri,
+    httpHeaders: { Authorization: `Bearer ${token}` },
+  };
+}
+
 export const SmartDocViewer = memo(function SmartDocViewer({ documents, zoomLevel = 100 }: SmartDocViewerProps) {
   const doc = documents[0];
   const [numPages, setNumPages] = useState<number>(0);
   const [pdfError, setPdfError] = useState<string>('');
+  const document_uri = doc?.uri ?? '';
+  const token = localStorage.getItem('bidding_token');
+  // 保持 file 对象引用稳定，避免 react-pdf 在父组件重渲染时重复加载同一 PDF。
+  const pdf_file = useMemo(
+    () => build_pdf_file_source(document_uri, token),
+    [document_uri, token],
+  );
 
   if (!doc) {
     return <div className="flex items-center justify-center h-full text-slate-400">无文件</div>;
@@ -33,17 +61,12 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents, zoomLeve
   const scale = zoomLevel / 100;
 
   if (isPdf) {
-    const token = localStorage.getItem('bidding_token');
-    const pdfFile = token 
-      ? { url: doc.uri, httpHeaders: { Authorization: `Bearer ${token}` } } 
-      : doc.uri;
-
     const targetWidth = Math.round(850 * scale);
 
     return (
       <div className="flex-1 w-full h-full bg-[#f3f4f6] overflow-auto custom-scrollbar">
         <Document
-          file={pdfFile}
+          file={pdf_file}
           onLoadSuccess={({ numPages }) => setNumPages(numPages)}
           onLoadError={(error) => setPdfError(error.message)}
           className="h-full w-full flex flex-col"
@@ -80,8 +103,10 @@ export const SmartDocViewer = memo(function SmartDocViewer({ documents, zoomLeve
   }
 
   // Word 文档 (Docx) 退回原渲染器，支持动态 zoom 缩放与双向滚动
-  const token = localStorage.getItem('bidding_token');
-  const requestHeaders = token ? { Authorization: `Bearer ${token}` } : {};
+  const docx_token = localStorage.getItem('bidding_token');
+  const requestHeaders: Record<string, string> = docx_token
+    ? { Authorization: `Bearer ${docx_token}` }
+    : {};
 
   return (
     <div 

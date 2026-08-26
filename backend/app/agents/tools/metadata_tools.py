@@ -130,7 +130,9 @@ def extract_engineering_info(document_id: str, search_keywords: str = "主要设
         db = SessionLocal()
         full_context = ""
         try:
-            doc = document_crud.get_document_by_id(db, document_id)
+            # 已通过 validate_document_access 完成权限校验，这里使用系统内部查询方法，
+            # 避免遗漏 user_id 和 tenant_id 参数后异常降级到不完整的 RAG 检索。
+            doc = document_crud.get_document_by_id_system(db, document_id)
             if doc and doc.parsed_metadata and doc.parsed_metadata.get("md_file_path"):
                 md_path = doc.parsed_metadata.get("md_file_path")
                 if os.path.exists(md_path):

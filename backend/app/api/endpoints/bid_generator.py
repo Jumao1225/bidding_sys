@@ -19,7 +19,7 @@ import tempfile
 import uuid
 import urllib.parse
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Response, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
@@ -1143,14 +1143,13 @@ def _run_agent_bid_filling_in_background(
 @router.post("/agent-fill-bid-format/{document_id}")
 async def trigger_agent_bid_filling(
     document_id: str,
-    background_tasks: BackgroundTasks,
     request_body: Optional[BidFillRequest] = None,
     db: Session = Depends(deps.get_db),
     current_user: Optional[User] = Depends(deps.get_current_user_optional)
 ):
     """
     触发 BidFillerAgent (LangGraph + ReAct Agent) 自动填报。
-    使用 BackgroundTasks 进行后台解耦，瞬间返回响应，配合 SSE (stream-logs) 获得 0 延迟卡片实时弹增体验。
+    使用独立子进程隔离长耗时 Word 与 Agent 操作，配合 SSE 获得实时进度。
     """
     if not document_id:
         raise HTTPException(status_code=400, detail="未提供有效的 document_id 参数")
@@ -1165,6 +1164,21 @@ async def trigger_agent_bid_filling(
     if request_body:
         custom_instructions = request_body.custom_instructions
         category_hints = request_body.category_hints
+
+    from app.services.bid_fill_task_service import bid_fill_task_service
+
+    reservation, reservation_status = bid_fill_task_service.acquire(document_id)
+    if reservation is None:
+        reservation_messages = {
+            "document_running": "该标书正在撰写中，请勿重复提交",
+            "capacity_reached": "当前已有标书撰写任务正在执行，请稍后重试",
+            "redis_unavailable": "任务调度服务暂不可用，请检查 Redis 后重试",
+        }
+        status_code = 503 if reservation_status == "redis_unavailable" else 409
+        raise HTTPException(
+            status_code=status_code,
+            detail=reservation_messages[reservation_status],
+        )
 
     # 清理该文档上一次的填报审计日志，并立即注入全局起始 in_progress 记录
     try:
@@ -1194,22 +1208,26 @@ async def trigger_agent_bid_filling(
         logger.warning(f"清理旧 AuditLog 异常: {del_err}")
         db.rollback()
 
-    import threading
-    filling_thread = threading.Thread(
-        target=_run_agent_bid_filling_in_background,
-        kwargs={
-            "document_id": document_id,
-            "u_id": u_id,
-            "t_id": t_id,
-            "custom_instructions": custom_instructions,
-            "category_hints": category_hints
-        },
-        daemon=True
-    )
-    filling_thread.start()
+    try:
+        from app.services.bid_fill_task_service import start_bid_fill_process
+
+        process_id = start_bid_fill_process(
+            document_id=document_id,
+            user_id=u_id,
+            tenant_id=t_id,
+            custom_instructions=custom_instructions,
+            category_hints=category_hints,
+            reservation_data=reservation.to_payload(),
+        )
+    except Exception as dispatch_error:
+        bid_fill_task_service.release(reservation)
+        logger.exception(f"启动独立标书撰写进程失败: document_id={document_id}, error={dispatch_error}")
+        raise HTTPException(status_code=503, detail="标书撰写进程启动失败，请稍后重试")
 
     return {
         "document_id": document_id,
+        "task_id": f"process-{process_id}",
+        "process_id": process_id,
         "status": "processing",
-        "message": "已成功启动 Agent 团队后台全自主撰写流程，请通过 SSE 实时监听进度"
+        "message": "已成功启动独立进程执行 Agent 团队标书撰写，请通过 SSE 实时监听进度"
     }

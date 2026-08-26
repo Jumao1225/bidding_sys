@@ -29,6 +29,12 @@ def test_extract_equipment_tables_and_context_filters_noise():
     
     四、现场特殊工况与要求
     现场临近水域，必须搭设水上作业平台并做好防倾覆措施。
+
+    五、安全文明施工违章库
+    <table>
+        <tr><th>工序</th><th>违章分类</th><th>违章等级</th></tr>
+        <tr><td>通用</td><td>管理违章</td><td>一类</td></tr>
+    </table>
     """
     
     filtered = extract_equipment_tables_and_context(sample_text)
@@ -42,8 +48,9 @@ def test_extract_equipment_tables_and_context_filters_noise():
     assert "10kV高压真空断路器" in filtered
     assert "主要设备与材料需求一览表" in filtered
     
-    # 验证文末特殊工况补充说明完整保留
-    assert "水上作业平台" in filtered
+    # 只保留 BOQ 上下文，不再把表格后的特殊工况与安全违章库拼入模型上下文
+    assert "水上作业平台" not in filtered
+    assert "管理违章" not in filtered
 
 def test_extract_equipment_tables_and_context_empty_fallback():
     """测试空文本与无表格文本的安全兜底"""
@@ -52,3 +59,29 @@ def test_extract_equipment_tables_and_context_empty_fallback():
     
     plain_text = "这是一段纯文字描述，没有任何表格。"
     assert extract_equipment_tables_and_context(plain_text) == plain_text
+
+
+def test_extract_equipment_tables_and_context_keeps_split_boq_continuation():
+    """测试工程量清单跨页拆成无重复表头的续表时仍能完整保留。"""
+    sample_text = """
+    附件1：工程量清单及报价明细、设备材料品牌表
+    <table>
+        <tr><th>序号</th><th>项目名称</th><th>项目特征</th><th>单位</th><th>数量</th></tr>
+        <tr><td>1</td><td>设备A</td><td>满足施工规范要求</td><td>台</td><td>2</td></tr>
+    </table>
+    <table>
+        <tr><td>2</td><td>设备B</td><td>续表项目，满足施工规范要求</td><td>m</td><td>10</td></tr>
+    </table>
+
+    设备材料品牌表
+    <table>
+        <tr><th>类别</th><th>合格供应商名单</th></tr>
+        <tr><td>电缆</td><td>品牌A</td></tr>
+    </table>
+    """
+
+    filtered = extract_equipment_tables_and_context(sample_text)
+
+    assert "设备A" in filtered
+    assert "设备B" in filtered
+    assert "品牌A" not in filtered

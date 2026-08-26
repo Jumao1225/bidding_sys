@@ -10,8 +10,9 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 from app.main import app
-from app.api.deps import get_current_active_user, get_db
+from app.api.deps import get_current_active_user, get_current_user_optional, get_db
 from app.api.endpoints.bid_generator import _get_bid_fill_pipeline_state
+from app.services.bid_fill_task_service import BidFillTaskReservation
 
 
 @pytest.mark.asyncio
@@ -171,6 +172,60 @@ async def test_get_bid_fill_worker_logs_no_logs_should_return_empty_items():
         app.dependency_overrides.clear()
 
 
+@pytest.mark.asyncio
+async def test_trigger_agent_bid_filling_available_slot_should_start_isolated_process():
+    """可用槽位下应启动独立进程，不在 API 进程执行标书撰写。"""
+    mock_user = MagicMock(id="user-test-bid", tenant_id="tenant-test-bid")
+    mock_db = MagicMock()
+    reservation = BidFillTaskReservation(
+        document_lock_key="bid-fill:document:doc-12345",
+        capacity_lock_key="bid-fill:capacity:0",
+        token="reservation-token",
+    )
+    app.dependency_overrides[get_current_user_optional] = lambda: mock_user
+    app.dependency_overrides[get_db] = lambda: mock_db
+
+    try:
+        with patch(
+            "app.services.bid_fill_task_service.bid_fill_task_service.acquire",
+            return_value=(reservation, "accepted"),
+        ), patch(
+            "app.services.bid_fill_task_service.start_bid_fill_process",
+            return_value=24680,
+        ) as start_process:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post("/api/v1/bidding/agent-fill-bid-format/doc-12345")
+
+        assert response.status_code == 200
+        assert response.json()["task_id"] == "process-24680"
+        assert response.json()["process_id"] == 24680
+        start_process.assert_called_once()
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_trigger_agent_bid_filling_duplicate_document_should_return_conflict():
+    """同一文档已有运行任务时，接口应返回 409 而非重复派发。"""
+    mock_user = MagicMock(id="user-test-bid", tenant_id="tenant-test-bid")
+    app.dependency_overrides[get_current_user_optional] = lambda: mock_user
+
+    try:
+        with patch(
+            "app.services.bid_fill_task_service.bid_fill_task_service.acquire",
+            return_value=(None, "document_running"),
+        ):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                response = await ac.post("/api/v1/bidding/agent-fill-bid-format/doc-12345")
+
+        assert response.status_code == 409
+        assert "正在撰写中" in response.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_bid_fill_pipeline_state_should_stay_processing_after_intermediate_supervisor_success():
     """中间 Supervisor 成功但最终终态未写入时，不应提前判定整条流程完成。"""
     now = datetime.now()
@@ -208,5 +263,3 @@ def test_bid_fill_pipeline_state_should_mark_failed_terminal_log():
 
     assert state["pipeline_status"] == "failed"
     assert state["is_completed"] is True
-
-

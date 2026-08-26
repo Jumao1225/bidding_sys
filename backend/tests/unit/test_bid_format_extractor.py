@@ -135,6 +135,7 @@ def test_extract_with_llm_and_rebuild_with_mocked_llm_json(monkeypatch):
     mock_doc = MagicMock()
     mock_doc.id = "test-doc-id"
     mock_doc.filename = "光伏电站项目.pdf"
+    mock_doc.tenant_id = "tenant-bid-format"
     mock_doc.parsed_metadata = {"md_file_path": ""}
     
     mock_db = MagicMock()
@@ -144,7 +145,7 @@ def test_extract_with_llm_and_rebuild_with_mocked_llm_json(monkeypatch):
 
     # 模拟 LLM 返回包含 table_template 的 JSON
     mock_llm_service = MagicMock()
-    mock_llm_service.is_configured = True
+    mock_llm_service.is_configured_for_tenant.return_value = True
     mock_llm_service.generate_structured_json.return_value = {
         "document_title": "光伏电站项目 - 投标文件格式模板",
         "source_chapter_name": "第六章 投标文件格式",
@@ -171,6 +172,8 @@ def test_extract_with_llm_and_rebuild_with_mocked_llm_json(monkeypatch):
     assert docx_bytes is not None
     assert len(docx_bytes) > 0
     assert mode == "llm_rebuilt"
+    mock_llm_service.is_configured_for_tenant.assert_called_once_with("tenant-bid-format")
+    assert mock_llm_service.generate_structured_json.call_args.kwargs["tenant_id"] == "tenant-bid-format"
 
 
 def test_extract_with_llm_exception_should_log_and_return_fallback_mode(monkeypatch):
@@ -180,6 +183,7 @@ def test_extract_with_llm_exception_should_log_and_return_fallback_mode(monkeypa
     mock_doc = MagicMock()
     mock_doc.id = "test-error-doc-id"
     mock_doc.filename = "异常测试项目.pdf"
+    mock_doc.tenant_id = "tenant-bid-format"
     mock_doc.parsed_metadata = {"md_file_path": ""}
     
     mock_db = MagicMock()
@@ -189,7 +193,7 @@ def test_extract_with_llm_exception_should_log_and_return_fallback_mode(monkeypa
 
     # 模拟 LLM 抛出异常
     mock_llm_service = MagicMock()
-    mock_llm_service.is_configured = True
+    mock_llm_service.is_configured_for_tenant.return_value = True
     mock_llm_service.generate_structured_json.side_effect = RuntimeError("网络超时或 API 连接异常")
 
     service = bid_format_extractor_service
@@ -199,6 +203,7 @@ def test_extract_with_llm_exception_should_log_and_return_fallback_mode(monkeypa
     assert docx_bytes is not None
     assert len(docx_bytes) > 0
     assert mode == "fallback_template"
+    mock_llm_service.is_configured_for_tenant.assert_called_once_with("tenant-bid-format")
 
 
 def test_slice_docx_natively_should_preserve_exact_word_elements(tmp_path):
@@ -249,7 +254,6 @@ def test_slice_docx_natively_should_preserve_exact_word_elements(tmp_path):
     assert "第一章 招标公告" not in all_text
     assert "第七章 评标办法" not in all_text
     assert len(sliced_doc.tables) == 1
-
 
 
 

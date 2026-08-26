@@ -25,6 +25,7 @@ class BaseMetadataService:
         system_prompt: str,
         document_id: str,
         tenant_id: Optional[str] = None,
+        persist: bool = True,
     ) -> T:
         """
         基于传入的上下文 context，利用大模型提取出符合 schema_cls 结构的 JSON 数据，
@@ -61,7 +62,7 @@ class BaseMetadataService:
             raise ValueError(f"大模型提取失败: {e}") from e
         
         # 自动落盘到 PostgreSQL (防御性拦截)
-        if self.db_model_cls and document_id:
+        if self.db_model_cls and document_id and persist:
             try:
                 self._save_to_db(document_id, result_obj)
             except Exception as db_err:
