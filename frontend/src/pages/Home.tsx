@@ -37,6 +37,7 @@ export function Home() {
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [activeTab, setActiveTab] = useState<'all' | 'tender' | 'bid'>('all');
   const [isLoading, setIsLoading] = useState(true);
+  const [downloadingDocId, setDownloadingDocId] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchDocuments = async () => {
@@ -57,6 +58,47 @@ export function Home() {
     };
     fetchDocuments();
   }, []);
+
+  const handleDownloadOriginalFile = async (e: React.MouseEvent, doc: DocumentRecord) => {
+    e.stopPropagation(); // 阻止点击卡片跳转
+    if (downloadingDocId) return;
+
+    setDownloadingDocId(doc.id);
+    try {
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+      const res = await apiFetch(`${baseUrl}/api/v1/documents/${doc.id}/download`);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || '下载原文件失败，文件可能不存在或无权限');
+      }
+
+      const blob = await res.blob();
+      const contentDisposition = res.headers.get('Content-Disposition') || '';
+      let filename = doc.filename || '标书原文件';
+      const match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i) || contentDisposition.match(/filename="?([^";]+)"?/i);
+      if (match && match[1]) {
+        try {
+          filename = decodeURIComponent(match[1]);
+        } catch {
+          filename = match[1];
+        }
+      }
+
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err: any) {
+      console.error('Download original file error:', err);
+      alert(err.message || '下载出错，请稍后重试');
+    } finally {
+      setDownloadingDocId(null);
+    }
+  };
 
   const handleDelete = async (e: React.MouseEvent, docId: string) => {
     e.stopPropagation(); // 阻止点击卡片跳转
@@ -212,14 +254,36 @@ export function Home() {
                         </p>
                       </div>
                     </div>
-                    {/* 删除按钮 */}
-                    <button
-                      onClick={(e) => handleDelete(e, doc.id)}
-                      className="p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100 flex-shrink-0"
-                      title="删除记录"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                    </button>
+                    {/* 操作按钮组 */}
+                    <div className="flex items-center space-x-0.5 flex-shrink-0">
+                      {/* 下载原文件按钮 */}
+                      <button
+                        onClick={(e) => handleDownloadOriginalFile(e, doc)}
+                        disabled={downloadingDocId === doc.id}
+                        className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all opacity-0 group-hover:opacity-100 disabled:opacity-100"
+                        title="下载原文件"
+                      >
+                        {downloadingDocId === doc.id ? (
+                          <svg className="w-4 h-4 animate-spin text-indigo-600" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                          </svg>
+                        ) : (
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                          </svg>
+                        )}
+                      </button>
+
+                      {/* 删除按钮 */}
+                      <button
+                        onClick={(e) => handleDelete(e, doc.id)}
+                        className="p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
+                        title="删除记录"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                      </button>
+                    </div>
                   </div>
                   <div className="mt-4 flex items-center justify-between pt-2 border-t border-slate-100">
                     <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${

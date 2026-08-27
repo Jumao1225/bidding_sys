@@ -11,6 +11,14 @@ class CRUDTenant:
     def get_by_name(self, db: Session, name: str) -> Optional[Tenant]:
         return db.query(Tenant).filter(Tenant.name == name).first()
 
+    def get_by_identifier(self, db: Session, identifier: str) -> Optional[Tenant]:
+        """根据企业名称、专属域名或唯一ID查询租户。"""
+        if not identifier:
+            return None
+        return db.query(Tenant).filter(
+            (Tenant.id == identifier) | (Tenant.name == identifier) | (Tenant.domain == identifier)
+        ).first()
+
     def create(self, db: Session, obj_in: TenantCreate) -> Tenant:
         db_obj = Tenant(
             name=obj_in.name,
@@ -40,6 +48,14 @@ class CRUDUser:
 
     def get_by_email(self, db: Session, email: str) -> Optional[User]:
         return db.query(User).filter(User.email == email).first()
+
+    def get_by_tenant_and_email(self, db: Session, *, tenant_id: str, email: str) -> Optional[User]:
+        """查询指定租户下的用户账号。"""
+        return db.query(User).filter(User.tenant_id == tenant_id, User.email == email).first()
+
+    def get_multi_by_email(self, db: Session, *, email: str) -> List[User]:
+        """全局查询指定登录账号的所有记录（用于跨租户重名识别）。"""
+        return db.query(User).filter(User.email == email).all()
 
     def create(self, db: Session, obj_in: UserCreate) -> User:
         db_obj = User(

@@ -171,4 +171,53 @@ class DocumentService:
                 except Exception as e:
                     logger.warning(f"未能彻底清理物理文件 {path_to_delete}: {e}")
 
+    def get_document_file_for_download(self, db: Session, doc_id: str, user_id: str, tenant_id: str) -> tuple[str, str]:
+        """获取指定文档的原文件物理路径与文件名（含多租户权限校验与多级候选路径探测）"""
+        from pathlib import Path
+        doc_obj = document_crud.get_document_by_id(db, doc_id, user_id, tenant_id)
+        if not doc_obj:
+            raise HTTPException(status_code=404, detail="文档记录未找到或无权访问")
+
+        raw_path = str(doc_obj.file_path or "").strip()
+        candidate_paths = []
+        if raw_path:
+            candidate_paths.append(raw_path)
+            if not os.path.isabs(raw_path):
+                # 尝试相对于 backend 根目录解析
+                backend_base = Path(__file__).resolve().parent.parent.parent
+                candidate_paths.append(str(backend_base / raw_path))
+
+        target_path = None
+        for path in candidate_paths:
+            if os.path.exists(path) and os.path.isfile(path):
+                target_path = path
+                break
+
+        # 若直接路径未命中，尝试在常见上传存储目录中查找
+        if not target_path:
+            backend_base = Path(__file__).resolve().parent.parent.parent
+            search_dirs = [
+                backend_base / "uploads" / "tenders",
+                backend_base / "uploads" / "bids",
+                backend_base / "uploads",
+                backend_base / "storage" / "temp_uploads",
+            ]
+            for sdir in search_dirs:
+                if sdir.exists() and sdir.is_dir():
+                    for fname in os.listdir(sdir):
+                        if (doc_id in fname) or (doc_obj.filename and fname.endswith(doc_obj.filename)):
+                            cand = str(sdir / fname)
+                            if os.path.isfile(cand):
+                                target_path = cand
+                                break
+                    if target_path:
+                        break
+
+        if not target_path or not os.path.exists(target_path):
+            logger.warning(f"下载原文件失败，物理文件不存在: doc_id={doc_id}, file_path={raw_path}")
+            raise HTTPException(status_code=404, detail="未在服务器上找到该文档的原文件")
+
+        return target_path, doc_obj.filename
+
 document_service = DocumentService()
+

@@ -1,5 +1,7 @@
+import urllib.parse
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.schemas.response.common import ResponseModel, success_response
@@ -48,6 +50,34 @@ def get_document_result(
         logger.error(f"Failed to fetch document result {doc_id}: {e}")
         raise HTTPException(status_code=500, detail="恢复历史看板数据失败")
 
+@router.get("/{doc_id}/download", summary="下载标书原文件")
+def download_original_document(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """根据文档 ID 下载对应的原始文件（PDF / Word 等）"""
+    try:
+        file_path, filename = document_service.get_document_file_for_download(
+            db, doc_id, current_user.id, current_user.tenant_id
+        )
+        encoded_filename = urllib.parse.quote(filename)
+        headers = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            headers=headers,
+            content_disposition_type="attachment"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to download original document {doc_id}: {e}")
+        raise HTTPException(status_code=500, detail="下载原文件失败")
+
 @router.delete("/{doc_id}", response_model=ResponseModel[dict])
 def delete_document(
     doc_id: str, 
@@ -63,3 +93,4 @@ def delete_document(
     except Exception as e:
         logger.error(f"Failed to delete document {doc_id}: {e}")
         raise HTTPException(status_code=500, detail="删除记录失败")
+

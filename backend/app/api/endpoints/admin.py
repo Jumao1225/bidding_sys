@@ -179,18 +179,21 @@ def create_user(
     """
     Create new user. Requires admin privileges.
     """
-    user = crud_user.user.get_by_email(db, email=user_in.email)
-    if user:
-        raise HTTPException(
-            status_code=400,
-            detail="The user with this username already exists in the system.",
-        )
     tenant = crud_user.tenant.get(db, id=user_in.tenant_id)
     if not tenant:
         raise HTTPException(
             status_code=404,
             detail="The specified tenant does not exist.",
         )
+
+    # 租户内查重：同一租户内账号不可重复，不同租户允许同名
+    existing_user = crud_user.user.get_by_tenant_and_email(db, tenant_id=user_in.tenant_id, email=user_in.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=400,
+            detail="The user with this username already exists in this tenant.",
+        )
+
     if current_manager.role == "tenant_admin":
         if user_in.tenant_id != current_manager.tenant_id:
             logger.warning("租户管理员 {} 尝试向其他租户创建用户", current_manager.id)
@@ -261,6 +264,14 @@ def update_user_tenant(
         raise HTTPException(
             status_code=404,
             detail="The specified tenant does not exist.",
+        )
+
+    # 目标租户查重：变更后不能与目标租户内的已有账号冲突
+    target_existing = crud_user.user.get_by_tenant_and_email(db, tenant_id=tenant_in.tenant_id, email=user.email)
+    if target_existing and target_existing.id != user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="The user with this username already exists in the target tenant.",
         )
     
     # 租户与业务角色在同一个事务中更新，确保界面上的“变更租户+权限”不会出现半成功状态。

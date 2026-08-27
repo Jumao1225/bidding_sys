@@ -886,7 +886,7 @@ export function SystemAdmin() {
                 </div>
                 <div>
                   <h3 className="text-lg font-bold text-slate-800">分配新账号</h3>
-                  <p className="text-xs text-slate-500">创建并分配指定角色权限的新成员账号</p>
+                  <p className="text-xs text-slate-500">创建并分配新成员账号 (同一企业内不可重复，不同企业允许同名)</p>
                 </div>
               </div>
               <form onSubmit={handleCreateUser} className="space-y-4">
@@ -897,7 +897,7 @@ export function SystemAdmin() {
                     value={newUserEmail}
                     onChange={e => setNewUserEmail(e.target.value)}
                     className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 rounded-xl outline-none text-sm transition-all font-medium"
-                    placeholder="输入登录邮箱或唯一用户名..."
+                    placeholder="输入登录邮箱或用户名，如 zhangsan 或 admin..."
                     required
                   />
                 </div>

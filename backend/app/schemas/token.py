@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 class Token(BaseModel):
     access_token: str
@@ -11,7 +11,15 @@ class TokenPayload(BaseModel):
 
 from app.schemas.user import User
 
+class TenantSelectionOption(BaseModel):
+    id: str
+    name: str
+    role: Optional[str] = None
+
 class LoginResponse(BaseModel):
-    access_token: str
-    token_type: str
-    user: User
+    access_token: Optional[str] = None
+    token_type: Optional[str] = None
+    user: Optional[User] = None
+    require_tenant_selection: Optional[bool] = False
+    message: Optional[str] = None
+    tenants: Optional[List[TenantSelectionOption]] = None

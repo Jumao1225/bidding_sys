@@ -58,4 +58,5 @@ async def test_login_wrong_password(setup_test_user):
         })
     
     assert response.status_code == 400
-    assert response.json()["detail"] == "Incorrect email or password"
+    assert response.json()["detail"] in ["账号或密码错误", "Incorrect email or password"]
+

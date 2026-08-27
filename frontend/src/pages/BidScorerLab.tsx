@@ -17,6 +17,7 @@ import {
   type ScoreItem
 } from '../api/bidScorerApi';
 import { ChunkAnnotationWorkbench } from '../components/ChunkAnnotationWorkbench';
+import { getBidUploadErrorMessage } from '../utils/bidScorerErrors';
 
 export const BidScorerLab: React.FC = () => {
   // 1. 数据状态与配置池
@@ -146,7 +147,9 @@ export const BidScorerLab: React.FC = () => {
       setStatusMessage(`上传解析完成！文档已拆分为 ${res.chunk_count} 个切片，可开始智能打分。`);
       setScoreResult(null); // 上传新文件时置空过往报表
     } catch (err: any) {
-      setErrorMessage(err.message || '上传失败，请稍后重试。');
+      console.error('投标文件上传解析失败:', err);
+      setStatusMessage('');
+      setErrorMessage(getBidUploadErrorMessage(err));
     } finally {
       setUploading(false);
     }
@@ -247,7 +250,7 @@ export const BidScorerLab: React.FC = () => {
       {/* 消息与警报提示框 */}
       <AnimatePresence>
         {errorMessage && (
-          <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="mb-6 p-4 rounded-2xl bg-rose-950/40 border border-rose-500/50 text-rose-300 flex items-center gap-3 shadow-lg">
+          <motion.div role="alert" aria-live="assertive" initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="mb-6 p-4 rounded-2xl bg-rose-950/40 border border-rose-500/50 text-rose-300 flex items-center gap-3 shadow-lg">
             <Shield className="w-5 h-5 text-rose-400 flex-shrink-0 animate-bounce" />
             <span className="text-sm font-semibold">{errorMessage}</span>
           </motion.div>

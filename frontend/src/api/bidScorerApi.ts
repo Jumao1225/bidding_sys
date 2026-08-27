@@ -73,6 +73,19 @@ export interface ScoreResultDetail {
 }
 
 /**
+ * 投标文件上传接口错误，保留 HTTP 状态码供页面区分临时服务异常与用户输入错误。
+ */
+export class BidDocumentUploadError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'BidDocumentUploadError';
+    this.status = status;
+  }
+}
+
+/**
  * 1. 拉取所有状态完好的历史解析招标文件作为“评分尺度/裁判法典 (source_doc)”
  * 默认仅查询 doc_type=tender 招标文件
  */
@@ -102,12 +115,20 @@ export async function uploadBidDocument(file: File, sourceDocId: string): Promis
   });
   if (!res.ok) {
     const errText = await res.text();
+    let errorMessage = '投标文件轻量解析上传失败';
+
     try {
       const errJson = JSON.parse(errText);
-      throw new Error(errJson.detail || '投标文件轻量解析上传失败');
+      if (typeof errJson.detail === 'string' && errJson.detail.trim()) {
+        errorMessage = errJson.detail;
+      }
     } catch {
-      throw new Error('投标文件轻量解析上传失败: ' + errText);
+      if (errText.trim()) {
+        errorMessage = `投标文件轻量解析上传失败: ${errText}`;
+      }
     }
+
+    throw new BidDocumentUploadError(errorMessage, res.status);
   }
   const json = await res.json();
   return json.data;
@@ -273,4 +294,3 @@ export async function rescoreCategory(
   const json = await res.json();
   return json.data;
 }
-
