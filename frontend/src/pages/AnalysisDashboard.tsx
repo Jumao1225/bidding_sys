@@ -338,6 +338,7 @@ export function AnalysisDashboard() {
       <div className="w-full">
         <CostTable
           documentId={activeDocId}
+          documentFilename={result?.filename}
           equipmentList={eng.main_equipment_list || []}
           financial={fin}
           costAnalysis={result?.cost_analysis || {}}

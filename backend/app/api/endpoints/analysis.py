@@ -1,13 +1,15 @@
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Depends
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from loguru import logger
 import os
 import uuid
+import urllib.parse
 from pathlib import Path
 import glob
 from datetime import datetime
+from pydantic import BaseModel, Field
 
 from app.schemas.response.common import ResponseModel, success_response
 from app.worker.tasks import analyze_bidding_doc
@@ -703,3 +705,193 @@ async def download_original_file(
 
     logger.warning("原文件预览未找到文件: task_or_document_id={}", task_id)
     raise HTTPException(status_code=404, detail="未找到对应的原文件")
+
+
+class ExportBomDocxRequest(BaseModel):
+    document_title: Optional[str] = Field(None, description="招标文件名称")
+    items: Optional[List[Dict[str, Any]]] = Field(None, description="前端当前展示的 BOM 清单（包含用户实时编辑项）")
+    total_cost: Optional[float] = Field(None, description="预估总成本")
+    budget_limit: Optional[str] = Field(None, description="最高限价或预算")
+    status_text: Optional[str] = Field(None, description="预算控制状态")
+    analysis_summary: Optional[str] = Field(None, description="专家评估指导意见")
+
+
+@router.post("/{document_id}/export-bom-docx", summary="导出智能 BOM 成本测算 Word 文档")
+def export_bom_docx(
+    document_id: str,
+    payload: Optional[ExportBomDocxRequest] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    根据前端当前测算数据或数据库实体，生成高保真 BOM 成本测算 Word (.docx) 文档。
+    表尾自动汇总小写与标准人民币大写总价，文件名以招标文件名称命名。
+    """
+    from app.db.models.project import Document
+    from app.db.models.ai_analysis import CostEstimate
+    from app.services.bom_export_service import generate_bom_docx
+
+    doc = db.query(Document).filter(
+        Document.id == document_id,
+        Document.tenant_id == current_user.tenant_id
+    ).first()
+
+    # 确定关联的招标文件原名（去除文件后缀）
+    raw_title = (payload.document_title if payload and payload.document_title else None) or (doc.filename if doc else None) or "招标文件"
+    clean_title = Path(raw_title).stem
+
+    items: List[Dict[str, Any]] = []
+    if payload and payload.items is not None and len(payload.items) > 0:
+        items = payload.items
+    elif doc:
+        cost_rows = db.query(CostEstimate).filter(CostEstimate.document_id == document_id).order_by(CostEstimate.id.asc()).all()
+        if cost_rows:
+            items = [
+                {
+                    "item_code": row.item_code,
+                    "name": row.item_name,
+                    "spec_requirement": row.spec_requirement or "",
+                    "qty": row.quantity,
+                    "unit": row.unit,
+                    "ref_price": row.unit_price or 0.0,
+                    "subtotal": row.calculated_total or 0.0,
+                    "matched_name": row.matched_name or row.item_name,
+                    "matched_brand": row.matched_brand or row.brand or "",
+                    "matched_model": row.matched_model or row.model or "",
+                    "matched_manufacturer": row.matched_manufacturer or row.manufacturer or "",
+                    "key_parameters": row.key_parameters or [],
+                    "match_quality": row.match_quality or "",
+                    "warning": row.warning or "",
+                    "comparison_note": row.comparison_note or "",
+                    "remark": row.remark or "",
+                    "section_name": row.section_name or "通用分项",
+                }
+                for row in cost_rows
+            ]
+        elif doc.parsed_metadata and isinstance(doc.parsed_metadata.get("cost_analysis"), dict):
+            items = doc.parsed_metadata["cost_analysis"].get("items") or []
+
+    total_cost = payload.total_cost if (payload and payload.total_cost is not None) else None
+    budget_limit = payload.budget_limit if (payload and payload.budget_limit) else (
+        doc.parsed_metadata.get("budget_limit") if doc and doc.parsed_metadata else None
+    )
+    status_text = payload.status_text if (payload and payload.status_text) else None
+    analysis_summary = payload.analysis_summary if (payload and payload.analysis_summary) else (
+        doc.parsed_metadata.get("cost_analysis", {}).get("analysis_summary") if doc and doc.parsed_metadata else None
+    )
+
+    try:
+        doc_io = generate_bom_docx(
+            document_title=clean_title,
+            items=items,
+            total_cost=total_cost,
+            budget_limit=budget_limit,
+            status_text=status_text,
+            analysis_summary=analysis_summary
+        )
+    except Exception as e:
+        logger.exception(f"生成 BOM Word 文档失败: {e}")
+        raise HTTPException(status_code=500, detail=f"生成 BOM 成本测算 Word 文档失败: {str(e)}")
+
+    export_filename = f"【BOM成本测算清单】{clean_title}.docx"
+    encoded_filename = urllib.parse.quote(export_filename)
+
+    return StreamingResponse(
+        doc_io,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": f"attachment; filename=\"{encoded_filename}\"; filename*=UTF-8''{encoded_filename}",
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
+    )
+
+
+@router.post("/{document_id}/export-bom-xlsx", summary="导出智能 BOM 成本测算 Excel 工作簿")
+def export_bom_xlsx(
+    document_id: str,
+    payload: Optional[ExportBomDocxRequest] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    根据前端当前测算数据或数据库实体，生成高保真 BOM 成本测算 Excel (.xlsx) 工作簿。
+    严格对齐 9 列开标清单标准格式，表尾自动汇总小写与标准人民币大写总价，文件名以招标文件名称命名。
+    """
+    from app.db.models.project import Document
+    from app.db.models.ai_analysis import CostEstimate
+    from app.services.bom_export_service import generate_bom_xlsx
+
+    doc = db.query(Document).filter(
+        Document.id == document_id,
+        Document.tenant_id == current_user.tenant_id
+    ).first()
+
+    raw_title = (payload.document_title if payload and payload.document_title else None) or (doc.filename if doc else None) or "招标文件"
+    clean_title = Path(raw_title).stem
+
+    items: List[Dict[str, Any]] = []
+    if payload and payload.items is not None and len(payload.items) > 0:
+        items = payload.items
+    elif doc:
+        cost_rows = db.query(CostEstimate).filter(CostEstimate.document_id == document_id).order_by(CostEstimate.id.asc()).all()
+        if cost_rows:
+            items = [
+                {
+                    "item_code": row.item_code,
+                    "name": row.item_name,
+                    "spec_requirement": row.spec_requirement or "",
+                    "qty": row.quantity,
+                    "unit": row.unit,
+                    "ref_price": row.unit_price or 0.0,
+                    "subtotal": row.calculated_total or 0.0,
+                    "matched_name": row.matched_name or row.item_name,
+                    "matched_brand": row.matched_brand or row.brand or "",
+                    "matched_model": row.matched_model or row.model or "",
+                    "matched_manufacturer": row.matched_manufacturer or row.manufacturer or "",
+                    "key_parameters": row.key_parameters or [],
+                    "match_quality": row.match_quality or "",
+                    "warning": row.warning or "",
+                    "comparison_note": row.comparison_note or "",
+                    "remark": row.remark or "",
+                    "section_name": row.section_name or "通用分项",
+                }
+                for row in cost_rows
+            ]
+        elif doc.parsed_metadata and isinstance(doc.parsed_metadata.get("cost_analysis"), dict):
+            items = doc.parsed_metadata["cost_analysis"].get("items") or []
+
+    total_cost = payload.total_cost if (payload and payload.total_cost is not None) else None
+    budget_limit = payload.budget_limit if (payload and payload.budget_limit) else (
+        doc.parsed_metadata.get("budget_limit") if doc and doc.parsed_metadata else None
+    )
+    status_text = payload.status_text if (payload and payload.status_text) else None
+    analysis_summary = payload.analysis_summary if (payload and payload.analysis_summary) else (
+        doc.parsed_metadata.get("cost_analysis", {}).get("analysis_summary") if doc and doc.parsed_metadata else None
+    )
+
+    try:
+        excel_io = generate_bom_xlsx(
+            document_title=clean_title,
+            items=items,
+            total_cost=total_cost,
+            budget_limit=budget_limit,
+            status_text=status_text,
+            analysis_summary=analysis_summary
+        )
+    except Exception as e:
+        logger.exception(f"生成 BOM Excel 工作簿失败: {e}")
+        raise HTTPException(status_code=500, detail=f"生成 BOM 成本测算 Excel 文档失败: {str(e)}")
+
+    export_filename = f"【BOM成本测算清单】{clean_title}.xlsx"
+    encoded_filename = urllib.parse.quote(export_filename)
+
+    return StreamingResponse(
+        excel_io,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename=\"{encoded_filename}\"; filename*=UTF-8''{encoded_filename}",
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
+    )
+
+

@@ -9,6 +9,7 @@ import {
   Tooltip, 
   Popconfirm,
   Empty,
+  Dropdown,
   message
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -22,9 +23,13 @@ import {
   FileSearchOutlined,
   ReloadOutlined,
   DownOutlined,
-  UpOutlined
+  UpOutlined,
+  DownloadOutlined,
+  FileWordOutlined,
+  FileExcelOutlined
 } from '@ant-design/icons';
 import { apiFetch, API_BASE_URL } from '../utils/api';
+import { exportBomToDocx, exportBomToXlsx } from '../utils/bomExporter';
 
 /**
  * 树形节点物料数据接口
@@ -70,6 +75,7 @@ interface CostItemNode {
 
 interface CostTableProps {
   documentId?: string;
+  documentFilename?: string;
   equipmentList?: any[];
   financial?: any;
   costAnalysis?: any;
@@ -168,6 +174,7 @@ export function normalizeSectionName(rawSec: unknown): string | null {
 
 export function CostTable({
   documentId,
+  documentFilename,
   equipmentList = [],
   financial = {},
   costAnalysis = {},
@@ -180,6 +187,7 @@ export function CostTable({
   const [items, setItems] = useState<any[]>(() => normalizeCostItems(costAnalysis?.items));
   const [isAdding, setIsAdding] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const [saveMessage, setSaveMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [selectedSection, setSelectedSection] = useState<string>('ALL');
 
@@ -534,6 +542,60 @@ export function CostTable({
     isRealTimeExceeded = dynamicStatusText.includes('已超出');
     isRealTimeWarning = dynamicStatusText.includes('接近');
   }
+
+  // 导出为 Word 文档 (.docx)
+  const handleExportDocx = async () => {
+    if (!items || items.length === 0) {
+      message.warning('暂无 BOM 测算数据可导出');
+      return;
+    }
+    try {
+      setIsExporting(true);
+      message.loading({ content: '正在生成 BOM 成本测算 Word 文档...', key: 'bom_export' });
+      await exportBomToDocx({
+        documentId,
+        documentTitle: documentFilename,
+        items: filteredTreeData && filteredTreeData.length > 0 ? filteredTreeData : items,
+        totalCost: realTimeTotalCost,
+        budgetLimit: effectiveLimitAmount ? `¥${effectiveLimitAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : undefined,
+        statusText: dynamicStatusText,
+        analysisSummary: normalizeCostText(costAnalysis?.analysis_summary)
+      });
+      message.success({ content: 'BOM 成本测算 Word 文档导出成功！', key: 'bom_export' });
+    } catch (err: any) {
+      console.error('Export BOM docx error:', err);
+      message.error({ content: err?.message || '导出 Word 文档失败', key: 'bom_export' });
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // 导出为 Excel 表格 (.xlsx)
+  const handleExportXlsx = async () => {
+    if (!items || items.length === 0) {
+      message.warning('暂无 BOM 测算数据可导出');
+      return;
+    }
+    try {
+      setIsExporting(true);
+      message.loading({ content: '正在生成 BOM 成本测算 Excel 表格...', key: 'bom_export' });
+      await exportBomToXlsx({
+        documentId,
+        documentTitle: documentFilename,
+        items: filteredTreeData && filteredTreeData.length > 0 ? filteredTreeData : items,
+        totalCost: realTimeTotalCost,
+        budgetLimit: effectiveLimitAmount ? `¥${effectiveLimitAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : undefined,
+        statusText: dynamicStatusText,
+        analysisSummary: normalizeCostText(costAnalysis?.analysis_summary)
+      });
+      message.success({ content: 'BOM 成本测算 Excel 表格导出成功！', key: 'bom_export' });
+    } catch (err: any) {
+      console.error('Export BOM xlsx error:', err);
+      message.error({ content: err?.message || '导出 Excel 表格失败', key: 'bom_export' });
+    } finally {
+      setIsExporting(false);
+    }
+  };
 
   // 开启行内编辑模式
   const handleStartEdit = (record: CostItemNode) => {
@@ -1463,7 +1525,7 @@ export function CostTable({
         {/* 顶部标题与摘要栏 */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
           <div>
-            <h3 className="text-xl font-extrabold text-slate-800 flex items-center gap-2 mb-1">
+            <h3 className="text-xl font-extrabold text-slate-800 flex items-center flex-wrap gap-2 mb-1">
               <span className="p-1.5 bg-blue-100 text-blue-600 rounded-lg text-sm">💰</span>
               智能 BOM 成本测算与对标匹配
               {onReextractEquipment && (
@@ -1487,6 +1549,40 @@ export function CostTable({
                 >
                   <ReloadOutlined className="text-sm" />
                 </button>
+              )}
+              {hasCostData && (
+                <Dropdown
+                  menu={{
+                    items: [
+                      {
+                        key: 'docx',
+                        icon: <FileWordOutlined className="text-blue-600" />,
+                        label: '导出为 Word 文档 (.docx)',
+                        onClick: handleExportDocx,
+                      },
+                      {
+                        key: 'xlsx',
+                        icon: <FileExcelOutlined className="text-emerald-600" />,
+                        label: '导出为 Excel 表格 (.xlsx)',
+                        onClick: handleExportXlsx,
+                      },
+                    ],
+                  }}
+                  trigger={['click']}
+                  disabled={isBusy || isExporting}
+                >
+                  <button
+                    type="button"
+                    disabled={isBusy || isExporting}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 ml-1 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300/80 rounded-md transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+                    title="导出当前 BOM 清单（支持 Word 与 Excel 格式，表尾包含大小写总价）"
+                    aria-label="导出表格"
+                  >
+                    <DownloadOutlined className="text-slate-600" />
+                    <span>{isExporting ? '正在导出...' : '导出表格'}</span>
+                    <DownOutlined className="text-[10px] text-slate-400" />
+                  </button>
+                </Dropdown>
               )}
             </h3>
             <p className="text-sm text-slate-500 font-medium">
