@@ -18,6 +18,7 @@ evaluation_metadata, cost_estimates, risk_items, qualification_matches, document
 import os
 import re
 import json
+from contextvars import ContextVar
 from typing import Dict, Any, List, Optional, Tuple, Set
 from loguru import logger
 from sqlalchemy.orm import Session
@@ -36,6 +37,10 @@ from app.db.models.project import Project as ProjectModel, Document as DocumentM
 from app.db.models.ai_analysis import QualificationMatch, RiskItem, CostEstimate
 from app.db.models.user import User as UserModel
 from app.utils.rmb_formatter import number_to_chinese_rmb
+
+# 运行时上下文变量：标书撰写时指定使用的企业档案 ID
+# 由 BidFillerAgent 入口设置，Worker 子进程/线程继承
+current_profile_id: ContextVar[Optional[str]] = ContextVar("current_profile_id", default=None)
 
 
 # ============================================================
@@ -127,7 +132,26 @@ def query_company_profile_tool(field_key: str) -> str:
 
     db: Session = SessionLocal()
     try:
-        profile = db.query(CompanyProfileModel).first()
+        # 优先使用运行时上下文中传入的 profile_id 精确查询指定档案
+        profile_id = current_profile_id.get()
+        if profile_id:
+            profile = db.query(CompanyProfileModel).filter(
+                CompanyProfileModel.id == profile_id
+            ).first()
+            if profile:
+                logger.debug(f"🛠️ [DB Tool] 使用指定企业档案: id={profile_id}, name='{profile.profile_name}'")
+            else:
+                logger.warning(f"🛠️ [DB Tool] 指定档案 {profile_id} 不存在，回退到默认档案")
+        else:
+            profile = None
+
+        # 回退策略：默认档案 → 最早创建的档案
+        if not profile:
+            profile = db.query(CompanyProfileModel).filter(
+                CompanyProfileModel.is_default == True
+            ).first()
+        if not profile:
+            profile = db.query(CompanyProfileModel).first()
 
         if profile:
             val = getattr(profile, std_key, None)

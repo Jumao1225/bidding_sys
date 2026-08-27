@@ -10,6 +10,12 @@ class _FakeQuery:
     def __init__(self, profile: CompanyProfileModel | None):
         self.profile = profile
 
+    def filter(self, *args, **kwargs) -> "_FakeQuery":
+        return self
+
+    def order_by(self, *args, **kwargs) -> "_FakeQuery":
+        return self
+
     def first(self) -> CompanyProfileModel | None:
         return self.profile
 

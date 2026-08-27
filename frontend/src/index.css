@@ -42,6 +42,24 @@
     @apply bg-slate-200 rounded-full hover:bg-slate-300 transition-colors;
   }
 
+  /* Dark mode sleek scrollbar */
+  .dark-scrollbar::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+  .dark-scrollbar::-webkit-scrollbar-track {
+    background: rgba(15, 23, 42, 0.4);
+    border-radius: 9999px;
+  }
+  .dark-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(100, 116, 139, 0.4);
+    border-radius: 9999px;
+    transition: background-color 0.2s ease;
+  }
+  .dark-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(168, 85, 247, 0.6);
+  }
+
   /* Hide scrollbar but keep functionality */
   .scrollbar-hide::-webkit-scrollbar {
     display: none;

@@ -113,8 +113,34 @@ export const AgentAuditPage: React.FC = () => {
     }
   };
 
+  const [profileList, setProfileList] = useState<Array<{
+    id: string;
+    profile_name?: string;
+    company_name?: string;
+    is_default?: boolean;
+  }>>([]);
+  const [selectedProfileId, setSelectedProfileId] = useState<string>('');
+
+  const fetchProfileList = async () => {
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/api/v1/company/profiles`);
+      if (res.ok) {
+        const data = await res.json();
+        const list = data.profiles || [];
+        setProfileList(list);
+        if (list.length > 0) {
+          const defaultItem = list.find((p: any) => p.is_default);
+          setSelectedProfileId((prev) => prev || (defaultItem ? defaultItem.id : list[0].id));
+        }
+      }
+    } catch (e) {
+      console.warn('获取企业主体档案列表失败:', e);
+    }
+  };
+
   useEffect(() => {
     fetchDocList();
+    fetchProfileList();
   }, []);
 
   const [isLivePolling, setIsLivePolling] = useState(false);
@@ -281,7 +307,8 @@ export const AgentAuditPage: React.FC = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          custom_instructions: customInstruction || undefined
+          custom_instructions: customInstruction || undefined,
+          profile_id: selectedProfileId || undefined
         })
       });
 
@@ -445,9 +472,6 @@ export const AgentAuditPage: React.FC = () => {
   const totalCompletionTokens = workers.reduce((acc, w) => acc + (w.completion_tokens || 0), 0);
   const totalWorkerComputeTimeMs = workers.reduce((acc, w) => acc + (w.execution_time_ms || 0), 0);
 
-  // 真实物理端到端耗时计算：
-  // 1. 运行中：展示秒表高频跳动 liveTimerMs；
-  // 2. 完成后：优先采用后端返回的真实物理耗时 serverWallTimeMs，或刚结束时冻结的秒表 frozenDurationMs，或最大单 Worker 耗时，确保数字平滑绝不突增暴增！
   const actualEffectiveWallTimeMs = (isGenerating || isLivePolling)
     ? liveTimerMs
     : (serverWallTimeMs > 0
@@ -458,18 +482,15 @@ export const AgentAuditPage: React.FC = () => {
 
   const displayTimeSeconds = (actualEffectiveWallTimeMs / 1000).toFixed(1);
 
-  // 并发加速倍率（算力总工时 / 物理耗时）
   const accelerationRatio = actualEffectiveWallTimeMs > 0 && totalWorkerComputeTimeMs > actualEffectiveWallTimeMs
     ? (totalWorkerComputeTimeMs / actualEffectiveWallTimeMs).toFixed(1)
     : '1.0';
 
-  // 计算成功写盘且无失败的章节数 (包含 success, completed, skipped, master_completed)
   const successfulWorkers = workers.filter((w) => {
     const s = (w.status || '').toLowerCase();
     return s === 'success' || s === 'completed' || s === 'skipped' || s === 'master_completed';
   });
 
-  // 按用户要求使用全量章节数 (workers.length) 作为固定分母计算真实成功率
   const writeSuccessRateStr = workers.length > 0
     ? `${Math.round((successfulWorkers.length / workers.length) * 100)}%`
     : '100%';
@@ -484,17 +505,120 @@ export const AgentAuditPage: React.FC = () => {
       (doc.project_code || '').toLowerCase().includes(docFilterText.toLowerCase())
   );
 
+  // 格式化落盘扩写提案内嵌数据，智能解析二维表格数组与对象，避免原始 JSON 字符串挤爆表格或字符重叠
+  const renderProposalValue = (val: any): React.ReactNode => {
+    if (val === null || val === undefined) return <span className="text-slate-500 italic">空</span>;
+
+    let parsed = val;
+    if (typeof val === 'string') {
+      const trimmed = val.trim();
+      if ((trimmed.startsWith('[') && trimmed.endsWith(']')) || (trimmed.startsWith('{') && trimmed.endsWith('}'))) {
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          parsed = val;
+        }
+      }
+    }
+
+    // 1. 如果是二维表格数据（行列表，如 [["我公司完全接受...", "无", "无"], ...]）
+    if (Array.isArray(parsed)) {
+      if (parsed.length === 0) return <span className="text-slate-500 italic">（空列表）</span>;
+
+      // 二维表格行
+      if (Array.isArray(parsed[0])) {
+        return (
+          <div className="space-y-2.5 max-h-72 overflow-y-auto dark-scrollbar pr-1">
+            {parsed.map((row: any[], rIdx: number) => (
+              <div key={rIdx} className="p-2.5 rounded-xl bg-slate-900/95 border border-slate-800 text-xs flex items-start gap-2.5 shadow-sm">
+                <span className="px-2 py-0.5 rounded-md bg-purple-500/20 text-purple-300 font-mono text-[11px] font-bold shrink-0 mt-0.5 border border-purple-500/30">
+                  行 {rIdx + 1}
+                </span>
+                <div className="flex-1 text-slate-200 leading-relaxed font-sans break-words space-y-1.5">
+                  {row.map((colVal: any, cIdx: number) => {
+                    const strCol = typeof colVal === 'object' ? JSON.stringify(colVal) : String(colVal ?? '');
+                    return (
+                      <div key={cIdx} className="flex items-start gap-1.5">
+                        {row.length > 1 && (
+                          <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 font-mono text-[10px] shrink-0 select-none mt-0.5">
+                            列{cIdx + 1}
+                          </span>
+                        )}
+                        <span className={cIdx === 0 ? "text-emerald-300 font-medium leading-relaxed" : "text-slate-300 leading-relaxed"}>
+                          {strCol}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      }
+
+      // 一维数组
+      return (
+        <ul className="space-y-1.5 max-h-56 overflow-y-auto dark-scrollbar pl-2 list-disc list-inside text-xs text-slate-200">
+          {parsed.map((item: any, iIdx: number) => (
+            <li key={iIdx} className="leading-relaxed font-sans break-words text-emerald-300">
+              {typeof item === 'object' ? JSON.stringify(item) : String(item)}
+            </li>
+          ))}
+        </ul>
+      );
+    }
+
+    // 2. 如果是对象
+    if (typeof parsed === 'object') {
+      return (
+        <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 text-xs font-mono space-y-1.5 max-h-52 overflow-y-auto dark-scrollbar">
+          {Object.entries(parsed).map(([k, v], oIdx) => (
+            <div key={oIdx} className="flex items-start gap-2">
+              <span className="text-purple-400 font-bold shrink-0">{k}:</span>
+              <span className="text-slate-200 break-words">{typeof v === 'object' ? JSON.stringify(v) : String(v)}</span>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // 3. 普通长文本
+    const strVal = String(parsed);
+    return (
+      <div className="text-xs text-emerald-300 font-medium leading-relaxed font-sans whitespace-pre-wrap break-words max-h-60 overflow-y-auto dark-scrollbar">
+        {strVal}
+      </div>
+    );
+  };
+
+  // 格式化模板原文槽位
+  const renderOriginalContext = (val: any): React.ReactNode => {
+    if (!val) return <span className="text-slate-500 italic">模板空位</span>;
+    const strVal = typeof val === 'object' ? JSON.stringify(val) : String(val);
+    return (
+      <div className="text-xs text-slate-400 font-mono leading-relaxed break-words max-h-48 overflow-y-auto dark-scrollbar">
+        {strVal}
+      </div>
+    );
+  };
+
   return (
-    <div className="min-h-screen min-w-0 bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-purple-500 selection:text-white">
-      {/* 顶栏 Header */}
-      <header className="min-h-16 border-b border-slate-800 bg-slate-900/90 backdrop-blur-md px-4 py-3 flex flex-col items-stretch gap-3 shrink-0 sticky top-0 z-20 2xl:h-16 2xl:flex-row 2xl:items-center 2xl:justify-between 2xl:px-6 2xl:py-0">
-        <div className="min-w-0 flex items-center gap-4">
-          <div className="min-w-0 flex flex-1 items-center gap-3">
-            <span className="p-1.5 bg-gradient-to-tr from-purple-600 to-indigo-600 text-white rounded-lg text-base shadow-sm">🚀</span>
-            <div className="min-w-0">
-              <h1 className="font-bold text-sm text-white">标书智能生成与 Agent 控制台</h1>
-              <div className="flex flex-wrap items-center gap-2 mt-0.5">
-                <span className="text-[11px] text-purple-300 font-bold shrink-0">📄 选择目标招标文件:</span>
+    <div className="font-sans text-slate-100 selection:bg-purple-500 selection:text-white pb-12 animate-fade-in">
+      {/* 统一一体化控制台 Mega-Container */}
+      <div className="border border-slate-800/90 bg-slate-950 rounded-3xl shadow-2xl overflow-hidden backdrop-blur-xl divide-y divide-slate-800/80">
+        
+        {/* 1. 顶层编排与快速操作区 */}
+        <div className="bg-slate-900/90 p-4">
+          <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3.5">
+            {/* 左侧: 双任务选择器 (目标文件 + 投标主体) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 flex-1">
+              {/* 目标招标文件选择 */}
+              <div className="flex items-center gap-2.5 bg-slate-950/90 border border-purple-900/40 focus-within:border-purple-500/80 focus-within:ring-2 focus-within:ring-purple-500/20 rounded-xl px-3.5 py-2.5 shadow-inner transition-all">
+                <span className="text-xs text-purple-300 font-bold shrink-0 flex items-center gap-1.5">
+                  <span>📄</span>
+                  <span>招标文件:</span>
+                </span>
                 <select
                   value={activeDocId}
                   onChange={(e) => {
@@ -503,7 +627,7 @@ export const AgentAuditPage: React.FC = () => {
                     localStorage.setItem('bidding_document_id', selectedId);
                     navigate(`/agent-audit/${selectedId}`);
                   }}
-                  className="min-w-0 flex-1 bg-slate-950 border border-purple-800/60 text-purple-200 font-medium text-[11px] rounded-lg px-2.5 py-0.5 focus:outline-none focus:border-purple-400 cursor-pointer truncate shadow-inner 2xl:max-w-[340px]"
+                  className="min-w-0 flex-1 bg-transparent text-purple-100 font-semibold text-xs focus:outline-none cursor-pointer truncate"
                 >
                   {docList.length > 0 ? (
                     docList.map((doc) => (
@@ -521,203 +645,262 @@ export const AgentAuditPage: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => setShowDocModal(true)}
-                  className="px-2.5 py-0.5 rounded-lg bg-purple-900/60 hover:bg-purple-800 text-purple-200 text-[11px] font-bold border border-purple-700/60 cursor-pointer transition-all flex items-center gap-1 shrink-0"
+                  className="px-2.5 py-1 rounded-lg bg-gradient-to-r from-purple-900/80 to-indigo-900/80 hover:from-purple-800 hover:to-indigo-800 text-purple-200 text-xs font-bold border border-purple-700/50 cursor-pointer transition-all shrink-0 whitespace-nowrap shadow-sm active:scale-95"
                   title="打开全景招标文件选择列表"
                 >
-                  <span>📂 列表选择 ({docList.length})</span>
+                  📂 列表 ({docList.length})
+                </button>
+              </div>
+
+              {/* 投标主体档案选择 */}
+              <div className="flex items-center gap-2.5 bg-slate-950/90 border border-blue-900/40 focus-within:border-blue-500/80 focus-within:ring-2 focus-within:ring-blue-500/20 rounded-xl px-3.5 py-2.5 shadow-inner transition-all">
+                <span className="text-xs text-blue-300 font-bold shrink-0 flex items-center gap-1.5">
+                  <span>🏢</span>
+                  <span>投标主体:</span>
+                </span>
+                <select
+                  value={selectedProfileId}
+                  onChange={(e) => setSelectedProfileId(e.target.value)}
+                  className="min-w-0 flex-1 bg-transparent text-blue-100 font-semibold text-xs focus:outline-none cursor-pointer truncate"
+                  title="指定生成此标书时使用的投标主体信息"
+                >
+                  {profileList.length > 0 ? (
+                    profileList.map((p) => (
+                      <option key={p.id} value={p.id} className="bg-slate-900 text-slate-100">
+                        {p.is_default ? '⭐ [默认] ' : ''}{p.profile_name || '未命名主体'} {p.company_name ? `(${p.company_name})` : ''}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="" className="bg-slate-900 text-slate-100">
+                      -- 暂无主体档案 (使用系统默认) --
+                    </option>
+                  )}
+                </select>
+
+                <button
+                  type="button"
+                  onClick={() => navigate('/company-profile')}
+                  className="px-2.5 py-1 rounded-lg bg-gradient-to-r from-blue-900/80 to-cyan-900/80 hover:from-blue-800 hover:to-cyan-800 text-blue-200 text-xs font-bold border border-blue-700/50 cursor-pointer transition-all shrink-0 whitespace-nowrap shadow-sm active:scale-95"
+                  title="前往企业档案页管理各投标主体"
+                >
+                  ⚙️ 配置
                 </button>
               </div>
             </div>
-          </div>
-        </div>
 
-        {/* 顶部右侧核心触发操作 */}
-        <div className="flex flex-wrap items-center gap-3 2xl:justify-end">
+            {/* 右侧: 3 大操作按钮 */}
+            <div className="flex flex-wrap items-center gap-2.5 shrink-0 xl:justify-end">
+              <button
+                type="button"
+                onClick={handleDownloadRawTemplate}
+                disabled={isDownloadingRaw || !activeDocId}
+                className="px-3.5 py-2.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 active:scale-98 text-slate-200 hover:text-white text-xs font-bold shadow-md border border-slate-700/70 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
+                title="提取并下载未经过 AI 扩写的原格式《投标文件格式》Word 模板"
+              >
+                {isDownloadingRaw ? (
+                  <>
+                    <span className="animate-spin w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full"></span>
+                    <span>正在提取...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>📄 原格式模板</span>
+                  </>
+                )}
+              </button>
 
-          <button
-            type="button"
-            onClick={handleDownloadRawTemplate}
-            disabled={isDownloadingRaw || !activeDocId}
-            className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-200 hover:text-white text-xs font-bold shadow-md border border-slate-700/80 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
-            title="提取并下载未经过 AI 扩写的原格式《投标文件格式》Word 模板"
-          >
-            {isDownloadingRaw ? (
-              <>
-                <span className="animate-spin w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full"></span>
-                <span>正在提取原格式...</span>
-              </>
-            ) : (
-              <>
-                <span>📄 下载原格式标书文件</span>
-              </>
-            )}
-          </button>
+              <button
+                type="button"
+                onClick={handleDownloadWord}
+                disabled={isDownloading || !activeDocId}
+                className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 active:scale-98 text-white text-xs font-bold shadow-lg shadow-emerald-950/50 border border-emerald-400/30 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
+              >
+                {isDownloading ? (
+                  <>
+                    <span className="animate-spin w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full"></span>
+                    <span>正在下载...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>📥 下载标书 Word</span>
+                  </>
+                )}
+              </button>
 
-          <button
-            type="button"
-            onClick={handleDownloadWord}
-            disabled={isDownloading || !activeDocId}
-            className="px-4 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white text-xs font-bold shadow-md shadow-emerald-900/30 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
-          >
-            {isDownloading ? (
-              <>
-                <span className="animate-spin w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full"></span>
-                <span>正在下载...</span>
-              </>
-            ) : (
-              <>
-                <span>📥 下载标书 Word (.docx)</span>
-              </>
-            )}
-          </button>
-
-          <button
-            type="button"
-            onClick={handleStartFilling}
-            disabled={isGenerating || !activeDocId}
-            className="px-5 py-1.5 rounded-xl bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 active:scale-98 text-white text-xs font-bold shadow-lg shadow-purple-900/40 transition-all flex items-center gap-2 cursor-pointer border border-purple-400/30 disabled:opacity-50"
-          >
-            {isGenerating ? (
-              <>
-                <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
-                <span>AI 团队全自主撰写中...</span>
-              </>
-            ) : (
-              <>
-                <span className="text-sm">✨</span>
-                <span>一键启动 Agent 全自主撰写标书</span>
-              </>
-            )}
-          </button>
-        </div>
-      </header>
-
-      {/* 通知与状态栏 */}
-      {notice && (
-        <div className="bg-purple-950/80 border-b border-purple-800/80 px-4 py-2.5 text-xs text-purple-200 flex items-center justify-between gap-3 font-medium animate-fade-in 2xl:px-6">
-          <div className="min-w-0 flex items-center gap-2">
-            <span>💡</span>
-            <span>{notice}</span>
-          </div>
-          <button type="button" onClick={() => setNotice(null)} className="text-purple-400 hover:text-white font-bold">
-            ✕
-          </button>
-        </div>
-      )}
-
-      {error && (
-        <div className="bg-rose-950/90 border-b border-rose-800 px-4 py-2.5 text-xs text-rose-200 flex items-center justify-between gap-3 font-medium animate-fade-in 2xl:px-6">
-          <div className="min-w-0 flex items-center gap-2">
-            <span>❌</span>
-            <span>{error}</span>
-          </div>
-          <button type="button" onClick={() => setError(null)} className="text-rose-400 hover:text-white font-bold">
-            ✕
-          </button>
-        </div>
-      )}
-
-      {/* 顶部指令配置 & 指标统计区 */}
-      <div className="bg-slate-900/70 border-b border-slate-800 px-4 py-4 space-y-4 shrink-0 2xl:px-6">
-        {/* 自定义撰写指令控制条 */}
-        <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-3 flex flex-wrap items-center gap-3">
-          <span className="text-sm p-1.5 bg-purple-500/10 text-purple-400 rounded-lg shrink-0">✍️</span>
-          <input
-            type="text"
-            placeholder="自定义全局撰写指令（如：“商务偏离表统一填无偏离，付款节点填30%预付款，项目经理指定张三”）..."
-            value={customInstruction}
-            onChange={(e) => setCustomInstruction(e.target.value)}
-            className="min-w-48 flex-1 bg-transparent text-xs text-slate-100 placeholder-slate-500 focus:outline-none"
-          />
-          <button
-            type="button"
-            onClick={handleStartFilling}
-            disabled={isGenerating}
-            className="px-3.5 py-1.5 rounded-xl bg-purple-900/60 hover:bg-purple-800 text-purple-200 text-xs font-bold transition-all border border-purple-700/50 cursor-pointer shrink-0 disabled:opacity-50"
-          >
-            带指令生成
-          </button>
-        </div>
-
-        {/* 4 大核心统计指标 */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 2xl:grid-cols-4 gap-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-purple-500/10 text-purple-400 border border-purple-500/20 flex items-center justify-center font-bold text-lg">
-              🤖
-            </div>
-            <div>
-              <div className="text-[11px] text-slate-400 font-medium">子 Agent 节点数</div>
-              <div className="text-lg font-bold text-white font-mono">{workers.length} 个章节</div>
+              <button
+                type="button"
+                onClick={handleStartFilling}
+                disabled={isGenerating || !activeDocId}
+                className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 active:scale-98 text-white text-xs font-extrabold shadow-xl shadow-purple-900/60 transition-all flex items-center gap-2 cursor-pointer border border-purple-400/50 ring-1 ring-purple-400/30 disabled:opacity-50"
+              >
+                {isGenerating ? (
+                  <>
+                    <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
+                    <span>AI 团队全自主撰写中...</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-sm">✨</span>
+                    <span>一键启动 Agent 全自主撰写</span>
+                  </>
+                )}
+              </button>
             </div>
           </div>
+        </div>
 
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-blue-500/10 text-blue-400 border border-blue-500/20 flex items-center justify-center font-bold text-lg">
-              ⏱️
+        {/* 2. 状态/通知栏 (条件渲染) */}
+        {notice && (
+          <div className="bg-purple-950/90 px-4 py-2.5 text-xs text-purple-200 flex items-center justify-between gap-3 font-medium shadow-inner animate-fade-in">
+            <div className="min-w-0 flex items-center gap-2">
+              <span className="text-sm">💡</span>
+              <span>{notice}</span>
             </div>
-            <div>
-              <div className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5">
-                <span>累计撰写耗时</span>
-                {(isGenerating || isLivePolling) && (
-                  <span className="w-2 h-2 rounded-full bg-blue-400 animate-ping inline-block" />
+            <button type="button" onClick={() => setNotice(null)} className="text-purple-400 hover:text-white font-bold px-1.5 py-0.5 rounded hover:bg-purple-900/50 transition-colors">
+              ✕
+            </button>
+          </div>
+        )}
+
+        {error && (
+          <div className="bg-rose-950/90 px-4 py-2.5 text-xs text-rose-200 flex items-center justify-between gap-3 font-medium shadow-inner animate-fade-in">
+            <div className="min-w-0 flex items-center gap-2">
+              <span className="text-sm">❌</span>
+              <span>{error}</span>
+            </div>
+            <button type="button" onClick={() => setError(null)} className="text-rose-400 hover:text-white font-bold px-1.5 py-0.5 rounded hover:bg-rose-900/50 transition-colors">
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* 3. 顶部指令配置 & 4 大指标统计区 */}
+        <div className="bg-slate-900/60 p-4.5 space-y-3.5">
+          {/* 自定义撰写指令控制条 */}
+          <div className="space-y-2.5">
+            <div className="bg-slate-950/95 border border-slate-800/90 focus-within:border-purple-500/80 focus-within:ring-2 focus-within:ring-purple-500/20 rounded-xl p-2.5 flex items-center gap-3 transition-all shadow-inner">
+              <span className="text-sm p-1.5 bg-purple-500/15 text-purple-400 rounded-lg shrink-0 border border-purple-500/20">✍️</span>
+              <input
+                type="text"
+                placeholder="自定义全局撰写指令（如：“商务偏离表统一填无偏离，付款节点填30%预付款，项目经理指定张三”）..."
+                value={customInstruction}
+                onChange={(e) => setCustomInstruction(e.target.value)}
+                className="min-w-48 flex-1 bg-transparent text-xs text-slate-100 placeholder-slate-500 focus:outline-none font-medium"
+              />
+              <button
+                type="button"
+                onClick={handleStartFilling}
+                disabled={isGenerating || !activeDocId}
+                className="px-4 py-2 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 active:scale-95 text-white text-xs font-bold transition-all shadow-md shadow-purple-950/50 cursor-pointer shrink-0 disabled:opacity-50 whitespace-nowrap border border-purple-400/30"
+              >
+                带指令生成
+              </button>
+            </div>
+
+            {/* 快捷常用提示词标签 */}
+            <div className="flex flex-wrap items-center gap-2 px-1">
+              <span className="text-[11px] text-slate-400 font-bold flex items-center gap-1">
+                <span>⚡</span>
+                <span>快捷注入:</span>
+              </span>
+              {[
+                '商务与技术条款严格填报无偏离',
+                '付款节点填报为30%预付款与60%进度款',
+                '工期统一按招标文件要求60日历天填报'
+              ].map((tag, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => setCustomInstruction(prev => prev ? `${prev}；${tag}` : tag)}
+                  className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-purple-950/80 border border-slate-800 hover:border-purple-700/60 text-[11px] text-purple-300 font-medium transition-all cursor-pointer shadow-xs active:scale-95"
+                >
+                  + {tag}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* 4 大核心统计指标 */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3.5">
+            <div className="bg-slate-950/90 border border-slate-800/80 hover:border-purple-500/40 rounded-xl p-3.5 flex items-center gap-3.5 transition-all shadow-inner group">
+              <div className="w-11 h-11 rounded-xl bg-purple-500/15 text-purple-400 border border-purple-500/25 flex items-center justify-center font-bold text-xl shrink-0 group-hover:scale-105 transition-transform">
+                🤖
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400 font-medium">子 Agent 节点数</div>
+                <div className="text-base sm:text-lg font-black text-white font-mono mt-0.5">{workers.length} 个章节</div>
+              </div>
+            </div>
+
+            <div className="bg-slate-950/90 border border-slate-800/80 hover:border-blue-500/40 rounded-xl p-3.5 flex items-center gap-3.5 transition-all shadow-inner group">
+              <div className="w-11 h-11 rounded-xl bg-blue-500/15 text-blue-400 border border-blue-500/25 flex items-center justify-center font-bold text-xl shrink-0 group-hover:scale-105 transition-transform">
+                ⏱️
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5">
+                  <span>累计撰写耗时</span>
+                  {(isGenerating || isLivePolling) && (
+                    <span className="w-2 h-2 rounded-full bg-blue-400 animate-ping inline-block" />
+                  )}
+                </div>
+                <div className="text-base sm:text-lg font-black text-white font-mono mt-0.5">{displayTimeSeconds} 秒</div>
+                {Number(accelerationRatio) > 1.1 && !isGenerating && !isLivePolling && (
+                  <div className="text-[10px] text-blue-400/80 font-mono mt-0.5" title={`并发累计算力工时: ${(totalWorkerComputeTimeMs / 1000).toFixed(1)} 秒`}>
+                    ⚡ 多Agent加速 {accelerationRatio}x
+                  </div>
                 )}
               </div>
-              <div className="text-lg font-bold text-white font-mono">{displayTimeSeconds} 秒</div>
-              {Number(accelerationRatio) > 1.1 && !isGenerating && !isLivePolling && (
-                <div className="text-[10px] text-blue-400/80 font-mono mt-0.5" title={`并发累计算力工时: ${(totalWorkerComputeTimeMs / 1000).toFixed(1)} 秒`}>
-                  ⚡ 多Agent加速 {accelerationRatio}x
-                </div>
-              )}
             </div>
-          </div>
 
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center justify-center font-bold text-lg">
-              ⚡
+            <div className="bg-slate-950/90 border border-slate-800/80 hover:border-emerald-500/40 rounded-xl p-3.5 flex items-center gap-3.5 transition-all shadow-inner group">
+              <div className="w-11 h-11 rounded-xl bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 flex items-center justify-center font-bold text-xl shrink-0 group-hover:scale-105 transition-transform">
+                ⚡
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400 font-medium">Token 思考总消耗</div>
+                <div className="text-base sm:text-lg font-black text-emerald-400 font-mono mt-0.5">{totalTokens.toLocaleString()}</div>
+                {totalTokens > 0 && (
+                  <div className="text-[10px] text-slate-500 font-mono mt-0.5">
+                    P: {totalPromptTokens.toLocaleString()} | C: {totalCompletionTokens.toLocaleString()}
+                  </div>
+                )}
+              </div>
             </div>
-            <div>
-              <div className="text-[11px] text-slate-400 font-medium">Token 思考总消耗</div>
-              <div className="text-lg font-bold text-emerald-400 font-mono">{totalTokens.toLocaleString()}</div>
-              {totalTokens > 0 && (
-                <div className="text-[10px] text-slate-500 font-mono mt-0.5">
-                  P: {totalPromptTokens.toLocaleString()} | C: {totalCompletionTokens.toLocaleString()}
-                </div>
-              )}
-            </div>
-          </div>
 
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-amber-500/10 text-amber-400 border border-amber-500/20 flex items-center justify-center font-bold text-lg">
-              ✅
-            </div>
-            <div>
-              <div className="text-[11px] text-slate-400 font-medium">写盘验证成功率</div>
-              <div className="text-lg font-bold text-amber-400 font-mono">
-                {writeSuccessRateStr}
+            <div className="bg-slate-950/90 border border-slate-800/80 hover:border-amber-500/40 rounded-xl p-3.5 flex items-center gap-3.5 transition-all shadow-inner group">
+              <div className="w-11 h-11 rounded-xl bg-amber-500/15 text-amber-400 border border-amber-500/25 flex items-center justify-center font-bold text-xl shrink-0 group-hover:scale-105 transition-transform">
+                ✅
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400 font-medium">写盘验证成功率</div>
+                <div className="text-base sm:text-lg font-black text-amber-400 font-mono mt-0.5">
+                  {writeSuccessRateStr}
+                </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
 
-      {/* 主工作台面板：左侧 Worker 列表 + 右侧思考与提案可视化 */}
-      <div className="flex-1 min-h-0 flex flex-col overflow-visible 2xl:flex-row 2xl:overflow-hidden">
+        {/* 4. 主工作台面板：左侧 Worker 列表 + 右侧思考与提案可视化 (固定对称高 720px) */}
+        <div className="flex flex-col xl:flex-row h-[720px] bg-slate-950">
         {/* 左侧边栏 Worker 列表 */}
-        <div className="w-full max-h-64 border-b border-slate-800 bg-slate-900/60 flex flex-col shrink-0 2xl:w-80 2xl:max-h-none 2xl:border-r 2xl:border-b-0">
-          <div className="p-3.5 border-b border-slate-800">
-            <input
-              type="text"
-              placeholder="🔍 搜索章节名称或子 Agent..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-purple-500 transition-colors"
-            />
+        <div className="w-full xl:w-84 border-b xl:border-b-0 xl:border-r border-slate-800/80 bg-slate-950/60 flex flex-col shrink-0 h-full">
+          <div className="p-3.5 border-b border-slate-800/80 shrink-0 bg-slate-900/40">
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="🔍 搜索章节名称或子 Agent..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-800/90 focus:border-purple-500 focus:ring-1 focus:ring-purple-500/30 rounded-xl px-3.5 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none transition-all shadow-inner"
+              />
+            </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1.5">
+          <div className="flex-1 overflow-y-auto dark-scrollbar p-2.5 space-y-2">
             {loading ? (
-              <div className="py-12 text-center text-slate-500 text-xs">
-                <div className="animate-spin w-6 h-6 border-2 border-purple-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+              <div className="py-16 text-center text-slate-500 text-xs">
+                <div className="animate-spin w-7 h-7 border-2 border-purple-500 border-t-transparent rounded-full mx-auto mb-3"></div>
                 加载 Agent 章节履历...
               </div>
             ) : filteredWorkers.length > 0 ? (
@@ -733,34 +916,34 @@ export const AgentAuditPage: React.FC = () => {
                       setSelectedWorkerId(w.id);
                       setSelectedChapterTitle(w.chapter_title);
                     }}
-                    className={`p-3 rounded-xl border transition-all cursor-pointer select-none ${isSelected
-                        ? isSupervisor
-                          ? 'bg-gradient-to-r from-purple-900/90 to-amber-950/80 border-amber-400 text-white shadow-xl shadow-amber-950/40 ring-1 ring-amber-400/50'
-                          : 'bg-purple-950/60 border-purple-500 text-white shadow-lg shadow-purple-950/50'
-                        : isSupervisor
-                          ? 'bg-slate-900/90 border-amber-500/40 text-amber-200 hover:bg-slate-800/80 hover:border-amber-400/60'
-                          : 'bg-slate-900/40 border-slate-800/80 text-slate-300 hover:bg-slate-800/60 hover:border-slate-700'
+                    className={`p-3.5 rounded-xl border transition-all cursor-pointer select-none ${isSelected
+                      ? isSupervisor
+                        ? 'bg-gradient-to-r from-purple-900/90 via-slate-900 to-amber-950/80 border-amber-400 text-white shadow-xl shadow-amber-950/40 ring-1 ring-amber-400/60 scale-[1.01]'
+                        : 'bg-gradient-to-r from-purple-950/90 to-indigo-950/80 border-purple-500 text-white shadow-xl shadow-purple-950/50 ring-1 ring-purple-500/50 scale-[1.01]'
+                      : isSupervisor
+                        ? 'bg-slate-950/70 border-amber-500/30 text-amber-200 hover:bg-slate-900/80 hover:border-amber-400/50'
+                        : 'bg-slate-950/60 border-slate-800/80 text-slate-300 hover:bg-slate-900/70 hover:border-slate-700'
                       }`}
                   >
-                    <div className="flex items-center justify-between mb-1">
+                    <div className="flex items-center justify-between mb-1.5">
                       <span className="font-bold text-xs truncate max-w-[170px]" title={w.chapter_title}>
                         {isSupervisor ? `👑 ${w.chapter_title}` : w.chapter_title}
                       </span>
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${w.status === 'in_progress'
-                          ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse'
-                          : w.status === 'failed'
-                            ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                            : isSupervisor
-                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono'
-                              : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                      <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${w.status === 'in_progress'
+                        ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse'
+                        : w.status === 'failed'
+                          ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                          : isSupervisor
+                            ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono'
+                            : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                         }`}>
                         {w.status === 'in_progress' ? '🤖 思考撰写中' : w.status === 'failed' ? '❌ 执行失败' : isSupervisor ? '👑 总控决策' : '✅ 已填报'}
                       </span>
                     </div>
 
-                    <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono mt-1">
-                      <span>{(w.execution_time_ms / 1000).toFixed(1)}s</span>
-                      <span>{w.total_tokens.toLocaleString()} tok</span>
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono mt-1.5 pt-1.5 border-t border-slate-800/50">
+                      <span>⏱️ {(w.execution_time_ms / 1000).toFixed(1)}s</span>
+                      <span>⚡ {w.total_tokens.toLocaleString()} tok</span>
                       <span className={isSupervisor ? "text-amber-300 font-semibold" : "text-purple-300 font-semibold"}>
                         {isSupervisor ? `章数: ${w.proposals_count}` : `提案: ${w.proposals_count} 项`}
                       </span>
@@ -769,38 +952,36 @@ export const AgentAuditPage: React.FC = () => {
                 );
               })
             ) : (
-              <div className="py-12 text-center text-slate-500 text-xs px-4">
-                <span className="text-2xl block mb-2">📝</span>
-                <span>暂未检索到填报履历，可点击右上角【一键启动 Agent 全自主撰写标书】</span>
+              <div className="py-16 text-center text-slate-500 text-xs px-4">
+                <span className="text-3xl block mb-2 opacity-60">📝</span>
+                <span>暂未检索到填报履历，可点击右上角【一键启动 Agent 全自主撰写】</span>
               </div>
             )}
           </div>
         </div>
 
         {/* 右侧主内容区域 */}
-        <div className="flex-1 min-w-0 min-h-[34rem] bg-slate-950 flex flex-col overflow-hidden 2xl:min-h-0">
+        <div className="flex-1 min-w-0 bg-slate-950/70 flex flex-col h-full overflow-hidden">
           {selectedWorker ? (
             <>
               {/* Active Worker Header */}
-              <div className="p-4 border-b border-slate-800 bg-slate-900/40 flex flex-col items-stretch gap-3 shrink-0 2xl:flex-row 2xl:items-center 2xl:justify-between">
+              <div className="p-4 border-b border-slate-800/80 bg-slate-900/60 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3 shrink-0 backdrop-blur-md">
                 <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-3">
-                    <h2 className="font-bold text-base text-white break-words">{selectedWorker.chapter_title}</h2>
-                    <span className="px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 text-xs font-mono border border-purple-500/30">
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <h2 className="font-extrabold text-sm sm:text-base text-white break-words tracking-tight">{selectedWorker.chapter_title}</h2>
+                    <span className="px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 text-xs font-mono font-bold border border-purple-500/30">
                       {selectedWorker.node_name}
                     </span>
                   </div>
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400 mt-1 font-mono">
-                    <span>类别: {selectedWorker.category}</span>
-                    <span>耗时: {(selectedWorker.execution_time_ms / 1000).toFixed(1)} 秒</span>
-                    <span>Prompt: {selectedWorker.prompt_tokens.toLocaleString()}</span>
-                    <span>Completion: {selectedWorker.completion_tokens.toLocaleString()}</span>
-                    <span className="text-emerald-400 font-semibold">Total: {selectedWorker.total_tokens.toLocaleString()} tok</span>
-                    <span>写盘提案: {selectedWorker.proposals_count} 项</span>
+                  <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1 text-xs text-slate-400 mt-1 font-mono">
+                    <span>类别: <strong className="text-slate-300">{selectedWorker.category}</strong></span>
+                    <span>耗时: <strong className="text-slate-300">{(selectedWorker.execution_time_ms / 1000).toFixed(1)}s</strong></span>
+                    <span>Token: <strong className="text-emerald-400">{selectedWorker.total_tokens.toLocaleString()} tok</strong></span>
+                    <span>落盘提案: <strong className="text-purple-300">{selectedWorker.proposals_count} 项</strong></span>
                   </div>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-3 2xl:justify-end">
+                <div className="flex flex-wrap items-center gap-2.5 xl:justify-end shrink-0">
                   {/* 单章节微调按钮 */}
                   {!selectedWorker.category?.includes('supervisor') && !selectedWorker.node_name.includes('Supervisor') && (
                     <button
@@ -817,192 +998,140 @@ export const AgentAuditPage: React.FC = () => {
                         </>
                       ) : (
                         <>
-                          <span>✨ 针对该章节重新生成 / Prompt 微调</span>
+                          <span>✨ 重新生成 / Prompt 微调</span>
                         </>
                       )}
                     </button>
                   )}
 
                   {/* Tab Switcher */}
-                  <div className="flex flex-wrap bg-slate-900 p-1 rounded-xl border border-slate-800">
+                  <div className="flex bg-slate-900/90 p-1 rounded-xl border border-slate-800 shadow-inner">
                     <button
                       type="button"
                       onClick={() => setActiveTab('details')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${activeTab === 'details' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${activeTab === 'details' ? 'bg-purple-600 text-white shadow-md shadow-purple-950/60' : 'text-slate-400 hover:text-white'
                         }`}
                     >
-                      📌 结构化写盘与工具履历
+                      📌 结构化写盘
                     </button>
                     <button
                       type="button"
                       onClick={() => setActiveTab('thought')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${activeTab === 'thought' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${activeTab === 'thought' ? 'bg-purple-600 text-white shadow-md shadow-purple-950/60' : 'text-slate-400 hover:text-white'
                         }`}
                     >
-                      🧠 完整思维链推导 (CoT)
+                      🧠 思维链 (CoT)
                     </button>
                     <button
                       type="button"
                       onClick={() => setActiveTab('raw')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${activeTab === 'raw' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${activeTab === 'raw' ? 'bg-purple-600 text-white shadow-md shadow-purple-950/60' : 'text-slate-400 hover:text-white'
                         }`}
                     >
-                      📄 原始 JSON 履历
+                      📄 原始 JSON
                     </button>
                   </div>
                 </div>
               </div>
 
               {/* Main Log Area */}
-              <div className="flex-1 p-6 overflow-y-auto custom-scrollbar bg-slate-950">
+              <div className="flex-1 p-5 overflow-y-auto dark-scrollbar bg-slate-950/90">
                 {activeTab === 'details' ? (
-                  <div className="space-y-6">
+                  <div className="space-y-5">
                     {/* 1. 调用的工具集 */}
-                    <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-xl">
+                    <div className="bg-slate-900/90 border border-slate-800/90 rounded-2xl p-4 shadow-xl backdrop-blur-md">
                       <h4 className="text-xs font-bold text-purple-400 uppercase tracking-wider mb-3 flex items-center gap-2">
                         <span>🛠️</span>
                         <span>Agent 调用的技能工具集 (Tools Invoked)</span>
                       </h4>
-                      <div className="grid grid-cols-1 2xl:grid-cols-2 gap-3">
-                        <div className="bg-slate-950/80 border border-purple-900/30 rounded-xl p-3 flex items-start gap-3">
-                          <div className="w-8 h-8 rounded-lg bg-purple-600/20 text-purple-400 flex items-center justify-center shrink-0 font-bold">⚡</div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                        <div className="bg-slate-950/90 border border-purple-900/40 rounded-xl p-3 flex items-start gap-3 shadow-sm hover:border-purple-700/60 transition-colors">
+                          <div className="w-8 h-8 rounded-lg bg-purple-600/20 text-purple-400 flex items-center justify-center shrink-0 font-bold text-sm border border-purple-500/30">⚡</div>
                           <div>
                             <div className="text-xs font-bold text-slate-200 font-mono">officecli_query_structure_tool</div>
-                            <div className="text-[11px] text-slate-400 mt-0.5">探测 Word 模版 DOM 段落/表格节点与空位槽</div>
+                            <div className="text-[11px] text-slate-400 mt-0.5 leading-normal">探测 Word 模版 DOM 段落/表格节点与空位槽</div>
                           </div>
                         </div>
-                        <div className="bg-slate-950/80 border border-blue-900/30 rounded-xl p-3 flex items-start gap-3">
-                          <div className="w-8 h-8 rounded-lg bg-blue-600/20 text-blue-400 flex items-center justify-center shrink-0 font-bold">🏢</div>
+                        <div className="bg-slate-950/90 border border-blue-900/40 rounded-xl p-3 flex items-start gap-3 shadow-sm hover:border-blue-700/60 transition-colors">
+                          <div className="w-8 h-8 rounded-lg bg-blue-600/20 text-blue-400 flex items-center justify-center shrink-0 font-bold text-sm border border-blue-500/30">🏢</div>
                           <div>
-                            <div className="text-xs font-bold text-slate-200 font-mono">get_company_profile</div>
-                            <div className="text-[11px] text-slate-400 mt-0.5">调取企业法人、注册资金、营业执照主体档案</div>
+                            <div className="text-xs font-bold text-slate-200 font-mono">query_company_profile_tool</div>
+                            <div className="text-[11px] text-slate-400 mt-0.5 leading-normal">调取指定投标主体的工商与资质档案</div>
                           </div>
                         </div>
-                        <div className="bg-slate-950/80 border border-emerald-900/30 rounded-xl p-3 flex items-start gap-3">
-                          <div className="w-8 h-8 rounded-lg bg-emerald-600/20 text-emerald-400 flex items-center justify-center shrink-0 font-bold">📖</div>
+                        <div className="bg-slate-950/90 border border-emerald-900/40 rounded-xl p-3 flex items-start gap-3 shadow-sm hover:border-emerald-700/60 transition-colors">
+                          <div className="w-8 h-8 rounded-lg bg-emerald-600/20 text-emerald-400 flex items-center justify-center shrink-0 font-bold text-sm border border-emerald-500/30">📖</div>
                           <div>
                             <div className="text-xs font-bold text-slate-200 font-mono">get_full_chapter_text</div>
-                            <div className="text-[11px] text-slate-400 mt-0.5">100% 全量检索招标文件原始章节要求与约束</div>
+                            <div className="text-[11px] text-slate-400 mt-0.5 leading-normal">100% 全量检索招标文件原始章节要求与约束</div>
                           </div>
                         </div>
-                        <div className="bg-slate-950/80 border border-amber-900/30 rounded-xl p-3 flex items-start gap-3">
-                          <div className="w-8 h-8 rounded-lg bg-amber-600/20 text-amber-400 flex items-center justify-center shrink-0 font-bold">💾</div>
+                        <div className="bg-slate-950/90 border border-amber-900/40 rounded-xl p-3 flex items-start gap-3 shadow-sm hover:border-amber-700/60 transition-colors">
+                          <div className="w-8 h-8 rounded-lg bg-amber-600/20 text-amber-400 flex items-center justify-center shrink-0 font-bold text-sm border border-amber-500/30">💾</div>
                           <div>
                             <div className="text-xs font-bold text-slate-200 font-mono">officecli_batch_fill_sentence_tool</div>
-                            <div className="text-[11px] text-slate-400 mt-0.5">原子批处理多槽位长句原位写盘与 DOM 校验</div>
+                            <div className="text-[11px] text-slate-400 mt-0.5 leading-normal">原子批处理多槽位长句原位写盘与 DOM 校验</div>
                           </div>
                         </div>
                       </div>
                     </div>
 
-                    {/* 2. 调取的数据库与上下文信息源 */}
-                    <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-xl">
-                      <h4 className="text-xs font-bold text-blue-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                        <span>📚</span>
-                        <span>调取与引用的数据库 & 上下文数据源 (Data Consumed)</span>
-                      </h4>
-                      <div className="flex flex-wrap gap-2.5">
-                        <div className="px-3 py-1.5 rounded-xl bg-purple-950/60 border border-purple-800/40 text-purple-300 text-xs flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse"></span>
-                          <span>🏢 企业主体档案 (Company Profile)</span>
-                          <span className="text-[10px] text-slate-400 font-mono">企名/法人/税号</span>
-                        </div>
-                        <div className="px-3 py-1.5 rounded-xl bg-blue-950/60 border border-blue-800/40 text-blue-300 text-xs flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
-                          <span>💰 价格与报价数据库 (Financial DB)</span>
-                          <span className="text-[10px] text-slate-400 font-mono">投标总价/分项单价</span>
-                        </div>
-                        <div className="px-3 py-1.5 rounded-xl bg-emerald-950/60 border border-emerald-800/40 text-emerald-300 text-xs flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                          <span>📜 招标文件切片 (DocChunk RAG)</span>
-                          <span className="text-[10px] text-slate-400 font-mono">偏离表/评分规则</span>
-                        </div>
-                        <div className="px-3 py-1.5 rounded-xl bg-amber-950/60 border border-amber-800/40 text-amber-300 text-xs flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-                          <span>🏅 资质与业绩中心 (Qualification DB)</span>
-                          <span className="text-[10px] text-slate-400 font-mono">ISO证书/项目经验</span>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* 3. 具体的原位修改与写盘明细 */}
-                    <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-xl">
-                      <div className="flex items-center justify-between mb-4">
+                    {/* 2. 具体的原位修改与写盘明细表格 */}
+                    <div className="bg-slate-900/90 border border-slate-800/90 rounded-2xl p-4 shadow-xl backdrop-blur-md">
+                      <div className="flex items-center justify-between mb-3">
                         <h4 className="text-xs font-bold text-emerald-400 uppercase tracking-wider flex items-center gap-2">
                           <span>✍️</span>
                           <span>原位修改与写盘落盘明细 (DOM Modifications & Write-Back)</span>
                         </h4>
-                        <span className="text-xs font-mono text-slate-400">写盘槽位: {selectedWorker.proposals_count} 处</span>
+                        <span className="text-xs font-mono text-purple-300 bg-purple-950/50 border border-purple-800/40 px-2.5 py-0.5 rounded-full font-bold">
+                          写盘槽位: {selectedWorker.proposals_count} 处
+                        </span>
                       </div>
 
-                      <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden shadow-inner">
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-left border-collapse text-xs">
+                      <div className="bg-slate-950 border border-slate-800/90 rounded-xl overflow-hidden shadow-inner">
+                        <div className="overflow-x-auto dark-scrollbar">
+                          <table className="w-full text-left border-collapse text-xs min-w-[760px]">
                             <thead>
-                              <tr className="bg-slate-900/90 text-slate-400 border-b border-slate-800 font-mono">
-                                <th className="p-3 w-12 text-center">#</th>
-                                <th className="p-3 w-48">DOM 节点路径</th>
-                                <th className="p-3">替换前模板原文</th>
-                                <th className="p-3">实际填入/扩写结果</th>
-                                <th className="p-3 w-28 text-center">写盘状态</th>
+                              <tr className="bg-slate-900 text-slate-400 border-b border-slate-800 font-mono text-[11px]">
+                                <th className="p-3.5 w-12 text-center whitespace-nowrap">#</th>
+                                <th className="p-3.5 w-44 whitespace-nowrap">DOM 节点路径</th>
+                                <th className="p-3.5 w-52 whitespace-nowrap">替换前模板原文</th>
+                                <th className="p-3.5 min-w-[320px] whitespace-nowrap">实际填入 / 扩写结果</th>
+                                <th className="p-3.5 w-28 text-center whitespace-nowrap">写盘状态</th>
                               </tr>
                             </thead>
-                            <tbody className="divide-y divide-slate-800/60 font-mono">
+                            <tbody className="divide-y divide-slate-800/60">
                               {selectedWorker.proposals && selectedWorker.proposals.length > 0 ? (
                                 selectedWorker.proposals.map((p: any, idx: number) => {
                                   const pathCell = p.path || p.node_path || p.chapter_title || `/body/p[${idx + 1}]`;
-                                  const origCell = p.original_context || p.original_text || p.template_text || "模板槽位/表单行";
-                                  const propCell = p.proposed_text || p.value || p.text || (typeof p === 'string' ? p : "已原子写盘");
+                                  const origCell = p.original_context || p.original_text || p.template_text;
+                                  const propCell = p.proposed_text ?? p.value ?? p.text ?? p;
                                   return (
-                                    <tr key={idx} className="hover:bg-slate-900/40 transition-colors">
-                                      <td className="p-3 text-center text-slate-500">{idx + 1}</td>
-                                      <td className="p-3 font-mono text-[11px] text-purple-300 break-all bg-purple-950/20 px-2 py-1 rounded">
-                                        {pathCell}
+                                    <tr key={idx} className="hover:bg-slate-900/50 transition-colors">
+                                      <td className="p-3.5 text-center text-slate-500 font-mono text-xs">{idx + 1}</td>
+                                      <td className="p-3.5 align-top">
+                                        <span className="font-mono text-[11px] text-purple-300 bg-purple-950/60 border border-purple-800/50 px-2.5 py-1 rounded-md inline-block max-w-[170px] truncate shadow-xs" title={pathCell}>
+                                          {pathCell}
+                                        </span>
                                       </td>
-                                      <td className="p-3 text-slate-400 leading-normal">{origCell}</td>
-                                      <td className="p-3 text-emerald-300 font-medium leading-normal bg-emerald-950/20 px-2 py-1 rounded">
-                                        {propCell}
+                                      <td className="p-3.5 align-top">
+                                        {renderOriginalContext(origCell)}
                                       </td>
-                                      <td className="p-3 text-center">
-                                        <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 text-[10px] border border-emerald-500/30">
+                                      <td className="p-3.5 align-top">
+                                        {renderProposalValue(propCell)}
+                                      </td>
+                                      <td className="p-3.5 text-center align-top">
+                                        <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 text-[10px] font-bold border border-emerald-500/40 whitespace-nowrap inline-flex items-center gap-1 shadow-xs">
                                           ✅ 已刷盘
                                         </span>
                                       </td>
                                     </tr>
                                   );
                                 })
-                              ) : selectedWorker.summary && selectedWorker.summary.includes('|') ? (
-                                selectedWorker.summary
-                                  .split('\n')
-                                  .filter(line => line.trim().startsWith('|') && !line.includes('---') && !line.includes('序号') && !line.includes('槽位/DOM'))
-                                  .map((line, idx) => {
-                                    const cells = line.split('|').map(c => c.trim()).filter(Boolean);
-                                    if (cells.length < 3) return null;
-                                    const pathCell = cells[1] || cells[0];
-                                    const origCell = cells[2] || cells[1];
-                                    const propCell = cells[3] || cells[2] || '已原子写盘';
-                                    return (
-                                      <tr key={idx} className="hover:bg-slate-900/40 transition-colors">
-                                        <td className="p-3 text-center text-slate-500">{idx + 1}</td>
-                                        <td className="p-3 font-mono text-[11px] text-purple-300 break-all bg-purple-950/20 px-2 py-1 rounded">
-                                          {pathCell}
-                                        </td>
-                                        <td className="p-3 text-slate-400 leading-normal">{origCell}</td>
-                                        <td className="p-3 text-emerald-300 font-medium leading-normal bg-emerald-950/20 px-2 py-1 rounded">
-                                          {propCell}
-                                        </td>
-                                        <td className="p-3 text-center">
-                                          <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 text-[10px] border border-emerald-500/30">
-                                            ✅ 已刷盘
-                                          </span>
-                                        </td>
-                                      </tr>
-                                    );
-                                  })
                               ) : (
                                 <tr>
-                                  <td colSpan={5} className="p-6 text-center text-slate-500 text-xs font-sans">
-                                    此章节共完成 {selectedWorker.proposals_count} 项原位改写。切换至【🧠 完整思维链推导】可查看全量段落落盘总结。
+                                  <td colSpan={5} className="p-8 text-center text-slate-500 text-xs font-sans">
+                                    此章节共完成 {selectedWorker.proposals_count} 项原位改写。切换至【🧠 思维链 (CoT)】可查看全量段落落盘总结。
                                   </td>
                                 </tr>
                               )}
@@ -1013,31 +1142,31 @@ export const AgentAuditPage: React.FC = () => {
                     </div>
                   </div>
                 ) : activeTab === 'thought' ? (
-                  <div className="space-y-6">
-                    {/* 实时 CoT 推导思考步骤明细 (Thought Steps / ReAct Chain) */}
-                    <div className="bg-slate-900/90 border border-purple-900/40 rounded-2xl p-6 shadow-2xl">
+                  <div className="space-y-4">
+                    {/* 实时 CoT 推导思考步骤明细 */}
+                    <div className="bg-slate-900/90 border border-purple-900/40 rounded-2xl p-5 shadow-2xl backdrop-blur-md">
                       <div className="text-purple-400 font-bold mb-4 pb-3 border-b border-slate-800 flex items-center justify-between">
-                        <span className="flex items-center gap-2 text-sm">
+                        <span className="flex items-center gap-2 text-xs sm:text-sm">
                           <span>🧠</span>
-                          <span>Agent 【{selectedWorker.chapter_title}】 真实 ReAct 思维链轨迹 ({selectedWorker.thought_steps?.length || 0} 步交互)</span>
+                          <span>Agent 【{selectedWorker.chapter_title}】 ReAct 思维链轨迹 ({selectedWorker.thought_steps?.length || 0} 步交互)</span>
                         </span>
                         <span className="text-slate-500 font-mono text-xs">{selectedWorker.created_at || ''}</span>
                       </div>
 
                       {selectedWorker.thought_steps && selectedWorker.thought_steps.length > 0 ? (
-                        <div className="space-y-4">
+                        <div className="space-y-3.5">
                           {selectedWorker.thought_steps.map((stepItem, idx) => {
                             if (stepItem.type === 'thought') {
                               return (
                                 <div key={idx} className="bg-slate-950/90 border border-purple-800/40 rounded-xl p-4 shadow-md">
-                                  <div className="flex items-center justify-between text-xs font-bold text-purple-300 mb-2">
+                                  <div className="flex items-center justify-between text-xs font-bold text-purple-300 mb-2.5">
                                     <div className="flex items-center gap-2">
-                                      <span className="w-6 h-6 rounded-full bg-purple-600/30 text-purple-300 flex items-center justify-center font-mono text-[11px]">
+                                      <span className="w-6 h-6 rounded-full bg-purple-600/30 text-purple-300 flex items-center justify-center font-mono text-[11px] font-bold border border-purple-500/40">
                                         {stepItem.step || idx + 1}
                                       </span>
-                                      <span>🧠 [大模型 Reasoning / 思考推导独白]</span>
+                                      <span className="text-purple-200">🧠 [大模型 Reasoning / 思考推导独白]</span>
                                     </div>
-                                    <span className="text-[10px] text-purple-400/80 font-mono">Thought Step</span>
+                                    <span className="text-[10px] text-purple-400/80 font-mono bg-purple-950/50 px-2 py-0.5 rounded border border-purple-800/30">Thought Step</span>
                                   </div>
                                   {stepItem.thought && (
                                     <div className="text-xs text-slate-200 font-mono leading-relaxed pl-8 whitespace-pre-wrap selection:bg-purple-600 selection:text-white">
@@ -1047,15 +1176,15 @@ export const AgentAuditPage: React.FC = () => {
                                   {stepItem.tool_calls && stepItem.tool_calls.length > 0 && (
                                     <div className="mt-3 pl-8 space-y-2">
                                       {stepItem.tool_calls.map((tc: any, tcIdx: number) => (
-                                        <div key={tcIdx} className="bg-purple-950/50 border border-purple-700/50 rounded-lg p-2.5 text-xs font-mono">
-                                          <div className="flex items-center gap-2 text-purple-300 font-bold mb-1">
+                                        <div key={tcIdx} className="bg-purple-950/50 border border-purple-700/50 rounded-xl p-3 text-xs font-mono shadow-sm">
+                                          <div className="flex items-center gap-2 text-purple-300 font-bold mb-1.5">
                                             <span>🛠️ 决定调用工具:</span>
-                                            <code className="bg-purple-900/60 text-purple-200 px-2 py-0.5 rounded text-[11px]">
+                                            <code className="bg-purple-900/70 text-purple-200 px-2.5 py-0.5 rounded text-[11px] border border-purple-600/40">
                                               {tc.name || tc.function?.name || 'tool'}
                                             </code>
                                           </div>
                                           {tc.args && (
-                                            <div className="text-[11px] text-slate-400 bg-slate-950 p-2 rounded border border-slate-800 overflow-x-auto">
+                                            <div className="text-[11px] text-slate-400 bg-slate-950 p-2.5 rounded-lg border border-slate-800/90 overflow-x-auto dark-scrollbar">
                                               <pre className="whitespace-pre-wrap">{typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args, null, 2)}</pre>
                                             </div>
                                           )}
@@ -1070,15 +1199,15 @@ export const AgentAuditPage: React.FC = () => {
                                 <div key={idx} className="bg-slate-950/90 border border-emerald-900/40 rounded-xl p-4 shadow-md ml-4">
                                   <div className="flex items-center justify-between text-xs font-bold text-emerald-300 mb-2">
                                     <div className="flex items-center gap-2">
-                                      <span className="w-6 h-6 rounded-full bg-emerald-600/30 text-emerald-300 flex items-center justify-center font-mono text-[11px]">
+                                      <span className="w-6 h-6 rounded-full bg-emerald-600/30 text-emerald-300 flex items-center justify-center font-mono text-xs border border-emerald-500/40">
                                         ⚡
                                       </span>
-                                      <span>⚡ [工具执行结果返回] — <code className="text-emerald-400">{stepItem.name}</code></span>
+                                      <span className="text-emerald-200">⚡ [工具执行结果返回] — <code className="text-emerald-400">{stepItem.name}</code></span>
                                     </div>
-                                    <span className="text-[10px] text-emerald-400/80 font-mono">Tool Output</span>
+                                    <span className="text-[10px] text-emerald-400/80 font-mono bg-emerald-950/50 px-2 py-0.5 rounded border border-emerald-800/30">Tool Output</span>
                                   </div>
                                   <div className="text-xs text-slate-300 font-mono leading-relaxed pl-8">
-                                    <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 overflow-x-auto max-h-60 custom-scrollbar text-[11px] text-emerald-200/90">
+                                    <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 overflow-x-auto max-h-60 dark-scrollbar text-[11px] text-emerald-200/90 shadow-inner">
                                       <pre className="whitespace-pre-wrap">{stepItem.output || '（执行完成）'}</pre>
                                     </div>
                                   </div>
@@ -1088,54 +1217,14 @@ export const AgentAuditPage: React.FC = () => {
                           })}
                         </div>
                       ) : (
-                        <div className="space-y-4">
-                          {/* 阶段 1: 需求感知 */}
-                          <div className="bg-slate-950/80 border border-purple-900/30 rounded-xl p-4">
-                            <div className="flex items-center gap-2 text-xs font-bold text-purple-300 mb-2">
-                              <span className="w-6 h-6 rounded-full bg-purple-600/30 text-purple-300 flex items-center justify-center font-mono text-[11px]">1</span>
-                              <span>[阶段一：模版槽位与语法需求感知]</span>
-                            </div>
-                            <p className="text-xs text-slate-300 font-mono leading-relaxed pl-8">
-                              通过 <code className="text-purple-400">officecli_query_structure_tool</code> 对目标章节进行全量 DOM 节点扫描，自动定位出模板中保留的前缀标签以及包含下划线 <code className="text-purple-400">______</code> 的可扩写槽位与空白表格。
-                            </p>
-                          </div>
-
-                          {/* 阶段 2: 信息检索 */}
-                          <div className="bg-slate-950/80 border border-blue-900/30 rounded-xl p-4">
-                            <div className="flex items-center gap-2 text-xs font-bold text-blue-300 mb-2">
-                              <span className="w-6 h-6 rounded-full bg-blue-600/30 text-blue-300 flex items-center justify-center font-mono text-[11px]">2</span>
-                              <span>[阶段二：数据库与 RAG 跨章节交叉检索]</span>
-                            </div>
-                            <p className="text-xs text-slate-300 font-mono leading-relaxed pl-8">
-                              调用 <code className="text-blue-400">get_company_profile</code> 提取企业法人与营业执照；调用 <code className="text-blue-400">get_full_chapter_text</code> 交叉检索招标文件原文约束。
-                            </p>
-                          </div>
-
-                          {/* 阶段 3: 逻辑推理 */}
-                          <div className="bg-slate-950/80 border border-emerald-900/30 rounded-xl p-4">
-                            <div className="flex items-center gap-2 text-xs font-bold text-emerald-300 mb-2">
-                              <span className="w-6 h-6 rounded-full bg-emerald-600/30 text-emerald-300 flex items-center justify-center font-mono text-[11px]">3</span>
-                              <span>[阶段三：合规性与数值精准推导]</span>
-                            </div>
-                            <p className="text-xs text-slate-300 font-mono leading-relaxed pl-8">
-                              遵守【模板原文 100% 盲守法则】，替换下划线，抹除假话空话，并将总价转化为大写人民币。
-                            </p>
-                          </div>
+                        <div className="text-slate-400 py-4 font-mono text-xs whitespace-pre-wrap leading-relaxed">
+                          {selectedWorker.summary || '无独立思维链日志'}
                         </div>
                       )}
                     </div>
-
-                    {/* 完整思考推导文本 */}
-                    <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 font-mono text-xs leading-relaxed text-slate-200 shadow-2xl overflow-x-auto whitespace-pre-wrap selection:bg-purple-600 selection:text-white">
-                      <div className="text-purple-400 font-bold mb-4 pb-2 border-b border-slate-800 flex items-center justify-between">
-                        <span>=== 📝 Agent 完整落盘文本与提案总结 ===</span>
-                        <span className="text-slate-500 font-normal text-[11px]">{selectedWorker.created_at || ''}</span>
-                      </div>
-                      {selectedWorker.summary}
-                    </div>
                   </div>
                 ) : (
-                  <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 font-mono text-xs text-emerald-400 overflow-x-auto selection:bg-purple-600 selection:text-white">
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 font-mono text-xs text-emerald-400 overflow-x-auto dark-scrollbar selection:bg-purple-600 selection:text-white shadow-xl">
                     <pre className="whitespace-pre-wrap">{JSON.stringify(selectedWorker, null, 2)}</pre>
                   </div>
                 )}
@@ -1153,15 +1242,15 @@ export const AgentAuditPage: React.FC = () => {
                 </h3>
 
                 <p className="text-xs text-slate-400 mb-6 leading-relaxed">
-                  系统已载入目标招标文件。点击下方【一键启动 Agent 全自主撰写标书】，多智能体专家团队将自动识别排版槽位、关联企业知识库与价格库，在后台原位扩写并刷盘生成标准 Word (.docx) 标书响应文档。
+                  系统已载入目标招标文件与指定投标主体。点击下方【一键启动 Agent 全自主撰写标书】，多智能体专家团队将自动识别排版槽位、关联企业知识库与价格库，在后台原位扩写并刷盘生成标准 Word (.docx) 标书响应文档。
                 </p>
 
-                <div className="flex items-center justify-center gap-4">
+                <div className="flex flex-wrap items-center justify-center gap-3">
                   <button
                     type="button"
                     onClick={handleStartFilling}
                     disabled={isGenerating || !activeDocId}
-                    className="px-6 py-3 rounded-2xl bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 active:scale-98 text-white text-sm font-bold shadow-xl shadow-purple-900/50 transition-all flex items-center gap-2 cursor-pointer border border-purple-400/40 disabled:opacity-50"
+                    className="px-6 py-3 rounded-2xl bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 active:scale-98 text-white text-xs font-bold shadow-xl shadow-purple-900/50 transition-all flex items-center gap-2 cursor-pointer border border-purple-400/40 disabled:opacity-50"
                   >
                     {isGenerating ? (
                       <>
@@ -1180,17 +1269,17 @@ export const AgentAuditPage: React.FC = () => {
                     type="button"
                     onClick={handleDownloadRawTemplate}
                     disabled={isDownloadingRaw || !activeDocId}
-                    className="px-4 py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 text-sm font-bold border border-slate-700 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    className="px-4 py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 text-xs font-bold border border-slate-700 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
                     title="提取并下载未经过 AI 扩写的原格式《投标文件格式》Word 模板"
                   >
                     {isDownloadingRaw ? (
                       <>
-                        <span className="animate-spin w-4 h-4 border-2 border-slate-300 border-t-transparent rounded-full"></span>
-                        <span>正在提取原格式...</span>
+                        <span className="animate-spin w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full"></span>
+                        <span>正在提取...</span>
                       </>
                     ) : (
                       <>
-                        <span>📄 下载原格式标书文件</span>
+                        <span>📄 下载原格式标书</span>
                       </>
                     )}
                   </button>
@@ -1199,15 +1288,16 @@ export const AgentAuditPage: React.FC = () => {
                     type="button"
                     onClick={handleDownloadWord}
                     disabled={isDownloading || !activeDocId}
-                    className="px-5 py-3 rounded-2xl bg-emerald-700 hover:bg-emerald-600 active:bg-emerald-800 text-white text-sm font-bold shadow-md shadow-emerald-950/40 border border-emerald-500/30 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    className="px-4 py-3 rounded-2xl bg-emerald-700 hover:bg-emerald-600 active:bg-emerald-800 text-white text-xs font-bold shadow-md shadow-emerald-950/40 border border-emerald-500/30 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
                   >
-                    <span>📥 下载已撰写标书 Word</span>
+                    <span>📥 下载标书 Word</span>
                   </button>
                 </div>
               </div>
             </div>
           )}
         </div>
+      </div>
       </div>
 
       {/* 招标文件全景选择 Modal 弹窗 */}
@@ -1258,8 +1348,8 @@ export const AgentAuditPage: React.FC = () => {
                         setShowDocModal(false);
                       }}
                       className={`p-4 rounded-2xl border transition-all cursor-pointer flex flex-col justify-between group ${isCurrent
-                          ? 'bg-purple-950/60 border-purple-500 ring-2 ring-purple-500/30 shadow-lg shadow-purple-950/50'
-                          : 'bg-slate-950/60 border-slate-800 hover:border-purple-600/60 hover:bg-slate-800/40'
+                        ? 'bg-purple-950/60 border-purple-500 ring-2 ring-purple-500/30 shadow-lg shadow-purple-950/50'
+                        : 'bg-slate-950/60 border-slate-800 hover:border-purple-600/60 hover:bg-slate-800/40'
                         }`}
                     >
                       <div>

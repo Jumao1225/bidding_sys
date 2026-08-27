@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.api import deps
 from app.db.crud import user as crud_user
-from app.schemas.user import Tenant, TenantCreate, User, UserCreate, UserUpdatePassword, UserUpdateTenant
+from app.schemas.user import Tenant, TenantCreate, User, UserCreate, UserUpdatePassword, UserUpdateTenant, UserUpdateStatus
 from app.schemas.model_config import ModelConfigResponse, ModelConfigUpdate
 from app.db.models.user import User as UserModel
 from app.schemas.response.common import ResponseModel, success_response
@@ -87,7 +87,7 @@ def update_model_config(
 def read_tenants(
     db: Session = Depends(deps.get_db),
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 1000,
     current_admin: UserModel = Depends(deps.get_current_admin_user),
 ) -> Any:
     """
@@ -115,6 +115,36 @@ def create_tenant(
     tenant = crud_user.tenant.create(db, obj_in=tenant_in)
     return tenant
 
+@router.put("/tenants/{tenant_id}/status", response_model=Tenant)
+def update_tenant_status(
+    *,
+    db: Session = Depends(deps.get_db),
+    tenant_id: str,
+    status_in: UserUpdateStatus,
+    current_admin: UserModel = Depends(deps.get_current_admin_user),
+) -> Any:
+    """
+    修改租户启用/停用状态。仅平台管理员可操作，禁止停用自身所在租户。
+    """
+    tenant = crud_user.tenant.get(db, id=tenant_id)
+    if not tenant:
+        raise HTTPException(
+            status_code=404,
+            detail="The tenant with this ID does not exist in the system.",
+        )
+    if not status_in.is_active and current_admin.tenant_id == tenant_id:
+        logger.warning("平台管理员 {} 尝试停用自身所在租户 {}", current_admin.id, tenant_id)
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot disable your own tenant",
+        )
+    tenant.is_active = status_in.is_active
+    db.add(tenant)
+    db.commit()
+    db.refresh(tenant)
+    logger.info("平台管理员 {} 将租户 {} 状态更新为 {}", current_admin.id, tenant.id, "启用" if tenant.is_active else "停用")
+    return tenant
+
 # -------------------------------------------------------------------
 # User Management
 # -------------------------------------------------------------------
@@ -123,7 +153,7 @@ def create_tenant(
 def read_users(
     db: Session = Depends(deps.get_db),
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 1000,
     tenant_id: str = Query(None, description="Filter by tenant ID"),
     current_manager: UserModel = Depends(deps.get_current_user_manager),
 ) -> Any:
@@ -165,9 +195,10 @@ def create_user(
         if user_in.tenant_id != current_manager.tenant_id:
             logger.warning("租户管理员 {} 尝试向其他租户创建用户", current_manager.id)
             raise HTTPException(status_code=403, detail="Tenant administrators can only manage their own tenant")
-        if user_in.role != "user":
-            logger.warning("租户管理员 {} 尝试创建角色 {}", current_manager.id, user_in.role)
-            raise HTTPException(status_code=403, detail="Tenant administrators can only create regular users")
+        # 租户管理员允许在本租户内创建普通用户或租户管理员，禁止越权创建平台管理员
+        if user_in.role not in ["user", "tenant_admin"]:
+            logger.warning("租户管理员 {} 尝试创建越权角色 {}", current_manager.id, user_in.role)
+            raise HTTPException(status_code=403, detail="Tenant administrators can only create regular users or tenant admins")
     user = crud_user.user.create(db, obj_in=user_in)
     logger.info("管理员 {} 在租户 {} 创建用户 {}，角色为 {}", current_manager.id, user.tenant_id, user.id, user.role)
     return user
@@ -241,6 +272,80 @@ def update_user_tenant(
     db.refresh(user)
     logger.info("平台管理员 {} 将用户 {} 调整到租户 {}，角色为 {}", current_admin.id, user.id, user.tenant_id, user.role)
     return user
+
+
+@router.put("/users/{user_id}/status", response_model=User)
+def update_user_status(
+    *,
+    db: Session = Depends(deps.get_db),
+    user_id: str,
+    status_in: UserUpdateStatus,
+    current_manager: UserModel = Depends(deps.get_current_user_manager),
+) -> Any:
+    """
+    修改用户启用/停用状态。禁止自停用，租户管理员受租户边界与越权防护约束。
+    """
+    if current_manager.id == user_id:
+        logger.warning("管理员 {} 尝试修改自身账号状态", current_manager.id)
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot change status of your own account",
+        )
+    user = crud_user.user.get(db, id=user_id)
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="The user with this ID does not exist in the system.",
+        )
+    if current_manager.role == "tenant_admin":
+        if user.tenant_id != current_manager.tenant_id:
+            logger.warning("租户管理员 {} 尝试修改其他租户用户状态", current_manager.id)
+            raise HTTPException(status_code=403, detail="Tenant administrators can only manage their own tenant")
+        if user.role in deps.PLATFORM_ADMIN_ROLES:
+            logger.warning("租户管理员 {} 尝试修改平台管理员状态", current_manager.id)
+            raise HTTPException(status_code=403, detail="Tenant administrators cannot modify platform administrators")
+    
+    user.is_active = status_in.is_active
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    logger.info("管理员 {} 将用户 {} 状态更新为 {}", current_manager.id, user.id, "启用" if user.is_active else "停用")
+    return user
+
+
+@router.delete("/users/{user_id}", response_model=ResponseModel[dict])
+def delete_user(
+    *,
+    db: Session = Depends(deps.get_db),
+    user_id: str,
+    current_manager: UserModel = Depends(deps.get_current_user_manager),
+) -> Any:
+    """
+    删除指定用户。禁止自删，租户管理员受租户边界与越权防护约束。
+    """
+    if current_manager.id == user_id:
+        logger.warning("管理员 {} 尝试删除自身账号", current_manager.id)
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete your own account",
+        )
+    user = crud_user.user.get(db, id=user_id)
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="The user with this ID does not exist in the system.",
+        )
+    if current_manager.role == "tenant_admin":
+        if user.tenant_id != current_manager.tenant_id:
+            logger.warning("租户管理员 {} 尝试删除其他租户用户", current_manager.id)
+            raise HTTPException(status_code=403, detail="Tenant administrators can only manage their own tenant")
+        if user.role in deps.PLATFORM_ADMIN_ROLES:
+            logger.warning("租户管理员 {} 尝试删除平台管理员", current_manager.id)
+            raise HTTPException(status_code=403, detail="Tenant administrators cannot delete platform administrators")
+    
+    crud_user.user.remove(db, id=user_id)
+    logger.info("管理员 {} 删除了用户 {}", current_manager.id, user_id)
+    return success_response(data={"id": user_id}, message="User deleted successfully")
 
 
 # -------------------------------------------------------------------

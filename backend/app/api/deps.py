@@ -71,6 +71,8 @@ def get_current_active_user(
 ) -> User:
     if not current_user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
+    if current_user.tenant and not current_user.tenant.is_active and current_user.role not in PLATFORM_ADMIN_ROLES:
+        raise HTTPException(status_code=400, detail="Tenant is inactive")
     # 将当前用户租户写入请求上下文，供 LLM、MinerU 和视觉模型选择租户配置。
     from app.core.context import current_user_id, current_tenant_id
     current_user_id.set(current_user.id)

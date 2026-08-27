@@ -31,6 +31,18 @@ def test_query_company_profile_fallback():
     assert res_bank is not None and len(res_bank) > 0
 
 
+def test_query_company_profile_with_contextvar():
+    """测试通过 ContextVar 动态绑定不同企业档案"""
+    from app.agents.tools.bid_db_tools import current_profile_id
+    token = current_profile_id.set("non-existent-profile-id-fallback-test")
+    try:
+        # 当指定 ID 不存在时，应优雅回退到默认档案
+        res = query_company_profile_tool.invoke({"field_key": "投标人名称"})
+        assert res is not None and len(res) > 0
+    finally:
+        current_profile_id.reset(token)
+
+
 def test_query_financial_quotation_chinese():
     """测试财务报价大写金额转换集成"""
     res_chinese = query_financial_quotation_tool.invoke({

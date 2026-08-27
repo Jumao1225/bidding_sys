@@ -26,6 +26,8 @@ def login_access_token(
         raise HTTPException(status_code=400, detail="Incorrect email or password")
     elif not user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
+    elif user.tenant and not user.tenant.is_active and user.role not in deps.PLATFORM_ADMIN_ROLES:
+        raise HTTPException(status_code=400, detail="Tenant is inactive")
     
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     

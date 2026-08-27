@@ -28,7 +28,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
     if (location.pathname.startsWith('/qualifications')) return '企业资质中心';
     if (location.pathname.startsWith('/price-book')) return '成本报价知识库';
     if (location.pathname.startsWith('/bid-scorer')) return '智能标书评估与打分';
-    if (location.pathname.startsWith('/agent-audit')) return 'Agent 运行履历与思维链控制台';
+    if (location.pathname.startsWith('/agent-audit')) return '标书智能生成与 Agent 控制台';
     if (location.pathname.startsWith('/model-config') || location.pathname.startsWith('/admin/env')) return '模型配置中心';
     if (location.pathname.startsWith('/admin')) return '系统运维管理';
     if (location.pathname.startsWith('/analysis')) return '智能文档解析';

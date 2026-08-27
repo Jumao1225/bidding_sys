@@ -42,6 +42,9 @@ class UserUpdate(UserBase):
 class UserUpdatePassword(BaseModel):
     password: str
 
+class UserUpdateStatus(BaseModel):
+    is_active: bool
+
 class UserUpdateTenant(BaseModel):
     tenant_id: str
     # 该接口只允许平台管理员调整普通用户与租户管理员权限。

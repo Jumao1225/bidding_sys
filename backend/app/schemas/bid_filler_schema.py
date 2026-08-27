@@ -78,6 +78,10 @@ class ReviewFinding(BaseModel):
 
 class BidFillRequest(BaseModel):
     """标书自动填报 API 请求入参"""
+    profile_id: Optional[str] = Field(
+        default=None,
+        description="指定使用的企业档案 ID（不传则使用默认档案）"
+    )
     company_profile: Optional[CompanyProfile] = Field(
         default_factory=CompanyProfile, description="自定义投标人档案（不传则使用系统默认公司数据）"
     )

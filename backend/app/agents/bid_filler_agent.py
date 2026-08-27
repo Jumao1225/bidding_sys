@@ -67,6 +67,7 @@ class BidFillerState(TypedDict):
 
     db_session: Any
     company_profile: CompanyProfile
+    profile_id: Optional[str]                              # 指定使用的企业档案 ID
     original_docx: Optional[bytes]
     docx_temp_path: Optional[str]
 
@@ -387,7 +388,25 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 
             db_meta = SessionLocal()
             try:
-                prof = db_meta.query(CompanyProfileModel).first()
+                # 按指定 profile_id 或默认档案查询企业工商信息
+                target_profile_id = state.get("profile_id")
+                if target_profile_id:
+                    prof = db_meta.query(CompanyProfileModel).filter(
+                        CompanyProfileModel.id == target_profile_id
+                    ).first()
+                    if prof:
+                        logger.info(f"Supervisor 使用指定企业档案: id={target_profile_id}, name='{prof.profile_name}'")
+                    else:
+                        logger.warning(f"指定档案 {target_profile_id} 不存在，回退默认档案")
+                        prof = db_meta.query(CompanyProfileModel).filter(
+                            CompanyProfileModel.is_default == True
+                        ).first()
+                else:
+                    prof = db_meta.query(CompanyProfileModel).filter(
+                        CompanyProfileModel.is_default == True
+                    ).first()
+                if not prof:
+                    prof = db_meta.query(CompanyProfileModel).first()
                 if prof:
                     if prof.company_name: prefetched_metadata["company_name"] = prof.company_name
                     if prof.credit_code: prefetched_metadata["credit_code"] = prof.credit_code
@@ -4028,8 +4047,15 @@ class BidFillerAgent:
         detected_placeholders: List[Dict[str, Any]], original_docx: Optional[bytes] = None,
         custom_instructions: Optional[str] = None,
         category_hints: Optional[Dict[str, str]] = None,
+        profile_id: Optional[str] = None,
     ) -> tuple[Dict[str, str], BidFillAuditReport, Optional[bytes]]:
         logger.info("启动 LangGraph BidFillerAgent Multi-Agent 标书撰写状态图...")
+
+        # 设置运行时上下文：指定 Agent 工具查询使用的企业档案
+        from app.agents.tools.bid_db_tools import current_profile_id
+        if profile_id:
+            current_profile_id.set(profile_id)
+            logger.info(f"Agent 运行时绑定企业档案: profile_id={profile_id}")
         from app.agents.bid_filler_workers import clear_worker_proposals
         clear_worker_proposals(document_id)
 
@@ -4047,6 +4073,7 @@ class BidFillerAgent:
         initial_state: BidFillerState = {
             "document_id": document_id, "tenant_id": effective_tenant, "original_context": "",
             "db_session": db, "company_profile": profile,
+            "profile_id": profile_id,
             "original_docx": original_docx, "docx_temp_path": None,
             "slot_analysis": None, "worker_proposals": None, "chapter_tasks": None,
             "custom_instructions": custom_instructions,

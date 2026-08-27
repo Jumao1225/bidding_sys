@@ -28,7 +28,7 @@ class MarketPriceReference(TenantBase):
 
 
 from datetime import datetime, timezone
-from sqlalchemy import String, Date, Float, DateTime
+from sqlalchemy import String, Date, Float, DateTime, Boolean
 
 class CompanyProfileModel(Base):
     __tablename__ = "company_profiles"
@@ -36,6 +36,10 @@ class CompanyProfileModel(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 档案显示名称，用于列表展示与标书撰写时选择投标主体
+    profile_name: Mapped[str | None] = mapped_column(String(100), nullable=True, comment="档案显示名称")
+    # 默认档案标记，同一租户内最多一条记录为 True
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, comment="是否为默认档案")
     # 企业档案允许先创建空记录，待管理员在企业档案页面补充完整信息。
     company_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     legal_representative: Mapped[str | None] = mapped_column(String(100))
@@ -48,6 +52,5 @@ class CompanyProfileModel(Base):
     bank_account: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
-
 
 

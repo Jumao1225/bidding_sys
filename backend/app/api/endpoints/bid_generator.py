@@ -1030,6 +1030,7 @@ def _run_agent_bid_filling_in_background(
     t_id: str,
     custom_instructions: Optional[str] = None,
     category_hints: Optional[dict] = None,
+    profile_id: Optional[str] = None,
 ):
     """后台工作线程：执行长耗时的 BidFillerAgent 多 Agent 标书撰写与落盘"""
     from app.core.context import current_user_id, current_tenant_id, current_task_id
@@ -1041,6 +1042,9 @@ def _run_agent_bid_filling_in_background(
     token_task = current_task_id.set(document_id)
     token_u = current_user_id.set(u_id)
     token_t = current_tenant_id.set(t_id)
+    # 设置 Agent 工具查询使用的企业档案
+    from app.agents.tools.bid_db_tools import current_profile_id as ctx_profile_id
+    token_profile = ctx_profile_id.set(profile_id) if profile_id else None
     db: Session = SessionLocal()
     import time as _bg_time
     bg_start_t = _bg_time.time()
@@ -1073,6 +1077,7 @@ def _run_agent_bid_filling_in_background(
             original_docx=template_bytes,
             custom_instructions=custom_instructions,
             category_hints=category_hints,
+            profile_id=profile_id,
         )
 
         if not filled_bytes:
@@ -1135,6 +1140,8 @@ def _run_agent_bid_filling_in_background(
             current_task_id.reset(token_task)
             current_user_id.reset(token_u)
             current_tenant_id.reset(token_t)
+            if token_profile is not None:
+                ctx_profile_id.reset(token_profile)
         except Exception:
             pass
         db.close()
@@ -1161,9 +1168,11 @@ async def trigger_agent_bid_filling(
 
     custom_instructions = None
     category_hints = None
+    profile_id = None
     if request_body:
         custom_instructions = request_body.custom_instructions
         category_hints = request_body.category_hints
+        profile_id = request_body.profile_id
 
     from app.services.bid_fill_task_service import bid_fill_task_service
 
@@ -1218,6 +1227,7 @@ async def trigger_agent_bid_filling(
             custom_instructions=custom_instructions,
             category_hints=category_hints,
             reservation_data=reservation.to_payload(),
+            profile_id=profile_id,
         )
     except Exception as dispatch_error:
         bid_fill_task_service.release(reservation)

@@ -234,7 +234,7 @@ export const BidScorerLab: React.FC = () => {
 
           <div className="flex items-center space-x-3 self-start md:self-center">
             <button 
-              onClick={() => { setScoreResult(null); setUploadedDocId(''); setSelectedFile(null); setStatusMessage(''); }}
+              onClick={() => { setScoreResult(null); setUploadedDocId(''); setSelectedFile(null); setStatusMessage(''); setErrorMessage(''); }}
               className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 text-sm font-medium border border-slate-700 transition-all shadow-md"
             >
               <Activity className="w-4 h-4 text-cyan-400" />

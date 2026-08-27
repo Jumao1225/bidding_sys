@@ -22,8 +22,8 @@ class CRUDTenant:
         db.refresh(db_obj)
         return db_obj
 
-    def get_multi(self, db: Session, *, skip: int = 0, limit: int = 100) -> List[Tenant]:
-        return db.query(Tenant).offset(skip).limit(limit).all()
+    def get_multi(self, db: Session, *, skip: int = 0, limit: int = 1000) -> List[Tenant]:
+        return db.query(Tenant).order_by(Tenant.updated_at.desc(), Tenant.created_at.desc()).offset(skip).limit(limit).all()
 
     def update(self, db: Session, *, db_obj: Tenant, obj_in: TenantUpdate) -> Tenant:
         update_data = obj_in.model_dump(exclude_unset=True)
@@ -55,11 +55,11 @@ class CRUDUser:
         db.refresh(db_obj)
         return db_obj
 
-    def get_multi(self, db: Session, *, skip: int = 0, limit: int = 100, tenant_id: Optional[str] = None) -> List[User]:
+    def get_multi(self, db: Session, *, skip: int = 0, limit: int = 1000, tenant_id: Optional[str] = None) -> List[User]:
         query = db.query(User)
         if tenant_id:
             query = query.filter(User.tenant_id == tenant_id)
-        return query.offset(skip).limit(limit).all()
+        return query.order_by(User.updated_at.desc(), User.created_at.desc()).offset(skip).limit(limit).all()
 
     def update(self, db: Session, *, db_obj: User, obj_in: UserUpdate) -> User:
         update_data = obj_in.model_dump(exclude_unset=True)
@@ -73,6 +73,13 @@ class CRUDUser:
         db.commit()
         db.refresh(db_obj)
         return db_obj
+
+    def remove(self, db: Session, *, id: str) -> Optional[User]:
+        obj = db.query(User).filter(User.id == id).first()
+        if obj:
+            db.delete(obj)
+            db.commit()
+        return obj
 
 tenant = CRUDTenant()
 user = CRUDUser()
