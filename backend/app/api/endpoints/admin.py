@@ -183,7 +183,7 @@ def create_user(
     if not tenant:
         raise HTTPException(
             status_code=404,
-            detail="The specified tenant does not exist.",
+            detail="所选的目标企业租户不存在，请重新选择。",
         )
 
     # 租户内查重：同一租户内账号不可重复，不同租户允许同名
@@ -191,7 +191,7 @@ def create_user(
     if existing_user:
         raise HTTPException(
             status_code=400,
-            detail="The user with this username already exists in this tenant.",
+            detail=f"【{tenant.name}】下已存在名为「{user_in.email}」的账号，同一企业内部不可重复创建同名账号。",
         )
 
     if current_manager.role == "tenant_admin":

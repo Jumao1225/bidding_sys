@@ -151,12 +151,21 @@ export function SystemAdmin() {
         setShowTenantModal(false);
         setNewTenantName('');
         fetchData();
+        alert('🎉 企业租户创建成功！');
       } else {
-        const data = await res.json().catch(() => ({}));
-        alert(`创建失败: ${data.detail || '未知错误'}`);
+        const errorData = await res.json().catch(() => ({}));
+        let errMsg = '未知错误';
+        if (typeof errorData.detail === 'string') {
+          errMsg = errorData.detail;
+        } else if (Array.isArray(errorData.detail)) {
+          errMsg = errorData.detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ');
+        } else if (errorData.message) {
+          errMsg = errorData.message;
+        }
+        alert(`开通租户失败: ${errMsg}`);
       }
-    } catch (err) {
-      alert('网络错误');
+    } catch (err: any) {
+      alert(`网络或服务请求错误: ${err.message || err}`);
     }
   };
 
@@ -164,11 +173,15 @@ export function SystemAdmin() {
     e.preventDefault();
     try {
       const targetTenantId = isTenantAdmin ? (user?.tenant_id || '') : newUserTenantId;
+      if (!targetTenantId) {
+        alert('请选择要分配的目标企业租户！');
+        return;
+      }
       const res = await apiFetch(`${baseUrl}/api/v1/admin/users`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          email: newUserEmail, 
+          email: newUserEmail.trim(), 
           password: newUserPassword, 
           tenant_id: targetTenantId,
           role: newUserRole,
@@ -182,12 +195,21 @@ export function SystemAdmin() {
         setNewUserTenantId(isTenantAdmin ? (user?.tenant_id || '') : '');
         setNewUserRole('user');
         fetchData();
+        alert('🎉 新账号分配成功！');
       } else {
-        const data = await res.json().catch(() => ({}));
-        alert(`创建失败: ${data.detail || '未知错误'}`);
+        const errorData = await res.json().catch(() => ({}));
+        let errMsg = '未知错误';
+        if (typeof errorData.detail === 'string') {
+          errMsg = errorData.detail;
+        } else if (Array.isArray(errorData.detail)) {
+          errMsg = errorData.detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ');
+        } else if (errorData.message) {
+          errMsg = errorData.message;
+        }
+        alert(`创建账号失败: ${errMsg}`);
       }
-    } catch (err) {
-      alert('网络错误');
+    } catch (err: any) {
+      alert(`网络或服务请求错误: ${err.message || err}`);
     }
   };
 
@@ -205,11 +227,12 @@ export function SystemAdmin() {
         setSelectedUserId('');
         alert('密码修改成功');
       } else {
-        const data = await res.json().catch(() => ({}));
-        alert(`修改失败: ${data.detail || '未知错误'}`);
+        const errorData = await res.json().catch(() => ({}));
+        const errMsg = typeof errorData.detail === 'string' ? errorData.detail : (errorData.message || '未知错误');
+        alert(`修改密码失败: ${errMsg}`);
       }
-    } catch (err) {
-      alert('网络错误');
+    } catch (err: any) {
+      alert(`网络错误: ${err.message || err}`);
     }
   };
 
@@ -233,11 +256,12 @@ export function SystemAdmin() {
         fetchData();
         alert('租户变更成功');
       } else {
-        const data = await res.json().catch(() => ({}));
-        alert(`修改失败: ${data.detail || '未知错误'}`);
+        const errorData = await res.json().catch(() => ({}));
+        const errMsg = typeof errorData.detail === 'string' ? errorData.detail : (errorData.message || '未知错误');
+        alert(`变更租户失败: ${errMsg}`);
       }
-    } catch (err) {
-      alert('网络错误');
+    } catch (err: any) {
+      alert(`网络错误: ${err.message || err}`);
     }
   };
 
@@ -923,7 +947,9 @@ export function SystemAdmin() {
                     >
                       <option value="" disabled>-- 请选择目标企业 --</option>
                       {tenants.map(t => (
-                        <option key={t.id} value={t.id}>{t.name}</option>
+                        <option key={t.id} value={t.id}>
+                          {t.name === 'System Admin' ? '👑 System Admin (平台管理专属空间)' : `🏢 ${t.name}`}
+                        </option>
                       ))}
                     </select>
                   </div>

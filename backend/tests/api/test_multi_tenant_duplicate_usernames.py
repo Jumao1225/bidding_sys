@@ -103,7 +103,7 @@ async def test_multi_tenant_duplicate_user_creation_and_rejection(duplicate_user
             },
         )
         assert duplicate_res.status_code == 400
-        assert "already exists in this tenant" in duplicate_res.json()["detail"]
+        assert "已存在" in duplicate_res.json()["detail"] or "already exists" in duplicate_res.json()["detail"]
 
 
 @pytest.mark.asyncio
