@@ -22,12 +22,42 @@ from loguru import logger
 
 from app.services.llm_service import llm_service
 
+def auto_migrate_db_constraints():
+    """在服务启动时自动检查并迁移数据库唯一约束，确保支持多租户同名账号。"""
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            # 1. 检查并移除旧的单列 email 唯一索引
+            conn.execute(text("DROP INDEX IF EXISTS ix_users_email;"))
+            conn.execute(text("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key;"))
+            # 2. 确保 email 普通索引存在（便于查询）
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_email ON users (email);"))
+            # 3. 确保复合唯一约束 uq_user_tenant_email 存在
+            conn.execute(text("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'uq_user_tenant_email'
+                    ) THEN
+                        ALTER TABLE users ADD CONSTRAINT uq_user_tenant_email UNIQUE (tenant_id, email);
+                    END IF;
+                END $$;
+            """))
+            conn.commit()
+            logger.info("✅ 数据库多租户复合约束 (tenant_id, email) 自动同步/迁移成功！")
+    except Exception as e:
+        logger.warning(f"⚠️ 自动迁移数据库约束提示: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     setup_app_logging()
     logger.info("🚀 智能投标系统后端启动成功 (全量模块已热重载 v3)")
     
+    # 自动执行数据库多租户约束升级与同步
+    auto_migrate_db_constraints()
+
     # 预加载 Embedding 模型，使其一直常驻后台内存/显存
     try:
         logger.info("⏳ 正在后台预加载 Embedding 模型，请稍候...")
