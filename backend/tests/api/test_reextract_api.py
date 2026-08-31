@@ -5,6 +5,7 @@ from app.main import app
 from app.api.deps import get_current_active_user
 from app.core.context import current_user_id, current_tenant_id
 from app.agents.tools.metadata_tools import extract_financial_info
+from app.agents.tools.metadata_tools import extract_engineering_info
 
 @pytest.mark.asyncio
 async def test_reextract_invalid_domain_should_return_400():
@@ -59,7 +60,7 @@ async def test_reextract_valid_domain_context_setting():
 
 @pytest.mark.asyncio
 async def test_reextract_cost_estimation_should_succeed():
-    """测试请求成本测算领域 (cost_estimation) 能够成功执行 cost_node 并持久化写库"""
+    """测试重新匹配 BOM 清单能够执行 cost_node、持久化结果并返回明确提示"""
     mock_user = MagicMock()
     mock_user.id = "user-test-999"
     mock_user.tenant_id = "tenant-test-888"
@@ -88,7 +89,36 @@ async def test_reextract_cost_estimation_should_succeed():
                 assert res.status_code == 200
                 res_json = res.json()
                 assert res_json["code"] == 200
+                assert res_json["message"] == "BOM 清单重新匹配成功"
                 assert res_json["data"]["total_cost"] == 50000.0
                 assert mock_doc.parsed_metadata["cost_analysis"]["total_cost"] == 50000.0
     finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_reextract_engineering_should_only_extract_equipment_without_cost_matching():
+    """测试重新提取设备清单不会联动调用成本匹配节点。"""
+    mock_user = MagicMock()
+    mock_user.id = "user-test-999"
+    mock_user.tenant_id = "tenant-test-888"
+    app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+    mock_doc = MagicMock()
+    mock_doc.parsed_metadata = {}
+    original_invoke = extract_engineering_info.invoke
+    object.__setattr__(extract_engineering_info, "invoke", lambda input_dict: '{"main_equipment_list": [{"item_name": "测试设备", "quantity": 2, "unit": "台"}]}')
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("app.agents.nodes.cost_agent.cost_node") as mock_cost_node:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.post("/api/v1/analysis/doc-123/reextract/engineering")
+
+                assert res.status_code == 200
+                assert res.json()["data"]["main_equipment_list"][0]["item_name"] == "测试设备"
+                mock_cost_node.assert_not_called()
+    finally:
+        object.__setattr__(extract_engineering_info, "invoke", original_invoke)
         app.dependency_overrides.clear()

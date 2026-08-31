@@ -201,6 +201,8 @@ def test_supervisor_paragraph_blank_slots_auto_heal():
                 "document_id": "test_doc_para_heal",
                 "docx_temp_path": tmp_path,
                 "original_context": "",
+                # 模拟当前任务携带的企业档案，验证数据库主体解析不稳定时的安全回退。
+                "company_profile": mock_prof,
                 "repair_count": 0,
                 "max_repair_rounds": 2,
                 "repair_instructions_map": {},
@@ -226,6 +228,60 @@ def test_supervisor_paragraph_blank_slots_auto_heal():
             assert "李四" in all_text
             assert "2026年06月30日" in all_text
 
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def test_supervisor_profile_slots_should_fallback_to_task_profile_when_db_profile_unavailable():
+    """测试数据库主体解析失败时，地址和电话仍能从当前任务企业档案原位补全。"""
+    doc = Document()
+    doc.add_paragraph("二、投标函格式")
+    doc.add_paragraph("地    址：____________________________")
+    doc.add_paragraph("电    话：____________________________")
+    doc.add_paragraph("投标单位名称：________________________")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
+        doc.save(tmp_path)
+
+    try:
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        task_profile = SimpleNamespace(
+            company_name="任务档案企业有限公司",
+            registered_address="任务档案地址",
+            contact_phone="010-12345678",
+            legal_representative="任务法人",
+            authorized_delegate="任务代表",
+            email="task@example.com",
+        )
+
+        with patch("app.agents.bid_filler_agent.SessionLocal", return_value=mock_db), \
+             patch("app.agents.tools.bid_db_tools.resolve_company_profile", return_value=None), \
+             patch("app.services.office_cli_service.office_cli_service.query_structure", return_value=""):
+            state = {
+                "document_id": "test_doc_task_profile_fallback",
+                "docx_temp_path": tmp_path,
+                "original_context": "",
+                "company_profile": task_profile,
+                "repair_count": 0,
+                "max_repair_rounds": 2,
+                "repair_instructions_map": {},
+                "audit_items": [],
+            }
+
+            supervisor_audit_node(state)
+
+        healed_doc = Document(tmp_path)
+        all_text = "\n".join(paragraph.text for paragraph in healed_doc.paragraphs)
+        assert "任务档案地址" in all_text
+        assert "010-12345678" in all_text
+        assert "任务档案企业有限公司" in all_text
+        assert "________________" not in all_text
     finally:
         if os.path.exists(tmp_path):
             try:

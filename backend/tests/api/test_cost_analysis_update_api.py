@@ -405,3 +405,152 @@ async def test_update_cost_analysis_with_legacy_structured_key_parameter_should_
         app.dependency_overrides.clear()
 
 
+@pytest.mark.asyncio
+async def test_update_cost_analysis_parent_custom_pricing_priority_over_children():
+    """测试当父项被用户自定义修改（is_parent_modified=True 或 pricing_mode='parent'）时，父项自身单价与小计优先，不再被子项求和覆盖"""
+    mock_user = MagicMock()
+    mock_user.id = "user-test-999"
+    mock_user.tenant_id = "tenant-test-888"
+    app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+    mock_doc = MagicMock()
+    mock_doc.project_id = "proj-123"
+    mock_doc.parsed_metadata = {}
+
+    payload = {
+        "items": [
+            {
+                "name": "高压开关柜成套设备",
+                "spec_requirement": "KYN28A-12 包含进线柜/出线柜/PT柜",
+                "qty": 2,
+                "unit": "面",
+                "ref_price": 50000.0,  # 用户手动设定的整套单价 50,000 元
+                "is_parent_modified": True,
+                "pricing_mode": "parent",
+                "match_quality": "手动修改"
+            },
+            {
+                "name": "真空断路器",
+                "spec_requirement": "VS1-12/1250-31.5",
+                "qty": 2,
+                "unit": "台",
+                "ref_price": 12000.0,  # 子项小计 24,000
+                "parent_item": "高压开关柜成套设备",
+                "tree_level": 2,
+                "match_quality": "精准匹配"
+            },
+            {
+                "name": "微机保护装置",
+                "spec_requirement": "线路保护测控",
+                "qty": 2,
+                "unit": "台",
+                "ref_price": 8000.0,  # 子项小计 16,000
+                "parent_item": "高压开关柜成套设备",
+                "tree_level": 2,
+                "match_quality": "精准匹配"
+            }
+        ],
+        "analysis_summary": "用户直接指定成套设备整套单价 50000 元/面"
+    }
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("sqlalchemy.orm.attributes.flag_modified"):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.put("/api/v1/analysis/doc-parent-custom-1/cost-analysis", json=payload)
+
+        assert res.status_code == 200
+        data = res.json()["data"]
+        items = data["items"]
+
+        # 验证母项保留了用户自定义的单价 50000 和小计 100000（2 * 50000），没有被子项求和（40000）覆盖
+        parent_node = items[0]
+        assert parent_node["name"] == "高压开关柜成套设备"
+        assert parent_node["ref_price"] == 50000.0
+        assert parent_node["subtotal"] == 100000.0
+        assert parent_node["is_parent_modified"] is True
+        assert parent_node["pricing_mode"] == "parent"
+
+        # 验证预估总成本严格以母项 100000.0 为准
+        assert data["total_cost"] == 100000.0
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_update_cost_analysis_with_raw_baseline_and_mutex_fields_persistence():
+    """测试基线快照（raw_...）及互斥标记（is_parent_modified, is_child_modified, is_custom_added）正确落盘与回传"""
+    mock_user = MagicMock()
+    mock_user.id = "user-test-999"
+    mock_user.tenant_id = "tenant-test-888"
+    app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+    mock_doc = MagicMock()
+    mock_doc.project_id = "proj-123"
+    mock_doc.parsed_metadata = {}
+
+    payload = {
+        "items": [
+            {
+                "name": "箱式变电站",
+                "spec_requirement": "YBM-12/0.4-630kVA",
+                "qty": 1,
+                "unit": "台",
+                "ref_price": 180000.0,
+                "is_parent_modified": False,
+                "is_child_modified": True,
+                "is_custom_added": False,
+                "pricing_mode": "children",
+                "raw_ref_price": 160000.0,
+                "raw_name": "预装式变电站",
+                "raw_brand": "特变电工",
+                "raw_model": "YBM-630",
+                "raw_manufacturer": "特变电工股份有限公司",
+                "raw_spec": "YBM-12/0.4-630kVA 初始标书要求",
+                "raw_qty": 1,
+                "raw_unit": "台",
+                "raw_match_quality": "精准匹配"
+            },
+            {
+                "name": "智能温控排风系统",
+                "spec_requirement": "带双路风机与温度自启动",
+                "qty": 2,
+                "unit": "套",
+                "ref_price": 3500.0,
+                "parent_item": "箱式变电站",
+                "is_custom_added": True,
+                "is_child_modified": True,
+                "raw_ref_price": 0.0,
+                "raw_name": "智能温控排风系统"
+            }
+        ]
+    }
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("sqlalchemy.orm.attributes.flag_modified"):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.put("/api/v1/analysis/doc-baseline-1/cost-analysis", json=payload)
+
+        assert res.status_code == 200
+        data = res.json()["data"]
+        items = data["items"]
+
+        parent_item = items[0]
+        assert parent_item["raw_brand"] == "特变电工"
+        assert parent_item["raw_model"] == "YBM-630"
+        assert parent_item["raw_ref_price"] == 160000.0
+        assert parent_item["is_child_modified"] is True
+        assert parent_item["pricing_mode"] == "children"
+
+        child_item = items[1]
+        assert child_item["is_custom_added"] is True
+        assert child_item["is_child_modified"] is True
+        assert child_item["parent_item"] == "箱式变电站"
+    finally:
+        app.dependency_overrides.clear()
+
+
+

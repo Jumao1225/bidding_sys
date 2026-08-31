@@ -196,8 +196,15 @@ export const AgentAuditPage: React.FC = () => {
 
       const items: WorkerItem[] = data.worker_items || [];
       setWorkers(items);
-      if (typeof data.total_wall_time_ms === 'number' && data.total_wall_time_ms > 0) {
-        setServerWallTimeMs(data.total_wall_time_ms);
+      // 后端返回的首次完成耗时是永久基准，后续微调产生的日志耗时不得覆盖它。
+      const firstDurationMs = typeof data.first_bid_fill_duration_ms === 'number'
+        ? data.first_bid_fill_duration_ms
+        : 0;
+      const totalWallTimeMs = typeof data.total_wall_time_ms === 'number'
+        ? data.total_wall_time_ms
+        : 0;
+      if (firstDurationMs > 0 || totalWallTimeMs > 0) {
+        setServerWallTimeMs(prev => firstDurationMs > 0 ? firstDurationMs : (prev > 0 ? prev : totalWallTimeMs));
       }
       syncWorkerSelection(items);
       setError(null);
@@ -210,6 +217,8 @@ export const AgentAuditPage: React.FC = () => {
   };
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  // 延迟建立 SSE 前保存定时器，避免快速切页后回调重新打开僵尸连接。
+  const sseStartupTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 使用 SSE (Server-Sent Events) 实时推流获取 Agent 履历与思维链
   const setupSSELogStream = (docId: string) => {
@@ -229,19 +238,26 @@ export const AgentAuditPage: React.FC = () => {
           setLoading(false);
           syncWorkerSelection(data.worker_items as WorkerItem[]);
         }
+        // 只接受首次全量撰写基准值；后续 SSE 中的临时日志耗时不参与累计撰写耗时展示。
+        const firstDurationMs = typeof data.first_bid_fill_duration_ms === 'number'
+          ? data.first_bid_fill_duration_ms
+          : 0;
         if (typeof data.total_wall_time_ms === 'number' && data.total_wall_time_ms > 0) {
-          setServerWallTimeMs(data.total_wall_time_ms);
+          setServerWallTimeMs(prev => firstDurationMs > 0 ? firstDurationMs : (prev > 0 ? prev : data.total_wall_time_ms));
         }
         // 只有后端最终 Supervisor 终态才允许前端结束计时，Worker 完成不代表终审完成。
         if (data.is_completed && data.pipeline_status === 'completed') {
-          setFrozenDurationMs(prev => (liveTimerMs > 0 ? liveTimerMs : prev));
+          const elapsedMs = timerStartRef.current ? Date.now() - timerStartRef.current : 0;
+          const completedDurationMs = firstDurationMs > 0 ? firstDurationMs : elapsedMs;
+          setFrozenDurationMs(prev => (prev > 0 ? prev : completedDurationMs));
           setIsLivePolling(false);
           setIsGenerating(false);
           setLoading(false);
           setNotice(`✨ ${data.pipeline_message || 'AI 团队自主撰写、终审与 Word 发布已完成。'}`);
           es.close();
         } else if (data.is_completed && data.pipeline_status === 'failed') {
-          setFrozenDurationMs(prev => (liveTimerMs > 0 ? liveTimerMs : prev));
+          const elapsedMs = timerStartRef.current ? Date.now() - timerStartRef.current : 0;
+          setFrozenDurationMs(prev => (prev > 0 ? prev : elapsedMs));
           setIsLivePolling(false);
           setIsGenerating(false);
           setLoading(false);
@@ -267,6 +283,10 @@ export const AgentAuditPage: React.FC = () => {
     setSelectedChapterTitle(null);
 
     if (activeDocId) {
+      setLiveTimerMs(0);
+      setServerWallTimeMs(0);
+      setFrozenDurationMs(0);
+      timerStartRef.current = null;
       fetchWorkerLogs(activeDocId);
       setupSSELogStream(activeDocId);
     } else {
@@ -274,8 +294,13 @@ export const AgentAuditPage: React.FC = () => {
     }
 
     return () => {
+      if (sseStartupTimeoutRef.current) {
+        clearTimeout(sseStartupTimeoutRef.current);
+        sseStartupTimeoutRef.current = null;
+      }
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
+        eventSourceRef.current = null;
       }
     };
   }, [activeDocId]);
@@ -297,8 +322,6 @@ export const AgentAuditPage: React.FC = () => {
     selectedChapterTitleRef.current = null;
     setLoading(false);
     setLiveTimerMs(0);
-    setFrozenDurationMs(0);
-    setServerWallTimeMs(0);
     timerStartRef.current = Date.now();
 
     try {
@@ -313,7 +336,11 @@ export const AgentAuditPage: React.FC = () => {
       });
 
       // 延迟 200ms 开启 SSE 0 延迟实时推流，确保能够精确捕获到最新的 in_progress 状态与实时卡片
-      setTimeout(() => {
+      if (sseStartupTimeoutRef.current) {
+        clearTimeout(sseStartupTimeoutRef.current);
+      }
+      sseStartupTimeoutRef.current = setTimeout(() => {
+        sseStartupTimeoutRef.current = null;
         setupSSELogStream(activeDocId);
       }, 200);
 
@@ -333,6 +360,11 @@ export const AgentAuditPage: React.FC = () => {
       setIsLivePolling(false);
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+      if (sseStartupTimeoutRef.current) {
+        clearTimeout(sseStartupTimeoutRef.current);
+        sseStartupTimeoutRef.current = null;
       }
     }
   };
@@ -422,6 +454,7 @@ export const AgentAuditPage: React.FC = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          profile_id: selectedProfileId || undefined,
           chapter_title: selectedWorker.chapter_title,
           custom_prompt: refinePrompt,
           category: selectedWorker.category,
@@ -472,7 +505,8 @@ export const AgentAuditPage: React.FC = () => {
   const totalCompletionTokens = workers.reduce((acc, w) => acc + (w.completion_tokens || 0), 0);
   const totalWorkerComputeTimeMs = workers.reduce((acc, w) => acc + (w.execution_time_ms || 0), 0);
 
-  const actualEffectiveWallTimeMs = (isGenerating || isLivePolling)
+  const hasFrozenDuration = serverWallTimeMs > 0 || frozenDurationMs > 0;
+  const actualEffectiveWallTimeMs = !hasFrozenDuration && (isGenerating || isLivePolling)
     ? liveTimerMs
     : (serverWallTimeMs > 0
       ? serverWallTimeMs
@@ -839,7 +873,7 @@ export const AgentAuditPage: React.FC = () => {
               <div>
                 <div className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5">
                   <span>累计撰写耗时</span>
-                  {(isGenerating || isLivePolling) && (
+                  {(isGenerating || isLivePolling) && !hasFrozenDuration && (
                     <span className="w-2 h-2 rounded-full bg-blue-400 animate-ping inline-block" />
                   )}
                 </div>

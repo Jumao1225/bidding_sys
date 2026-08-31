@@ -3,13 +3,18 @@
 """
 
 import pytest
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from unittest.mock import patch, MagicMock
 from app.agents.tools.bid_db_tools import (
     query_company_profile_tool,
     query_company_qualification_tool,
     query_financial_quotation_tool,
     _match_alias_key,
+    resolve_company_profile,
 )
+from app.db.models import Base, CompanyProfileModel
 
 
 def test_alias_mapping():
@@ -18,6 +23,12 @@ def test_alias_mapping():
     assert _match_alias_key("法人代表") == "legal_representative"
     assert _match_alias_key("基本户开户行") == "bank_name"
     assert _match_alias_key("投标人名称") == "company_name"
+
+
+def test_alias_mapping_should_prefer_longest_specific_label():
+    """复合字段标签不能被“单位”等短别名误判为企业名称。"""
+    assert _match_alias_key("投标单位代表姓名（签字）") == "authorized_delegate"
+    assert _match_alias_key("单位地址") == "registered_address"
 
 
 def test_query_company_profile_fallback():
@@ -41,6 +52,100 @@ def test_query_company_profile_with_contextvar():
         assert res is not None and len(res) > 0
     finally:
         current_profile_id.reset(token)
+
+
+def _create_profile_test_session():
+    """创建仅包含企业档案表的内存数据库，隔离主体解析单元测试。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine, tables=[CompanyProfileModel.__table__])
+    session_factory = sessionmaker(bind=engine)
+    return engine, session_factory()
+
+
+def test_resolve_company_profile_should_prefer_requested_profile():
+    """指定主体存在时，解析结果必须优先使用指定主体。"""
+    engine, db = _create_profile_test_session()
+    try:
+        db.add_all([
+            CompanyProfileModel(
+                id="default-profile",
+                profile_name="默认主体",
+                company_name="默认公司",
+                is_default=True,
+                created_at=datetime.now(timezone.utc),
+            ),
+            CompanyProfileModel(
+                id="selected-profile",
+                profile_name="指定主体",
+                company_name="四川石楠建设工程有限公司",
+                is_default=False,
+                created_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+            ),
+        ])
+        db.commit()
+
+        result = resolve_company_profile(db, "selected-profile")
+
+        assert result is not None
+        assert result.id == "selected-profile"
+        assert result.company_name == "四川石楠建设工程有限公司"
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_resolve_company_profile_should_fallback_to_default_for_unknown_id():
+    """指定主体不存在时，解析结果必须回退到默认主体。"""
+    engine, db = _create_profile_test_session()
+    try:
+        db.add(CompanyProfileModel(
+            id="default-profile",
+            profile_name="默认主体",
+            company_name="默认公司",
+            is_default=True,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        result = resolve_company_profile(db, "missing-profile")
+
+        assert result is not None
+        assert result.id == "default-profile"
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_resolve_company_profile_should_use_oldest_profile_without_default():
+    """没有默认主体时，必须按创建时间稳定选择最早档案。"""
+    engine, db = _create_profile_test_session()
+    try:
+        created_at = datetime.now(timezone.utc)
+        db.add_all([
+            CompanyProfileModel(
+                id="new-profile",
+                profile_name="较新主体",
+                company_name="较新公司",
+                is_default=False,
+                created_at=created_at + timedelta(seconds=1),
+            ),
+            CompanyProfileModel(
+                id="old-profile",
+                profile_name="较早主体",
+                company_name="较早公司",
+                is_default=False,
+                created_at=created_at,
+            ),
+        ])
+        db.commit()
+
+        result = resolve_company_profile(db)
+
+        assert result is not None
+        assert result.id == "old-profile"
+    finally:
+        db.close()
+        engine.dispose()
 
 
 def test_query_financial_quotation_chinese():

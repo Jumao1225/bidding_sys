@@ -1,6 +1,63 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from app.agents.nodes.cost_agent import cost_node, CostItem, CostAnalysisResult
+from app.agents.nodes.cost_agent import (
+    cost_node,
+    CostItem,
+    CostAnalysisResult,
+    find_local_price_reference,
+)
+
+
+def test_find_local_price_reference_should_match_equivalent_name_and_unit():
+    """名称存在稳定共同片段且计量单位兼容时，应返回企业价格库记录。"""
+    result = find_local_price_reference(
+        {"item_name": "太阳能光伏组件", "unit": "块"},
+        [
+            {
+                "item_name": "单晶光伏组件",
+                "unit": "台",
+                "unit_price": 1234.5,
+                "spec": "XXX功率等级",
+            }
+        ],
+    )
+
+    assert result is not None
+    assert result["unit_price"] == 1234.5
+    assert result["unit_compatible"] is True
+
+
+def test_find_local_price_reference_should_return_none_for_unrelated_name():
+    """清单名称与价格库没有有效共同片段时，不应误匹配。"""
+    result = find_local_price_reference(
+        {"item_name": "电缆敷设施工", "unit": "项"},
+        [
+            {
+                "item_name": "单晶光伏组件",
+                "unit": "块",
+                "unit_price": 500.0,
+            }
+        ],
+    )
+
+    assert result is None
+
+
+def test_find_local_price_reference_should_keep_candidate_but_mark_unit_mismatch():
+    """名称相似但计量单位不兼容时，应保留候选供调用方给出风险提示，不直接计价。"""
+    result = find_local_price_reference(
+        {"item_name": "光伏组件", "unit": "m"},
+        [
+            {
+                "item_name": "单晶光伏组件",
+                "unit": "块",
+                "unit_price": 500.0,
+            }
+        ],
+    )
+
+    assert result is not None
+    assert result["unit_compatible"] is False
 
 def test_cost_item_pydantic_schema_validation():
     """测试 CostItem 基础模型的结构化校验，包含星号关键指标与品牌要求"""
@@ -44,10 +101,10 @@ def test_cost_item_zero_price_fallback():
 @patch("app.agents.nodes.cost_agent.SessionLocal")
 @patch("app.agents.nodes.cost_agent.document_crud")
 @patch("app.agents.nodes.cost_agent.business_crud")
-@patch("app.agents.nodes.cost_agent.rag_service")
+@patch("app.agents.nodes.cost_agent._get_cost_rag_context")
 @patch("app.agents.nodes.cost_agent.llm_service")
 def test_cost_node_execution_should_succeed(
-    mock_llm, mock_rag, mock_business_crud, mock_document_crud, mock_session
+    mock_llm, mock_get_rag_context, mock_business_crud, mock_document_crud, mock_session
 ):
     """测试 cost_node 全流程模拟执行与结果计算"""
     # 1. Mock DB Session
@@ -74,7 +131,7 @@ def test_cost_node_execution_should_succeed(
     mock_db.query.return_value.filter.return_value.all.return_value = [mock_price_ref]
     
     # 4. Mock RAG Text
-    mock_rag.search_bidding_document.return_value = "采购清单：核心交换机 2台"
+    mock_get_rag_context.return_value = "采购清单：核心交换机 2台"
     
     # 5. Mock LLM Structured Output
     mock_analysis_result = CostAnalysisResult(
@@ -116,14 +173,16 @@ def test_cost_node_execution_should_succeed(
     assert cost_data["items"][0]["matched_brand"] == "华为"
     assert cost_data["items"][0]["remark"] == "测试"
     assert mock_llm.generate_structured_output.call_args.kwargs["tenant_id"] == "tenant-123"
+    mock_get_rag_context.assert_called_once_with("doc-123", "tenant-123")
+    assert "采购清单：核心交换机 2台" in mock_llm.generate_structured_output.call_args.kwargs["prompt"]
 
 @patch("app.agents.nodes.cost_agent.SessionLocal")
 @patch("app.agents.nodes.cost_agent.document_crud")
 @patch("app.agents.nodes.cost_agent.business_crud")
-@patch("app.agents.nodes.cost_agent.rag_service")
+@patch("app.agents.nodes.cost_agent._get_cost_rag_context")
 @patch("app.agents.nodes.cost_agent.llm_service")
 def test_cost_node_with_financial_metadata_max_limit_exceeded(
-    mock_llm, mock_rag, mock_business_crud, mock_document_crud, mock_session
+    mock_llm, mock_get_rag_context, mock_business_crud, mock_document_crud, mock_session
 ):
     """测试当存在 FinancialMetadata 最高限价且测算成本超出时，cost_node 正确返回已超出最高投标限价"""
     from app.db.models.metadata import FinancialMetadata
@@ -142,7 +201,7 @@ def test_cost_node_with_financial_metadata_max_limit_exceeded(
     mock_doc.parsed_metadata = {}
     mock_document_crud.get_document_by_id.return_value = mock_doc
     mock_business_crud.get_all_price_references.return_value = []
-    mock_rag.search_bidding_document.return_value = "设备清单"
+    mock_get_rag_context.return_value = "设备清单"
     
     mock_analysis_result = CostAnalysisResult(
         items=[

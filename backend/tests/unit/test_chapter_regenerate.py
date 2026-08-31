@@ -4,20 +4,24 @@
 import os
 import tempfile
 from docx import Document
+from types import SimpleNamespace
 
 from app.schemas.bid_filler_schema import RegenerateChapterRequest, RegenerateChapterResponse
 from app.agents.bid_filler_workers import build_worker_prompt
 from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+from app.api.endpoints.bid_generator import _restore_profile_slots_after_chapter_reset
 
 
 def test_regenerate_chapter_request_schema_validation():
     """验证单章节微调请求与响应模型结构与默认值。"""
     req = RegenerateChapterRequest(
+        profile_id="profile-sichuan-shinan",
         chapter_title="商务条款响应及偏差表",
         custom_prompt="所有偏离项全部填无偏离，响应时间不超过1小时",
         category="needs_data",
         mapping_hint="deviation"
     )
+    assert req.profile_id == "profile-sichuan-shinan"
     assert req.chapter_title == "商务条款响应及偏差表"
     assert "无偏离" in req.custom_prompt
     assert req.category == "needs_data"
@@ -81,6 +85,43 @@ def test_regenerate_chapter_proposals_writeback_in_dom():
 
         res_doc = Document(tmp_path)
         assert "完全响应商务条款无偏离" in res_doc.paragraphs[0].text
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def test_chapter_profile_restore_should_only_fill_reset_chapter_scope():
+    """验证单章节重写的档案兜底只作用于当前章节，不污染其他章节。"""
+    doc = Document()
+    doc.add_paragraph("一、其他章节")
+    doc.add_paragraph("地址：________________")
+    doc.add_paragraph("二、资格证明文件")
+    doc.add_paragraph("地址：________________")
+    doc.add_paragraph("电话：________________")
+    doc.add_paragraph("三、后续章节")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
+        doc.save(tmp_path)
+
+    try:
+        profile = SimpleNamespace(
+            registered_address="档案地址",
+            contact_phone="档案电话",
+        )
+
+        filled_count = _restore_profile_slots_after_chapter_reset(
+            tmp_path,
+            profile,
+            None,
+            "资格证明文件",
+        )
+
+        assert filled_count == 2
+        result_doc = Document(tmp_path)
+        assert result_doc.paragraphs[1].text == "地址：________________"
+        assert result_doc.paragraphs[3].text == "地址： 档案地址"
+        assert result_doc.paragraphs[4].text == "电话： 档案电话"
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)

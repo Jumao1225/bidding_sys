@@ -113,6 +113,10 @@ class BidFillAuditReport(BaseModel):
 
 class RegenerateChapterRequest(BaseModel):
     """单章节重新生成与 Prompt 微调请求模型"""
+    profile_id: Optional[str] = Field(
+        default=None,
+        description="指定本次单章节重生成使用的企业档案 ID，不传则使用默认档案",
+    )
     chapter_title: str = Field(..., description="目标章节名称（如：'商务条款响应及偏差表'、'投标函格式'等）")
     custom_prompt: Optional[str] = Field(default=None, description="针对该章节的用户微调提示词或具体重写要求")
     category: Optional[str] = Field(default="needs_fill", description="章节类别（needs_fill / needs_data / needs_writing）")
@@ -129,4 +133,3 @@ class RegenerateChapterResponse(BaseModel):
     execution_time_ms: int = Field(default=0, description="本次单章重生成耗时（毫秒）")
     total_tokens: int = Field(default=0, description="消耗的总 Token 数量")
     worker_item: Optional[Dict[str, Any]] = Field(default=None, description="更新后的 Worker 审计履历项详情")
-

@@ -6,12 +6,13 @@ Bid Generator API 接口测试 (test_bid_generator_api.py)
 
 import pytest
 import httpx
+import inspect
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 from app.main import app
 from app.api.deps import get_current_active_user, get_current_user_optional, get_db
-from app.api.endpoints.bid_generator import _get_bid_fill_pipeline_state
+from app.api.endpoints.bid_generator import _get_bid_fill_pipeline_state, get_bid_fill_worker_logs
 from app.services.bid_fill_task_service import BidFillTaskReservation
 
 
@@ -172,6 +173,11 @@ async def test_get_bid_fill_worker_logs_no_logs_should_return_empty_items():
         app.dependency_overrides.clear()
 
 
+def test_get_bid_fill_worker_logs_route_should_run_outside_event_loop():
+    """同步数据库查询路由必须交给 FastAPI 线程池，不能阻塞主事件循环。"""
+    assert inspect.iscoroutinefunction(get_bid_fill_worker_logs) is False
+
+
 @pytest.mark.asyncio
 async def test_trigger_agent_bid_filling_available_slot_should_start_isolated_process():
     """可用槽位下应启动独立进程，不在 API 进程执行标书撰写。"""
@@ -184,6 +190,7 @@ async def test_trigger_agent_bid_filling_available_slot_should_start_isolated_pr
     )
     app.dependency_overrides[get_current_user_optional] = lambda: mock_user
     app.dependency_overrides[get_db] = lambda: mock_db
+    selected_profile_id = "profile-sichuan-shinan"
 
     try:
         with patch(
@@ -195,12 +202,16 @@ async def test_trigger_agent_bid_filling_available_slot_should_start_isolated_pr
         ) as start_process:
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-                response = await ac.post("/api/v1/bidding/agent-fill-bid-format/doc-12345")
+                response = await ac.post(
+                    "/api/v1/bidding/agent-fill-bid-format/doc-12345",
+                    json={"profile_id": selected_profile_id},
+                )
 
         assert response.status_code == 200
         assert response.json()["task_id"] == "process-24680"
         assert response.json()["process_id"] == 24680
         start_process.assert_called_once()
+        assert start_process.call_args.kwargs["profile_id"] == selected_profile_id
     finally:
         app.dependency_overrides.clear()
 

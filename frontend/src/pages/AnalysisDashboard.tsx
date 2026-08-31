@@ -17,6 +17,8 @@ export function AnalysisDashboard() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [retryingDomain, setRetryingDomain] = useState<string | null>(null);
+  // 设备清单重新提取后，先以原始清单渲染，避免旧成本结果遮盖最新提取结果。
+  const [isEquipmentOnly, setIsEquipmentOnly] = useState(false);
   const hasAutoDownloadedRef = useRef(false);
 
   const [result, setResult] = useState<any>(null);
@@ -43,6 +45,7 @@ export function AnalysisDashboard() {
     const targetDocId = (id && id !== 'new') ? id : localStorage.getItem('bidding_document_id');
     if (!targetDocId) return;
 
+    setIsEquipmentOnly(false);
     setIsLoadingHistory(true);
     const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
 
@@ -101,6 +104,7 @@ export function AnalysisDashboard() {
   };
 
   const handleAnalysisSuccess = (res: any) => {
+    setIsEquipmentOnly(false);
     setResult(res);
     if (res.document_id) {
       localStorage.setItem('bidding_document_id', res.document_id);
@@ -173,7 +177,11 @@ export function AnalysisDashboard() {
     }
 
     setRetryingDomain(domain);
-    setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'info', content: `正在重新提取专项领域: ${domain} ...` }]);
+    // 成本核算专项接口的实际用途是重新匹配 BOM 清单，避免继续使用“重新提取”造成误解。
+    const operationLabel = domain === 'cost_estimation' || domain === 'cost'
+      ? '重新匹配 BOM 清单'
+      : `重新提取专项领域: ${domain}`;
+    setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'info', content: `正在${operationLabel} ...` }]);
     try {
       const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
       const res = await apiFetch(`${baseUrl}/api/v1/analysis/${targetDocId}/reextract/${domain}`, {
@@ -183,6 +191,7 @@ export function AnalysisDashboard() {
         const json = await res.json();
         if (json.code === 200 && json.data && !json.data.error) {
           if (domain === 'cost_estimation' || domain === 'cost') {
+            setIsEquipmentOnly(false);
             setResult((prev: any) => ({
               ...prev,
               cost_analysis: json.data
@@ -197,6 +206,9 @@ export function AnalysisDashboard() {
               }
             }));
           } else {
+            if (domain === 'engineering') {
+              setIsEquipmentOnly(true);
+            }
             setResult((prev: any) => ({
               ...prev,
               metadata: {
@@ -205,8 +217,12 @@ export function AnalysisDashboard() {
               }
             }));
           }
-          const domainLabel = domain === 'cost_estimation' ? 'BOM 成本测算' : domain === 'writer' ? '标书起草' : domain;
-          setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'success', content: `✅ ${domainLabel} 领域重新提取/计算成功！` }]);
+          const successLabel = domain === 'cost_estimation' || domain === 'cost'
+            ? 'BOM 清单重新匹配'
+            : domain === 'writer'
+              ? '标书起草'
+              : domain;
+          setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'success', content: `✅ ${successLabel}${domain === 'cost_estimation' || domain === 'cost' ? '成功！' : '领域重新提取/计算成功！'}` }]);
           return true;
         } else {
           const errMsg = json.data?.error || json.message || '系统错误';
@@ -227,11 +243,9 @@ export function AnalysisDashboard() {
     }
   };
 
-  const handleReextractEquipmentAndCost = async () => {
-    // 先重新提取原文中的设备清单，成功后再使用最新清单执行成本核算。
-    const extractionSucceeded = await handleReextract('engineering');
-    if (!extractionSucceeded) return;
-    await handleReextract('cost_estimation');
+  const handleReextractEquipmentOnly = async () => {
+    // 设备清单提取与价格匹配解耦：此按钮只读取原文并刷新工程清单。
+    await handleReextract('engineering');
   };
 
 
@@ -343,9 +357,11 @@ export function AnalysisDashboard() {
           financial={fin}
           costAnalysis={result?.cost_analysis || {}}
           onReextract={() => handleReextract('cost_estimation')}
-          onReextractEquipment={handleReextractEquipmentAndCost}
+          onReextractEquipment={handleReextractEquipmentOnly}
+          isEquipmentOnly={isEquipmentOnly}
           onCostUpdated={(updatedCost) => {
             if (result) {
+              setIsEquipmentOnly(false);
               setResult({
                 ...result,
                 cost_analysis: updatedCost

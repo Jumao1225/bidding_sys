@@ -1,8 +1,13 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { apiFetch } from '../utils/api';
-import { Upload, X, FileText, CheckCircle2, ChevronRight, Loader2 } from 'lucide-react';
+import {
+  build_analysis_error_info,
+  type AnalysisErrorInfo,
+  type AnalysisErrorSource,
+} from '../utils/analysisError';
+import { X } from 'lucide-react';
 import { SmartDocViewer } from './SmartDocViewer';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { Group, Panel, Separator } from 'react-resizable-panels';
 import { Virtuoso } from 'react-virtuoso';
 
@@ -149,6 +154,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
   const [result, setResult] = useState<any>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
+  const [analysisError, setAnalysisError] = useState<AnalysisErrorInfo | null>(null);
   
   // 视图与布局状态 (从 localStorage 初始化)
   const [viewMode, setViewMode] = useState<'text' | 'original'>(() => 
@@ -270,6 +276,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       setFile(e.dataTransfer.files[0]);
       setResult(null); // 上传新文件清空结果
+      setAnalysisError(null);
     }
   };
 
@@ -277,12 +284,29 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     if (e.target.files && e.target.files.length > 0) {
       setFile(e.target.files[0]);
       setResult(null);
+      setAnalysisError(null);
     }
+  };
+
+  /**
+   * 页面只展示可操作的中文提示，原始错误保留在控制台供联调排查。
+   */
+  const show_analysis_error = (raw_error: unknown, source: AnalysisErrorSource = 'task') => {
+    const friendly_error = build_analysis_error_info(raw_error, source);
+    console.error('[文档解析失败]', { source, raw_error, friendly_error });
+    setAnalysisError(friendly_error);
+    setStatusText(friendly_error.title);
+    onTerminalMessage?.({
+      id: `${Date.now()}-${Math.random()}`,
+      type: 'error',
+      content: `${friendly_error.title}：${friendly_error.message}`,
+    });
   };
 
   const handleAnalyze = async () => {
     if (!file) return;
 
+    setAnalysisError(null);
     setIsAnalyzing(true);
     if (onAnalyzingChange) onAnalyzingChange(true);
     setProgress(0);
@@ -400,7 +424,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                 }
                 if (onAnalysisSuccess) onAnalysisSuccess(msgData.result);
               } else if (msgData.result && msgData.result.error) {
-                alert("解析出错: " + msgData.result.error);
+                show_analysis_error(msgData.result.error, 'task');
               }
               eventSource.close();
               setTimeout(() => setIsAnalyzing(false), 500); // 延迟关闭以展示 100% 状态
@@ -414,16 +438,16 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
           console.error("EventSource failed:", error);
           eventSource.close();
           setIsAnalyzing(false);
-          alert("进度连接中断，请重试。");
+          show_analysis_error(error, 'connection');
         };
 
       } else {
-        alert("解析失败: " + data.message);
+        show_analysis_error(data, 'task');
         setIsAnalyzing(false);
       }
     } catch (error) {
       console.error("解析失败:", error);
-      alert("解析请求失败，请检查后端服务及跨域设置。");
+      show_analysis_error(error, 'request');
       setIsAnalyzing(false);
     }
   };
@@ -434,6 +458,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     setFile(null);
     setTaskId(null);
     setFileName(null);
+    setAnalysisError(null);
     localStorage.removeItem('bidding_analysis_result');
     localStorage.removeItem('bidding_task_id');
     localStorage.removeItem('bidding_file_name');
@@ -604,6 +629,40 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
           </div>
         )}
 
+        {analysisError && !isAnalyzing && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            role="alert"
+            aria-live="assertive"
+            className="mt-4 rounded-2xl border border-rose-200 bg-rose-50/80 p-5 shadow-sm"
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-full bg-rose-100 text-rose-600">
+                  <span aria-hidden="true" className="text-lg font-bold">!</span>
+                </div>
+                <div className="min-w-0">
+                  <h3 className="font-bold text-rose-900">{analysisError.title}</h3>
+                  <p className="mt-1 text-sm leading-6 text-rose-800">{analysisError.message}</p>
+                  <p className="mt-2 text-sm leading-6 text-slate-600">{analysisError.suggestion}</p>
+                  <p className="mt-3 font-mono text-xs text-slate-400">
+                    错误编号：{analysisError.code}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAnalysisError(null)}
+                aria-label="关闭错误提示"
+                className="rounded-lg p-1.5 text-rose-500 transition-colors hover:bg-rose-100 hover:text-rose-700"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          </motion.div>
+        )}
+
         {file && !isAnalyzing && (
           <div className="mt-4 p-4 bg-slate-50 rounded-xl flex items-center justify-between border border-slate-200 hover:border-blue-300 transition-colors animate-fade-in-up">
             <div className="flex items-center space-x-4">
@@ -617,7 +676,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
               onClick={handleAnalyze}
               className="px-6 py-2.5 rounded-xl font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 shadow-lg shadow-blue-200 transform transition-all hover:-translate-y-0.5 hover:shadow-xl active:scale-95"
             >
-              开始 AI 解析
+              {analysisError ? '重新解析' : '开始 AI 解析'}
             </button>
           </div>
         )}

@@ -1,6 +1,8 @@
 import os
 import uuid
 from pathlib import Path
+from typing import Literal
+
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import PlainTextResponse
 from loguru import logger
@@ -11,6 +13,7 @@ from app.services.parsers.mineru_parser import mineru_parser
 
 router = APIRouter()
 mineru_service = mineru_parser
+SUPPORTED_UPLOAD_SUFFIXES = frozenset({".pdf", ".doc", ".docx"})
 
 from app.db.models.user import User
 from app.api import deps
@@ -32,7 +35,10 @@ async def get_mineru_status(current_user: User = Depends(deps.get_current_active
 @router.post("/parse", response_model=ResponseModel[MinerUParseResponse])
 async def parse_document(
     file: UploadFile = File(..., description="要测试解析的文档 (PDF/Word 等)"),
-    parse_mode: str = Form("auto", description="解析模式: auto (自动识别), txt (纯文本), ocr (强制OCR)"),
+    parse_mode: Literal["auto", "txt", "ocr"] = Form(
+        "auto",
+        description="解析模式: auto (自动识别), txt (纯文本), ocr (强制OCR)",
+    ),
     current_user: User = Depends(deps.get_current_active_user)
 ):
     """
@@ -43,6 +49,20 @@ async def parse_document(
     if not file.filename:
         raise HTTPException(status_code=400, detail="必须上传有效的文件")
 
+    safe_file_name = Path(file.filename).name
+    file_suffix = Path(safe_file_name).suffix.lower()
+    if file_suffix not in SUPPORTED_UPLOAD_SUFFIXES:
+        logger.warning(
+            "拒绝不支持的 MinerU 上传文件: user_id={}, file_name={}, suffix={}",
+            current_user.id,
+            safe_file_name,
+            file_suffix or "<empty>",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="仅支持 PDF、DOC、DOCX 格式的文件",
+        )
+
     task_id = str(uuid.uuid4())
     
     # 2. 保存文件到临时上传目录
@@ -50,7 +70,7 @@ async def parse_document(
     upload_dir = base_dir / "uploads" / "temp_mineru"
     os.makedirs(upload_dir, exist_ok=True)
 
-    file_path = upload_dir / f"{task_id}_{file.filename}"
+    file_path = upload_dir / f"{task_id}_{safe_file_name}"
 
     try:
         file_bytes = await file.read()
@@ -85,8 +105,8 @@ async def parse_document(
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
-            except Exception:
-                pass
+            except OSError:
+                logger.exception("清理 MinerU 临时上传文件失败: {}", file_path)
 
 
 @router.get("/preview-md/{task_id}", response_class=PlainTextResponse)

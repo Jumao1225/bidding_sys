@@ -43,6 +43,63 @@ from app.utils.rmb_formatter import number_to_chinese_rmb
 current_profile_id: ContextVar[Optional[str]] = ContextVar("current_profile_id", default=None)
 
 
+def resolve_company_profile(
+    db: Session,
+    profile_id: Optional[str] = None,
+) -> Optional[CompanyProfileModel]:
+    """按指定主体、默认主体、最早创建主体的顺序解析企业档案。
+
+    统一所有 Agent 读取企业档案的兜底规则，避免直接使用无序的
+    ``query(...).first()`` 导致不同主体之间发生串用。
+    """
+    if profile_id:
+        selected_profile = db.query(CompanyProfileModel).filter(
+            CompanyProfileModel.id == profile_id
+        ).first()
+        if selected_profile:
+            logger.info(
+                "🛠️ [企业档案解析] 使用指定主体: id={}, name='{}', company='{}'",
+                profile_id,
+                selected_profile.profile_name,
+                selected_profile.company_name,
+            )
+            return selected_profile
+        logger.warning(
+            "🛠️ [企业档案解析] 指定主体不存在，准备回退默认主体: profile_id={}",
+            profile_id,
+        )
+
+    default_profile = db.query(CompanyProfileModel).filter(
+        CompanyProfileModel.is_default == True
+    ).order_by(
+        CompanyProfileModel.created_at.asc(),
+        CompanyProfileModel.id.asc(),
+    ).first()
+    if default_profile:
+        logger.info(
+            "🛠️ [企业档案解析] 使用默认主体: id={}, name='{}', company='{}'",
+            default_profile.id,
+            default_profile.profile_name,
+            default_profile.company_name,
+        )
+        return default_profile
+
+    first_profile = db.query(CompanyProfileModel).order_by(
+        CompanyProfileModel.created_at.asc(),
+        CompanyProfileModel.id.asc(),
+    ).first()
+    if first_profile:
+        logger.warning(
+            "🛠️ [企业档案解析] 没有默认主体，使用最早创建主体: id={}, name='{}', company='{}'",
+            first_profile.id,
+            first_profile.profile_name,
+            first_profile.company_name,
+        )
+    else:
+        logger.warning("🛠️ [企业档案解析] 数据库中没有任何企业档案")
+    return first_profile
+
+
 # ============================================================
 # 全量数据库字段别名同义词映射字典 (Comprehensive Alias Mapping)
 # ============================================================
@@ -51,9 +108,9 @@ ALIAS_MAP = {
     # 1. 企业基础工商档案 (company_profiles)
     "company_name": ["company_name", "公司名称", "投标人名称", "单位名称", "投标人全称", "投标人", "单位", "响应人名称", "投标单位", "企业名称"],
     "legal_representative": ["legal_representative", "法定代表人", "法人", "法人代表", "单位负责人", "法定代表人（签字）", "法定代表人或其委托代理人", "法定代表人姓名"],
-    "authorized_delegate": ["authorized_delegate", "授权代表", "被授权人", "授权委托人", "签字代表", "委托代理人", "代表（签字）", "受托人", "代理人", "项目代表"],
+    "authorized_delegate": ["authorized_delegate", "授权代表", "被授权人", "授权委托人", "签字代表", "委托代理人", "代表（签字）", "投标单位代表姓名", "代表姓名", "受托人", "代理人", "项目代表"],
     "credit_code": ["credit_code", "统一社会信用代码", "纳税人识别号", "税号", "营业执照注册号", "信用代码", "社会信用代码", "机构代码"],
-    "registered_address": ["registered_address", "注册地址", "公司地址", "住所", "单位地址", "注册地", "经营地址", "详细地址", "通讯地址"],
+    "registered_address": ["registered_address", "注册地址", "公司地址", "住所", "单位地址", "地址", "注册地", "经营地址", "详细地址", "通讯地址"],
     "contact_phone": ["contact_phone", "联系电话", "手机号", "电话", "联系方式", "固定电话", "联系人电话"],
     "email": ["email", "电子邮箱", "邮箱", "email", "e-mail", "联系邮箱", "企业邮箱"],
     "bank_name": ["bank_name", "开户银行", "基本户开户行", "结算银行", "开户行", "基本开户银行", "存款银行", "基本户银行"],
@@ -63,7 +120,8 @@ ALIAS_MAP = {
     "project_name": ["project_name", "项目名称", "招标项目名称", "采购项目名称", "工程名称", "项目全称", "招标工程名称"],
     "project_code": ["project_code", "project_id_code", "项目编号", "招标编号", "包件号", "标段编号", "采购编号", "项目代码", "招标代码"],
     "tender_segment": ["tender_segment", "标段名称", "包件名称", "标段", "包件", "分包名称"],
-    "bid_deadline": ["bid_deadline", "投标截止时间", "开标时间", "递交截止时间", "截标时间", "开标日期"],
+    # 通用投标文件中的“日期”字段通常由投标截止时间元数据提供，兼容仅保留标签的封面日期槽位。
+    "bid_deadline": ["bid_deadline", "投标截止时间", "开标时间", "递交截止时间", "截标时间", "开标日期", "投标日期", "日期"],
     "bid_validity_days": ["bid_validity_days", "投标有效期", "有效期", "投标有效期天数"],
     "construction_period": ["construction_period", "construction_period_description", "工期", "建设周期", "交货期", "服务期", "承诺工期", "交货期限", "完成时间", "服务期限"],
 
@@ -104,13 +162,33 @@ ALIAS_MAP = {
 
 
 def _match_alias_key(user_key: str) -> str:
-    """归一化别名到标准数据库字段 key"""
-    key_clean = user_key.lower().strip()
+    """按最长有效别名归一化字段，避免短别名抢占更具体的标签。"""
+    key_clean = str(user_key or "").lower().strip()
+    normalized_key = re.sub(r"[\s:：_＿（）()\[\]［］]", "", key_clean)
+    if not normalized_key:
+        return key_clean
+
+    matched_key = ""
+    matched_alias_length = 0
     for std_key, aliases in ALIAS_MAP.items():
         for alias in aliases:
-            if alias.lower() in key_clean or key_clean in alias.lower():
-                return std_key
-    return key_clean
+            normalized_alias = re.sub(
+                r"[\s:：_＿（）()\[\]［］]",
+                "",
+                str(alias).lower(),
+            )
+            if not normalized_alias:
+                continue
+            # 仅允许“完整别名包含于实际标签”，避免“委托人”这类短标签
+            # 被扩展别名“委托代理人”反向命中，造成企业字段误填。
+            if normalized_alias in normalized_key:
+                # 具体别名优先于“单位”“代表”等短别名，保证复合标签归入正确字段。
+                alias_length = len(normalized_alias)
+                if alias_length > matched_alias_length:
+                    matched_key = std_key
+                    matched_alias_length = alias_length
+
+    return matched_key or key_clean
 
 
 # ============================================================
@@ -132,26 +210,8 @@ def query_company_profile_tool(field_key: str) -> str:
 
     db: Session = SessionLocal()
     try:
-        # 优先使用运行时上下文中传入的 profile_id 精确查询指定档案
-        profile_id = current_profile_id.get()
-        if profile_id:
-            profile = db.query(CompanyProfileModel).filter(
-                CompanyProfileModel.id == profile_id
-            ).first()
-            if profile:
-                logger.debug(f"🛠️ [DB Tool] 使用指定企业档案: id={profile_id}, name='{profile.profile_name}'")
-            else:
-                logger.warning(f"🛠️ [DB Tool] 指定档案 {profile_id} 不存在，回退到默认档案")
-        else:
-            profile = None
-
-        # 回退策略：默认档案 → 最早创建的档案
-        if not profile:
-            profile = db.query(CompanyProfileModel).filter(
-                CompanyProfileModel.is_default == True
-            ).first()
-        if not profile:
-            profile = db.query(CompanyProfileModel).first()
+        # 按运行时主体上下文解析，禁止使用无序查询结果作为主体依据。
+        profile = resolve_company_profile(db, current_profile_id.get())
 
         if profile:
             val = getattr(profile, std_key, None)

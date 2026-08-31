@@ -166,7 +166,9 @@ async def reextract_domain(
             if domain in ("cost_estimation", "cost"):
                 from sqlalchemy.orm.attributes import flag_modified
                 from app.agents.nodes.cost_agent import cost_node
-                
+
+                # 成本专项重新执行的业务含义是重新匹配 BOM 清单并刷新价格库结果。
+                logger.info("开始重新匹配 BOM 清单，文档 ID: {}", document_id)
                 state = {
                     "document_id": document_id,
                     "user_id": current_user.id,
@@ -181,8 +183,9 @@ async def reextract_domain(
                 doc.parsed_metadata = parsed_metadata
                 flag_modified(doc, "parsed_metadata")
                 db.commit()
-                
-                return success_response(data=cost_data, message="成本测算重新计算成功")
+
+                logger.info("BOM 清单重新匹配完成，文档 ID: {}，匹配项数量: {}", document_id, len(cost_data.get("items") or []))
+                return success_response(data=cost_data, message="BOM 清单重新匹配成功")
 
             if domain in ("strategy_qual", "qualifications_analysis", "qual_analysis"):
                 from sqlalchemy.orm.attributes import flag_modified
@@ -297,13 +300,27 @@ class CostItemUpdateRequest(BaseModel):
     model: Optional[str] = Field(default=None, description="规格型号")
     manufacturer: Optional[str] = Field(default=None, description="生产厂商")
     section_name: Optional[str] = Field(default=None, description="所属分标段/分区域/分项工程名称")
+    is_parent_modified: Optional[bool] = Field(default=None, description="是否已被用户直接自定义修改父项价格/属性")
+    is_child_modified: Optional[bool] = Field(default=None, description="是否已被用户直接修改子项价格/属性")
+    is_custom_added: Optional[bool] = Field(default=None, description="是否为用户手动添加的新分项")
+    pricing_mode: Optional[str] = Field(default=None, description="定价模式: parent=父项自定义优先, children=子项自动汇总")
+    raw_ref_price: Optional[float] = Field(default=None, description="原始参考单价")
+    raw_name: Optional[str] = Field(default=None, description="原始标的物名称")
+    raw_brand: Optional[str] = Field(default=None, description="原始品牌")
+    raw_model: Optional[str] = Field(default=None, description="原始型号")
+    raw_manufacturer: Optional[str] = Field(default=None, description="原始生产厂商")
+    raw_spec: Optional[str] = Field(default=None, description="原始规格或说明")
+    raw_qty: Optional[float] = Field(default=None, description="原始数量")
+    raw_unit: Optional[str] = Field(default=None, description="原始单位")
+    raw_match_quality: Optional[str] = Field(default=None, description="原始置信度")
 
     @field_validator(
         "item_code", "name", "spec_requirement", "unit", "matched_name",
         "matched_brand", "matched_model", "matched_manufacturer",
         "brand_requirements", "match_quality", "warning", "comparison_note",
         "remark", "parent_item", "root_item", "brand", "model", "manufacturer",
-        "section_name", mode="before"
+        "section_name", "pricing_mode", "raw_name", "raw_brand", "raw_model", "raw_manufacturer",
+        "raw_spec", "raw_unit", "raw_match_quality", mode="before"
     )
     @classmethod
     def normalize_text_fields(cls, value: Any) -> Any:
@@ -893,5 +910,3 @@ def export_bom_xlsx(
             "Access-Control-Expose-Headers": "Content-Disposition"
         }
     )
-
-

@@ -382,31 +382,14 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
         prefetched_metadata: Dict[str, Any] = {}
         try:
             from app.db.session import SessionLocal
-            from app.db.models.business import CompanyProfileModel
+            from app.agents.tools.bid_db_tools import resolve_company_profile
             from app.db.models.metadata import TimelineMetadata, FinancialMetadata
             from app.utils.rmb_formatter import number_to_chinese_rmb
 
             db_meta = SessionLocal()
             try:
-                # 按指定 profile_id 或默认档案查询企业工商信息
-                target_profile_id = state.get("profile_id")
-                if target_profile_id:
-                    prof = db_meta.query(CompanyProfileModel).filter(
-                        CompanyProfileModel.id == target_profile_id
-                    ).first()
-                    if prof:
-                        logger.info(f"Supervisor 使用指定企业档案: id={target_profile_id}, name='{prof.profile_name}'")
-                    else:
-                        logger.warning(f"指定档案 {target_profile_id} 不存在，回退默认档案")
-                        prof = db_meta.query(CompanyProfileModel).filter(
-                            CompanyProfileModel.is_default == True
-                        ).first()
-                else:
-                    prof = db_meta.query(CompanyProfileModel).filter(
-                        CompanyProfileModel.is_default == True
-                    ).first()
-                if not prof:
-                    prof = db_meta.query(CompanyProfileModel).first()
+                # 按本次任务绑定的主体读取企业工商信息，避免并发任务串用档案。
+                prof = resolve_company_profile(db_meta, state.get("profile_id"))
                 if prof:
                     if prof.company_name: prefetched_metadata["company_name"] = prof.company_name
                     if prof.credit_code: prefetched_metadata["credit_code"] = prof.credit_code
@@ -878,6 +861,139 @@ def _is_non_actionable_placeholder(value: str) -> bool:
     )
 
 
+def _iter_document_profile_slot_paragraphs(
+    doc: Document,
+    allowed_elements: Optional[Sequence[Any]] = None,
+):
+    """遍历正文及表格中的段落，可选地限制在指定章节 XML 范围内。"""
+    seen_elements = set()
+    allowed_element_ids = None
+    if allowed_elements is not None:
+        allowed_element_ids = {
+            id(node)
+            for root_element in allowed_elements
+            for node in root_element.iter()
+        }
+
+    def _yield_paragraph(paragraph: Any, is_in_table: bool):
+        element = getattr(paragraph, "_element", None)
+        element_id = id(element)
+        if (
+            element is None
+            or element_id in seen_elements
+            or (
+                allowed_element_ids is not None
+                and element_id not in allowed_element_ids
+            )
+        ):
+            return
+        seen_elements.add(element_id)
+        yield paragraph, is_in_table
+
+    for paragraph in getattr(doc, "paragraphs", []):
+        yield from _yield_paragraph(paragraph, False)
+
+    def _walk_table(table: Any):
+        for row in getattr(table, "rows", []):
+            for cell in getattr(row, "cells", []):
+                for paragraph in getattr(cell, "paragraphs", []):
+                    yield from _yield_paragraph(paragraph, True)
+                for nested_table in getattr(cell, "tables", []):
+                    yield from _walk_table(nested_table)
+
+    for table in getattr(doc, "tables", []):
+        yield from _walk_table(table)
+
+
+def _read_profile_field(profile_sources: List[Any], field_names: Sequence[str]) -> Optional[str]:
+    """按数据源优先级读取企业字段，过滤空值、模拟对象和异常对象文本。"""
+    for profile in profile_sources:
+        if profile is None:
+            continue
+        for field_name in field_names:
+            value = getattr(profile, field_name, None)
+            if value is None or not isinstance(value, str):
+                continue
+            clean_value = value.strip()
+            if clean_value and not clean_value.startswith("<MagicMock"):
+                return clean_value
+    return None
+
+
+def _auto_fill_profile_slots(
+    doc: Document,
+    profile_sources: List[Any],
+    timeline_source: Any = None,
+    allowed_elements: Optional[Sequence[Any]] = None,
+) -> int:
+    """根据现有字段别名映射原位补全档案信息，不改变原段落排版属性。"""
+    if doc is None or not profile_sources:
+        return 0
+
+    # 复用企业字段中心的别名映射，避免在写盘层维护第二套业务字段硬编码。
+    from app.agents.tools.bid_db_tools import ALIAS_MAP, _match_alias_key
+
+    filled_count = 0
+    slot_pattern = re.compile(
+        r"^\s*([^:：\n]{2,30}[:：])"
+        r"(?:\s{2,}|_{2,}|＿{2,}|\[待[^\]]+\]|［待[^］]+］)"
+        r"(?:年\s*月\s*日)?\s*$"
+    )
+
+    for paragraph, is_in_table in _iter_document_profile_slot_paragraphs(
+        doc,
+        allowed_elements=allowed_elements,
+    ):
+        raw_text = str(getattr(paragraph, "text", "") or "")
+        if not raw_text.strip() or is_narrative_clause_or_lead_in(raw_text):
+            continue
+
+        matched = slot_pattern.match(raw_text)
+        if not matched:
+            continue
+
+        label = matched.group(1)
+        label_clean = re.sub(r"[\s:：_＿（）()［］\[\]]", "", label)
+        if not label_clean:
+            continue
+
+        profile_field = _match_alias_key(label_clean)
+        profile_value = (
+            _read_profile_field(profile_sources, (profile_field,))
+            if profile_field in ALIAS_MAP
+            else None
+        )
+        date_value = _read_profile_field(
+            [timeline_source],
+            ("planned_delivery_date", "bid_deadline"),
+        ) if re.search(r"年.*月.*日", raw_text) else None
+        if profile_value and date_value:
+            filled_value = f"{profile_value}                       {date_value}"
+        else:
+            filled_value = profile_value or date_value
+        if not filled_value:
+            logger.debug(f"[企业档案槽位] 字段 {label_clean} 没有可用真实值，保留模板空白")
+            continue
+
+        paragraph._element.clear_content()
+        _apply_run_style_xml(
+            paragraph.add_run(label),
+            enable_underline=False,
+            is_table=is_in_table,
+        )
+        _apply_run_style_xml(
+            paragraph.add_run(f" {filled_value}"),
+            enable_underline=not is_in_table,
+            is_table=is_in_table,
+        )
+        filled_count += 1
+        logger.info(
+            f"[企业档案槽位自愈] 已按实际标签补全字段: {label_clean} -> '{filled_value}'"
+        )
+
+    return filled_count
+
+
 def validate_filled_docx_integrity(
     docx_path: str,
     expected_total: Optional[Decimal] = None,
@@ -1115,10 +1231,27 @@ def _find_paragraph_by_path(doc: Document, path: str):
 def _has_fillable_slot_marker(text: str) -> bool:
     """判断文本中是否存在明确的可填槽位标记。"""
     normalized = str(text or "")
+    trailing_label = re.search(r"^\s*([^:：\n]{2,40})[:：]\s*$", normalized)
+    if trailing_label:
+        # 部分模板只保留字段标签，没有下划线或尾随空格；通过现有字段中心
+        # 判断其是否为已知表单字段，避免放开普通叙述句的末尾冒号。
+        from app.agents.tools.bid_db_tools import ALIAS_MAP, _match_alias_key
+
+        matched_field = _match_alias_key(trailing_label.group(1))
+        if matched_field in ALIAS_MAP:
+            return True
+
+    if re.search(
+        r"[^:：\n]{2,30}[:：]\s*$",
+        normalized,
+    ) and len(re.findall(r"[:：]", normalized)) >= 2:
+        # 复合字段行可能以最后一个“字段标签：”收尾，空位不一定带下划线或尾随空格。
+        return True
+
     return bool(re.search(
         r"_{2,}|＿{2,}|\[[^\]]+\]|［[^］]+］|【[^】]+】|"
         r"（[^）]*(?:姓名|名称|编号|日期|电话|地址)[^）]*）|"
-        r"(?:[:：])\s{2,}|\d*\s*年\s*\d*\s*月\s*\d*\s*日",
+        r"(?:[:：])\s{2,}|\s{3,}|\d*\s*年\s*\d*\s*月\s*\d*\s*日",
         normalized,
     ))
 
@@ -1130,7 +1263,10 @@ def _is_protected_template_overwrite(
     proposal_type: str,
 ) -> bool:
     """拦截没有填报槽位依据的固定格式原文覆盖。"""
-    current = str(real_text or "").strip()
+    # 不能先 strip 再判断槽位：模板常用“冒号 + 连续空格”表示待填位置，
+    # strip 会把这个有效槽位证据直接删除，导致合法字段被误判为固定原文。
+    current_raw = str(real_text or "")
+    current = current_raw.strip()
     original = str(original_context or "").strip()
     proposed = str(proposed_value or "").strip()
     if not current or not proposed or proposal_type == "image":
@@ -1139,7 +1275,7 @@ def _is_protected_template_overwrite(
         return False
 
     # 当前节点或 Worker 保存的原始上下文只要明确含有槽位，就允许替换槽位数据。
-    if _has_fillable_slot_marker(current) or _has_fillable_slot_marker(original):
+    if _has_fillable_slot_marker(current_raw) or _has_fillable_slot_marker(original):
         return False
 
     # 没有槽位的非空节点视为投标格式固定原文，禁止被 Agent 的整句/短值提案覆盖。
@@ -1436,6 +1572,21 @@ def _anchor_terms(value: str) -> List[str]:
     return [term for term in terms if term not in ignored_terms]
 
 
+def _normalize_anchor_text(value: str) -> str:
+    """去除锚点文本中的空白、标点及下划线，保留可比较的文字与数字。"""
+    return re.sub(r"[\W_]+", "", str(value or ""), flags=re.UNICODE)
+
+
+def _has_shared_anchor_fragment(left: str, right: str, fragment_length: int = 4) -> bool:
+    """判断两个动态锚点是否存在足够长的连续共同片段。"""
+    if not left or not right or len(left) < fragment_length:
+        return False
+    return any(
+        left[index:index + fragment_length] in right
+        for index in range(len(left) - fragment_length + 1)
+    )
+
+
 def _image_target_matches_anchor(paragraph, proposal: Dict[str, Any]) -> bool:
     """校验图片图注/原文锚点与目标段落是否语义匹配。"""
     target_text = str(getattr(paragraph, "text", "") or "").strip()
@@ -1448,21 +1599,28 @@ def _image_target_matches_anchor(paragraph, proposal: Dict[str, Any]) -> bool:
     ).strip()
     caption_terms = _anchor_terms(caption)
     anchor_terms = _anchor_terms(anchor_text)
-    target_normalized = re.sub(r"\s+", "", target_text)
+    target_normalized = _normalize_anchor_text(target_text)
 
     anchor_matches = False
     if anchor_text:
-        anchor_normalized = re.sub(r"\s+", "", anchor_text)
+        anchor_normalized = _normalize_anchor_text(anchor_text)
         if anchor_normalized and (
             anchor_normalized in target_normalized
             or target_normalized in anchor_normalized
+            or _has_shared_anchor_fragment(anchor_normalized, target_normalized)
         ):
             anchor_matches = True
         elif any(term in target_normalized for term in anchor_terms):
             anchor_matches = True
 
     caption_matches = bool(
-        caption_terms and any(term in target_normalized for term in caption_terms)
+        caption_terms and (
+            any(_normalize_anchor_text(term) in target_normalized for term in caption_terms)
+            or any(
+                _has_shared_anchor_fragment(_normalize_anchor_text(term), target_normalized)
+                for term in caption_terms
+            )
+        )
     )
 
     # 有图注时必须同时满足原文锚点和图注匹配，防止“目标节点存在但证书类型错误”。
@@ -2266,13 +2424,18 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
             matrix = []
             if isinstance(raw_val, list) and raw_val and isinstance(raw_val[0], list):
                 matrix = raw_val
-            elif p_val.startswith("[") and p_val.endswith("]"):
+            elif (
+                p_val.startswith("[")
+                and p_val.endswith("]")
+                and "/tbl[" in p_path
+            ):
                 try:
                     parsed = json.loads(p_val)
                     if isinstance(parsed, list) and parsed and isinstance(parsed[0], list):
                         matrix = parsed
-                except Exception as je:
-                    logger.warning(f"   解析表格提案 JSON 字符串异常: {je}")
+                except json.JSONDecodeError:
+                    # 正文中的待补充标记也可能以方括号开头，不应被误当成表格矩阵告警。
+                    logger.debug(f"   跳过非法表格矩阵提案: {p_path}")
 
             is_table_prop = bool(
                 p_type == "table_rows" or
@@ -3356,81 +3519,32 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
                     getattr(profile, "company_name", "") or ""
                 ).strip()
                 if not expected_company_name:
-                    profile_model = db_audit.query(CompanyProfileModel).first()
+                    from app.agents.tools.bid_db_tools import resolve_company_profile
+                    profile_model = resolve_company_profile(db_audit, state.get("profile_id"))
                     expected_company_name = str(
                         getattr(profile_model, "company_name", "") or ""
                     ).strip()
 
-                def _safe_str(val: Any) -> Optional[str]:
-                    if val is not None and isinstance(val, str) and val.strip() and not str(val).startswith("<MagicMock"):
-                        return val.strip()
-                    return None
-
                 # 3.1 正文段落冒号留白深度自检与企业/项目数据原位自愈 (Paragraph Blank Slots Auto-Heal)
                 try:
-                    prof = db_audit.query(CompanyProfileModel).first() if db_audit else None
+                    from app.agents.tools.bid_db_tools import resolve_company_profile
+                    prof = resolve_company_profile(db_audit, state.get("profile_id")) if db_audit else None
                     tl = db_audit.query(TimelineMetadata).filter(TimelineMetadata.document_id == doc_id).first() if db_audit else None
 
-                    for p_idx, p_elem in enumerate(doc_obj.paragraphs):
-                        p_raw = p_elem.text.strip()
-                        if not p_raw:
-                            continue
+                    # 优先使用指定企业档案；数据库主体解析失败时，回退到本次任务携带的企业档案。
+                    # 这样不依赖 Agent 是否主动调用查询工具，通用表单字段也能稳定完成原位填报。
+                    profile_sources = [prof, state.get("company_profile")]
+                    profile_slot_count = _auto_fill_profile_slots(
+                        doc_obj,
+                        profile_sources,
+                        timeline_source=tl,
+                    )
+                    if profile_slot_count:
+                        doc_modified = True
+                        logger.info(
+                            f"   [Supervisor 企业档案兜底] 已自动补全 {profile_slot_count} 个企业信息段落槽位"
+                        )
 
-                        # 前置严格过滤：若原段落为正文叙述句、公文条款导语或含有句中标点，绝对严禁作为表单属性标签进行自愈！
-                        if is_narrative_clause_or_lead_in(p_raw):
-                            continue
-
-                        # 探测冒号后连续空格/下划线/未填占位符的属性标签行
-                        m_slot = re.match(r'^\s*([^:：\n]{2,25}[:：])(\s{2,}|_{2,}|＿{2,}|\s*年\s*月\s*日|\[待[^\]]+\]|［待[^］]+］|\s*$)', p_raw)
-                        if m_slot:
-                            lbl = m_slot.group(1)
-                            if is_narrative_clause_or_lead_in(lbl):
-                                continue
-
-                            lbl_clean = re.sub(r'[\s:：_＿（）\(\)［］\[\]]', '', lbl)
-                            if len(lbl_clean) < 2 or len(lbl_clean) > 20:
-                                continue
-
-                            filled_val = None
-
-                            if prof:
-                                # 基于企业画像与项目元数据的动态 Schema 解析表 (纯动态取值，无任何硬编码业务数据)
-                                field_resolvers = [
-                                    (["地址", "通讯地址", "注册地址", "办公地址", "单位地址", "公司地址"], lambda: _safe_str(getattr(prof, "registered_address", None))),
-                                    (["电话", "联系电话", "手机", "联系方式", "固定电话", "办公电话"], lambda: _safe_str(getattr(prof, "contact_phone", None))),
-                                    (["邮编", "邮政编码", "邮政代码"], lambda: _safe_str(getattr(prof, "postal_code", None))),
-                                    (["邮箱", "电子邮箱", "Email", "email"], lambda: _safe_str(getattr(prof, "email", None))),
-                                    (["传真", "传真号码", "公司传真", "单位传真"], lambda: _safe_str(getattr(prof, "fax_number", None))),
-                                    (["名称", "投标人", "投标单位", "单位名称", "投标人全称", "投标单位全称", "企业名称", "单位全称"], lambda: _safe_str(getattr(prof, "company_name", None))),
-                                ]
-
-                                for keywords, getter_fn in field_resolvers:
-                                    if any(k == lbl_clean or lbl_clean.endswith(k) or k in lbl_clean for k in keywords):
-                                        filled_val = getter_fn()
-                                        break
-
-                                # 法定代表人/授权代表/签字人 与日期复合槽位动态解析
-                                if not filled_val and any(k in lbl_clean for k in ["代表", "法人", "法定代表人", "签字", "授权代表", "代理人", "签署人"]):
-                                    rep_name = _safe_str(getattr(prof, "legal_representative", None))
-                                    if any(k in p_raw for k in ["年", "月", "日"]):
-                                        date_val = _safe_str(getattr(tl, "planned_delivery_date", None))
-                                        if rep_name and date_val:
-                                            filled_val = f"{rep_name}                       {date_val}"
-                                        elif rep_name:
-                                            filled_val = rep_name
-                                        elif date_val:
-                                            filled_val = date_val
-                                    else:
-                                        filled_val = rep_name
-                                elif not filled_val and (any(k in lbl_clean for k in ["日期", "日 期", "签署日期", "投标日期", "签章日期"]) or (len(lbl_clean) <= 4 and any(k in p_raw for k in ["年", "月", "日"]))):
-                                    filled_val = _safe_str(getattr(tl, "planned_delivery_date", None))
-
-                            if filled_val and isinstance(filled_val, str):
-                                p_elem._element.clear_content()
-                                _apply_run_style_xml(p_elem.add_run(lbl), enable_underline=False, is_table=False)
-                                _apply_run_style_xml(p_elem.add_run(f" {filled_val}"), enable_underline=True, is_table=False)
-                                doc_modified = True
-                                logger.info(f"   🔧 [Supervisor 段落自愈] 已自动将企业档案补全至段落槽位: {lbl} -> '{filled_val}'")
                 except Exception as exc_para:
                     logger.warning(f"   Supervisor 段落自愈检测异常: {exc_para}")
 

@@ -76,14 +76,22 @@ def rollup_hierarchical_cost_items(items: List[Dict[str, Any]]) -> Tuple[List[Di
         curr_price = float(n.get("ref_price") or 0.0)
         curr_mq = n.get("match_quality")
 
+        is_parent_modified = bool(n.get("is_parent_modified")) or n.get("pricing_mode") == "parent"
+
         if n["_children"]:
             children_sum = 0.0
             for child in n["_children"]:
                 children_sum += _rollup(child)
             children_sum = round(children_sum, 2)
 
-            # 若子项总金额大于 0，父节点始终由子项自底向上汇总驱动
-            if children_sum > 0:
+            # 若父节点已被用户直接自定义修改定价，则父项统价优先，不被子项汇总覆盖
+            if is_parent_modified and curr_price > 0:
+                q = n.get("qty") if (n.get("qty") and n.get("qty") > 0) else 1.0
+                n["subtotal"] = round(q * curr_price, 2)
+                if not n.get("match_quality") or n.get("match_quality") in ["未匹配", "成套汇总"]:
+                    n["match_quality"] = "手动修改"
+            # 若未手动修改父项且子项总金额大于 0，父节点由子项自底向上汇总驱动
+            elif children_sum > 0:
                 n["subtotal"] = children_sum
                 q = n.get("qty") if (n.get("qty") and n.get("qty") > 0) else 1.0
                 n["ref_price"] = round(children_sum / q, 2)
@@ -114,7 +122,11 @@ def rollup_hierarchical_cost_items(items: List[Dict[str, Any]]) -> Tuple[List[Di
         node.pop("_children", None)
         node.pop("_parent", None)
         node.pop("_orig_idx", None)
-        if float(node.get("ref_price") or 0.0) <= 0:
+        # 结构节点仅用于还原 BOM 层级，不应被统计为未匹配报价项。
+        is_structural_node = bool(node.get("is_structural")) or (
+            node.get("qty") is None and not str(node.get("unit") or "").strip()
+        )
+        if float(node.get("ref_price") or 0.0) <= 0 and not is_structural_node:
             unmatched_count += 1
             if not node.get("match_quality"):
                 node["match_quality"] = "未匹配"

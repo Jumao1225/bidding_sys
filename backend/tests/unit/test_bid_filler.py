@@ -201,6 +201,47 @@ def test_apply_underline_to_filled_doc_should_set_underline_on_value_run():
             os.remove(temp_path)
 
 
+def test_fill_docx_proposals_should_accept_space_slots_without_context_marker():
+    """测试模板使用冒号后连续空格留白时，不因上下文缺少槽位标记而拦截合法填报。"""
+    import os
+    import tempfile
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    doc.add_paragraph("地址：                                ")
+    doc.add_paragraph("电话：                                ")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+
+    try:
+        doc.save(temp_path)
+        proposals = [
+            {
+                "path": "/body/p[1]",
+                "original_context": "模板空位",
+                "proposed_text": "档案地址",
+            },
+            {
+                "path": "/body/p[2]",
+                "original_context": "模板空位",
+                "proposed_text": "档案电话",
+            },
+        ]
+
+        count = fill_docx_proposals_in_dom(temp_path, proposals)
+
+        result_doc = Document(temp_path)
+        assert count == 2
+        assert "地址：" in result_doc.paragraphs[0].text
+        assert "档案地址" in result_doc.paragraphs[0].text
+        assert "电话：" in result_doc.paragraphs[1].text
+        assert "档案电话" in result_doc.paragraphs[1].text
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def test_fill_docx_proposals_in_dom_should_preserve_real_labels_and_add_underline():
     """测试 DOM 引擎从真实 Word 节点读取原文，保留前缀标签并成功注入 OpenXML 下划线"""
     import tempfile, os
@@ -851,6 +892,84 @@ def test_is_narrative_clause_or_lead_in_generic_rules():
         assert is_narrative_clause_or_lead_in(lbl) is False, f"'{lbl}' 应被识别为合法表单属性标签"
 
 
+def test_template_protection_should_allow_form_labels_and_internal_blank_slots():
+    """表单标签、句中空白槽位应允许填报，固定正文仍应受到保护。"""
+    from app.agents.bid_filler_agent import _is_protected_template_overwrite
+
+    assert _is_protected_template_overwrite(
+        "投标单位（加盖公章）：",
+        "",
+        "企业名称",
+        "text",
+    ) is False
+    assert _is_protected_template_overwrite(
+        "兹委托受托人        合法地代表我单位参加                 组织的             项目的采购活动。",
+        "",
+        "兹委托受托人授权人合法地代表我单位参加采购组织的项目采购活动。",
+        "sentence_batch",
+    ) is False
+    assert _is_protected_template_overwrite(
+        "本授权书宣告：",
+        "",
+        "不应覆盖固定正文",
+        "text",
+    ) is True
+
+
+def test_template_protection_should_allow_label_only_date_slot():
+    """仅保留“日 期 ：”标签的封面日期字段应被识别为可填槽位。"""
+    from app.agents.bid_filler_agent import (
+        _has_fillable_slot_marker,
+        _is_protected_template_overwrite,
+    )
+
+    date_label = "日 期 ："
+
+    assert _has_fillable_slot_marker(date_label) is True
+    assert _is_protected_template_overwrite(
+        date_label,
+        date_label,
+        "2026年6月30日",
+        "text",
+    ) is False
+
+
+def test_fill_docx_proposals_in_dom_should_write_label_only_date_slot():
+    """封面仅有日期标签时应原位写入日期，同时不影响固定正文保护。"""
+    import os
+    import tempfile
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    doc.add_paragraph("日 期 ：")
+    doc.add_paragraph("本授权书宣告：")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as temp_file:
+        temp_path = temp_file.name
+
+    try:
+        doc.save(temp_path)
+        written_count = fill_docx_proposals_in_dom(
+            temp_path,
+            [
+                {
+                    "path": "/body/p[1]",
+                    "original_context": "日 期 ：",
+                    "proposed_text": "2026年6月30日",
+                    "type": "text",
+                }
+            ],
+        )
+
+        result_doc = Document(temp_path)
+        assert written_count == 1
+        assert result_doc.paragraphs[0].text == "日 期 ：2026年6月30日"
+        assert result_doc.paragraphs[1].text == "本授权书宣告："
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def test_reset_chapter_to_template_should_cleanly_reset_target_chapter():
     """测试单章节重置器能够将工作副本中被污染的段落100%精准重置回纯净模板状态"""
     import tempfile, os
@@ -912,6 +1031,51 @@ def test_reset_chapter_to_template_should_cleanly_reset_target_chapter():
         for p in [tpl_path, work_path]:
             if os.path.exists(p):
                 os.remove(p)
+
+
+def test_reset_chapter_to_template_should_prefer_parent_heading_over_child_heading():
+    """验证聚合章节重置时优先使用完整父标题，不会只重置后续子表单。"""
+    import tempfile, os
+    from docx import Document
+    from app.utils.table_utils import reset_chapter_to_template
+
+    doc_tpl = Document()
+    doc_tpl.add_paragraph("四、资格证明文件")
+    doc_tpl.add_paragraph("授权委托书")
+    doc_tpl.add_paragraph("地址：________________")
+    doc_tpl.add_paragraph("关于资格证明文件的书面承诺")
+    doc_tpl.add_paragraph("投标单位（公章）：________________")
+    doc_tpl.add_paragraph("五、其他章节")
+
+    doc_work = Document()
+    doc_work.add_paragraph("四、资格证明文件")
+    doc_work.add_paragraph("授权委托书")
+    doc_work.add_paragraph("地址：历史填充值")
+    doc_work.add_paragraph("关于资格证明文件的书面承诺")
+    doc_work.add_paragraph("投标单位（公章）：历史填充值")
+    doc_work.add_paragraph("五、其他章节")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf_tpl, \
+         tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf_work:
+        tpl_path = tf_tpl.name
+        work_path = tf_work.name
+
+    try:
+        doc_tpl.save(tpl_path)
+        doc_work.save(work_path)
+
+        assert reset_chapter_to_template(work_path, tpl_path, "资格证明文件") is True
+
+        result_texts = [paragraph.text for paragraph in Document(work_path).paragraphs]
+        assert "地址：________________" in result_texts
+        assert "投标单位（公章）：________________" in result_texts
+        assert "地址：历史填充值" not in result_texts
+        assert "投标单位（公章）：历史填充值" not in result_texts
+        assert "五、其他章节" in result_texts
+    finally:
+        for path in [tpl_path, work_path]:
+            if os.path.exists(path):
+                os.remove(path)
 
 
 

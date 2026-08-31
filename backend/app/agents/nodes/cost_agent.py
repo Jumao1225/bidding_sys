@@ -1,4 +1,6 @@
 import json
+import re
+import unicodedata
 from loguru import logger
 from app.services.llm_service import llm_service
 from app.agents.state import BiddingState
@@ -8,7 +10,7 @@ from app.db.crud.document import document_crud
 from app.db.crud.business import business_crud
 from app.db.models.business import MarketPriceReference
 from app.core.audit_decorator import audit_node
-from app.services.rag_service import rag_service
+from app.agents.tools.rag_tools import search_bidding_document
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
@@ -117,6 +119,34 @@ class CostAnalysisResult(BaseModel):
     items: List[CostItem] = Field(description="核算出的所有物品清单", default_factory=list)
     analysis_summary: Optional[str] = Field(default="", description="成本核算专家总结与风险评估说明")
 
+
+def _get_cost_rag_context(document_id: str, tenant_id: str) -> str:
+    """调用现有通用 RAG 工具，为成本核算补充招标原文依据。"""
+    if not document_id:
+        return ""
+
+    query = "采购清单 工程量清单 设备材料 规格型号 数量 单位 参考价格"
+    try:
+        context = search_bidding_document.invoke({
+            "document_id": document_id,
+            "query": query,
+        })
+        normalized_context = str(context or "").strip()
+        logger.info(
+            "CostAgent 已调用通用 RAG 工具补充成本核算原文：文档ID=%s，租户=%s，上下文字符数=%d",
+            document_id,
+            tenant_id,
+            len(normalized_context),
+        )
+        return normalized_context
+    except Exception as exc:
+        logger.exception(
+            "CostAgent 调用通用 RAG 工具失败，将仅依据工程元数据继续核算：文档ID=%s，错误=%s",
+            document_id,
+            exc,
+        )
+        return ""
+
 def filter_candidate_price_book(batch_items: list, full_price_book: list, max_candidates: int = 50) -> list:
     """
     针对当前批次的设备列表，从全量海量价格库中智能动态筛选出最相关的候选价格条目。
@@ -198,6 +228,100 @@ def filter_candidate_price_book(batch_items: list, full_price_book: list, max_ca
     selected = [item for score, item in scored_items[:max_candidates]]
     return selected
 
+
+def _normalize_price_match_text(value: object) -> str:
+    """统一价格匹配文本，消除全半角、空格和常见标点差异。"""
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[\s,，、;；:：()（）\[\]【】/\\_\-]+", "", normalized)
+
+
+def _longest_common_name_fragment(left: str, right: str) -> str:
+    """获取两个名称的最长连续中文/数字片段，避免仅凭一个泛词误配。"""
+    if not left or not right:
+        return ""
+    best = ""
+    for start in range(len(left)):
+        for end in range(start + 2, len(left) + 1):
+            fragment = left[start:end]
+            if len(fragment) > len(best) and fragment in right:
+                best = fragment
+    return best
+
+
+def _is_count_unit(unit: object) -> bool:
+    """判断单位是否属于可互换的离散件计数单位。"""
+    return str(unit or "").strip() in {"台", "块", "个", "只", "组", "件"}
+
+
+def _price_units_compatible(source_unit: object, reference_unit: object) -> bool:
+    """判断清单单位与价格库单位是否允许直接计算价格。"""
+    source = str(source_unit or "").strip()
+    reference = str(reference_unit or "").strip()
+    if not source or not reference:
+        return True
+    if source == reference:
+        return True
+    return _is_count_unit(source) and _is_count_unit(reference)
+
+
+def find_local_price_reference(item: dict, price_book: list[dict]) -> Optional[dict]:
+    """对明显同名/同类清单执行本地确定性匹配，作为模型结果的安全兜底。"""
+    if not item or not price_book:
+        return None
+
+    source_name = _normalize_price_match_text(item.get("item_name") or item.get("name"))
+    if not source_name:
+        return None
+    source_spec = _normalize_price_match_text(item.get("specifications") or item.get("spec_requirement"))
+    source_unit = item.get("unit")
+    ranked: list[tuple[int, dict, str]] = []
+
+    for reference in price_book:
+        reference_name = _normalize_price_match_text(reference.get("item_name"))
+        if not reference_name:
+            continue
+
+        fragment = _longest_common_name_fragment(source_name, reference_name)
+        if source_name == reference_name:
+            name_score = 100
+            quality = "精准匹配"
+        elif source_name in reference_name or reference_name in source_name:
+            name_score = 82
+            quality = "模糊匹配"
+        elif len(fragment) >= 4:
+            name_score = 68 + min(len(fragment), 8)
+            quality = "模糊匹配"
+        else:
+            continue
+
+        score = name_score
+        reference_spec = _normalize_price_match_text(reference.get("spec") or reference.get("model"))
+        if source_spec and reference_spec:
+            if source_spec == reference_spec:
+                score += 20
+            elif source_spec in reference_spec or reference_spec in source_spec:
+                score += 10
+
+        if _price_units_compatible(source_unit, reference.get("unit")):
+            score += 12
+        else:
+            score -= 20
+        ranked.append((score, reference, quality))
+
+    if not ranked:
+        return None
+    ranked.sort(key=lambda value: value[0], reverse=True)
+    score, reference, quality = ranked[0]
+    if score < 60:
+        return None
+
+    # 复制结果，避免后续成本核算过程意外修改共享价格库对象。
+    result = dict(reference)
+    result["match_quality"] = quality
+    result["unit_compatible"] = _price_units_compatible(source_unit, reference.get("unit"))
+    result["match_score"] = score
+    return result
+
 @audit_node(name="CostAgent-CalculateCost")
 def cost_node(state: BiddingState) -> dict:
     """
@@ -218,6 +342,7 @@ def cost_node(state: BiddingState) -> dict:
     limit_type = "unspecified"
     price_book = []
     equipment_list_from_db = []
+    rag_context = ""
     
     try:
         document = document_crud.get_document_by_id(db, document_id, user_id, tenant_id)
@@ -296,6 +421,10 @@ def cost_node(state: BiddingState) -> dict:
     finally:
         db.close()
 
+    # 当工程元数据为空时，成本核算仍使用现有 RAG 工具补充原文，避免空清单直接进入核算流程。
+    if not equipment_list_from_db:
+        rag_context = _get_cost_rag_context(document_id, tenant_id)
+
     # 提取纯净工程设备列表
     BATCH_SIZE = 100
     raw_batches = [
@@ -327,6 +456,11 @@ def cost_node(state: BiddingState) -> dict:
 
         logger.info(f"🚀 [5路并发核算] 处理第 {batch_idx + 1}/{len(raw_batches)} 批设备 ({len(prompt_items)} 项待匹配, 候选价格条目: {len(candidate_price_book)} 项)")
 
+        rag_context_block = (
+            f"\n【通用 RAG 工具返回的招标原文上下文】:\n{rag_context}\n"
+            if rag_context
+            else ""
+        )
         batch_prompt = f"""
 你是一位资深的工程与设备成本核算专家。
 请分析以下待对标的【设备需求清单（当前批次）】，并将其与企业内部【全维度价格参考库（自有设备候选库）】进行智能通用语义匹配与参数对标。
@@ -336,9 +470,11 @@ def cost_node(state: BiddingState) -> dict:
 
 【企业全维度价格参考库 (自有设备候选库)】:
 {json.dumps(candidate_price_book, ensure_ascii=False, indent=2)}
+{rag_context_block}
 
 【智能对标与防重复计价核心规则】:
 1. 必须对清单中的每一项设备按 item_index (0, 1, 2...) 输出对应的对标结果。
+   - 如果待对标设备清单为空，必须从 RAG 原文上下文中提取明确出现的可计价设备、材料或服务行，再输出对应结果；原文没有明确数量时数量不得臆造。
 2. 【成套总成 vs 子项防重复计价】:
    - 若某成套主设备（如开关柜、箱变）在价格库中匹配到了整套指导价：
      - 该成套主设备给出正常的 ref_price；
@@ -482,6 +618,9 @@ def cost_node(state: BiddingState) -> dict:
                 key_params = orig_item.get("key_parameters") or []
                 brand_req = orig_item.get("brand_requirements") or ""
 
+                # 没有数量和单位的标题/说明节点只用于还原 BOM 树，不能参与企业价格库匹配。
+                is_structural_node = raw_qty is None and not str(unit or "").strip()
+
                 # 2. 对标字段注入
                 ref_price = float(match_info.ref_price or 0.0) if match_info else 0.0
                 matched_name = match_info.matched_name if match_info else ""
@@ -497,6 +636,37 @@ def cost_node(state: BiddingState) -> dict:
                     else ""
                 ) or resolve_price_reference_remark(match_info, price_book)
 
+                # 模型未返回有效价格时，用名称/规格/计量单位的确定性规则补齐明显匹配，
+                # 解决大批量 BOM 中模型漏回 item_index 或漏填 matched_name 的问题。
+                if not is_structural_node and (match_info is None or ref_price <= 0):
+                    local_match = find_local_price_reference(orig_item, price_book)
+                    if local_match:
+                        ref_price = float(local_match.get("unit_price") or 0.0)
+                        matched_name = str(local_match.get("item_name") or "")
+                        matched_brand = str(local_match.get("brand") or "")
+                        matched_model = str(local_match.get("model") or local_match.get("spec") or "")
+                        matched_mfr = str(local_match.get("manufacturer") or "")
+                        match_quality = str(local_match.get("match_quality") or "模糊匹配")
+                        if not _price_units_compatible(unit, local_match.get("unit")):
+                            ref_price = 0.0
+                            warning = (
+                                f"已找到价格库候选，但清单单位{unit or '未填写'}与库单位"
+                                f"{local_match.get('unit') or '未填写'}不一致，未直接计价"
+                            )
+                        else:
+                            warning = warning or ""
+                        remark = str(local_match.get("remark") or "").strip()
+
+                if is_structural_node:
+                    ref_price = 0.0
+                    matched_name = ""
+                    matched_brand = ""
+                    matched_model = ""
+                    matched_mfr = ""
+                    match_quality = "结构节点"
+                    warning = ""
+                    remark = ""
+
                 # 3. 防重复打包计价置零安全保护
                 if ("不重复" in note and "计算" in note) or ("合并" in note and "计价" in note) or ("已包含" in note and "统价" in note) or ("已包含" in note and "打包" in note):
                     ref_price = 0.0
@@ -505,7 +675,7 @@ def cost_node(state: BiddingState) -> dict:
                 safe_qty = float(raw_qty) if raw_qty is not None else 1.0
                 subtotal = round(safe_qty * ref_price, 2)
 
-                if ref_price <= 0:
+                if ref_price <= 0 and not is_structural_node:
                     unmatched_count += 1
                     if match_quality not in ["精准匹配", "模糊匹配"]:
                         match_quality = "未匹配"
@@ -527,6 +697,7 @@ def cost_node(state: BiddingState) -> dict:
                     "section_name": sec_name,
                     "key_parameters": key_params,
                     "brand_requirements": brand_req,
+                    "is_structural": is_structural_node,
                     "matched_name": matched_name,
                     "matched_brand": matched_brand,
                     "matched_model": matched_model,

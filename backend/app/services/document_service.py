@@ -220,4 +220,3 @@ class DocumentService:
         return target_path, doc_obj.filename
 
 document_service = DocumentService()
-

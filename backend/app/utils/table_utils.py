@@ -9,6 +9,19 @@ from typing import List, Tuple, Optional, Dict, Any
 from loguru import logger
 
 
+def _get_visible_element_text(element: Any) -> str:
+    """读取 Word XML 中实际显示的文本，排除字段结果等重复 XML 文本。"""
+    if element is None:
+        return ""
+
+    text_parts = [
+        str(node.text or "")
+        for node in element.iter()
+        if str(getattr(node, "tag", "")).endswith("}t")
+    ]
+    return "".join(text_parts).strip()
+
+
 def detect_table_header_rows(table) -> int:
     """
     智能识别 Word 表格的表头所占行数（支持单行表头与多行复合表头）。
@@ -295,7 +308,7 @@ def get_doc_chapter_tables_mapping(doc) -> List[Dict[str, Any]]:
     for elem in doc.element.body:
         tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
         if tag == "p":
-            txt = "".join(elem.itertext()).strip()
+            txt = _get_visible_element_text(elem)
             if not txt:
                 continue
 
@@ -477,14 +490,18 @@ def extract_chapter_dom_structure(
             tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
             if tag == "p":
                 p_count += 1
-                txt = "".join(elem.itertext()).strip()
+                txt = _get_visible_element_text(elem)
                 if not txt:
                     continue
                 clean_p = re.sub(r'^[一二三四五六七八九十百0-9\s、\.\(\)（）]+', '', txt).strip()
                 clean_p = re.sub(r'[\s、\.\(\)（）]+', '', clean_p)
                 score = 0.0
                 if clean_target and clean_p:
-                    if clean_target in clean_p or clean_p in clean_target:
+                    # 完整章节标题优先于后续子表单标题，避免“资格证明文件”
+                    # 被“关于资格证明文件的书面承诺”等包含式文本抢占起点。
+                    if clean_p == clean_target:
+                        score += 200.0
+                    elif clean_target in clean_p or clean_p in clean_target:
                         score += 100.0
                     elif target_tokens:
                         overlap = sum(1 for tk in target_tokens if tk in clean_p)
@@ -511,7 +528,7 @@ def extract_chapter_dom_structure(
 
             if tag == "p":
                 p_idx += 1
-                txt = "".join(elem.itertext()).strip()
+                txt = _get_visible_element_text(elem)
                 if p_idx == target_start_p:
                     in_target = True
                     collected_lines.append(f"📌 [当前目标章节正文标题] /body/p[{p_idx}]: {txt}")
@@ -754,9 +771,10 @@ def inspect_and_repair_table_blanks(doc, document_id: str = "") -> int:
 
 def extract_equipment_tables_and_context(raw_text: str) -> str:
     """
-    智能靶向过滤：
-    仅提取工程量、采购、报价、设备材料清单表格及其邻近标题，
-    不再把最后一个表格后的整段正文拼入上下文，避免安全制度、岗位职责和风险条款污染 BOM/BOQ 提取。
+    通用表格上下文提取：
+    仅按 HTML/Markdown 语法定位表格，并保留每个表格前最近章节及其完整说明。
+    不依据固定业务关键词判断表格是否属于 BOM/BOQ，表格语义筛选交由大模型完成。
+    不把最后一个表格后的正文拼入上下文，避免无表格尾部内容污染提取。
     """
     if not raw_text:
         return ""
@@ -777,86 +795,29 @@ def extract_equipment_tables_and_context(raw_text: str) -> str:
         # 若没有识别出表格，完整保留原文，绝不截断
         return raw_text
 
-    # 采用“名称列 + 计量/计价列”双重门槛，避免仅凭“工程/服务/项目”等宽泛词命中安全管理表。
-    NAME_COLUMN_KEYWORDS = ["项目名称", "货物名称", "设备名称", "材料名称", "物资名称", "标的名称", "工作内容", "服务名称"]
-    MEASURE_COLUMN_KEYWORDS = ["工程量", "数量", "单位", "单价", "合价", "总价", "定额", "计量"]
-    BOQ_CONTEXT_KEYWORDS = ["工程量清单", "采购清单", "报价清单", "分项报价", "货物需求", "设备材料", "主要标的物", "供货范围"]
-    NON_BOQ_KEYWORDS = [
-        "安全生产", "安全文明施工", "违章", "作业票", "岗位职责", "人员分工", "风险管理",
-        "风险辨识", "应急预案", "管理制度", "培训要求", "处罚条款", "评标办法", "评分标准",
-        "验收说明", "合规承诺", "施工规范"
-    ]
-    BOQ_CONTINUATION_STOP_KEYWORDS = [
-        "设备材料品牌表", "项目安全协议", "安全文明施工违章库", "常规施工风险", "工程结算单"
-    ]
-
-    def extract_table_header_text(table_content: str) -> str:
-        """仅提取表头行，避免正文描述中的关键词误判表格类型。"""
-        if re.search(r"<table", table_content, re.IGNORECASE):
-            first_row = re.search(r"<tr[\s\S]*?</tr>", table_content, re.IGNORECASE)
-            if not first_row:
-                return ""
-            cells = re.findall(r"<(?:th|td)[^>]*>([\s\S]*?)</(?:th|td)>", first_row.group(0), re.IGNORECASE)
-            return re.sub(r"<[^>]+>", " ", " ".join(cells)).strip().lower()
-
-        lines = [line.strip() for line in table_content.splitlines() if line.strip()]
-        if not lines:
+    def extract_nearest_heading_context(preceding_text: str) -> str:
+        """从表格前置文本中保留最近章节标题及其后的完整说明。"""
+        if not preceding_text:
             return ""
-        return re.sub(r"\s+", " ", lines[0]).strip().lower()
+        heading_matches = list(re.finditer(r"(?m)^\s*#{1,6}\s+[^\n]+", preceding_text))
+        if not heading_matches:
+            return preceding_text.strip()
+        return preceding_text[heading_matches[-1].start():].strip()
 
-    filtered_sections = []
+    context_sections = []
     last_end = 0
-    active_boq_table = False
-
-    for start, end, t_type, tbl_content in table_spans:
-        header_text = extract_table_header_text(tbl_content)
+    for start, end, _table_type, table_content in table_spans:
+        # 只保留相邻表格之间的原文，避免将整篇文档前置正文重复带入每个表格。
         preceding_text = raw_text[last_end:start].strip()
-        preceding_lines = [l.strip() for l in preceding_text.split('\n') if l.strip()]
-        nearby_text = "\n".join(preceding_lines[-15:]).lower()
-
-        has_name_column = any(kw in header_text for kw in NAME_COLUMN_KEYWORDS)
-        has_measure_column = any(kw in header_text for kw in MEASURE_COLUMN_KEYWORDS)
-        has_boq_context = any(kw in nearby_text for kw in BOQ_CONTEXT_KEYWORDS)
-        # 续表首行通常是上一张清单的第一条数据，描述字段可能包含“施工规范”等词，
-        # 不能把这类数据内容误当成非清单表头；只有尚未进入清单上下文时才检查表头。
-        has_non_boq_context = any(kw in nearby_text for kw in NON_BOQ_KEYWORDS)
-        if not active_boq_table:
-            has_non_boq_context = has_non_boq_context or any(kw in header_text for kw in NON_BOQ_KEYWORDS)
-        has_continuation_stop = any(kw in nearby_text for kw in BOQ_CONTINUATION_STOP_KEYWORDS)
-        is_new_boq_table = (
-            (has_name_column and has_measure_column)
-            or (has_boq_context and has_measure_column)
-        ) and not (has_non_boq_context and not has_boq_context)
-        # 工程量清单经常跨页拆成多个无表头续表，继承上一张清单表的上下文。
-        is_continuation_table = active_boq_table and not has_continuation_stop and not has_non_boq_context
-        is_boq_table = is_new_boq_table or is_continuation_table
-        
-        if is_boq_table:
-            # 提取紧随该设备表格前方的章节大标题或说明（如 "第X标段/分部工程清单"）
-            if preceding_lines and not is_continuation_table:
-                # 倒序向上查找最近的各级标题行与技术说明（扩大探测窗口至 15 行），确保大标题 100% 完整保留
-                headers = []
-                for l in reversed(preceding_lines[-15:]):
-                    if l.startswith('#') or re.match(r'^(?:[0-9]+[、.．]|[一二三四五六七八九十]+[、.．]|第[0-9一二三四五六七八九十]+[标标段章节部分区]|(?:（|\()[0-9一二三四五六七八九十]+(?:）|\)))', l):
-                        headers.append(l)
-                    elif any(c in l for c in ['表', '清单', '需求', '规格', '标段', '工程', '部分', '系统', '一览表']):
-                        headers.append(l)
-                headers = list(reversed(headers))
-                if headers:
-                    filtered_sections.append("\n".join(headers))
-            filtered_sections.append(tbl_content)
-            active_boq_table = True
-        else:
-            # 若是非设备表格（如人员资质表、财务表），跳过该表格及其紧贴标题
-            if has_continuation_stop or has_non_boq_context:
-                active_boq_table = False
-        
+        if preceding_text:
+            context_sections.append(extract_nearest_heading_context(preceding_text))
+        context_sections.append(table_content)
         last_end = end
 
-    if not filtered_sections:
-        return ""
-
-    return "\n\n".join(filtered_sections)
+    logger.info(
+        f"[TableUtils] 原文表格块扫描完成：HTML/Markdown表格={len(table_spans)}，未进行业务关键词过滤"
+    )
+    return "\n\n".join(section for section in context_sections if section)
 
 
 def normalize_section_name(raw_sec: Optional[str]) -> Optional[str]:
@@ -954,14 +915,17 @@ def get_chapter_body_elements(doc, chapter_title: str) -> List[Any]:
         tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
         if tag == "p":
             p_count += 1
-            txt = "".join(elem.itertext()).strip()
+            txt = _get_visible_element_text(elem)
             if not txt:
                 continue
             clean_p = re.sub(r'^[一二三四五六七八九十百0-9\s、\.\(\)（）]+', '', txt).strip()
             clean_p = re.sub(r'[\s、\.\(\)（）]+', '', clean_p)
             score = 0.0
             if clean_target and clean_p:
-                if clean_target in clean_p or clean_p in clean_target:
+                # 与章节重置保持同一匹配优先级：先找完整标题，再处理包含式匹配。
+                if clean_p == clean_target:
+                    score += 200.0
+                elif clean_target in clean_p or clean_p in clean_target:
                     score += 100.0
                 elif target_tokens:
                     overlap = sum(1 for tk in target_tokens if tk in clean_p)
@@ -986,7 +950,7 @@ def get_chapter_body_elements(doc, chapter_title: str) -> List[Any]:
             continue
         elif in_target:
             if tag == "p":
-                txt = "".join(elem.itertext()).strip()
+                txt = _get_visible_element_text(elem)
                 is_top_chapter_pattern = bool(
                     re.match(r'^[一二三四五六七八九十百]+[、\.\s]', txt)
                     or re.match(r'^第[一二三四五六七八九十0-9]+[章节篇部分]', txt)
@@ -1044,4 +1008,3 @@ def reset_chapter_to_template(
     except Exception as e:
         logger.warning(f"重置章节至模板状态异常: {e}")
         return False
-

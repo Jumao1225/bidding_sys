@@ -10,6 +10,8 @@ import {
   Popconfirm,
   Empty,
   Dropdown,
+  Modal,
+  Select,
   message
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -26,7 +28,9 @@ import {
   UpOutlined,
   DownloadOutlined,
   FileWordOutlined,
-  FileExcelOutlined
+  FileExcelOutlined,
+  PlusCircleOutlined,
+  UndoOutlined
 } from '@ant-design/icons';
 import { apiFetch, API_BASE_URL } from '../utils/api';
 import { exportBomToDocx, exportBomToXlsx } from '../utils/bomExporter';
@@ -71,6 +75,23 @@ interface CostItemNode {
   rollupChildCount?: number;
   missingChildPriceCount?: number;
   children?: CostItemNode[];
+  // 基线快照与父子互斥状态属性
+  is_parent_modified?: boolean;
+  is_child_modified?: boolean;
+  is_custom_added?: boolean;
+  pricing_mode?: 'parent' | 'children' | 'auto';
+  isLockedByParent?: boolean;
+  isLockedByChildren?: boolean;
+  hasModifiedChildren?: boolean;
+  raw_ref_price?: number;
+  raw_brand?: string;
+  raw_model?: string;
+  raw_manufacturer?: string;
+  raw_spec?: string;
+  raw_qty?: number;
+  raw_unit?: string;
+  raw_name?: string;
+  raw_match_quality?: string;
 }
 
 interface CostTableProps {
@@ -84,6 +105,8 @@ interface CostTableProps {
   onCostUpdated?: (updatedData: any) => void;
   isRetrying?: boolean;
   isExtractingEquipment?: boolean;
+  // 工程清单刚提取完成时，只展示原始清单，不读取旧成本结果，也不触发价格匹配。
+  isEquipmentOnly?: boolean;
 }
 
 /**
@@ -125,7 +148,7 @@ export function normalizeCostTextList(value: unknown): string[] {
 }
 
 /**
- * 清理成本明细中的历史异常值，统一前端渲染和请求边界的数据类型。
+ * 清理成本明细中的历史异常值，统一前端渲染和请求边界的数据类型，并保留基线初始值。
  */
 export function normalizeCostItem(item: unknown): Record<string, any> {
   if (!item || typeof item !== 'object' || Array.isArray(item)) return {};
@@ -134,12 +157,23 @@ export function normalizeCostItem(item: unknown): Record<string, any> {
   if (!normalized.name && normalized.item_name) {
     normalized.name = normalized.item_name;
   }
+  // 工程元数据与成本结果使用不同字段名，进入 BOM 表前统一为成本表字段。
+  if (normalized.spec_requirement === undefined && normalized.specifications !== undefined) {
+    normalized.spec_requirement = normalized.specifications;
+  }
+  if (normalized.qty === undefined && normalized.quantity !== undefined) {
+    normalized.qty = normalized.quantity;
+  }
+  if (normalized.per_set_qty === undefined && normalized.per_set_quantity !== undefined) {
+    normalized.per_set_qty = normalized.per_set_quantity;
+  }
   const textFields = [
     'item_code', 'name', 'spec_requirement', 'unit', 'matched_name',
     'matched_brand', 'matched_model', 'matched_manufacturer',
     'brand_requirements', 'match_quality', 'warning', 'comparison_note',
     'remark', 'parent_item', 'root_item', 'section_name', 'brand', 'model',
-    'manufacturer'
+    'manufacturer', 'pricing_mode', 'raw_brand', 'raw_model', 'raw_manufacturer',
+    'raw_spec', 'raw_unit', 'raw_name', 'raw_match_quality'
   ];
   textFields.forEach((field) => {
     if (field in normalized && normalized[field] !== null && normalized[field] !== undefined) {
@@ -147,6 +181,36 @@ export function normalizeCostItem(item: unknown): Record<string, any> {
     }
   });
   normalized.key_parameters = normalizeCostTextList(normalized.key_parameters);
+
+  // 初始化基线快照（如果尚未记录）
+  if (normalized.raw_ref_price === undefined || normalized.raw_ref_price === null) {
+    normalized.raw_ref_price = normalized.ref_price !== undefined && normalized.ref_price !== null ? Number(normalized.ref_price) : 0;
+  }
+  if (normalized.raw_name === undefined) {
+    normalized.raw_name = normalized.name || '';
+  }
+  if (normalized.raw_brand === undefined) {
+    normalized.raw_brand = normalized.brand || normalized.matched_brand || '';
+  }
+  if (normalized.raw_model === undefined) {
+    normalized.raw_model = normalized.model || normalized.matched_model || '';
+  }
+  if (normalized.raw_manufacturer === undefined) {
+    normalized.raw_manufacturer = normalized.manufacturer || normalized.matched_manufacturer || '';
+  }
+  if (normalized.raw_spec === undefined) {
+    normalized.raw_spec = normalized.spec_requirement || '';
+  }
+  if (normalized.raw_qty === undefined) {
+    normalized.raw_qty = normalized.qty !== undefined && normalized.qty !== null ? Number(normalized.qty) : 1;
+  }
+  if (normalized.raw_unit === undefined) {
+    normalized.raw_unit = normalized.unit || '';
+  }
+  if (normalized.raw_match_quality === undefined) {
+    normalized.raw_match_quality = normalized.match_quality || '';
+  }
+
   return normalized;
 }
 
@@ -169,7 +233,11 @@ export function normalizeCostItems(value: unknown): any[] {
  */
 export function normalizeSectionName(rawSec: unknown): string | null {
   const s = normalizeCostText(rawSec).trim();
-  return s || null;
+  if (!s) return null;
+
+  // 兼容历史清单标题中的包装文字，仅处理明确的“项目需求清单（分项）”结构。
+  const wrappedTitle = s.match(/^(?:\d+[、.．]\s*)?项目需求清单\s*[（(]([^（）()]+)[）)]$/);
+  return wrappedTitle?.[1]?.trim() || s;
 }
 
 export function CostTable({
@@ -182,9 +250,13 @@ export function CostTable({
   onReextractEquipment,
   onCostUpdated,
   isRetrying = false,
-  isExtractingEquipment = false
+  isExtractingEquipment = false,
+  isEquipmentOnly = false
 }: CostTableProps) {
-  const [items, setItems] = useState<any[]>(() => normalizeCostItems(costAnalysis?.items));
+  const [items, setItems] = useState<any[]>(() => {
+    const costItems = normalizeCostItems(costAnalysis?.items);
+    return !isEquipmentOnly && costItems.length > 0 ? costItems : normalizeCostItems(equipmentList);
+  });
   const [isAdding, setIsAdding] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -204,7 +276,21 @@ export function CostTable({
   const [editUnit, setEditUnit] = useState('台');
   const [editPrice, setEditPrice] = useState<number>(0);
 
-  // 新增自定义费用分项表单 State
+  // 新增子项专用 Modal 弹窗 State
+  const [isAddChildModalOpen, setIsAddChildModalOpen] = useState(false);
+  const [targetParentNode, setTargetParentNode] = useState<CostItemNode | null>(null);
+  const [childFormName, setChildFormName] = useState('');
+  const [childFormBrand, setChildFormBrand] = useState('');
+  const [childFormModel, setChildFormModel] = useState('');
+  const [childFormManufacturer, setChildFormManufacturer] = useState('');
+  const [childFormSpec, setChildFormSpec] = useState('');
+  const [childFormQty, setChildFormQty] = useState<number>(1);
+  const [childFormUnit, setChildFormUnit] = useState('台');
+  const [childFormPrice, setChildFormPrice] = useState<number>(0);
+  const [childFormPerSetQty, setChildFormPerSetQty] = useState<number>(1);
+  const [childFormRemark, setChildFormRemark] = useState('');
+
+  // 新增自定义费用分项表单 State（底部表单）
   const [newName, setNewName] = useState('');
   const [newBrand, setNewBrand] = useState('');
   const [newModel, setNewModel] = useState('');
@@ -214,14 +300,14 @@ export function CostTable({
   const [newQty, setNewQty] = useState<number>(1);
   const [newUnit, setNewUnit] = useState('项');
   const [newPrice, setNewPrice] = useState<number>(0);
+  const [newParentItem, setNewParentItem] = useState<string>('');
   const isBusy = isRetrying || isExtractingEquipment;
 
-  // 当外部传入的 costAnalysis 发生重测算变化时更新本地 items
+  // 成本模式优先展示测算结果；仅清单模式必须直接展示最新工程提取树。
   useEffect(() => {
-    if (costAnalysis && costAnalysis.items) {
-      setItems(normalizeCostItems(costAnalysis.items));
-    }
-  }, [costAnalysis]);
+    const costItems = normalizeCostItems(costAnalysis?.items);
+    setItems(!isEquipmentOnly && costItems.length > 0 ? costItems : normalizeCostItems(equipmentList));
+  }, [costAnalysis, equipmentList, isEquipmentOnly]);
 
   // 提取数据中实际包含的所有分标段/分区域名称（忠实保持标书原始出现的自然先后顺序）
   const availableSections = React.useMemo(() => {
@@ -248,7 +334,7 @@ export function CostTable({
 
     // 忠实保留标书章节原本的自然出现先后顺序 (Natural Order)
     return list;
-  }, [items]);
+  }, [items, equipmentList]);
 
   // 当 items 或 availableSections 变更时，自动校准悬空的 selectedSection 状态
   useEffect(() => {
@@ -313,9 +399,35 @@ export function CostTable({
         subtotal: Number((safeQty * safePrice).toFixed(2)),
         section_name: normSection,
         children: [],
+        // 传递基线快照与修改状态
+        is_parent_modified: Boolean(item.is_parent_modified),
+        is_child_modified: Boolean(item.is_child_modified),
+        is_custom_added: Boolean(item.is_custom_added),
+        pricing_mode: item.pricing_mode || (item.is_parent_modified ? 'parent' : 'auto'),
+        raw_ref_price: item.raw_ref_price !== undefined ? item.raw_ref_price : safePrice,
+        raw_name: item.raw_name || nodeName,
+        raw_brand: item.raw_brand !== undefined ? item.raw_brand : (item.brand || item.matched_brand || ''),
+        raw_model: item.raw_model !== undefined ? item.raw_model : (item.model || item.matched_model || ''),
+        raw_manufacturer: item.raw_manufacturer !== undefined ? item.raw_manufacturer : (item.manufacturer || item.matched_manufacturer || ''),
+        raw_spec: item.raw_spec !== undefined ? item.raw_spec : (item.spec_requirement || ''),
+        raw_qty: item.raw_qty !== undefined ? item.raw_qty : safeQty,
+        raw_unit: item.raw_unit !== undefined ? item.raw_unit : (rawUnit || ''),
+        raw_match_quality: item.raw_match_quality || item.match_quality || '',
       };
       return node;
     });
+
+    // 当模型已经给出 tree_level，但 parent_item 因名称清洗或历史字段差异暂时无法命中时，
+    // 使用同一分项下最近的上一级节点兜底挂载，避免已提取的父子关系在前端退化为平铺行。
+    const isSameHierarchyScope = (current: CostItemNode, previous: CostItemNode): boolean => {
+      const currentRoot = current.root_item ? String(current.root_item).trim() : '';
+      const previousRoot = previous.root_item ? String(previous.root_item).trim() : '';
+      const sameRoot = !currentRoot || !previousRoot || currentRoot === previousRoot;
+      const sameSection = !current.section_name || !previous.section_name || current.section_name === previous.section_name;
+      return sameRoot && sameSection;
+    };
+
+    let recoveredHierarchyCount = 0;
 
     // 2. 就近向上回溯挂载算法（Backward Scope Matching）
     // 纯通用树构建算法：解决同名子节点挂载冲突，支持任意 N 级嵌套树结构
@@ -324,7 +436,7 @@ export function CostTable({
 
     for (let i = 0; i < allNodes.length; i++) {
       const node = allNodes[i];
-      const parentName = node.parent_item;
+      let parentName = node.parent_item;
 
       if (parentName) {
         // 倒序向上查找最近的直接父节点
@@ -356,12 +468,50 @@ export function CostTable({
           foundParent.children.push(node);
           totalChildren += 1;
         } else {
-          // 向前未找到则作为根节点
+          // parent_item 文本无法命中时，回退到模型已经明确给出的层级证据。
+          const currentLevel = Number(node.tree_level) || 1;
+          if (currentLevel > 1) {
+            const levelParent = allNodes
+              .slice(0, i)
+              .reverse()
+              .find((prev) => Number(prev.tree_level) === currentLevel - 1 && isSameHierarchyScope(node, prev));
+            if (levelParent) {
+              node.parent_item = levelParent.name;
+              parentName = levelParent.name;
+              levelParent.children = levelParent.children || [];
+              levelParent.children.push(node);
+              totalChildren += 1;
+              recoveredHierarchyCount += 1;
+              continue;
+            }
+          }
+          // 没有可靠的名称或层级证据时，保留为根节点，不强行猜测父项。
           rootNodes.push(node);
         }
       } else {
+        // 清单模式下，tree_level 是后端明确提取的结构证据；即使 parent_item 丢失，
+        // 也尝试从最近的上一级节点恢复展示关系。
+        const currentLevel = Number(node.tree_level) || 1;
+        if (currentLevel > 1) {
+          const levelParent = allNodes
+            .slice(0, i)
+            .reverse()
+            .find((prev) => Number(prev.tree_level) === currentLevel - 1 && isSameHierarchyScope(node, prev));
+          if (levelParent) {
+            node.parent_item = levelParent.name;
+            levelParent.children = levelParent.children || [];
+            levelParent.children.push(node);
+            totalChildren += 1;
+            recoveredHierarchyCount += 1;
+            continue;
+          }
+        }
         rootNodes.push(node);
       }
+    }
+
+    if (recoveredHierarchyCount > 0) {
+      console.info(`[BOM] 已依据提取的 tree_level 恢复 ${recoveredHierarchyCount} 个父子挂载关系。`);
     }
 
     // 3. 递归标记 isParent、收集 parentKeys、计算深度与清理空 children
@@ -385,6 +535,27 @@ export function CostTable({
 
     traverseAndClean(rootNodes, 1);
 
+    // 3.5 标记父子互斥状态与锁（isLockedByParent, hasModifiedChildren, isLockedByChildren）
+    const markMutualExclusion = (node: CostItemNode, parentModified: boolean) => {
+      const isSelfParentModified = Boolean(node.is_parent_modified || node.pricing_mode === 'parent');
+      node.isLockedByParent = parentModified;
+
+      if (node.children && node.children.length > 0) {
+        let anyChildModified = false;
+        node.children.forEach(child => {
+          markMutualExclusion(child, parentModified || isSelfParentModified);
+          if (child.is_child_modified || child.is_custom_added || child.hasModifiedChildren || (child.match_quality === '手动修改' && !child.is_parent_modified)) {
+            anyChildModified = true;
+          }
+        });
+        node.hasModifiedChildren = anyChildModified;
+        // 若下属子项被修改/添加，则父项直接修改被锁定（由子项自底向上汇总驱动）
+        node.isLockedByChildren = anyChildModified;
+      }
+    };
+
+    rootNodes.forEach(root => markMutualExclusion(root, false));
+
     // 4. 自底向上（Bottom-Up）递归汇总父节点金额与折算参考单价
     const rollupNodePrices = (node: CostItemNode): number => {
       if (node.children && node.children.length > 0) {
@@ -400,18 +571,30 @@ export function CostTable({
 
         // 判断当前父节点自身是否正在被直接行内编辑
         const isSelfEditing = editingIndex === node.originalIndex;
+        const isParentModified = Boolean(node.is_parent_modified || node.pricing_mode === 'parent');
         const directChildCount = node.children.length;
         const missingCount = Math.max(0, directChildCount - childrenWithPriceCount);
 
-        if (isSelfEditing && editPrice > 0) {
+        if (isSelfEditing) {
           // 用户当前正直接编辑该母项单价
-          const safeQty = node.qty && node.qty > 0 ? Number(node.qty) : 1;
+          const safeQty = editQty > 0 ? editQty : 1;
           node.subtotal = Number((safeQty * editPrice).toFixed(2));
           node.ref_price = editPrice;
           node.isRollupPrice = false;
           node.isPartialRollup = false;
+          node.match_quality = '手动修改';
+        } else if (isParentModified && (node.ref_price > 0 || (node.subtotal && node.subtotal > 0))) {
+          // 用户已直接修改父项价格：父项统价优先！不再被子项求和覆盖
+          const safeQty = node.qty && node.qty > 0 ? Number(node.qty) : 1;
+          const safePrice = Number(node.ref_price) >= 0 ? Number(node.ref_price) : 0;
+          node.subtotal = Number((safeQty * safePrice).toFixed(2));
+          node.isRollupPrice = false;
+          node.isPartialRollup = false;
+          if (!node.match_quality || node.match_quality === '成套汇总' || node.match_quality === '未匹配') {
+            node.match_quality = '手动修改';
+          }
         } else if (childrenSubtotalSum > 0) {
-          // 子项有金额 -> 始终无条件由子项自底向上汇总实时驱动！
+          // 子项有金额且父项未自定义 -> 始终由子项自底向上汇总实时驱动！
           node.subtotal = Number(childrenSubtotalSum.toFixed(2));
           const safeQty = node.qty && node.qty > 0 ? Number(node.qty) : 1;
           node.ref_price = Number((childrenSubtotalSum / safeQty).toFixed(2));
@@ -468,6 +651,27 @@ export function CostTable({
   // 受控展开行 Keys
   const [expandedRowKeys, setExpandedRowKeys] = useState<readonly React.Key[]>([]);
 
+  // 首次加载或切换到新的清单数据时，默认展开一级成套主标的，
+  // 让父子关系直接可见；用户手动折叠后不再被此逻辑强制展开。
+  const autoExpandedDataSignatureRef = React.useRef('');
+  useEffect(() => {
+    // 将展示模式纳入签名，避免从成本结果切换到原始清单时因根节点相同而跳过展开。
+    const dataSignature = `${isEquipmentOnly ? 'equipment' : 'cost'}:${treeData.map(node => String(node.key)).join('|')}`;
+    if (!dataSignature || dataSignature === autoExpandedDataSignatureRef.current) {
+      return;
+    }
+
+    autoExpandedDataSignatureRef.current = dataSignature;
+    const parentKeysToExpand = isEquipmentOnly
+      ? allParentKeys
+      : treeData
+        .filter(node => Boolean(node.children && node.children.length > 0))
+        .map(node => node.key);
+    if (parentKeysToExpand.length > 0) {
+      setExpandedRowKeys(parentKeysToExpand);
+    }
+  }, [treeData, allParentKeys, isEquipmentOnly]);
+
   // 是否已全部展开
   const isAllExpanded = allParentKeys.length > 0 && expandedRowKeys.length >= allParentKeys.length;
 
@@ -522,7 +726,7 @@ export function CostTable({
   // 实时计算预算与超额状态
   let isRealTimeExceeded = false;
   let isRealTimeWarning = false;
-  let dynamicStatusText = normalizeCostText(costAnalysis.budget_status);
+  let dynamicStatusText = isEquipmentOnly ? '' : normalizeCostText(costAnalysis.budget_status);
   let overrunAmount = 0;
   let usageRatio = 0;
 
@@ -600,11 +804,19 @@ export function CostTable({
   // 开启行内编辑模式
   const handleStartEdit = (record: CostItemNode) => {
     if (record.isParent) {
-      // 若该母项当前未展开，自动为用户展开下属子项方便修改
+      if (record.isLockedByChildren) {
+        message.warning(`成套设备「${record.name}」已修改下属子项，当前价格由子项自动汇总。如需直接修改父项，请先点击「重置子项」。`, 4);
+        return;
+      }
+      // 若该母项当前未展开，自动为用户展开下属子项方便查看
       if (!expandedRowKeys.includes(record.key)) {
         setExpandedRowKeys(prev => Array.from(new Set([...prev, record.key])));
       }
-      message.info(`成套设备「${record.name}」价格由下属 ${record.childCount || 0} 个子项自动汇总计算，单价已锁定，请在下方子项修改价格。`, 4);
+    } else {
+      if (record.isLockedByParent) {
+        message.warning(`该子项所属的成套设备「${record.parent_item || '父项'}」已启用父项自定义定价，子项已锁定。如需修改子项，请先点击「重置父项」。`, 4);
+        return;
+      }
     }
     setEditingKey(record.key);
     setEditingIndex(record.originalIndex);
@@ -653,14 +865,28 @@ export function CostTable({
     targetItem.remark = editRemark.trim();
     targetItem.qty = editQty > 0 ? editQty : 1;
     targetItem.unit = editUnit.trim() ? editUnit.trim() : null;
+    targetItem.ref_price = editPrice >= 0 ? editPrice : 0;
+    targetItem.subtotal = Number((targetItem.qty * targetItem.ref_price).toFixed(2));
 
-    // 若非成套母项，才允许直接更新自身单价与小计；成套母项的价格始终强制由下属子项求和驱动
-    if (!record.isParent) {
-      targetItem.ref_price = editPrice >= 0 ? editPrice : 0;
-      targetItem.subtotal = targetItem.qty * targetItem.ref_price;
-
-      if (targetItem.ref_price > 0 && (targetItem.match_quality === '未匹配' || !targetItem.match_quality)) {
-        targetItem.match_quality = '手动修改';
+    if (record.isParent) {
+      // 修改了父项：标记为父项自定义模式，锁定下属子项
+      targetItem.is_parent_modified = true;
+      targetItem.pricing_mode = 'parent';
+      targetItem.match_quality = '手动修改';
+    } else {
+      // 修改了子项或独立项
+      targetItem.is_child_modified = true;
+      targetItem.match_quality = '手动修改';
+      // 如果属于某个父项，将所属父项置为子项汇总定价模式
+      if (record.parent_item) {
+        const parentIdx = items.findIndex(it => it.name === record.parent_item || (it.children && it.name === record.parent_item));
+        if (parentIdx >= 0 && updatedItems[parentIdx]) {
+          updatedItems[parentIdx] = {
+            ...updatedItems[parentIdx],
+            is_parent_modified: false,
+            pricing_mode: 'children'
+          };
+        }
       }
     }
 
@@ -669,6 +895,216 @@ export function CostTable({
     setEditingKey(null);
     setEditingIndex(null);
     saveCostAnalysis(updatedItems);
+  };
+
+  // 重置父项：恢复父项初始基线数据，清除父项自定义覆盖，并解锁下属子项修改与添加权限
+  const handleResetParent = (record: CostItemNode) => {
+    const updatedItems = [...items];
+    const targetIdx = record.originalIndex;
+    if (targetIdx < 0 || targetIdx >= updatedItems.length) return;
+
+    const targetItem = { ...updatedItems[targetIdx] };
+    targetItem.name = targetItem.raw_name || targetItem.name;
+    targetItem.matched_brand = targetItem.raw_brand || '';
+    targetItem.brand = targetItem.raw_brand || '';
+    targetItem.matched_model = targetItem.raw_model || '';
+    targetItem.model = targetItem.raw_model || '';
+    targetItem.matched_manufacturer = targetItem.raw_manufacturer || '';
+    targetItem.manufacturer = targetItem.raw_manufacturer || '';
+    targetItem.spec_requirement = targetItem.raw_spec || targetItem.spec_requirement;
+    targetItem.qty = targetItem.raw_qty !== undefined ? targetItem.raw_qty : targetItem.qty;
+    targetItem.unit = targetItem.raw_unit || targetItem.unit;
+    targetItem.ref_price = targetItem.raw_ref_price !== undefined ? targetItem.raw_ref_price : 0;
+    targetItem.subtotal = Number(((targetItem.qty || 1) * targetItem.ref_price).toFixed(2));
+    targetItem.match_quality = targetItem.raw_match_quality || '成套汇总';
+    targetItem.is_parent_modified = false;
+    targetItem.pricing_mode = 'children';
+
+    updatedItems[targetIdx] = targetItem;
+    setItems(updatedItems);
+    if (editingIndex === targetIdx) {
+      handleCancelEdit();
+    }
+    saveCostAnalysis(updatedItems);
+    message.success(`已重置成套设备「${record.name}」，已恢复初始状态并解锁下属子项修改与添加！`, 4);
+  };
+
+  // 重置子项：恢复该成套设备下全部子项初始对标基线数据（清除新增子项并恢复修改项），并解锁父项直接修改
+  const handleResetChildren = (record: CostItemNode) => {
+    const parentName = record.name;
+    const updatedItems: any[] = [];
+
+    items.forEach((item, idx) => {
+      const isChildOfThisParent = item.parent_item === parentName || item.root_item === parentName;
+      if (isChildOfThisParent) {
+        // 如果是手动添加的子项，则直接移除
+        if (item.is_custom_added) {
+          return;
+        }
+        // 恢复原始子项属性
+        const restoredItem = { ...item };
+        restoredItem.name = restoredItem.raw_name || restoredItem.name;
+        restoredItem.matched_brand = restoredItem.raw_brand || '';
+        restoredItem.brand = restoredItem.raw_brand || '';
+        restoredItem.matched_model = restoredItem.raw_model || '';
+        restoredItem.model = restoredItem.raw_model || '';
+        restoredItem.matched_manufacturer = restoredItem.raw_manufacturer || '';
+        restoredItem.manufacturer = restoredItem.raw_manufacturer || '';
+        restoredItem.spec_requirement = restoredItem.raw_spec || restoredItem.spec_requirement;
+        restoredItem.qty = restoredItem.raw_qty !== undefined ? restoredItem.raw_qty : restoredItem.qty;
+        restoredItem.unit = restoredItem.raw_unit || restoredItem.unit;
+        restoredItem.ref_price = restoredItem.raw_ref_price !== undefined ? restoredItem.raw_ref_price : 0;
+        restoredItem.subtotal = Number(((restoredItem.qty || 1) * restoredItem.ref_price).toFixed(2));
+        restoredItem.match_quality = restoredItem.raw_match_quality || (restoredItem.ref_price > 0 ? '精准匹配' : '未匹配');
+        restoredItem.is_child_modified = false;
+        updatedItems.push(restoredItem);
+      } else {
+        if (idx === record.originalIndex) {
+          const restoredParent = { ...item };
+          restoredParent.is_parent_modified = false;
+          restoredParent.pricing_mode = 'children';
+          updatedItems.push(restoredParent);
+        } else {
+          updatedItems.push(item);
+        }
+      }
+    });
+
+    setItems(updatedItems);
+    handleCancelEdit();
+    saveCostAnalysis(updatedItems);
+    message.success(`已重置成套设备「${record.name}」的全部子项，已恢复初始对标状态并解锁父项直接修改！`, 4);
+  };
+
+  // 重置单项（适用于独立项或单个子项）
+  const handleResetSingleItem = (record: CostItemNode) => {
+    const updatedItems = [...items];
+    const targetIdx = record.originalIndex;
+    if (targetIdx < 0 || targetIdx >= updatedItems.length) return;
+
+    const item = { ...updatedItems[targetIdx] };
+    item.name = item.raw_name || item.name;
+    item.matched_brand = item.raw_brand || '';
+    item.brand = item.raw_brand || '';
+    item.matched_model = item.raw_model || '';
+    item.model = item.raw_model || '';
+    item.matched_manufacturer = item.raw_manufacturer || '';
+    item.manufacturer = item.raw_manufacturer || '';
+    item.spec_requirement = item.raw_spec || item.spec_requirement;
+    item.qty = item.raw_qty !== undefined ? item.raw_qty : item.qty;
+    item.unit = item.raw_unit || item.unit;
+    item.ref_price = item.raw_ref_price !== undefined ? item.raw_ref_price : 0;
+    item.subtotal = Number(((item.qty || 1) * item.ref_price).toFixed(2));
+    item.match_quality = item.raw_match_quality || (item.ref_price > 0 ? '精准匹配' : '未匹配');
+    item.is_child_modified = false;
+    item.is_parent_modified = false;
+
+    updatedItems[targetIdx] = item;
+    setItems(updatedItems);
+    if (editingIndex === targetIdx) {
+      handleCancelEdit();
+    }
+    saveCostAnalysis(updatedItems);
+    message.success(`已重置「${record.name}」至初始状态。`, 3);
+  };
+
+  // 打开添加子项弹窗
+  const handleOpenAddChildModal = (parentRecord: CostItemNode) => {
+    if (parentRecord.is_parent_modified) {
+      message.warning(`成套设备「${parentRecord.name}」已启用父项自定义定价。如需添加子项，请先重置父项。`, 4);
+      return;
+    }
+    setTargetParentNode(parentRecord);
+    setChildFormName('');
+    setChildFormBrand(parentRecord.brand || parentRecord.matched_brand || '');
+    setChildFormModel('');
+    setChildFormManufacturer(parentRecord.manufacturer || parentRecord.matched_manufacturer || '');
+    setChildFormSpec('');
+    setChildFormQty(1);
+    setChildFormUnit(parentRecord.unit === '面' || parentRecord.unit === '台' ? '台' : '件');
+    setChildFormPrice(0);
+    setChildFormPerSetQty(1);
+    setChildFormRemark('');
+    setIsAddChildModalOpen(true);
+  };
+
+  // 提交保存新增的子项
+  const handleSaveNewChildItem = () => {
+    if (!targetParentNode || !childFormName.trim()) {
+      message.error('请输入子项标的物/设备名称');
+      return;
+    }
+
+    const brandVal = childFormBrand.trim();
+    const modelVal = childFormModel.trim();
+    const mfgVal = childFormManufacturer.trim();
+    const specVal = childFormSpec.trim();
+    const remarkVal = childFormRemark.trim();
+
+    const newChild: any = {
+      name: childFormName.trim(),
+      spec_requirement: specVal || modelVal || `成套设备「${targetParentNode.name}」下属分项`,
+      qty: childFormQty > 0 ? childFormQty : 1,
+      unit: childFormUnit.trim() || '台',
+      ref_price: childFormPrice >= 0 ? childFormPrice : 0,
+      subtotal: Number(((childFormQty > 0 ? childFormQty : 1) * (childFormPrice >= 0 ? childFormPrice : 0)).toFixed(2)),
+      matched_name: childFormName.trim(),
+      matched_brand: brandVal || '自定义',
+      brand: brandVal || '自定义',
+      matched_model: modelVal,
+      model: modelVal,
+      matched_manufacturer: mfgVal,
+      manufacturer: mfgVal,
+      match_quality: '手动添加',
+      comparison_note: `成套设备「${targetParentNode.name}」下手动新增子项`,
+      remark: remarkVal,
+      key_parameters: [],
+      brand_requirements: brandVal,
+      parent_item: targetParentNode.name,
+      root_item: targetParentNode.root_item || targetParentNode.name,
+      tree_level: (targetParentNode.tree_level || 1) + 1,
+      per_set_qty: childFormPerSetQty > 0 ? childFormPerSetQty : (childFormQty > 0 ? childFormQty : 1),
+      per_set_quantity: childFormPerSetQty > 0 ? childFormPerSetQty : (childFormQty > 0 ? childFormQty : 1),
+      section_name: targetParentNode.section_name || null,
+      is_custom_added: true,
+      is_child_modified: true,
+      raw_ref_price: 0,
+      raw_qty: childFormQty > 0 ? childFormQty : 1,
+      raw_unit: childFormUnit.trim() || '台',
+      raw_name: childFormName.trim(),
+      raw_brand: brandVal,
+      raw_model: modelVal,
+      raw_manufacturer: mfgVal,
+      raw_spec: specVal,
+      raw_match_quality: '手动添加'
+    };
+
+    // 寻找插入位置：在该父项及其所有已有子项的最后位置插入
+    let insertIdx = targetParentNode.originalIndex + 1;
+    for (let i = targetParentNode.originalIndex + 1; i < items.length; i++) {
+      if (items[i].parent_item === targetParentNode.name || items[i].root_item === targetParentNode.name) {
+        insertIdx = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    const updatedItems = [...items];
+    const parentIdx = targetParentNode.originalIndex;
+    if (parentIdx >= 0 && parentIdx < updatedItems.length) {
+      updatedItems[parentIdx] = {
+        ...updatedItems[parentIdx],
+        is_parent_modified: false,
+        pricing_mode: 'children'
+      };
+    }
+    updatedItems.splice(insertIdx, 0, newChild);
+
+    setItems(updatedItems);
+    setExpandedRowKeys(prev => Array.from(new Set([...prev, targetParentNode.key])));
+    setIsAddChildModalOpen(false);
+    saveCostAnalysis(updatedItems);
+    message.success(`已成功为「${targetParentNode.name}」添加子项「${childFormName.trim()}」！`, 4);
   };
 
   // 添加自定义费用项
@@ -688,13 +1124,26 @@ export function CostTable({
     if (mfgVal) noteParts.push(`厂商: ${mfgVal}`);
     const comparisonNote = noteParts.length > 0 ? noteParts.join(' | ') : '用户在卡片上手动新增的成本费用分项';
 
-    const newItem = {
+    let parentName: string | null = null;
+    let rootName: string | null = null;
+    let level = 1;
+    let sectionVal = selectedSection !== 'ALL' ? selectedSection : null;
+
+    if (newParentItem) {
+      const parentObj = treeData.find(n => n.name === newParentItem);
+      parentName = newParentItem;
+      rootName = parentObj?.root_item || newParentItem;
+      level = parentObj ? (parentObj.tree_level || 1) + 1 : 2;
+      sectionVal = parentObj?.section_name || sectionVal;
+    }
+
+    const newItem: any = {
       name: newName.trim(),
-      spec_requirement: specVal || modelVal || '自定义费用分项（如人工/售后维保费）',
+      spec_requirement: specVal || modelVal || (parentName ? `成套设备「${parentName}」下属分项` : '自定义费用分项（如人工/售后维保费）'),
       qty: newQty > 0 ? newQty : 1,
-      unit: newUnit.trim() || '项',
+      unit: newUnit.trim() || (parentName ? '台' : '项'),
       ref_price: newPrice >= 0 ? newPrice : 0,
-      subtotal: (newQty > 0 ? newQty : 1) * (newPrice >= 0 ? newPrice : 0),
+      subtotal: Number(((newQty > 0 ? newQty : 1) * (newPrice >= 0 ? newPrice : 0)).toFixed(2)),
       matched_name: newName.trim(),
       matched_brand: brandVal || '自定义',
       brand: brandVal || '自定义',
@@ -707,10 +1156,51 @@ export function CostTable({
       remark: remarkVal,
       key_parameters: [],
       brand_requirements: brandVal,
-      section_name: selectedSection !== 'ALL' ? selectedSection : null
+      parent_item: parentName,
+      root_item: rootName,
+      tree_level: level,
+      per_set_qty: newQty > 0 ? newQty : 1,
+      per_set_quantity: newQty > 0 ? newQty : 1,
+      section_name: sectionVal,
+      is_custom_added: true,
+      is_child_modified: Boolean(parentName),
+      raw_ref_price: 0,
+      raw_qty: newQty > 0 ? newQty : 1,
+      raw_unit: newUnit.trim() || (parentName ? '台' : '项'),
+      raw_name: newName.trim(),
+      raw_brand: brandVal,
+      raw_model: modelVal,
+      raw_manufacturer: mfgVal,
+      raw_spec: specVal,
+      raw_match_quality: '手动添加'
     };
 
-    const updatedItems = [...items, newItem];
+    let updatedItems = [...items];
+    if (parentName) {
+      // 挂载到父项：寻找该父项及其子项的最后位置插入
+      const parentIdx = items.findIndex(it => it.name === parentName);
+      if (parentIdx >= 0) {
+        let insertIdx = parentIdx + 1;
+        for (let i = parentIdx + 1; i < items.length; i++) {
+          if (items[i].parent_item === parentName || items[i].root_item === parentName) {
+            insertIdx = i + 1;
+          } else {
+            break;
+          }
+        }
+        updatedItems[parentIdx] = {
+          ...updatedItems[parentIdx],
+          is_parent_modified: false,
+          pricing_mode: 'children'
+        };
+        updatedItems.splice(insertIdx, 0, newItem);
+      } else {
+        updatedItems.push(newItem);
+      }
+    } else {
+      updatedItems.push(newItem);
+    }
+
     setItems(updatedItems);
 
     setNewName('');
@@ -722,6 +1212,7 @@ export function CostTable({
     setNewQty(1);
     setNewUnit('项');
     setNewPrice(0);
+    setNewParentItem('');
     setIsAdding(false);
 
     saveCostAnalysis(updatedItems);
@@ -778,7 +1269,20 @@ export function CostTable({
             tree_level: item.tree_level || 1,
             per_set_qty: item.per_set_qty || item.per_set_quantity || null,
             per_set_quantity: item.per_set_quantity || item.per_set_qty || null,
-            section_name: normalizeSectionName(item.section_name)
+            section_name: normalizeSectionName(item.section_name),
+            is_parent_modified: Boolean(item.is_parent_modified),
+            is_child_modified: Boolean(item.is_child_modified),
+            is_custom_added: Boolean(item.is_custom_added),
+            pricing_mode: normalizeCostText(item.pricing_mode) || null,
+            raw_ref_price: item.raw_ref_price !== undefined ? item.raw_ref_price : null,
+            raw_name: normalizeCostText(item.raw_name) || null,
+            raw_brand: normalizeCostText(item.raw_brand) || null,
+            raw_model: normalizeCostText(item.raw_model) || null,
+            raw_manufacturer: normalizeCostText(item.raw_manufacturer) || null,
+            raw_spec: normalizeCostText(item.raw_spec) || null,
+            raw_qty: item.raw_qty !== undefined ? item.raw_qty : null,
+            raw_unit: normalizeCostText(item.raw_unit) || null,
+            raw_match_quality: normalizeCostText(item.raw_match_quality) || null
           })),
           analysis_summary: normalizeCostText(costAnalysis.analysis_summary) || '已手动调整 BOM 成本报价项与指导单价。'
         })
@@ -839,7 +1343,8 @@ export function CostTable({
     }
   };
 
-  const hasCostData = items.length > 0;
+  const hasItems = items.length > 0;
+  const hasCostData = hasItems && !isEquipmentOnly;
 
   // Ant Design 列配置
   const columns: ColumnsType<CostItemNode> = [
@@ -851,8 +1356,9 @@ export function CostTable({
       render: (_: any, record: CostItemNode) => {
         const isEditing = editingKey === record.key;
         const keyParams = Array.isArray(record.key_parameters) ? record.key_parameters : [];
-        const isManual = record.match_quality === '手动添加';
-        const isManualEdit = record.match_quality === '手动修改';
+        const isManual = record.match_quality === '手动添加' || record.is_custom_added;
+        const isManualEdit = record.match_quality === '手动修改' || record.is_child_modified;
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
         const level = record.tree_level || 1;
         // 严格 3 色循环阶梯：4 复用 1(蓝)、5 复用 2(靛)、6 复用 3(天蓝)...
         const colorTier = (((level - 1) % 3) + 1);
@@ -862,7 +1368,12 @@ export function CostTable({
             {/* 多级 BOM 层级与总成标识 */}
             <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
               {record.isParent ? (
-                colorTier === 1 ? (
+                isParentCustom ? (
+                  <span className="text-xs text-purple-950 bg-purple-100/90 px-2.5 py-1 rounded-xl border border-purple-300 font-bold shadow-2xs inline-flex items-center gap-1.5">
+                    <span className="text-[11px] px-1.5 py-0.5 rounded bg-purple-600 text-white font-mono font-black">L{level}</span>
+                    <span>🏷️ {level === 1 ? '成套主标的 (自定义统价)' : `${level}级成套总成 (自定义统价)`} (含 {record.childCount} 项)</span>
+                  </span>
+                ) : colorTier === 1 ? (
                   <span className="text-xs text-blue-950 bg-blue-100/90 px-2.5 py-1 rounded-xl border border-blue-300 font-bold shadow-2xs inline-flex items-center gap-1.5">
                     <span className="text-[11px] px-1.5 py-0.5 rounded bg-blue-600 text-white font-mono font-black">L{level}</span>
                     <span>📦 {level === 1 ? '一级成套主标的' : `${level}级成套总成`} (含 {record.childCount} 项)</span>
@@ -917,15 +1428,14 @@ export function CostTable({
               )}
             </div>
 
-            {/* 所属区域/标段提示徽章 (仅在存在多个不同分部时显示，单清单项目不显示以避免视觉冗余) */}
-            {availableSections.length > 1 && record.section_name && (
+            {/* 所属分项提示徽章：只要后端提供了语义分项就显示，不依赖分项数量。 */}
+            {record.section_name && (
               <div className="flex items-center gap-1.5 mb-1.5">
                 <span className="text-[11px] text-cyan-800 bg-cyan-50/90 px-2.5 py-0.5 rounded-md inline-flex items-center gap-1 font-bold border border-cyan-300/80 shadow-2xs">
-                  <span>📍 所属区域: <strong className="font-extrabold text-cyan-950">{record.section_name}</strong></span>
+                  <span>📍 所属分项: <strong className="font-extrabold text-cyan-950">{record.section_name}</strong></span>
                 </span>
               </div>
             )}
-
 
             {/* 设备名称与说明编辑态 */}
             {isEditing ? (
@@ -980,11 +1490,19 @@ export function CostTable({
                     </span>
                   )}
                   <span>{record.name}</span>
-                  {(isManual || isManualEdit) && (
+                  {record.isLockedByParent ? (
+                    <span className="bg-slate-100 text-slate-500 border border-slate-300 text-[10px] px-1.5 py-0.5 rounded font-bold ml-1" title="父项已启用自定义统价，子项已锁定修改">
+                      🔒 父项统价锁定
+                    </span>
+                  ) : record.is_custom_added ? (
+                    <span className="bg-emerald-50 text-emerald-600 border border-emerald-200 text-[10px] px-1.5 py-0.5 rounded font-bold ml-1">
+                      ✨ 新增子项
+                    </span>
+                  ) : (isManual || isManualEdit) ? (
                     <span className="bg-purple-50 text-purple-600 border border-purple-200 text-[10px] px-1.5 py-0.5 rounded font-bold ml-1">
                       {isManual ? '手动新增' : '手动修改'}
                     </span>
-                  )}
+                  ) : null}
                 </div>
 
                 {/* 标书原文/技术要求 */}
@@ -1026,8 +1544,9 @@ export function CostTable({
       render: (_: any, record: CostItemNode) => {
         const isEditing = editingKey === record.key;
         const currentRefPrice = isEditing ? editPrice : (record.ref_price ? Number(record.ref_price) : 0);
-        const isUnmatched = currentRefPrice <= 0 || (record.match_quality === '未匹配' && !record.isRollupPrice);
+        const isUnmatched = currentRefPrice <= 0 || (record.match_quality === '未匹配' && !record.isRollupPrice && !record.is_parent_modified);
         const isManual = record.match_quality === '手动添加';
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
 
         if (isEditing) {
           return (
@@ -1066,6 +1585,32 @@ export function CostTable({
                   className="text-xs font-medium"
                 />
               </div>
+            </div>
+          );
+        }
+
+        if (isParentCustom) {
+          const displayBrand = record.matched_brand || record.brand;
+          const displayModel = record.matched_model || record.model;
+          const displayMfg = record.matched_manufacturer || record.manufacturer;
+
+          return (
+            <div className="space-y-1.5 text-xs py-1">
+              <div className="font-bold text-purple-900 flex items-center gap-1.5">
+                <span className="text-purple-600 font-bold">🏷️</span>
+                <span className="text-sm text-slate-900 font-bold">成套总成 / 用户自定义统价</span>
+              </div>
+              <div className="text-[11px] bg-purple-50/95 text-purple-950 p-2.5 rounded-xl border border-purple-200/90 leading-relaxed font-medium shadow-2xs">
+                <span className="font-bold block mb-0.5 text-purple-800">📋 自定义定价说明：</span>
+                已直接自定义成套设备整体价格，下属 <strong className="text-purple-950 font-black">{record.childCount || 0}</strong> 个子项已被锁定。如需修改子项，请点击右侧「重置父项」。
+              </div>
+              {(displayBrand || displayModel || displayMfg) && (
+                <div className="flex flex-wrap gap-1 text-[11px] mt-1">
+                  {displayBrand && <span className="bg-purple-50 text-purple-700 px-2 py-0.5 rounded-md font-medium border border-purple-100">品牌: {displayBrand}</span>}
+                  {displayModel && <span className="bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-md font-medium border border-indigo-100">型号: {displayModel}</span>}
+                  {displayMfg && <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md font-medium">厂商: {displayMfg}</span>}
+                </div>
+              )}
             </div>
           );
         }
@@ -1186,14 +1731,18 @@ export function CostTable({
         const isExact = record.match_quality === '精准匹配';
         const isManual = record.match_quality === '手动添加';
         const isManualEdit = record.match_quality === '手动修改';
-        const isRollup = record.isRollupPrice || record.match_quality === '成套汇总' || record.match_quality === '子项汇总';
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
+        const isRollup = (record.isRollupPrice || record.match_quality === '成套汇总' || record.match_quality === '子项汇总') && !isParentCustom;
         const note = record.comparison_note || '';
         const isSpecDiff = note.includes("规格不同") || note.includes("量纲不一") || note.includes("差异") || note.includes("仅参考") || note.includes("不一致") || note.includes("偏离");
         const currentRefPrice = isEditing ? editPrice : (record.ref_price ? Number(record.ref_price) : 0);
-        const isUnmatched = currentRefPrice <= 0 || (record.match_quality === '未匹配' && !isRollup);
+        const isUnmatched = currentRefPrice <= 0 || (record.match_quality === '未匹配' && !isRollup && !isParentCustom);
 
         if (isEditing) {
           return <Tag color="processing">修改中</Tag>;
+        }
+        if (isParentCustom) {
+          return <Tag color="purple" className="font-bold border-purple-300">父项自定义</Tag>;
         }
         if (isRollup) {
           if (record.isPartialRollup) {
@@ -1288,38 +1837,38 @@ export function CostTable({
       render: (_: any, record: CostItemNode) => {
         const isEditing = editingKey === record.key;
         const currentRefPrice = isEditing ? editPrice : (record.ref_price ? Number(record.ref_price) : 0);
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
 
         if (isEditing) {
-          if (record.isParent) {
-            return (
-              <div className="flex flex-col items-end">
-                <Tooltip title="成套主标的物价格由下属子项自动汇总计算，禁止手动修改单价，请在下方修改子项">
-                  <InputNumber
-                    disabled
-                    prefix="¥"
-                    value={record.ref_price ? Number(record.ref_price) : 0}
-                    size="small"
-                    className="w-28 font-bold bg-slate-100/80 cursor-not-allowed text-indigo-700"
-                  />
-                </Tooltip>
-                <span className="text-[10px] text-slate-400 mt-0.5 font-medium flex items-center gap-0.5">
-                  <span>🔒</span>
-                  <span>子项汇总锁定</span>
-                </span>
-              </div>
-            );
-          }
-
           return (
-            <InputNumber
-              min={0}
-              step="any"
-              prefix="¥"
-              value={editPrice}
-              onChange={(v) => setEditPrice(v || 0)}
-              size="small"
-              className="w-28 font-bold"
-            />
+            <div className="flex flex-col items-end">
+              <InputNumber
+                min={0}
+                step="any"
+                prefix="¥"
+                value={editPrice}
+                onChange={(v) => setEditPrice(v || 0)}
+                size="small"
+                className="w-28 font-bold"
+              />
+              {record.isParent && (
+                <span className="text-[10px] text-purple-600 mt-0.5 font-bold flex items-center gap-0.5">
+                  <span>✏️</span>
+                  <span>自定义成套单价</span>
+                </span>
+              )}
+            </div>
+          );
+        }
+
+        if (isParentCustom && currentRefPrice > 0) {
+          return (
+            <div className="flex flex-col items-end">
+              <span className="font-extrabold text-purple-700 text-sm">¥{currentRefPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+              <span className="text-[10px] text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded border border-purple-200 mt-0.5 font-bold">
+                父项自定义单价
+              </span>
+            </div>
           );
         }
 
@@ -1339,6 +1888,17 @@ export function CostTable({
               <span className="font-extrabold text-indigo-700 text-sm">¥{currentRefPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
               <span className="text-[10px] text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-200 mt-0.5 font-bold">
                 子项折合单价
+              </span>
+            </div>
+          );
+        }
+
+        if (record.isLockedByParent) {
+          return (
+            <div className="flex flex-col items-end">
+              <span className="text-slate-400 font-normal text-xs">{currentRefPrice > 0 ? `¥${currentRefPrice.toLocaleString()}` : '--'}</span>
+              <span className="text-[10px] text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200 mt-0.5 font-normal">
+                已统入父项价
               </span>
             </div>
           );
@@ -1370,26 +1930,33 @@ export function CostTable({
         const currentQty = isEditing ? editQty : (record.qty !== null && record.qty !== undefined ? Number(record.qty) : 1);
         const currentRefPrice = isEditing ? editPrice : (record.ref_price ? Number(record.ref_price) : 0);
         const itemSubtotal = record.subtotal !== undefined ? record.subtotal : currentQty * currentRefPrice;
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
 
         if (itemSubtotal > 0) {
           if (record.isParent) {
             return (
               <div className="flex flex-col items-end">
-                <span className={`font-black text-sm whitespace-nowrap ${record.isPartialRollup ? 'text-amber-800' : 'text-indigo-800'}`}>
+                <span className={`font-black text-sm whitespace-nowrap ${
+                  isParentCustom ? 'text-purple-800' : (record.isPartialRollup ? 'text-amber-800' : 'text-indigo-800')
+                }`}>
                   ¥{itemSubtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </span>
-                {record.isRollupPrice && (
+                {isParentCustom ? (
+                  <span className="text-[10px] font-bold px-1.5 py-0.2 rounded border bg-purple-50 text-purple-700 border-purple-200">
+                    父项统定价总计
+                  </span>
+                ) : record.isRollupPrice ? (
                   <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded border ${
                     record.isPartialRollup ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-indigo-50/90 text-indigo-600 border-indigo-200'
                   }`}>
                     {record.isPartialRollup ? '阶段小计 (待补全)' : '成套总计'}
                   </span>
-                )}
+                ) : null}
               </div>
             );
           }
           return (
-            <span className="font-bold text-blue-600 whitespace-nowrap">
+            <span className={`font-bold whitespace-nowrap ${record.isLockedByParent ? 'text-slate-400' : 'text-blue-600'}`}>
               ¥{itemSubtotal.toLocaleString()}
             </span>
           );
@@ -1404,7 +1971,7 @@ export function CostTable({
       title: '备注',
       dataIndex: 'remark',
       key: 'remark',
-      width: 210,
+      width: 180,
       render: (_: any, record: CostItemNode) => {
         const isEditing = editingKey === record.key;
 
@@ -1435,7 +2002,7 @@ export function CostTable({
     {
       title: '操作',
       key: 'action',
-      width: 90,
+      width: 130,
       align: 'center',
       render: (_: any, record: CostItemNode) => {
         const isEditing = editingKey === record.key;
@@ -1463,16 +2030,155 @@ export function CostTable({
           );
         }
 
+        if (record.isParent) {
+          const isParentModified = Boolean(record.is_parent_modified || record.pricing_mode === 'parent');
+          const hasModifiedChildren = Boolean(record.hasModifiedChildren);
+
+          return (
+            <div className="flex items-center justify-center gap-1">
+              {/* 添加子项按钮 */}
+              {isParentModified ? (
+                <Tooltip title="父项已启用自定义定价，子项已锁定。如需添加子项，请先重置父项">
+                  <Button
+                    type="text"
+                    size="small"
+                    disabled
+                    icon={<PlusCircleOutlined className="text-slate-300 cursor-not-allowed" />}
+                  />
+                </Tooltip>
+              ) : (
+                <Tooltip title="为此成套设备添加子标的物/分项">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<PlusCircleOutlined className="text-blue-600 hover:text-blue-800" />}
+                    onClick={() => handleOpenAddChildModal(record)}
+                  />
+                </Tooltip>
+              )}
+
+              {/* 编辑父项按钮 */}
+              {hasModifiedChildren ? (
+                <Tooltip title="下属子项已修改，成套价格由子项自动汇总。如需直接修改父项，请先点击「重置子项」">
+                  <Button
+                    type="text"
+                    size="small"
+                    disabled
+                    icon={<EditOutlined className="text-slate-300 cursor-not-allowed" />}
+                  />
+                </Tooltip>
+              ) : (
+                <Tooltip title={isParentModified ? "修改成套设备价格与属性" : "直接修改成套设备价格（保存后将锁定子项）"}>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<EditOutlined className={isParentModified ? "text-purple-600 hover:text-purple-800" : "text-indigo-500 hover:text-indigo-700"} />}
+                    onClick={() => handleStartEdit(record)}
+                  />
+                </Tooltip>
+              )}
+
+              {/* 重置父项按钮（仅在父项已修改时显示） */}
+              {isParentModified && (
+                <Tooltip title="重置父项自定义修改，恢复初始对标价格并解锁子项">
+                  <Popconfirm
+                    title="确定重置父项？"
+                    description="将恢复父项初始数据，并解锁下属子项修改与添加权限。"
+                    onConfirm={() => handleResetParent(record)}
+                    okText="确定重置"
+                    cancelText="取消"
+                  >
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<UndoOutlined className="text-purple-600 hover:text-purple-800" />}
+                    />
+                  </Popconfirm>
+                </Tooltip>
+              )}
+
+              {/* 重置子项按钮（仅在子项被修改时显示） */}
+              {hasModifiedChildren && (
+                <Tooltip title="重置全部子项，恢复初始状态并解锁父项直接修改">
+                  <Popconfirm
+                    title="确定重置所有子项？"
+                    description="将恢复该成套设备下全部子项初始对标清单与价格，并解锁父项直接修改。"
+                    onConfirm={() => handleResetChildren(record)}
+                    okText="确定重置"
+                    cancelText="取消"
+                  >
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<ReloadOutlined className="text-amber-600 hover:text-amber-800" />}
+                    />
+                  </Popconfirm>
+                </Tooltip>
+              )}
+
+              {/* 删除整套设备 */}
+              <Popconfirm
+                title="确定移除此成套设备及下属分项？"
+                onConfirm={() => handleDeleteItem(record.originalIndex)}
+                okText="确定"
+                cancelText="取消"
+              >
+                <Button
+                  type="text"
+                  size="small"
+                  danger
+                  icon={<DeleteOutlined className="text-slate-300 hover:text-rose-600" />}
+                />
+              </Popconfirm>
+            </div>
+          );
+        }
+
+        // 子项或独立项
+        const isLockedByParent = Boolean(record.isLockedByParent);
+        const isChildModified = Boolean(record.is_child_modified || record.match_quality === '手动修改');
+
         return (
           <div className="flex items-center justify-center gap-1">
-            <Tooltip title={record.isParent ? `成套设备价格由下属 ${record.childCount || 0} 个子项自动汇总（单价锁定，点击可修改名称/数量）` : '修改单价与数量'}>
-              <Button
-                type="text"
-                size="small"
-                icon={<EditOutlined className={record.isParent ? 'text-indigo-400 hover:text-indigo-600' : 'text-slate-400 hover:text-blue-600'} />}
-                onClick={() => handleStartEdit(record)}
-              />
-            </Tooltip>
+            {isLockedByParent ? (
+              <Tooltip title="所属成套设备已启用父项自定义定价，子项已锁定。如需修改子项，请先在上方重置父项">
+                <Button
+                  type="text"
+                  size="small"
+                  disabled
+                  icon={<EditOutlined className="text-slate-300 cursor-not-allowed" />}
+                />
+              </Tooltip>
+            ) : (
+              <Tooltip title="修改此项单价与数量">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<EditOutlined className="text-slate-400 hover:text-blue-600" />}
+                  onClick={() => handleStartEdit(record)}
+                />
+              </Tooltip>
+            )}
+
+            {/* 单项重置按钮 */}
+            {isChildModified && !isLockedByParent && (
+              <Tooltip title="重置此项至初始对标状态">
+                <Popconfirm
+                  title={`确定重置「${record.name}」？`}
+                  description="将恢复该项初始基线数据。"
+                  onConfirm={() => handleResetSingleItem(record)}
+                  okText="确定重置"
+                  cancelText="取消"
+                >
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<UndoOutlined className="text-purple-600 hover:text-purple-800" />}
+                  />
+                </Popconfirm>
+              </Tooltip>
+            )}
+
             <Popconfirm
               title="确定移除此费用分项？"
               onConfirm={() => handleDeleteItem(record.originalIndex)}
@@ -1517,7 +2223,7 @@ export function CostTable({
           <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-white/50 backdrop-blur-[2px] rounded-3xl gap-2">
             <svg className="animate-spin h-8 w-8 text-blue-600" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
             <span className="text-xs font-bold text-blue-600">
-              {isExtractingEquipment ? '正在重新提取设备清单并计算成本...' : '正在重新对接价格库并计算成本...'}
+              {isExtractingEquipment ? '正在重新提取设备清单...' : '正在重新匹配 BOM 清单并计算成本...'}
             </span>
           </div>
         )}
@@ -1527,14 +2233,14 @@ export function CostTable({
           <div>
             <h3 className="text-xl font-extrabold text-slate-800 flex items-center flex-wrap gap-2 mb-1">
               <span className="p-1.5 bg-blue-100 text-blue-600 rounded-lg text-sm">💰</span>
-              智能 BOM 成本测算与对标匹配
+              {isEquipmentOnly ? 'BOM 设备清单（待匹配）' : '智能 BOM 成本测算与对标匹配'}
               {onReextractEquipment && (
                 <button
                   onClick={(e) => { e.stopPropagation(); onReextractEquipment(); }}
                   disabled={isBusy}
                   className="inline-flex items-center gap-1.5 px-2 py-1 ml-1 text-xs font-semibold text-blue-600 hover:text-blue-700 hover:bg-blue-50 rounded-md transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
                   aria-label="重新提取设备清单"
-                  title="重新读取原文并提取设备清单，完成后自动重新核算成本"
+                  title="重新读取原文并提取设备清单，完成后等待手动进行价格匹配"
                 >
                   <FileSearchOutlined />
                   <span>重新提取设备清单</span>
@@ -1544,10 +2250,12 @@ export function CostTable({
                 <button 
                   onClick={(e) => { e.stopPropagation(); onReextract(); }}
                   disabled={isBusy}
-                  className="p-1.5 ml-1 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors cursor-pointer"
-                  title="重新对接价格库并测算成本"
+                  className="inline-flex items-center gap-1.5 px-2 py-1 ml-1 text-xs font-semibold text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+                  aria-label="重新匹配 BOM 清单"
+                  title="重新匹配 BOM 清单，并重新计算参考单价与成本"
                 >
                   <ReloadOutlined className="text-sm" />
+                  <span>重新匹配 BOM 清单</span>
                 </button>
               )}
               {hasCostData && (
@@ -1586,9 +2294,11 @@ export function CostTable({
               )}
             </h3>
             <p className="text-sm text-slate-500 font-medium">
-              {hasCostData 
-                ? `全库匹配 ${items.length} 项（点击 ✏️ 可随时修改参考单价与数量）` 
-                : "自动提取标书货物需求明细，结合价格库测算成本与风险..."}
+              {isEquipmentOnly
+                ? `已提取清单 ${items.length} 项，尚未进行价格匹配`
+                : hasCostData
+                  ? `全库匹配 ${items.length} 项（点击 ✏️ 可随时修改参考单价与数量）`
+                  : "自动提取标书货物需求明细，结合价格库测算成本与风险..."}
             </p>
           </div>
 
@@ -1685,7 +2395,7 @@ export function CostTable({
         )}
 
         {/* 顶部父子树形折叠控制与多区域快速筛选工具栏 */}
-        {hasCostData && (
+        {hasItems && (
           <div className="flex flex-col gap-2.5 mb-3 px-1">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 font-medium">
@@ -1710,7 +2420,7 @@ export function CostTable({
                           : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
                       }`}
                     >
-                      全部区域 ({items.length})
+                      全部分项 ({items.length})
                     </button>
                     {availableSections.map(sec => {
                       const secCount = items.filter(it => normalizeSectionName(it.section_name) === sec).length;
@@ -1866,7 +2576,7 @@ export function CostTable({
               border-bottom: 2px solid #eab308 !important;
             }
           `}</style>
-          {hasCostData ? (
+          {hasItems ? (
             <Table<CostItemNode>
               columns={columns}
               dataSource={filteredTreeData}
@@ -2049,6 +2759,21 @@ export function CostTable({
                 </div>
 
                 <div className="md:col-span-3">
+                  <label className="block text-slate-500 font-bold mb-1">所属成套设备 (可选，默认独立设备)</label>
+                  <Select
+                    allowClear
+                    placeholder="选择挂载的成套设备 (留空则为独立主项)"
+                    value={newParentItem || undefined}
+                    onChange={(val) => setNewParentItem(val || '')}
+                    className="w-full"
+                    options={treeData.filter(n => n.isParent || n.tree_level === 1).map(n => ({
+                      label: `${n.name} (L${n.tree_level || 1})`,
+                      value: n.name
+                    }))}
+                  />
+                </div>
+
+                <div className="md:col-span-6">
                   <label className="block text-slate-500 font-bold mb-1">内容说明</label>
                   <input
                     type="text"
@@ -2127,6 +2852,140 @@ export function CostTable({
             </form>
           )}
         </div>
+
+        {/* 为指定成套设备添加子项弹窗 Modal */}
+        <Modal
+          title={
+            <div className="flex items-center gap-2 text-slate-800 font-extrabold pb-2 border-b border-slate-100">
+              <span className="text-blue-600 text-lg">➕</span>
+              <span>为成套设备「{targetParentNode?.name}」添加子标的物 / 分项</span>
+            </div>
+          }
+          open={isAddChildModalOpen}
+          onOk={handleSaveNewChildItem}
+          onCancel={() => setIsAddChildModalOpen(false)}
+          okText="确认添加并自动汇总"
+          cancelText="取消"
+          width={650}
+          destroyOnClose
+          okButtonProps={{ className: 'bg-blue-600 hover:bg-blue-700 font-bold rounded-xl' }}
+          cancelButtonProps={{ className: 'rounded-xl font-bold' }}
+        >
+          <div className="py-2 space-y-3.5 text-xs">
+            <div className="bg-blue-50/80 p-2.5 rounded-xl border border-blue-200/80 text-blue-900 leading-relaxed font-medium">
+              💡 <strong>说明：</strong>新增的子项将自动挂载至「<strong>{targetParentNode?.name}</strong>」下，保存后将自动触发成套设备价格自底向上汇总重新计算。
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="md:col-span-2">
+                <label className="block text-slate-600 font-bold mb-1">标的物 / 子项设备名称 *</label>
+                <Input
+                  required
+                  placeholder="例如: 智能微断开关 / 防雷浪涌保护器 / 传感器"
+                  value={childFormName}
+                  onChange={(e) => setChildFormName(e.target.value)}
+                  className="font-bold text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 font-bold mb-1">品牌</label>
+                <Input
+                  placeholder="例如: 施耐德 / 正泰 / 华为 / 自定义"
+                  value={childFormBrand}
+                  onChange={(e) => setChildFormBrand(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 font-bold mb-1">规格 / 型号</label>
+                <Input
+                  placeholder="例如: iC65N 2P C16A / SPD-40kA"
+                  value={childFormModel}
+                  onChange={(e) => setChildFormModel(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 font-bold mb-1">生产厂家</label>
+                <Input
+                  placeholder="例如: 施耐德电气(中国)有限公司"
+                  value={childFormManufacturer}
+                  onChange={(e) => setChildFormManufacturer(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 font-bold mb-1">单套定额数量 (每套成套设备所需数量)</label>
+                <InputNumber
+                  min={0.01}
+                  step="any"
+                  value={childFormPerSetQty}
+                  onChange={(v) => {
+                    const pQty = v || 1;
+                    setChildFormPerSetQty(pQty);
+                    if (targetParentNode?.qty) {
+                      setChildFormQty(Number((pQty * (targetParentNode.qty || 1)).toFixed(2)));
+                    }
+                  }}
+                  className="w-full font-bold"
+                />
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="block text-slate-600 font-bold mb-1">规格参数 / 内容要求</label>
+                <Input.TextArea
+                  rows={2}
+                  placeholder="技术要求或规格参数说明"
+                  value={childFormSpec}
+                  onChange={(e) => setChildFormSpec(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 font-bold mb-1">总工程量 (数量)</label>
+                <InputNumber
+                  min={0.01}
+                  step="any"
+                  value={childFormQty}
+                  onChange={(v) => setChildFormQty(v || 1)}
+                  className="w-full font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 font-bold mb-1">单位</label>
+                <Input
+                  placeholder="台 / 个 / 套 / 块"
+                  value={childFormUnit}
+                  onChange={(e) => setChildFormUnit(e.target.value)}
+                />
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="block text-slate-600 font-bold mb-1">参考指导单价 (元) *</label>
+                <InputNumber
+                  min={0}
+                  step="any"
+                  prefix="¥"
+                  placeholder="0.00"
+                  value={childFormPrice}
+                  onChange={(v) => setChildFormPrice(v || 0)}
+                  className="w-full font-bold text-base text-blue-700"
+                />
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="block text-slate-600 font-bold mb-1">备注说明</label>
+                <Input
+                  placeholder="例如: 随箱成套配置、含安装附件"
+                  value={childFormRemark}
+                  onChange={(e) => setChildFormRemark(e.target.value)}
+                />
+              </div>
+            </div>
+          </div>
+        </Modal>
       </div>
     </ConfigProvider>
   );

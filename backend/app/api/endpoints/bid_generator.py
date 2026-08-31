@@ -33,6 +33,110 @@ from app.services.bid_format_extractor_service import bid_format_extractor_servi
 
 router = APIRouter()
 
+FIRST_BID_FILL_DURATION_KEY = "first_bid_fill_duration_ms"
+
+
+def _get_first_bid_fill_duration_ms(db: Session, document_id: str) -> int:
+    """读取文档首次全量撰写完成时持久化的端到端耗时。"""
+    from app.db.models.project import Document
+
+    document = db.query(Document).filter(Document.id == document_id).first()
+    metadata = getattr(document, "parsed_metadata", None) or {}
+    duration_ms = metadata.get(FIRST_BID_FILL_DURATION_KEY) if isinstance(metadata, dict) else None
+    if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool) and duration_ms > 0:
+        return int(duration_ms)
+    return 0
+
+
+def _restore_profile_slots_after_chapter_reset(
+    docx_path: str,
+    profile: Any,
+    timeline: Any,
+    chapter_title: str,
+) -> int:
+    """在章节还原模板后，按现有字段映射补全可确认的企业档案槽位。"""
+    if not docx_path or not os.path.exists(docx_path):
+        return 0
+
+    try:
+        from docx import Document
+        from app.agents.bid_filler_agent import _auto_fill_profile_slots
+        from app.utils.table_utils import get_chapter_body_elements
+
+        document = Document(docx_path)
+        chapter_elements = get_chapter_body_elements(document, chapter_title)
+        if not chapter_elements:
+            logger.warning(
+                "单章节重置后的档案槽位回填未找到目标章节范围: chapter={}",
+                chapter_title,
+            )
+            return 0
+
+        filled_count = _auto_fill_profile_slots(
+            document,
+            [profile] if profile is not None else [],
+            timeline_source=timeline,
+            allowed_elements=chapter_elements,
+        )
+        if filled_count:
+            document.save(docx_path)
+            logger.info(
+                "🔄 [单章节模板回填] 章节重置后按现有字段映射补全 {} 个可确认槽位",
+                filled_count,
+            )
+        return filled_count
+    except Exception as restore_error:
+        logger.exception(
+            "单章节重置后的企业档案槽位回填异常: {}",
+            restore_error,
+        )
+        return 0
+
+
+def _query_first_bid_fill_duration_ms(document_id: str) -> int:
+    """在线程池中查询首次撰写耗时，供 SSE 轮询复用独立数据库会话。"""
+    from app.db.session import SessionLocal
+    from sqlalchemy.exc import SQLAlchemyError
+
+    session: Session = SessionLocal()
+    try:
+        return _get_first_bid_fill_duration_ms(session, document_id)
+    except (SQLAlchemyError, AttributeError, TypeError, ValueError) as query_err:
+        logger.exception(f"查询首次标书撰写耗时失败: document_id={document_id}, error={query_err}")
+        return 0
+    finally:
+        session.close()
+
+
+def _persist_first_bid_fill_duration(db: Session, document_id: str, duration_ms: int) -> None:
+    """仅在首次成功完成全量撰写时保存耗时，后续生成不得覆盖该基准值。"""
+    if duration_ms <= 0:
+        logger.warning(f"首次标书撰写耗时无效，跳过持久化: document_id={document_id}, duration_ms={duration_ms}")
+        return
+
+    from app.db.models.project import Document
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if document is None:
+            logger.warning(f"未找到文档，无法持久化首次标书撰写耗时: document_id={document_id}")
+            return
+
+        metadata = dict(getattr(document, "parsed_metadata", None) or {})
+        existing_duration = metadata.get(FIRST_BID_FILL_DURATION_KEY)
+        if isinstance(existing_duration, (int, float)) and not isinstance(existing_duration, bool) and existing_duration > 0:
+            logger.info(f"首次标书撰写耗时已存在，保持原值: document_id={document_id}, duration_ms={int(existing_duration)}")
+            return
+
+        metadata[FIRST_BID_FILL_DURATION_KEY] = int(duration_ms)
+        document.parsed_metadata = metadata
+        db.commit()
+        logger.info(f"已持久化首次标书撰写耗时: document_id={document_id}, duration_ms={duration_ms}")
+    except (SQLAlchemyError, AttributeError, TypeError, ValueError) as persist_err:
+        db.rollback()
+        logger.exception(f"持久化首次标书撰写耗时失败: document_id={document_id}, error={persist_err}")
+
 
 def _get_bid_fill_pipeline_state(logs: list) -> Dict[str, Any]:
     """根据最终 Supervisor 终态日志判断整条标书填报流水线状态。"""
@@ -74,6 +178,46 @@ def _get_bid_fill_pipeline_state(logs: list) -> Dict[str, Any]:
         "pipeline_message": "后台填报流程异常结束，请查看审计日志",
         "is_completed": True,
     }
+
+
+def _query_bid_fill_logs(document_id: str) -> list[Any]:
+    """在线程池中查询标书撰写日志，避免同步数据库 I/O 阻塞事件循环。"""
+    from app.db.models.audit import AgentAuditLog
+    from app.db.session import SessionLocal
+    from sqlalchemy import cast, desc, String
+
+    session: Session = SessionLocal()
+    try:
+        try:
+            return (
+                session.query(AgentAuditLog)
+                .filter(
+                    or_(
+                        AgentAuditLog.task_id == document_id,
+                        cast(AgentAuditLog.inputs, String).like(f"%{document_id}%")
+                    )
+                )
+                .order_by(desc(AgentAuditLog.created_at))
+                .all()
+            )
+        except Exception as filter_err:
+            # 兼容历史数据库 JSON 字段类型不支持 CAST LIKE 的情况。
+            logger.warning(f"基于 SQL 过滤 AgentAuditLog 异常，降级全量过滤: {filter_err}")
+            all_logs = (
+                session.query(AgentAuditLog)
+                .order_by(desc(AgentAuditLog.created_at))
+                .limit(200)
+                .all()
+            )
+            return [
+                log for log in all_logs
+                if log.task_id == document_id or document_id in str(log.inputs or {})
+            ]
+    except Exception as query_err:
+        logger.exception(f"查询标书撰写日志失败: document_id={document_id}, error={query_err}")
+        return []
+    finally:
+        session.close()
 
 
 # ============================================================
@@ -135,7 +279,7 @@ def get_bidding_documents_list(
 
 
 @router.get("/fill-bid-format/{document_id}/worker-logs")
-async def get_bid_fill_worker_logs(
+def get_bid_fill_worker_logs(
     document_id: str,
     db: Session = Depends(deps.get_db),
     current_user: Optional[User] = Depends(deps.get_current_user_optional)
@@ -170,7 +314,8 @@ async def get_bid_fill_worker_logs(
         worker_items = []
         seen_chapters = set()
 
-        total_wall_time_ms = 0
+        first_bid_fill_duration_ms = _get_first_bid_fill_duration_ms(db, document_id)
+        total_wall_time_ms = first_bid_fill_duration_ms
         min_created_at = None
         max_created_at = None
 
@@ -181,7 +326,7 @@ async def get_bid_fill_worker_logs(
                 if max_created_at is None or log.created_at > max_created_at:
                     max_created_at = log.created_at
 
-            if log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
+            if total_wall_time_ms == 0 and log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
                 total_wall_time_ms = max(total_wall_time_ms, log.execution_time_ms)
 
             if log.action_type in ("llm_call_worker", "llm_call_supervisor", "chapter_execution") or (log.node_name and (log.node_name.startswith("BidFillerWorker") or "Supervisor" in log.node_name)):
@@ -225,6 +370,7 @@ async def get_bid_fill_worker_logs(
             "total_workers_count": len(worker_items),
             "worker_items": worker_items,
             "total_wall_time_ms": total_wall_time_ms,
+            "first_bid_fill_duration_ms": first_bid_fill_duration_ms,
             "total_worker_time_ms": total_worker_time_ms,
             **pipeline_state,
         }
@@ -235,16 +381,13 @@ async def get_bid_fill_worker_logs(
             "total_workers_count": 0,
             "worker_items": [],
             "total_wall_time_ms": 0,
+            "first_bid_fill_duration_ms": 0,
             "total_worker_time_ms": 0
         }
 
 
 @router.get("/fill-bid-format/{document_id}/stream-logs")
-async def stream_bid_fill_worker_logs(
-    document_id: str,
-    db: Session = Depends(deps.get_db),
-    current_user: Optional[User] = Depends(deps.get_current_user_optional)
-):
+async def stream_bid_fill_worker_logs(document_id: str):
     """
     通过 SSE (Server-Sent Events) 实时推流获取 BidFillerWorker 全套 Agent 节点运行履历与 CoT 思维链
     """
@@ -254,36 +397,20 @@ async def stream_bid_fill_worker_logs(
     async def log_event_generator():
         import asyncio
         import time
-        from app.db.models.audit import AgentAuditLog
-        from sqlalchemy import desc, cast, String
-        from app.db.session import SessionLocal
 
         last_json = None
         same_count = 0
 
         while True:
-            session: Session = SessionLocal()
             try:
-                try:
-                    logs = (
-                        session.query(AgentAuditLog)
-                        .filter(
-                            or_(
-                                AgentAuditLog.task_id == document_id,
-                                cast(AgentAuditLog.inputs, String).like(f"%{document_id}%")
-                            )
-                        )
-                        .order_by(desc(AgentAuditLog.created_at))
-                        .all()
-                    )
-                except Exception:
-                    all_logs = session.query(AgentAuditLog).order_by(desc(AgentAuditLog.created_at)).limit(200).all()
-                    logs = [l for l in all_logs if l.task_id == document_id or document_id in str(l.inputs or {})]
+                # 数据库查询放入线程池，确保 SSE 轮询不会占用 FastAPI 主事件循环。
+                logs = await run_in_threadpool(_query_bid_fill_logs, document_id)
 
                 worker_items = []
                 seen_chapters = set()
 
-                total_wall_time_ms = 0
+                first_bid_fill_duration_ms = await run_in_threadpool(_query_first_bid_fill_duration_ms, document_id)
+                total_wall_time_ms = first_bid_fill_duration_ms
                 min_created_at = None
                 max_created_at = None
 
@@ -294,7 +421,7 @@ async def stream_bid_fill_worker_logs(
                         if max_created_at is None or log.created_at > max_created_at:
                             max_created_at = log.created_at
 
-                    if log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
+                    if total_wall_time_ms == 0 and log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
                         total_wall_time_ms = max(total_wall_time_ms, log.execution_time_ms)
 
                     if log.action_type in ("llm_call_worker", "llm_call_supervisor", "chapter_execution") or (log.node_name and (log.node_name.startswith("BidFillerWorker") or "Supervisor" in log.node_name)):
@@ -342,6 +469,7 @@ async def stream_bid_fill_worker_logs(
                     "pipeline_status": pipeline_state["pipeline_status"],
                     "pipeline_message": pipeline_state["pipeline_message"],
                     "total_wall_time_ms": total_wall_time_ms,
+                    "first_bid_fill_duration_ms": first_bid_fill_duration_ms,
                     "total_worker_time_ms": total_worker_time_ms,
                     "timestamp": time.time()
                 }
@@ -360,8 +488,6 @@ async def stream_bid_fill_worker_logs(
 
             except Exception as e:
                 logger.error(f"SSE 推流日志生成异常: {e}")
-            finally:
-                session.close()
 
             await asyncio.sleep(1.0)
 
@@ -397,7 +523,11 @@ async def regenerate_single_chapter(
     category = (request_body.category or "needs_fill").strip()
     mapping_hint = (request_body.mapping_hint or "").strip()
 
-    logger.info(f"🔄 收到单章节重新生成/微调请求: doc_id={document_id}, chapter={chapter_title}, prompt='{custom_prompt[:60]}'")
+    logger.info(
+        f"🔄 收到单章节重新生成/微调请求: doc_id={document_id}, "
+        f"chapter={chapter_title}, profile_id={request_body.profile_id}, "
+        f"prompt='{custom_prompt[:60]}'"
+    )
 
     # 1. 准备 Word 工作副本与纯净原始模板
     drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
@@ -430,6 +560,9 @@ async def regenerate_single_chapter(
     token_task = current_task_id.set(document_id)
     token_u = current_user_id.set(u_id)
     token_t = current_tenant_id.set(t_id)
+    # 单章节重生成与全量撰写保持一致，显式绑定本次选择的企业主体。
+    from app.agents.tools.bid_db_tools import current_profile_id as ctx_profile_id
+    token_profile = ctx_profile_id.set(request_body.profile_id)
 
     # 3. 记录初始进行中状态
     try:
@@ -437,7 +570,13 @@ async def regenerate_single_chapter(
         audit_service.log_event(
             action_type="llm_call_worker",
             node_name=f"BidFillerWorker-{chapter_title[:30]}",
-            inputs={"chapter_title": chapter_title, "category": category, "document_id": document_id, "custom_prompt": custom_prompt},
+            inputs={
+                "chapter_title": chapter_title,
+                "category": category,
+                "document_id": document_id,
+                "profile_id": request_body.profile_id,
+                "custom_prompt": custom_prompt,
+            },
             outputs={
                 "summary": f"🔄 正在根据用户提示词对章节 [{chapter_title}] 重新起草与微调...",
                 "proposals_count": 0,
@@ -498,12 +637,15 @@ async def regenerate_single_chapter(
 
         # 预读取企业档案与项目元数据（用于公文类单章微调定向注入）
         prefetched_metadata: Dict[str, Any] = {}
+        prof = None
+        tl = None
         try:
-            from app.db.models.business import CompanyProfileModel
+            from app.agents.tools.bid_db_tools import resolve_company_profile
             from app.db.models.metadata import TimelineMetadata, FinancialMetadata
             from app.utils.rmb_formatter import number_to_chinese_rmb
 
-            prof = db.query(CompanyProfileModel).first()
+            # 读取指定主体，禁止通过无序 first() 串用其他企业档案。
+            prof = resolve_company_profile(db, request_body.profile_id)
             if prof:
                 if prof.company_name: prefetched_metadata["company_name"] = prof.company_name
                 if prof.credit_code: prefetched_metadata["credit_code"] = prof.credit_code
@@ -539,6 +681,16 @@ async def regenerate_single_chapter(
         except Exception as e_meta:
             logger.warning(f"微调接口预读取企业与项目元数据异常: {e_meta}")
 
+        # Worker 提案数量受模型判断影响，不能用它作为模板槽位完整性的唯一保证。
+        # 章节已还原为干净模板后，先用统一字段映射回填已确认的档案值，再交给 Worker
+        # 处理需要语义判断的内容；这样不会依赖某一种表单名称或固定段落编号。
+        restored_slot_count = _restore_profile_slots_after_chapter_reset(
+            working_docx_path,
+            prof,
+            tl,
+            chapter_title,
+        )
+
         start_time = time.time()
         worker_res = await run_in_threadpool(
             run_chapter_worker,
@@ -553,6 +705,7 @@ async def regenerate_single_chapter(
             extra_instructions=custom_prompt or "请按照主流程标准，全量重新检索招标文件与数据库并完成全表覆写。",
             repair_instructions="",
             prefetched_metadata=prefetched_metadata,
+            tenant_id=t_id,
         )
         elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -635,6 +788,7 @@ async def regenerate_single_chapter(
             current_task_id.reset(token_task)
             current_user_id.reset(token_u)
             current_tenant_id.reset(token_t)
+            ctx_profile_id.reset(token_profile)
         except Exception:
             pass
 
@@ -677,7 +831,7 @@ async def get_bid_fill_audit_report(
 
     # 融合直查数据库得到的子 Agent 思考全过程履历
     try:
-        worker_logs = await get_bid_fill_worker_logs(document_id=document_id, db=db, current_user=current_user)
+        worker_logs = get_bid_fill_worker_logs(document_id=document_id, db=db, current_user=current_user)
         res_dict["worker_items"] = worker_logs.get("worker_items", [])
         res_dict["total_workers_count"] = worker_logs.get("total_workers_count", 0)
     except Exception as exc:
@@ -1100,6 +1254,7 @@ def _run_agent_bid_filling_in_background(
 
             # 写入 Supervisor 最终完成日志，记录端到端真实物理总耗时
             total_wall_ms = int((_bg_time.time() - bg_start_t) * 1000)
+            _persist_first_bid_fill_duration(db, document_id, total_wall_ms)
             try:
                 from app.db.models.audit import AgentAuditLog
                 final_sup_log = AgentAuditLog(

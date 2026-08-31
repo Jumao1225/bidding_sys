@@ -255,6 +255,22 @@ def test_image_proposal_should_reject_mismatched_target_and_accept_dynamic_ancho
             os.remove(docx_path)
 
 
+def test_image_anchor_should_tolerate_dynamic_suffix_difference():
+    """图片锚点匹配应允许同一材料名称后附等级等动态后缀差异。"""
+    from app.agents.bid_filler_agent import _image_target_matches_anchor
+
+    doc = Document()
+    paragraph = doc.add_paragraph("需满足：核心能力等级达到甲级。")
+
+    assert _image_target_matches_anchor(
+        paragraph,
+        {
+            "anchor_text": "需满足：核心能力等级达到甲级。",
+            "caption": "核心能力等级乙级",
+        },
+    ) is True
+
+
 def test_text_requirement_image_embedding(temp_qualification_image):
     """测试当 Word 模版只有纯文本条款（如截图中的 1. 营业执照... 8. 电力工程施工总承包...安全生产许可证）时，自动在该条款段落下方插入图片"""
     with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:

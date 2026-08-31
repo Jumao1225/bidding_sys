@@ -1,5 +1,6 @@
 from langchain_core.tools import tool
 import json
+import re
 from typing import Any, Callable, Optional, Sequence
 
 from loguru import logger
@@ -22,6 +23,92 @@ FINANCIAL_LIMIT_KEYWORDS = (
 )
 FINANCIAL_FALLBACK_KEYWORDS = ("预算", "限价", "控制价")
 FINANCIAL_CORE_MATCH_LIMIT = 4
+
+
+def _discover_table_chapter_titles(
+    document_id: str,
+    search_keywords: str,
+    tenant_id: Optional[str],
+) -> list[str]:
+    """从当前文档的表格分块中发现相关章节，不依赖固定章节名称。"""
+    from app.db.models.project import DocChunk
+    from app.db.session import SessionLocal
+
+    query_tokens = [
+        token
+        for token in re.split(r"[\s,，、;；|]+", search_keywords or "")
+        if len(token.strip()) >= 2
+    ]
+    db = SessionLocal()
+    try:
+        query = db.query(DocChunk).filter(
+            DocChunk.document_id == document_id,
+            DocChunk.chunk_index > 0,
+            or_(DocChunk.content_type.is_(None), DocChunk.content_type != "toc_block"),
+            DocChunk.section_title.isnot(None),
+        )
+        if tenant_id:
+            query = query.filter(DocChunk.tenant_id == tenant_id)
+
+        section_scores: dict[str, tuple[int, int]] = {}
+        for chunk in query.order_by(DocChunk.chunk_index).all():
+            content = str(chunk.content or "")
+            has_html_table = bool(re.search(r"<table[\s\S]*?</table>", content, re.IGNORECASE))
+            has_markdown_table = bool(
+                re.search(r"(?:^|\n)\|[^\n]+\|\n\|[-:\s|]+\|", content)
+            )
+            if not has_html_table and not has_markdown_table:
+                continue
+
+            section_title = str(chunk.section_title or "").strip()
+            if not section_title:
+                continue
+            keyword_score = sum(content.count(token) for token in query_tokens)
+            table_score, previous_keyword_score = section_scores.get(section_title, (0, 0))
+            section_scores[section_title] = (
+                table_score + 1,
+                previous_keyword_score + keyword_score,
+            )
+
+        if not section_scores:
+            logger.info("未发现包含结构化表格的章节，继续使用 RAG 召回上下文：文档ID={}", document_id)
+            return []
+
+        # 优先选择同时命中查询词的表格章节；没有关键词命中时再保留所有表格章节。
+        relevant_sections = [
+            section
+            for section, (_, keyword_score) in section_scores.items()
+            if keyword_score > 0
+        ]
+        if relevant_sections:
+            # 只保留与最高相关章节接近的候选，避免“设备、规格、数量”等通用词把投标格式/合同表格带入工程上下文。
+            highest_keyword_score = max(section_scores[section][1] for section in relevant_sections)
+            minimum_keyword_score = max(1, highest_keyword_score * 0.75)
+            selected_sections = [
+                section
+                for section in relevant_sections
+                if section_scores[section][1] >= minimum_keyword_score
+            ]
+        else:
+            selected_sections = list(section_scores)
+        selected_sections.sort(
+            key=lambda section: (
+                section_scores[section][1],
+                section_scores[section][0],
+            ),
+            reverse=True,
+        )
+        logger.info(
+            "从文档表格分块发现工程清单候选章节：文档ID={}，章节={}",
+            document_id,
+            selected_sections,
+        )
+        return selected_sections
+    except SQLAlchemyError:
+        logger.exception("发现工程清单候选章节失败，继续使用 RAG 召回上下文：文档ID={}", document_id)
+        return []
+    finally:
+        db.close()
 
 
 def _select_financial_core_chunks(chunks: Sequence[Any]) -> list[Any]:
@@ -100,8 +187,9 @@ def _extract_and_format(
     section_title: str = None,
     context_mode: str = "window",
     context_enricher: Optional[Callable[[str, Optional[str]], str]] = None,
+    prefer_full_chapter: bool = False,
 ) -> str:
-    """内部通用辅助方法：执行RAG并提取元数据"""
+    """内部通用辅助方法：执行 RAG、补齐必要章节上下文并提取元数据。"""
     try:
         from app.worker.tasks import emit_agent_log
         from app.agents.tools.security import validate_document_access
@@ -111,7 +199,7 @@ def _extract_and_format(
         
         if not validate_document_access(document_id):
             return f"拒绝访问：您无权提取文档 {document_id} 的信息。"
-            
+
         # 兜底补全逻辑：如果未传入限定章节，调用路由引擎进行动态意图识别
         if not section_title:
             emit_agent_log("info", "检测到未传入章节限定，正在启动 Routing 智能决策引擎...")
@@ -126,12 +214,27 @@ def _extract_and_format(
             elif decision.target_chapters:
                 section_title = decision.target_chapters
                 emit_agent_log("info", f"Routing 引擎决策为【局部锁定】，目标章节: {section_title}")
+
+        # 工程清单属于多表格结构化数据，即使路由判定为全局搜索，也不能只把少量向量命中片段交给模型。
+        # 这里从当前文档自身的表格分块发现候选章节，章节名称完全来自数据库原文。
+        if prefer_full_chapter and not section_title:
+            discovered_chapters = _discover_table_chapter_titles(
+                document_id,
+                search_keywords,
+                tenant_id,
+            )
+            if discovered_chapters:
+                section_title = discovered_chapters
+                emit_agent_log(
+                    "info",
+                    f"工程清单路由未锁定章节，已根据文档表格结构补充候选章节: {discovered_chapters}",
+                )
                 
         log_msg = f"调用工具: 正在使用 '{search_keywords}' (模式: {context_mode}) 执行 RAG 检索..."
         if section_title:
             log_msg = f"调用工具: 正在限定章节 {section_title} 中使用 '{search_keywords}' (模式: {context_mode}) 执行 RAG 检索..."
         emit_agent_log("tool_call", log_msg)
-        
+
         # 1. 精细化 RAG 检索 (使用分词多路召回与指定的 context_mode)
         # top_k 设为 5，平衡上下文大小与检索召回率
         context = rag_service.search_bidding_document(
@@ -142,6 +245,18 @@ def _extract_and_format(
             context_mode=context_mode,
             query_mode="split"
         )
+
+        # 工程清单直接使用 RAG 的 chapter 模式结果：向量命中任意分块后，
+        # 由 RAG 按数据库中的 section_title 收集该章节的全部原文分块。
+        # 不能在这里再次调用基于模糊标题的整章查询，否则会把“响应表”等
+        # 标题包含相同关键词的模板分块误当成目标章节，覆盖正确的向量召回结果。
+        if prefer_full_chapter and context_mode == "chapter":
+            logger.info(
+                "工程清单使用数据库 section_title 章节召回结果：文档ID={}，章节限定={}，上下文字符数={}。",
+                document_id,
+                section_title,
+                len(context or ""),
+            )
 
         if context_enricher:
             enriched_context = context_enricher(document_id, tenant_id)
@@ -162,6 +277,31 @@ def _extract_and_format(
     except Exception as e:
         emit_agent_log("error", f"❌ 执行提取时发生错误: {str(e)}")
         return f"执行提取时发生错误: {str(e)}"
+
+
+def _get_full_chapter_context(document_id: str, section_title: Any) -> str:
+    """逐个读取路由返回的章节名称，并合并可用的完整章节上下文。"""
+    chapter_titles = section_title if isinstance(section_title, list) else [section_title]
+    valid_titles = [str(title).strip() for title in chapter_titles if str(title).strip()]
+    if not valid_titles:
+        return ""
+
+    context_blocks: list[str] = []
+    for chapter_name in valid_titles:
+        chapter_context = rag_service.get_full_chapter_text(document_id, chapter_name)
+        if not chapter_context or chapter_context.startswith((
+            "错误：", "未能在文档中检索到", "获取整章原文发生异常",
+        )):
+            logger.warning(
+                "完整章节补取失败，跳过该章节：文档ID={}，章节={}，返回={}",
+                document_id,
+                chapter_name,
+                chapter_context,
+            )
+            continue
+        context_blocks.append(chapter_context)
+
+    return "\n\n".join(context_blocks)
 
 @tool
 def extract_qualification_info(document_id: str, search_keywords: str = "资质要求 特定资格要求 营业执照 失信被执行 证书 执业资格 历史业绩 同类项目 废标项 否决投标", section_title: str = None) -> str:
@@ -215,58 +355,16 @@ def extract_engineering_info(document_id: str, search_keywords: str = "主要设
       - search_keywords: 默认自带工程量清单与技术规格相关关键词，你可以根据需要补充
       - section_title: 可选，如果你知道技术清单在哪个具体章节（如"项目需求"），请填入以缩小检索范围，防止幻觉
     """
-    try:
-        from app.worker.tasks import emit_agent_log
-        from app.agents.tools.security import validate_document_access
-        from app.core.context import current_tenant_id
-        from app.db.session import SessionLocal
-        from app.db.crud.document import document_crud
-        import os
-        
-        if not validate_document_access(document_id):
-            return f"拒绝访问：您无权提取文档 {document_id} 的信息。"
-
-        emit_agent_log("tool_call", "正在提取工程量清单与技术要求全量上下文...")
-        
-        # 优先读取完整的 Markdown 文本以保证所有大型清单表格与前置大章节标题 100% 完整无遗漏
-        db = SessionLocal()
-        full_context = ""
-        try:
-            # 已通过 validate_document_access 完成权限校验，这里使用系统内部查询方法，
-            # 避免遗漏 user_id 和 tenant_id 参数后异常降级到不完整的 RAG 检索。
-            doc = document_crud.get_document_by_id_system(db, document_id)
-            if doc and doc.parsed_metadata and doc.parsed_metadata.get("md_file_path"):
-                md_path = doc.parsed_metadata.get("md_file_path")
-                if os.path.exists(md_path):
-                    with open(md_path, "r", encoding="utf-8") as f:
-                        full_context = f.read()
-            if not full_context:
-                # 降级从数据库拉取全部 chunks 拼装
-                chunks = document_crud.get_document_chunks(db, document_id)
-                if chunks:
-                    full_context = "\n\n".join([c.content for c in chunks])
-        finally:
-            db.close()
-
-        tenant_id = current_tenant_id.get()
-
-        if not full_context:
-            return _extract_and_format(engineering_service, document_id, search_keywords, section_title, context_mode="chapter")
-
-        emit_agent_log("info", "开始进行工程元数据多表格并发结构化提取与宏观大类状态机归口...")
-        metadata_obj = engineering_service.extract_metadata(
-            full_context,
-            document_id,
-            tenant_id=tenant_id,
-        )
-        emit_agent_log("success", "✅ 工程量清单与技术工况元数据提取并落盘成功！")
-        
-        if hasattr(metadata_obj, "model_dump"):
-            return json.dumps(metadata_obj.model_dump(), indent=2, ensure_ascii=False)
-        else:
-            return json.dumps(metadata_obj.dict(), indent=2, ensure_ascii=False)
-    except Exception as e:
-        return _extract_and_format(engineering_service, document_id, search_keywords, section_title, context_mode="chapter")
+    # 工程清单统一走 pgvector RAG：由向量检索从当前文档召回相关章节及其连续切片，
+    # 不再直接读取 output.md，也不把整份原始文档无条件塞进大模型上下文。
+    return _extract_and_format(
+        engineering_service,
+        document_id,
+        search_keywords,
+        section_title,
+        context_mode="chapter",
+        prefer_full_chapter=True,
+    )
 
 @tool
 def extract_evaluation_info(document_id: str, search_keywords: str = "评标办法 评分权重 商务分 技术分 质保期 售后响应 违约金 扣罚", section_title: str = None) -> str:

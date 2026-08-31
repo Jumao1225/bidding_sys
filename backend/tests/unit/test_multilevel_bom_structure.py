@@ -412,3 +412,28 @@ def test_multilevel_nested_cabinet_and_components_hierarchy():
     assert unmatched == 0
 
 
+def test_structural_bom_nodes_should_not_count_as_unmatched_items():
+    """无数量无单位的 BOM 分组节点只负责展示层级，不应增加未匹配数量。"""
+    processed, total_cost, unmatched = rollup_hierarchical_cost_items([
+        {
+            "name": "设备分组标题",
+            "qty": None,
+            "unit": None,
+            "ref_price": 0.0,
+            "subtotal": 0.0,
+            "is_structural": True,
+            "tree_level": 1,
+        },
+        {
+            "name": "可计价设备",
+            "parent_item": "设备分组标题",
+            "qty": 2.0,
+            "unit": "台",
+            "ref_price": 100.0,
+            "subtotal": 200.0,
+            "tree_level": 2,
+        },
+    ])
+
+    assert total_cost == 200.0
+    assert unmatched == 0

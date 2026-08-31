@@ -1,11 +1,71 @@
 import logging
+import re
 import typing
+import unicodedata
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.db.models.project import DocChunk
 from app.services.llm_service import llm_service
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_section_title(value: object) -> str:
+    """统一章节标题格式，用于数据库字段的精确语义比对。"""
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    normalized = re.sub(r"^[#*`~\s　]+", "", normalized)
+    return re.sub(r"[\s　]+", "", normalized).strip()
+
+
+def _section_title_stem(value: object) -> str:
+    """去除章节序号前缀，保留局部标题正文用于精确语义比对。"""
+    stem = _normalize_section_title(value)
+    prefix_pattern = r"^(?:第[一二三四五六七八九十百零\d]+[章节部分篇]|[一二三四五六七八九十百零\d]+[、.])"
+    while True:
+        stripped = re.sub(prefix_pattern, "", stem, count=1)
+        if stripped == stem:
+            return stem
+        stem = stripped
+
+
+def _resolve_exact_section_titles(
+    db: Session,
+    document_id: str,
+    section_title: typing.Union[str, list],
+    tenant_id: typing.Optional[str] = None,
+) -> list[str]:
+    """从当前文档的 section_title 字段中解析精确匹配值，拒绝宽泛子串匹配。"""
+    requested_titles = section_title if isinstance(section_title, list) else [section_title]
+    requested_norms = {
+        title_key
+        for title in requested_titles
+        for title_key in {
+            _normalize_section_title(title),
+            _section_title_stem(title),
+        }
+        if title_key
+    }
+    if not requested_norms:
+        return []
+
+    query = db.query(DocChunk.section_title).filter(
+        DocChunk.document_id == document_id,
+        DocChunk.section_title.isnot(None),
+    )
+    if tenant_id:
+        query = query.filter(DocChunk.tenant_id == tenant_id)
+
+    matched_titles: list[str] = []
+    seen_titles: set[str] = set()
+    for (stored_title,) in query.distinct().all():
+        stored_keys = {
+            _normalize_section_title(stored_title),
+            _section_title_stem(stored_title),
+        }
+        if stored_keys.intersection(requested_norms) and stored_title not in seen_titles:
+            matched_titles.append(stored_title)
+            seen_titles.add(stored_title)
+    return matched_titles
 
 def merge_overlapping_text(text1: str, text2: str, max_overlap: int = 400) -> str:
     """Find the longest suffix of text1 that matches a prefix of text2."""
@@ -74,6 +134,7 @@ class RAGService:
                 chunk_id_to_idx = {c.id: idx for idx, c in enumerate(chunk_list)}
                 
                 # 构建基准数据库 Query Filter，支持按 section_title 条件限定（剔除 0 号目录页与 toc_block）
+                section_filter_fallback = False
                 base_query = db.query(DocChunk).filter(
                     DocChunk.document_id == document_id,
                     DocChunk.chunk_index > 0,
@@ -82,14 +143,25 @@ class RAGService:
                 if tenant_id:
                     base_query = base_query.filter(DocChunk.tenant_id == tenant_id)
                 if section_title:
-                    if isinstance(section_title, str) and section_title.strip():
-                        clean_sec = section_title.strip()
-                        base_query = base_query.filter(DocChunk.section_title.ilike(f"%{clean_sec}%"))
-                    elif isinstance(section_title, list) and section_title:
-                        from sqlalchemy import or_
-                        conditions = [DocChunk.section_title.ilike(f"%{sec.strip()}%") for sec in section_title if sec.strip()]
-                        if conditions:
-                            base_query = base_query.filter(or_(*conditions))
+                    # 章节限定只允许命中数据库中完整相同的 section_title，
+                    # 避免“项目需求”误命中“项目需求响应表”等相似模板标题。
+                    exact_section_titles = _resolve_exact_section_titles(
+                        db,
+                        document_id,
+                        section_title,
+                        tenant_id=tenant_id,
+                    )
+                    if exact_section_titles:
+                        base_query = base_query.filter(
+                            DocChunk.section_title.in_(exact_section_titles)
+                        )
+                    else:
+                        section_filter_fallback = True
+                        logger.warning(
+                            "RAG 章节限定未找到精确 section_title，降级为当前文档向量召回：文档ID=%s，章节=%s",
+                            document_id,
+                            section_title,
+                        )
 
                 # 3. 向量检索 (Vector Search)
                 import math
@@ -108,16 +180,25 @@ class RAGService:
                         hit_chunk_ids.add(c.id)
                         
                 # 4. 混合检索 (Hybrid Search - ILIKE)
-                for q_text in expanded_queries:
-                    safe_q = q_text.replace('%', '\\%').replace('_', '\\_')
-                    keyword_hits = (
-                        base_query
-                        .filter(DocChunk.content.ilike(f"%{safe_q}%"))
-                        .limit(top_k_num)
-                        .all()
+                # 当章节限定在旧数据中没有精确 section_title 时，优先相信向量命中，
+                # 避免“项目需求”等泛关键词把响应模板加入目标章节上下文。
+                if not section_filter_fallback or not hit_chunk_ids:
+                    for q_text in expanded_queries:
+                        safe_q = q_text.replace('%', '\\%').replace('_', '\\_')
+                        keyword_hits = (
+                            base_query
+                            .filter(DocChunk.content.ilike(f"%{safe_q}%"))
+                            .limit(top_k_num)
+                            .all()
+                        )
+                        for c in keyword_hits:
+                            hit_chunk_ids.add(c.id)
+                elif section_filter_fallback:
+                    logger.info(
+                        "RAG 章节限定降级时保留向量命中，跳过泛关键词扩散：文档ID=%s，命中分块=%d",
+                        document_id,
+                        len(hit_chunk_ids),
                     )
-                    for c in keyword_hits:
-                        hit_chunk_ids.add(c.id)
                         
                 if not hit_chunk_ids:
                     return "未检索到相关内容。"
@@ -158,9 +239,9 @@ class RAGService:
                 # 6. 结果合并与去重排序
                 sorted_results = sorted(list(final_output_chunks), key=lambda x: chunk_id_to_idx.get(x.id, 0))
                 
-                # 限制最终返回数量，避免大模型上下文爆掉 (最多返回 20 个 Chunk，约 6 万字)
-                max_return = 20
-                sorted_results = sorted_results[:max_return]
+                # chapter 模式必须返回命中 section_title 的全部分块；window 模式才保留安全上限。
+                if context_mode == "window":
+                    sorted_results = sorted_results[:20]
                 
                 # 7. 提取结果并拼接 trace_info，合并连续 Chunk 以消除重叠文本
                 results = []
@@ -263,8 +344,8 @@ class RAGService:
     def get_full_chapter_text(self, document_id: str, chapter_name: str) -> str:
         """
         获取指定文档中某个章节的 100% 连贯全文原文（无 Top-K 向量截断）。
-        在数据库中按 section_title 匹配并按 DocChunk.chunk_index 顺序拼接所有相关切片。
-        支持 '第四章'、'（4）'、'项目需求' 等多别名智能模糊召回。
+        在数据库中按 section_title 精确匹配并按 DocChunk.chunk_index 顺序拼接所有相关切片。
+        允许章节序号存在差异，但不使用任意子串模糊匹配，避免误取响应表或格式模板。
         """
         if not document_id or not chapter_name:
             return "错误：必须提供 document_id 和 chapter_name"
@@ -272,43 +353,31 @@ class RAGService:
         clean_name = chapter_name.strip()
         db: Session = SessionLocal()
         try:
-            # 通用抽象别名生成器（根据传入章节名称自动推导序号变体与主干词，零业务硬编码）
-            aliases = [clean_name]
-
-            # 1. 序号形态通用转换（如 '第一章' <-> '第1章' <-> '（1）' <-> '1、'）
-            import re
-            zh_num_pattern = re.search(r'[第（(]?([一二三四五六七八九十0-9]+)[章节部分、\.\)）]?', clean_name)
-            if zh_num_pattern:
-                raw_num = zh_num_pattern.group(1)
-                num_zh_to_ar = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}
-                num_ar_to_zh = {v: k for k, v in num_zh_to_ar.items()}
-                ar_num = num_zh_to_ar.get(raw_num, raw_num if raw_num.isdigit() else "")
-                zh_num = num_ar_to_zh.get(raw_num, raw_num if not raw_num.isdigit() else "")
-
-                for n_val in set(filter(None, [ar_num, zh_num])):
-                    aliases.extend([f"第{n_val}章", f"（{n_val}）", f"({n_val})", f"{n_val}、", f"{n_val}."])
-
-            # 2. 核心主干词通用提取（剔除前后缀如“格式”、“响应表”、“偏离表”等通用词汇）
-            pure_stem = re.sub(r'^[第（(]?[一二三四五六七八九十0-9]+[章节部分、\.\)）\s]*', '', clean_name)
-            pure_stem = re.sub(r'(?:格式|响应对照表|响应表|偏离表|汇总表|明细表|清单)$', '', pure_stem).strip()
-            if pure_stem and len(pure_stem) >= 2:
-                aliases.append(pure_stem)
-
-            from sqlalchemy import or_
-            filter_conditions = [DocChunk.section_title.ilike(f"%{a}%") for a in set(aliases) if a]
+            matched_titles = _resolve_exact_section_titles(db, document_id, clean_name)
+            if not matched_titles:
+                logger.info(
+                    "RAGService: section_title 精确匹配不到章节 '%s'（文档ID: %s）",
+                    clean_name,
+                    document_id,
+                )
+                return f"未能在文档中检索到章节名称匹配 '{chapter_name}' 的任何段落。"
 
             chunks = (
                 db.query(DocChunk)
                 .filter(
                     DocChunk.document_id == document_id,
-                    or_(*filter_conditions)
+                    DocChunk.section_title.in_(matched_titles),
                 )
                 .order_by(DocChunk.chunk_index)
                 .all()
             )
 
             if not chunks:
-                logger.info(f"RAGService: 未能通过章节关键字 '{aliases}' 找到任何切片 (文档ID: {document_id})")
+                logger.info(
+                    "RAGService: section_title 已解析但没有可用分块：章节=%s，文档ID=%s",
+                    clean_name,
+                    document_id,
+                )
                 return f"未能在文档中检索到章节名称匹配 '{chapter_name}' 的任何段落。"
 
             matched_sections = list(dict.fromkeys([c.section_title for c in chunks if c.section_title]))

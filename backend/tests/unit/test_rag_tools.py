@@ -21,15 +21,22 @@ def test_get_full_chapter_text_success_should_concat_chunks():
     mock_chunk2.chunk_index = 1
     mock_chunk2.content = "第二条：质保期为2年，故障4小时内响应。"
 
-    mock_query = MagicMock()
-    mock_query.filter.return_value.order_by.return_value.all.return_value = [mock_chunk1, mock_chunk2]
+    title_query = MagicMock()
+    title_query.filter.return_value.distinct.return_value.all.return_value = [
+        ("第三章 合同条款",),
+    ]
+    chunk_query = MagicMock()
+    chunk_query.filter.return_value.order_by.return_value.all.return_value = [
+        mock_chunk1,
+        mock_chunk2,
+    ]
 
     with patch("app.services.rag_service.SessionLocal") as mock_session_cls:
         mock_db = MagicMock()
         mock_session_cls.return_value = mock_db
-        mock_db.query.return_value = mock_query
+        mock_db.query.side_effect = [title_query, chunk_query]
 
-        res = rag_service.get_full_chapter_text("doc_123", "合同条款")
+        res = rag_service.get_full_chapter_text("doc_123", "第三章 合同条款")
 
         assert "第三章 合同条款" in res
         assert "共 2 个段落" in res
@@ -40,7 +47,7 @@ def test_get_full_chapter_text_success_should_concat_chunks():
 def test_get_full_chapter_text_empty_should_return_not_found_msg():
     """测试当找不到目标章节时返回清晰提示"""
     mock_query = MagicMock()
-    mock_query.filter.return_value.order_by.return_value.all.return_value = []
+    mock_query.filter.return_value.distinct.return_value.all.return_value = []
 
     with patch("app.services.rag_service.SessionLocal") as mock_session_cls:
         mock_db = MagicMock()
@@ -50,6 +57,23 @@ def test_get_full_chapter_text_empty_should_return_not_found_msg():
         res = rag_service.get_full_chapter_text("doc_123", "不存在的章节")
 
         assert "未能在文档中检索到章节名称匹配" in res
+
+
+def test_get_full_chapter_text_should_not_match_unrelated_template_by_substring():
+    """章节召回不能因短标题子串命中无关响应模板。"""
+    title_query = MagicMock()
+    title_query.filter.return_value.distinct.return_value.all.return_value = [
+        ("七、第四章项目需求中实质性要求响应对照表",),
+    ]
+
+    with patch("app.services.rag_service.SessionLocal") as mock_session_cls:
+        mock_db = MagicMock()
+        mock_session_cls.return_value = mock_db
+        mock_db.query.return_value = title_query
+
+        res = rag_service.get_full_chapter_text("doc_123", "第四章 项目需求")
+
+    assert "未能在文档中检索到章节名称匹配" in res
 
 
 def test_get_full_chapter_text_tool_denied():
