@@ -886,6 +886,15 @@ def is_narrative_clause_or_lead_in(text: str) -> bool:
     if any(marker in clean_no_punct for marker in narrative_markers):
         return True
 
+    # 识别带主语的公文声明/导语谓语，避免“本授权书宣告：”被误判为字段标签。
+    # 该规则只描述通用篇章结构，不绑定具体企业、项目或业务字段名称。
+    if re.match(
+        r'^\s*(?:本|我方|我单位|兹|现|特此|据此).{0,30}'
+        r'(?:宣告|声明|承诺|保证|说明|同意|授权)(?:如下)?\s*[:：]?\s*$',
+        raw,
+    ):
+        return True
+
     # 结尾系词判断（如 "通讯地址为："、"条件为："）
     if re.search(r'为[:：]\s*$', raw):
         return True

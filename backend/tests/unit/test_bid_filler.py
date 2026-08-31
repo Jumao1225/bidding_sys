@@ -860,6 +860,7 @@ def test_is_narrative_clause_or_lead_in_generic_rules():
         "根据贵方的 SZDZ-2026-NG008 号招标文件，正式授权下述签字人李四代表我方，全权处理本次项目投标的有关事宜。",
         "我方在此声明如下：",
         "本投标人郑重承诺如下：",
+        "本授权书宣告：",
         "现授权如下：",
         "特此声明：",
         "（一）关于资格证明文件的书面声明如下：",
@@ -917,21 +918,15 @@ def test_template_protection_should_allow_form_labels_and_internal_blank_slots()
 
 
 def test_template_protection_should_allow_label_only_date_slot():
-    """仅保留“日 期 ：”标签的封面日期字段应被识别为可填槽位。"""
+    """仅保留字段标签的槽位应按结构识别，不依赖具体字段别名。"""
     from app.agents.bid_filler_agent import (
         _has_fillable_slot_marker,
         _is_protected_template_overwrite,
     )
 
-    date_label = "日 期 ："
-
-    assert _has_fillable_slot_marker(date_label) is True
-    assert _is_protected_template_overwrite(
-        date_label,
-        date_label,
-        "2026年6月30日",
-        "text",
-    ) is False
+    for label, value in (("日 期 ：", "2026年6月30日"), ("项目负责人：", "张三")):
+        assert _has_fillable_slot_marker(label) is True
+        assert _is_protected_template_overwrite(label, label, value, "text") is False
 
 
 def test_fill_docx_proposals_in_dom_should_write_label_only_date_slot():
@@ -968,6 +963,125 @@ def test_fill_docx_proposals_in_dom_should_write_label_only_date_slot():
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+def test_format_date_only_should_remove_time_from_deadline_value():
+    """投标截止时间在文档展示层只保留年月日，不能输出时分。"""
+    from datetime import date, datetime
+    from app.utils.date_formatter import format_date_only
+
+    assert format_date_only("2026-06-30 14:00") == "2026年6月30日"
+    assert format_date_only("2026/06/30T14:00:00") == "2026年6月30日"
+    assert format_date_only(datetime(2026, 6, 30, 14, 0)) == "2026年6月30日"
+    assert format_date_only(date(2026, 6, 30)) == "2026年6月30日"
+    assert format_date_only("不是日期") is None
+
+
+def test_normalize_date_only_text_should_keep_time_in_normal_paragraph():
+    """只有日期槽位上下文才去除时分，普通正文中的合法时间应保持不变。"""
+    from app.utils.date_formatter import normalize_date_only_text
+
+    assert normalize_date_only_text(
+        "投标截止时间：2026-06-30 14:00",
+        "投标截止时间：",
+    ) == "投标截止时间：2026年6月30日"
+    assert normalize_date_only_text(
+        "系统服务时间为2026-06-30 14:00",
+        "系统服务时间说明",
+    ) == "系统服务时间为2026-06-30 14:00"
+
+
+def test_auto_fill_profile_slots_should_use_deadline_date_without_time():
+    """企业档案自愈填充签字日期时，应使用投标截止日期但不得带时分。"""
+    from types import SimpleNamespace
+    from app.agents.bid_filler_agent import _auto_fill_profile_slots
+
+    doc = Document()
+    doc.add_paragraph("法定代表人或授权代表签字（或盖章）：                       年     月    日")
+
+    filled_count = _auto_fill_profile_slots(
+        doc,
+        [SimpleNamespace(legal_representative="张三")],
+        timeline_source=SimpleNamespace(bid_deadline="2026-06-30 14:00"),
+    )
+
+    assert filled_count == 1
+    assert "张三" in doc.paragraphs[0].text
+    assert "2026年6月30日" in doc.paragraphs[0].text
+    assert "14:00" not in doc.paragraphs[0].text
+
+
+def test_fill_docx_proposals_in_dom_should_normalize_worker_datetime_proposal():
+    """Worker 提案带原始截止时间时，DOM 写盘应按目标日期槽位自动降精度。"""
+    import os
+    import tempfile
+    from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
+
+    doc = Document()
+    doc.add_paragraph("投标截止日期：                       年     月    日")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as temp_file:
+        temp_path = temp_file.name
+
+    try:
+        doc.save(temp_path)
+        written_count = fill_docx_proposals_in_dom(
+            temp_path,
+            [
+                {
+                    "path": "/body/p[1]",
+                    "original_context": "投标截止日期：                       年     月    日",
+                    "proposed_text": "2026-06-30 14:00",
+                    "type": "text",
+                }
+            ],
+        )
+
+        result_doc = Document(temp_path)
+        assert written_count == 1
+        assert "2026年6月30日" in result_doc.paragraphs[0].text
+        assert "14:00" not in result_doc.paragraphs[0].text
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_proposals_to_commands_should_normalize_date_before_cli_fallback():
+    """DOM 不可用时，OfficeCLI 降级命令也应遵守日期-only 规则。"""
+    from app.agents.bid_filler_agent import proposals_to_commands
+
+    commands, approved, rejected = proposals_to_commands(
+        [
+            {
+                "path": "/body/p[1]",
+                "original_context": "投标截止日期：                       年     月    日",
+                "proposed_text": "2026-06-30 14:00",
+                "type": "text",
+            }
+        ]
+    )
+
+    assert approved == 1
+    assert rejected == 0
+    assert commands[0]["props"]["text"].endswith("2026年6月30日")
+    assert "14:00" not in commands[0]["props"]["text"]
+
+
+def test_worker_prompt_should_expose_date_only_deadline_to_agent():
+    """Worker 应拿到运行时截止日期，并被明确要求不提交时分。"""
+    from app.agents.bid_filler_workers import build_worker_prompt
+
+    system_prompt, user_prompt = build_worker_prompt(
+        chapter_title="封面",
+        category="needs_fill",
+        template_text="投标截止日期：____年__月__日",
+        content_hint="",
+        document_id="doc-date-only",
+        prefetched_metadata={"bid_deadline_date": "2026年6月30日"},
+    )
+
+    assert "日期槽位只填写年月日" in system_prompt
+    assert "投标截止日期（仅日期）: 2026年6月30日" in user_prompt
 
 
 def test_reset_chapter_to_template_should_cleanly_reset_target_chapter():

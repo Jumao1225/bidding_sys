@@ -642,6 +642,7 @@ async def regenerate_single_chapter(
         try:
             from app.agents.tools.bid_db_tools import resolve_company_profile
             from app.db.models.metadata import TimelineMetadata, FinancialMetadata
+            from app.utils.date_formatter import format_date_only
             from app.utils.rmb_formatter import number_to_chinese_rmb
 
             # 读取指定主体，禁止通过无序 first() 串用其他企业档案。
@@ -659,6 +660,9 @@ async def regenerate_single_chapter(
                 if getattr(tl, "project_name", None): prefetched_metadata["project_name"] = tl.project_name
                 proj_code = getattr(tl, "project_id_code", None) or getattr(tl, "project_code", None)
                 if proj_code: prefetched_metadata["project_code"] = proj_code
+                deadline_date = format_date_only(getattr(tl, "bid_deadline", None))
+                if deadline_date:
+                    prefetched_metadata["bid_deadline_date"] = deadline_date
                 
                 period_str = str(getattr(tl, "construction_period_description", "") or "").strip()
                 if not period_str and getattr(tl, "construction_period_days", None):

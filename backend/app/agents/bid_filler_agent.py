@@ -48,6 +48,7 @@ from app.schemas.bid_filler_schema import (
     ReviewFinding,
 )
 from app.services.llm_service import llm_service
+from app.utils.date_formatter import format_date_only, normalize_date_only_text
 from app.utils.rmb_formatter import number_to_chinese_rmb
 from app.utils.table_utils import is_narrative_clause_or_lead_in
 
@@ -403,6 +404,9 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
                     if getattr(tl, "project_name", None): prefetched_metadata["project_name"] = tl.project_name
                     proj_code = getattr(tl, "project_id_code", None) or getattr(tl, "project_code", None)
                     if proj_code: prefetched_metadata["project_code"] = proj_code
+                    deadline_date = format_date_only(getattr(tl, "bid_deadline", None))
+                    if deadline_date:
+                        prefetched_metadata["bid_deadline_date"] = deadline_date
 
                     period_str = str(getattr(tl, "construction_period_description", "") or "").strip()
                     if not period_str and getattr(tl, "construction_period_days", None):
@@ -963,12 +967,15 @@ def _auto_fill_profile_slots(
             if profile_field in ALIAS_MAP
             else None
         )
-        date_value = _read_profile_field(
-            [timeline_source],
-            ("planned_delivery_date", "bid_deadline"),
-        ) if re.search(r"年.*月.*日", raw_text) else None
+        raw_deadline = (
+            getattr(timeline_source, "bid_deadline", None)
+            if timeline_source is not None and re.search(r"年.*月.*日", raw_text)
+            else None
+        )
+        date_value = format_date_only(raw_deadline)
         if profile_value and date_value:
-            filled_value = f"{profile_value}                       {date_value}"
+            # 使用受控间距，避免原始截止时间中的时分或过量空格导致日期换行。
+            filled_value = f"{profile_value}    {date_value}"
         else:
             filled_value = profile_value or date_value
         if not filled_value:
@@ -1239,6 +1246,11 @@ def _has_fillable_slot_marker(text: str) -> bool:
 
         matched_field = _match_alias_key(trailing_label.group(1))
         if matched_field in ALIAS_MAP:
+            return True
+
+        # 未登记到别名表的未知字段，也可通过“短字段标签 + 冒号”的结构识别为槽位；
+        # 共享叙述句判定会排除“本授权书宣告：”等固定公文导语，避免放开普通正文。
+        if not is_narrative_clause_or_lead_in(normalized):
             return True
 
     if re.search(
@@ -2845,6 +2857,15 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                 real_text = p_elem.text or ""
                 p_type = str(p_item.get("type", "")).strip()
 
+                # Worker 可能把数据库原始截止时间带入提案，写盘边界再次按真实节点
+                # 上下文归一化，保证日期槽位不会落入 HH:MM。
+                if p_type != "image":
+                    proposed_val = normalize_date_only_text(
+                        proposed_val,
+                        real_text,
+                        orig_ctx,
+                    )
+
                 # 投标格式中的固定原文没有可填槽位时，禁止被 Agent 的短值或整句提案覆盖。
                 # 已填写数据的修复必须携带含槽位的 original_context，才能证明它是数据替换而非格式改写。
                 if (
@@ -3176,6 +3197,11 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                 full_rep_item = next((p for p in group_items if _is_full_paragraph_replacement(real_text, str(p.get("proposed_text") if p.get("proposed_text") is not None else p.get("value", "")), str(p.get("type", "")))), None)
                 if full_rep_item:
                     f_val = str(full_rep_item.get("proposed_text") if full_rep_item.get("proposed_text") is not None else full_rep_item.get("value", "")).strip()
+                    f_val = normalize_date_only_text(
+                        f_val,
+                        real_text,
+                        str(full_rep_item.get("original_context", "")),
+                    )
                     _render_diff_paragraph_runs(p_elem, real_text, f_val, enable_underline_on_diff=True, is_table=is_in_table)
                     success_count += len(group_items)
                     logger.info(f"   [多槽位整句直写] 命中整句提案，成功整段渲染写入段落 {path}！")
@@ -3189,6 +3215,11 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                     val = str(p_item.get("proposed_text") if p_item.get("proposed_text") is not None else p_item.get("value", "")).strip()
                     if not val:
                         continue
+                    val = normalize_date_only_text(
+                        val,
+                        current_text,
+                        str(p_item.get("original_context", "")),
+                    )
                     ph_match = re.search(slot_pattern, current_text)
                     if ph_match:
                         start_pos, end_pos = ph_match.span()
@@ -3308,6 +3339,7 @@ def proposals_to_commands(proposals: List[Dict]) -> tuple:
         # 剥离说明性元数据注释并拦截零改动无操作提案
         from app.agents.review_engine import clean_zero_change_annotations, is_zero_change_or_no_op_proposal
         text = clean_zero_change_annotations(text)
+        text = normalize_date_only_text(text, orig_context)
         if is_zero_change_or_no_op_proposal(text, orig_context):
             rejected += 1; continue
 

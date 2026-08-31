@@ -666,6 +666,12 @@ def build_worker_prompt(
 - 支持 `italic_underline`（斜体且下划线）、`italic`（斜体）、`underline`（下划线）、`bold`（加粗）和 `bold_red`（红色加粗）。
 - 对“实质性要求响应对照表”、偏离表及其他要求清单，必须先核对原文样式标记，再生成响应内容；不得仅凭普通文本推断哪些条款属于重点要求。
 
+【日期写入规则】
+- 标书中的日期槽位只填写年月日，不填写时、分、秒；
+- 若数据库返回投标截止时间（如 YYYY-MM-DD HH:MM），写入 Word 时只取其日期部分；
+- “投标截止日期、开标日期、递交日期”以及封面/签字处的普通日期均可使用投标截止日期；
+- 不得把原始时间字符串直接提交为日期槽位值。
+
 【最高铁律 — 原文零改动与高质量填报法则】
 1. **模板原文 100% 盲守**：绝对严禁删除、篡改、润色、删减或遗漏任何模板原文（包括前缀标签如“项目名称：”、“招标编号：”、“致：”、标点符号及授权声明等全部固定文本）！
 2. **仅精准替换占位符**：只针对模板中的下划线 `______`、括号 `( )`、`[待填]` 槽位填充检索到的真实数据，非占位符的原文必须 100% 原封不动完整保留！
@@ -749,6 +755,8 @@ Supervisor 在上一轮审核中发现以下问题。你必须先重新查询当
             meta_items.append(f"- 投标项目名称: {prefetched_metadata['project_name']}")
         if prefetched_metadata.get("project_code"):
             meta_items.append(f"- 招标/项目编号: {prefetched_metadata['project_code']}")
+        if prefetched_metadata.get("bid_deadline_date"):
+            meta_items.append(f"- 投标截止日期（仅日期）: {prefetched_metadata['bid_deadline_date']}")
         if prefetched_metadata.get("total_price_str"):
             w_str = f" (大写: {prefetched_metadata['total_price_words']})" if prefetched_metadata.get("total_price_words") else ""
             meta_items.append(f"- 投标总报价: {prefetched_metadata['total_price_str']}{w_str}")

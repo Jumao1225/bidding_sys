@@ -120,8 +120,7 @@ ALIAS_MAP = {
     "project_name": ["project_name", "项目名称", "招标项目名称", "采购项目名称", "工程名称", "项目全称", "招标工程名称"],
     "project_code": ["project_code", "project_id_code", "项目编号", "招标编号", "包件号", "标段编号", "采购编号", "项目代码", "招标代码"],
     "tender_segment": ["tender_segment", "标段名称", "包件名称", "标段", "包件", "分包名称"],
-    # 通用投标文件中的“日期”字段通常由投标截止时间元数据提供，兼容仅保留标签的封面日期槽位。
-    "bid_deadline": ["bid_deadline", "投标截止时间", "开标时间", "递交截止时间", "截标时间", "开标日期", "投标日期", "日期"],
+    "bid_deadline": ["bid_deadline", "投标截止时间", "开标时间", "递交截止时间", "截标时间", "开标日期"],
     "bid_validity_days": ["bid_validity_days", "投标有效期", "有效期", "投标有效期天数"],
     "construction_period": ["construction_period", "construction_period_description", "工期", "建设周期", "交货期", "服务期", "承诺工期", "交货期限", "完成时间", "服务期限"],
 
