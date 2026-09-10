@@ -16,6 +16,10 @@ import { BidScorerLab } from './pages/BidScorerLab';
 import { AgentAuditPage } from './pages/AgentAuditPage';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { AdminRoute } from './components/AdminRoute';
+import {
+  ACTIVE_DOCUMENT_STORAGE_KEY,
+  DOCUMENT_CHANGED_EVENT,
+} from './utils/documentIdentity';
 
 
 
@@ -27,19 +31,19 @@ function App() {
   // 从 localStorage 读取 document_id，供 ChatPanel RAG 接口使用
   // 每次打开对话框时重新读取，确保拿到最新分析结果的 ID
   const [documentId, setDocumentId] = useState<string | null>(
-    () => localStorage.getItem('bidding_document_id')
+    () => localStorage.getItem(ACTIVE_DOCUMENT_STORAGE_KEY)
   );
 
   // 对话框拖拽逻辑
   useEffect(() => {
     // 监听历史记录加载或新分析成功导致的文档 ID 变更
     const handleDocChange = () => {
-      setDocumentId(localStorage.getItem('bidding_document_id'));
+      setDocumentId(localStorage.getItem(ACTIVE_DOCUMENT_STORAGE_KEY));
     };
 
-    window.addEventListener('bidding_document_changed', handleDocChange);
+    window.addEventListener(DOCUMENT_CHANGED_EVENT, handleDocChange);
     return () => {
-      window.removeEventListener('bidding_document_changed', handleDocChange);
+      window.removeEventListener(DOCUMENT_CHANGED_EVENT, handleDocChange);
     };
   }, []);
 
@@ -189,7 +193,7 @@ function App() {
   const handleFabClick = () => {
     if (!hasDraggedFab.current) {
       // 打开时重新读取最新的 document_id（用户可能刚完成分析）
-      setDocumentId(localStorage.getItem('bidding_document_id'));
+      setDocumentId(localStorage.getItem(ACTIVE_DOCUMENT_STORAGE_KEY));
       setIsChatOpen(!isChatOpen);
     }
   };

@@ -47,6 +47,18 @@ def test_get_chapter_specific_table_indices_fuzzy_and_noisy_titles():
     assert indices_parts == [1]
 
 
+def test_get_chapter_specific_table_indices_should_include_subtitle_table_for_major_chapter():
+    """一级报价章节下的子标题表格也必须纳入当前章节的真实表格契约。"""
+    doc = Document()
+    doc.add_paragraph("五、投标配置及分项报价表")
+    doc.add_paragraph("投标报价分析表")
+    table = doc.add_table(rows=3, cols=3)
+    for index, header in enumerate(["序号", "标的物名称", "总价"]):
+        table.rows[0].cells[index].text = header
+
+    assert get_chapter_specific_table_indices(doc, "投标配置及分项报价表") == [0]
+
+
 def test_fill_docx_proposals_in_dom_table_collision_guard_should_redirect_and_protect():
     """
     核心冲突测试：
@@ -173,4 +185,3 @@ def test_get_chapter_specific_table_indices_cover_and_text_chapters_should_retur
     # 断言 3: 商务偏离表必须精准命中表格 0
     dev_indices = get_chapter_specific_table_indices(doc, "商务条款响应及偏离表")
     assert dev_indices == [0]
-

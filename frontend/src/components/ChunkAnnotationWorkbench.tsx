@@ -11,6 +11,7 @@ import type { DocChunkDetail, ChunkUpdateItem } from '../api/bidScorerApi';
 import { fetchDocumentChunks, updateDocumentChunks } from '../api/bidScorerApi';
 import { SmartDocViewer } from './SmartDocViewer';
 import { API_BASE_URL } from '../utils/api';
+import { useDialog } from './DialogProvider';
 
 interface ChunkAnnotationWorkbenchProps {
   documentId: string;
@@ -27,6 +28,7 @@ export const ChunkAnnotationWorkbench: React.FC<ChunkAnnotationWorkbenchProps> =
   onClose,
   onStartScoring,
 }: any) => {
+  const { confirm } = useDialog();
   const [chunks, setChunks] = useState<DocChunkDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -362,8 +364,13 @@ export const ChunkAnnotationWorkbench: React.FC<ChunkAnnotationWorkbenchProps> =
   };
 
   // 删除单个指定切片 (支持人工智能与人工标注切片)
-  const handleDeleteChunk = (chunkId: string) => {
-    if (window.confirm('确定要删除此切片吗？')) {
+  const handleDeleteChunk = async (chunkId: string) => {
+    const confirmed = await confirm('确定要删除此切片吗？', {
+      title: '确认删除切片',
+      intent: 'danger',
+      confirmText: '删除切片',
+    });
+    if (confirmed) {
       setChunks(prev => prev.filter(c => c.id !== chunkId));
       setSelectedChunkIds(prev => {
         const next = new Set(prev);
@@ -376,9 +383,14 @@ export const ChunkAnnotationWorkbench: React.FC<ChunkAnnotationWorkbenchProps> =
   };
 
   // 批量删除选中的切片
-  const handleBatchDeleteChunks = () => {
+  const handleBatchDeleteChunks = async () => {
     if (selectedChunkIds.size === 0) return;
-    if (window.confirm(`确定要删除选中的 ${selectedChunkIds.size} 块切片吗？`)) {
+    const confirmed = await confirm(`确定要删除选中的 ${selectedChunkIds.size} 块切片吗？`, {
+      title: '确认批量删除切片',
+      intent: 'danger',
+      confirmText: '批量删除',
+    });
+    if (confirmed) {
       setChunks(prev => prev.filter(c => !selectedChunkIds.has(c.id)));
       setSelectedChunkIds(new Set());
       setHasUnsavedChanges(true);
@@ -387,13 +399,18 @@ export const ChunkAnnotationWorkbench: React.FC<ChunkAnnotationWorkbenchProps> =
   };
 
   // 仅清空人工标注的切片
-  const handleClearManualChunksOnly = () => {
+  const handleClearManualChunksOnly = async () => {
     const manualChunks = chunks.filter(c => c.id.startsWith('manual_'));
     if (manualChunks.length === 0) {
       setSuccessMsg('当前暂无人工标注的切片。');
       return;
     }
-    if (window.confirm(`确定要清空您手动标注的 ${manualChunks.length} 块人工切片吗？`)) {
+    const confirmed = await confirm(`确定要清空您手动标注的 ${manualChunks.length} 块人工切片吗？`, {
+      title: '确认清空人工切片',
+      intent: 'warning',
+      confirmText: '清空切片',
+    });
+    if (confirmed) {
       setChunks(prev => prev.filter(c => !c.id.startsWith('manual_')));
       setSelectedChunkIds(new Set());
       setHasUnsavedChanges(true);
@@ -469,7 +486,7 @@ export const ChunkAnnotationWorkbench: React.FC<ChunkAnnotationWorkbenchProps> =
   };
 
   // 清空 AI 自动切片（智能保留用户人工划选/框选/按页标注的切片）
-  const handleClearAiChunksOnly = () => {
+  const handleClearAiChunksOnly = async () => {
     // 识别人工创建的切片 (ID 以 manual_ 开头)
     const manualChunks = chunks.filter(c => c.id.startsWith('manual_'));
     const aiChunksCount = chunks.length - manualChunks.length;
@@ -479,7 +496,12 @@ export const ChunkAnnotationWorkbench: React.FC<ChunkAnnotationWorkbenchProps> =
       return;
     }
 
-    if (window.confirm(`确定要清空 ${aiChunksCount} 块 AI 自动切片吗？\n（您亲自标注的 ${manualChunks.length} 块人工切片将被完好保留）`)) {
+    const confirmed = await confirm(`确定要清空 ${aiChunksCount} 块 AI 自动切片吗？\n（您亲自标注的 ${manualChunks.length} 块人工切片将被完好保留）`, {
+      title: '确认清空 AI 自动切片',
+      intent: 'warning',
+      confirmText: '清空 AI 切片',
+    });
+    if (confirmed) {
       setChunks(manualChunks);
       setSelectedChunkIds(new Set());
       setActiveChunkId(manualChunks.length > 0 ? manualChunks[0].id : null);

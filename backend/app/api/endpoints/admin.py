@@ -5,9 +5,15 @@ from sqlalchemy.orm import Session
 from app.api import deps
 from app.db.crud import user as crud_user
 from app.schemas.user import Tenant, TenantCreate, User, UserCreate, UserUpdatePassword, UserUpdateTenant, UserUpdateStatus
-from app.schemas.model_config import ModelConfigResponse, ModelConfigUpdate
+from app.schemas.model_config import (
+    ModelConfigResponse,
+    ModelConfigUpdate,
+    ModelConnectivityTestRequest,
+    ModelConnectivityTestResponse,
+)
 from app.db.models.user import User as UserModel
 from app.schemas.response.common import ResponseModel, success_response
+from app.services.model_connectivity_service import model_connectivity_service
 from app.services.model_config_service import model_config_service
 from loguru import logger
 
@@ -78,6 +84,38 @@ def update_model_config(
         data=ModelConfigResponse(tenant_id=target_tenant_id, values=updated_values),
         message="模型配置已保存到后端并立即生效",
     )
+
+
+@router.post("/model-config/test", response_model=ResponseModel[ModelConnectivityTestResponse])
+def test_model_config(
+    test_in: ModelConnectivityTestRequest,
+    db: Session = Depends(deps.get_db),
+    tenant_id: str | None = Query(default=None),
+    current_manager: UserModel = Depends(deps.get_current_user_manager),
+) -> ResponseModel[ModelConnectivityTestResponse]:
+    """测试页面当前草稿中的单个模型接口，不保存配置也不创建 MinerU 解析任务。"""
+    target_tenant_id = _resolve_model_config_tenant(db, tenant_id, current_manager)
+    try:
+        result = model_connectivity_service.test(
+            model_type=test_in.model_type,
+            api_key=test_in.api_key,
+            api_base=test_in.api_base,
+            model_name=test_in.model_name,
+            tenant_id=target_tenant_id,
+        )
+        response_data = ModelConnectivityTestResponse(**result)
+    except Exception as test_error:
+        logger.exception("管理员 {} 测试租户 {} 的模型接口失败", current_manager.id, target_tenant_id)
+        raise HTTPException(status_code=500, detail="模型接口测试服务异常，请稍后重试") from test_error
+
+    logger.info(
+        "管理员 {} 完成租户 {} 的 {} 模型接口测试，available={}",
+        current_manager.id,
+        target_tenant_id,
+        test_in.model_type,
+        response_data.available,
+    )
+    return success_response(data=response_data, message="模型接口测试完成")
 
 # -------------------------------------------------------------------
 # Tenant Management

@@ -114,6 +114,92 @@ class DocxParser(BaseParser):
         styled_text = "".join(styled_parts).strip()
         return styled_text if styled_text else paragraph.text.strip()
 
+    def extract_heading_candidates(self, docx_path: str) -> List[Dict[str, Any]]:
+        """
+        提取原始 Word 中可作为章节标题的候选段落。
+
+        该方法复用当前 Word 转 Markdown 时使用的标题样式、一级章节正则、中文序号
+        和表题判断规则，同时保留原始 body 节点索引，供后续在原始 DOCX 中精确切片。
+        候选段落只负责“提供定位锚点”，不负责改写正文内容。
+        """
+        if not os.path.exists(docx_path):
+            raise FileNotFoundError(f"未找到指定的 Word 文件: {docx_path}")
+
+        document = docx.Document(docx_path)
+        body_children = list(document.element.body)
+        from docx.text.paragraph import Paragraph
+
+        candidates: List[Dict[str, Any]] = []
+        for body_index, child in enumerate(body_children):
+            if not child.tag.endswith("p"):
+                continue
+
+            paragraph = Paragraph(child, document)
+            title = paragraph.text.strip()
+            if not title:
+                continue
+
+            style_name = ""
+            try:
+                style_name = (paragraph.style.name or "").strip()
+            except (AttributeError, ValueError):
+                style_name = ""
+            normalized_style_name = style_name.lower()
+
+            heading_level: Optional[int] = None
+            candidate_kind = ""
+            if "heading 1" in normalized_style_name:
+                heading_level = 1
+                candidate_kind = "heading_style"
+            elif "heading 2" in normalized_style_name:
+                heading_level = 2
+                candidate_kind = "heading_style"
+            elif "heading 3" in normalized_style_name:
+                heading_level = 3
+                candidate_kind = "heading_style"
+            elif any(pattern.match(title) for pattern in MAJOR_CHAPTER_PATTERNS):
+                heading_level = 1
+                candidate_kind = "major_chapter_pattern"
+            elif ORDINAL_HEADING_PATTERN.match(title):
+                heading_level = 2
+                candidate_kind = "ordinal_heading"
+            else:
+                is_table_caption = self._is_table_caption(title, paragraph)
+                has_heading_semantics = any(
+                    marker in title
+                    for marker in ("投标", "应答", "响应", "格式", "附件", "附录", "组成", "编制", "范本", "样式")
+                )
+                has_bold_runs = bool(
+                    [run for run in paragraph.runs if run.text.strip()]
+                    and all(run.bold for run in paragraph.runs if run.text.strip())
+                )
+                if is_table_caption and (has_heading_semantics or has_bold_runs):
+                    # 保留有业务语义的短标题和加粗标题，覆盖“第六章《……》”等非标准写法，
+                    # 同时避免把正文中的大量短句全部送入大模型候选列表。
+                    heading_level = 2
+                    candidate_kind = "title_like"
+
+            if heading_level is None:
+                continue
+
+            candidates.append(
+                {
+                    "candidate_id": f"body_p_{body_index}",
+                    "body_index": body_index,
+                    "title": title,
+                    "heading_level": heading_level,
+                    "style_name": style_name,
+                    "candidate_kind": candidate_kind,
+                }
+            )
+
+        logger.info(
+            "DocxParser: 提取 Word 标题候选完成，文件={}, 候选数量={}",
+            docx_path,
+            len(candidates),
+        )
+        return candidates
+
     def _convert_docx_to_markdown(self, docx_path: str) -> str:
         if not os.path.exists(docx_path):
             raise FileNotFoundError(f"未找到指定的 Word 文件: {docx_path}")

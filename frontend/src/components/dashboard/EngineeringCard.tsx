@@ -1,4 +1,4 @@
-import React from 'react';
+import { format_analysis_value } from '../../utils/displayValue';
 
 interface EngineeringProps {
   engineering?: {
@@ -52,7 +52,7 @@ export function EngineeringCard({ engineering = {}, onReextract, isRetrying = fa
               <span className="text-rose-500">🚨</span> 实体验证红线 (废标风险高)
             </h4>
             <div className="text-xs text-rose-800 font-medium leading-relaxed relative z-10">
-              {tech_validation.description}
+              {format_analysis_value(tech_validation.description)}
             </div>
           </div>
         )}
@@ -65,7 +65,7 @@ export function EngineeringCard({ engineering = {}, onReextract, isRetrying = fa
               {special_working_conditions.map((point, idx) => (
                 <li key={idx} className="flex gap-2 text-sm text-slate-700 bg-orange-50/50 p-2.5 rounded-lg border border-orange-100/50">
                   <span className="text-orange-500 mt-0.5 shrink-0">⚠️</span>
-                  <span className="leading-relaxed font-medium">{point}</span>
+                  <span className="leading-relaxed font-medium">{format_analysis_value(point)}</span>
                 </li>
               ))}
             </ul>
@@ -81,7 +81,7 @@ export function EngineeringCard({ engineering = {}, onReextract, isRetrying = fa
           <div>
             <h4 className="text-xs font-bold text-slate-400 mb-2 uppercase tracking-wider">现场环境约束</h4>
             <div className="text-sm text-slate-600 bg-slate-50 p-3 rounded-lg border border-slate-100 leading-relaxed italic">
-              {site_environment_constraints}
+              {format_analysis_value(site_environment_constraints)}
             </div>
           </div>
         )}
@@ -95,7 +95,7 @@ export function EngineeringCard({ engineering = {}, onReextract, isRetrying = fa
                 <div className="flex flex-wrap gap-1.5">
                   {mandatory_standards.map((std, idx) => (
                     <span key={`std-${idx}`} className="px-2 py-1 bg-slate-100 text-slate-600 rounded text-[10px] font-medium border border-slate-200">
-                      {std}
+                      {format_analysis_value(std)}
                     </span>
                   ))}
                 </div>
@@ -107,7 +107,7 @@ export function EngineeringCard({ engineering = {}, onReextract, isRetrying = fa
                 <ul className="space-y-1">
                   {safety_and_env_requirements.map((req, idx) => (
                     <li key={`req-${idx}`} className="text-[11px] text-slate-500 flex items-start gap-1">
-                      <span className="text-emerald-500">•</span> {req}
+                      <span className="text-emerald-500">•</span> {format_analysis_value(req)}
                     </li>
                   ))}
                 </ul>

@@ -21,6 +21,7 @@ from app.agents.tools.metadata_tools import (
     extract_evaluation_info
 )
 from app.utils.table_utils import normalize_section_name
+from app.utils.text_normalizer import normalize_markup_text
 
 router = APIRouter()
 
@@ -33,6 +34,92 @@ def _find_task_upload_file(upload_dir: Path, task_id: str) -> Optional[str]:
     pattern = str(upload_dir / "**" / f"{task_id}_*")
     matched_files = sorted(glob.glob(pattern, recursive=True))
     return next((path for path in matched_files if os.path.isfile(path)), None)
+
+
+def _enrich_export_group_context(
+    db: Session,
+    document_id: str,
+    document: Any,
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """从已保存快照和工程元数据补回导出项的表内分类信息。"""
+    if not items:
+        return items
+
+    def normalize_text_list(value: Any) -> List[str]:
+        values = value if isinstance(value, list) else [value]
+        normalized: List[str] = []
+        for item in values:
+            if isinstance(item, dict):
+                item = item.get("input") or item.get("value") or item.get("name")
+            text = str(item or "").strip()
+            if text:
+                normalized.append(text)
+        return normalized
+
+    context_sources: List[Dict[str, Dict[str, Any]]] = []
+    saved_cost_analysis = (document.parsed_metadata or {}).get("cost_analysis", {})
+    saved_items = saved_cost_analysis.get("items", []) if isinstance(saved_cost_analysis, dict) else []
+    if isinstance(saved_items, list):
+        context_sources.append({
+            str(item.get("name") or item.get("item_name") or "").strip(): item
+            for item in saved_items
+            if isinstance(item, dict) and str(item.get("name") or item.get("item_name") or "").strip()
+        })
+
+    from app.db.models.metadata import EngineeringMetadata
+
+    engineering_metadata = db.query(EngineeringMetadata).filter(
+        EngineeringMetadata.document_id == document_id,
+    ).first()
+    engineering_items = getattr(engineering_metadata, "main_equipment_list", None)
+    if isinstance(engineering_items, list):
+        context_sources.append({
+            str(item.get("item_name") or item.get("name") or "").strip(): item
+            for item in engineering_items
+            if isinstance(item, dict) and str(item.get("item_name") or item.get("name") or "").strip()
+        })
+
+    if not context_sources:
+        return items
+
+    enriched_items: List[Dict[str, Any]] = []
+    enriched_count = 0
+    for value in items:
+        if not isinstance(value, dict):
+            enriched_items.append(value)
+            continue
+
+        enriched = dict(value)
+        item_name = str(enriched.get("name") or enriched.get("item_name") or "").strip()
+        context_hit = False
+        for source in context_sources:
+            context = source.get(item_name)
+            if not context:
+                continue
+            if not enriched.get("part_name") and context.get("part_name"):
+                enriched["part_name"] = str(context["part_name"]).strip()
+                context_hit = True
+            if not enriched.get("group_path") and context.get("group_path"):
+                enriched["group_path"] = normalize_text_list(context.get("group_path"))
+                context_hit = True
+            if enriched.get("source_table_index") is None and context.get("source_table_index") is not None:
+                enriched["source_table_index"] = context.get("source_table_index")
+                context_hit = True
+            if not enriched.get("grouping_mode") and context.get("grouping_mode"):
+                enriched["grouping_mode"] = context.get("grouping_mode")
+                context_hit = True
+        if context_hit:
+            enriched_count += 1
+        enriched_items.append(enriched)
+
+    if enriched_count:
+        logger.info(
+            "导出数据补回表内分组上下文: document_id={}, 命中项数={}",
+            document_id,
+            enriched_count,
+        )
+    return enriched_items
 
 @router.post("/upload-and-analyze", response_model=ResponseModel[dict])
 async def upload_and_analyze(
@@ -123,7 +210,7 @@ async def reextract_domain(
         "evaluation": extract_evaluation_info
     }
     
-    if domain not in domain_map and domain not in ("cost_estimation", "cost", "writer", "draft", "writer_agent", "strategy_qual", "qualifications_analysis", "qual_analysis", "opening_summary", "opening_summary_agent"):
+    if domain not in domain_map and domain not in ("cost_estimation", "cost", "writer", "draft", "writer_agent", "strategy_qual", "qualifications_analysis", "qual_analysis", "strategy_risk", "risks_analysis", "risk_analysis", "opening_summary", "opening_summary_agent"):
         raise HTTPException(status_code=400, detail=f"未知的提取领域: {domain}")
         
     try:
@@ -140,6 +227,7 @@ async def reextract_domain(
         token_task = current_task_id.set(document_id)
         token_user = current_user_id.set(current_user.id)
         token_tenant = current_tenant_id.set(current_user.tenant_id)
+        analysis_lock = None
         
         from fastapi.concurrency import run_in_threadpool
 
@@ -176,6 +264,30 @@ async def reextract_domain(
                 }
                 cost_result = await run_in_threadpool(cost_node, state)
                 cost_data = cost_result.get("cost_analysis", {})
+
+                # 重新匹配只刷新价格与匹配信息，保留用户已保存的 BOM 节点关系、顺序及增删结果。
+                from app.services.cost_service import (
+                    merge_cost_analysis_with_manual_structure,
+                    persist_cost_estimate_rows,
+                )
+                saved_cost_analysis = (doc.parsed_metadata or {}).get("cost_analysis", {})
+                cost_data = merge_cost_analysis_with_manual_structure(
+                    cost_data,
+                    saved_cost_analysis if isinstance(saved_cost_analysis, dict) else {},
+                )
+                # cost_node 会先写入一次新匹配结果；合并人工结构后必须再次同步最终结果，避免实体表残留旧结构。
+                persist_cost_estimate_rows(
+                    db=db,
+                    document_id=document_id,
+                    tenant_id=current_user.tenant_id,
+                    user_id=current_user.id,
+                    project_id=(
+                        getattr(doc, "project_id", None)
+                        if isinstance(getattr(doc, "project_id", None), str)
+                        else None
+                    ),
+                    items=cost_data.get("items") or [],
+                )
                 
                 # 持久化更新至数据库 parsed_metadata
                 parsed_metadata = dict(doc.parsed_metadata or {})
@@ -188,8 +300,15 @@ async def reextract_domain(
                 return success_response(data=cost_data, message="BOM 清单重新匹配成功")
 
             if domain in ("strategy_qual", "qualifications_analysis", "qual_analysis"):
-                from sqlalchemy.orm.attributes import flag_modified
                 from app.agents.nodes.strategy_agent import analyze_qualifications_node
+                from app.worker.tasks import redis_client
+
+                analysis_lock = redis_client.lock(
+                    f"analysis:worker:{document_id}:strategy_qual",
+                    timeout=900,
+                )
+                if not analysis_lock.acquire(blocking=False):
+                    raise HTTPException(status_code=409, detail="履约盘点正在执行，请勿重复提交")
 
                 state = {
                     "document_id": document_id,
@@ -198,15 +317,64 @@ async def reextract_domain(
                     "company_quals": (doc.parsed_metadata or {}).get("company_quals", "")
                 }
                 qual_result = await run_in_threadpool(analyze_qualifications_node, state)
-                qual_data = qual_result.get("qualifications_analysis", {})
+                worker_failed = any(
+                    item.get("worker") == "strategy_qual" and item.get("status") == "failed"
+                    for item in qual_result.get("worker_summaries", [])
+                    if isinstance(item, dict)
+                )
+                if worker_failed:
+                    raise HTTPException(status_code=503, detail="履约盘点分析失败，请稍后重试")
 
-                parsed_metadata = dict(doc.parsed_metadata or {})
-                parsed_metadata["qualifications_analysis"] = qual_data
-                doc.parsed_metadata = parsed_metadata
-                flag_modified(doc, "parsed_metadata")
-                db.commit()
+                db.expire_all()
+                doc_fresh = document_crud.get_document_by_id(
+                    db, document_id, current_user.id, current_user.tenant_id
+                )
+                fresh_meta = doc_fresh.parsed_metadata if doc_fresh else {}
+                return success_response(
+                    data={
+                        "qualifications_analysis": fresh_meta.get("qualifications_analysis", {}),
+                        "analysis_status": fresh_meta.get("analysis_status", {}),
+                    },
+                    message="资质核对与能力盘点重新计算成功",
+                )
 
-                return success_response(data=qual_data, message="资质核对与能力盘点重新计算成功")
+            if domain in ("strategy_risk", "risks_analysis", "risk_analysis"):
+                from app.agents.nodes.strategy_agent import identify_risks_node
+                from app.worker.tasks import redis_client
+
+                analysis_lock = redis_client.lock(
+                    f"analysis:worker:{document_id}:strategy_risk",
+                    timeout=900,
+                )
+                if not analysis_lock.acquire(blocking=False):
+                    raise HTTPException(status_code=409, detail="风险提示正在执行，请勿重复提交")
+
+                state = {
+                    "document_id": document_id,
+                    "user_id": current_user.id,
+                    "tenant_id": current_user.tenant_id,
+                }
+                risk_result = await run_in_threadpool(identify_risks_node, state)
+                worker_failed = any(
+                    item.get("worker") == "strategy_risk" and item.get("status") == "failed"
+                    for item in risk_result.get("worker_summaries", [])
+                    if isinstance(item, dict)
+                )
+                if worker_failed:
+                    raise HTTPException(status_code=503, detail="风险提示分析失败，请稍后重试")
+
+                db.expire_all()
+                doc_fresh = document_crud.get_document_by_id(
+                    db, document_id, current_user.id, current_user.tenant_id
+                )
+                fresh_meta = doc_fresh.parsed_metadata if doc_fresh else {}
+                return success_response(
+                    data={
+                        "risks_analysis": fresh_meta.get("risks_analysis", []),
+                        "analysis_status": fresh_meta.get("analysis_status", {}),
+                    },
+                    message="风险提示重新分析成功",
+                )
 
             if domain in ("writer", "draft", "writer_agent"):
                 from app.agents.bid_filler_agent import bid_filler_orchestrator_node as writer_agent_node
@@ -246,6 +414,11 @@ async def reextract_domain(
                 logger.error(f"重新提取 {domain} 失败或无权限: {res_str}")
                 raise HTTPException(status_code=500, detail=f"重新提取失败: {res_str}")
         finally:
+            if analysis_lock is not None:
+                try:
+                    analysis_lock.release()
+                except Exception:
+                    logger.exception("释放分析专项锁失败: domain={}, document_id={}", domain, document_id)
             current_task_id.reset(token_task)
             current_user_id.reset(token_user)
             current_tenant_id.reset(token_tenant)
@@ -261,8 +434,10 @@ from pydantic import BaseModel, Field, field_validator
 
 def _normalize_cost_text(value: Any) -> Any:
     """将历史结构化字段转换为接口可接受的文本，兼容旧版 {type, input} 数据。"""
-    if value is None or isinstance(value, str):
+    if value is None:
         return value
+    if isinstance(value, str):
+        return normalize_markup_text(value)
     if isinstance(value, (int, float, bool)):
         return str(value)
     if isinstance(value, dict):
@@ -275,6 +450,9 @@ def _normalize_cost_text(value: Any) -> Any:
     return str(value)
 
 class CostItemUpdateRequest(BaseModel):
+    node_id: Optional[str] = Field(default=None, description="稳定的 BOM 节点唯一标识")
+    parent_node_id: Optional[str] = Field(default=None, description="稳定的直接父节点标识；为空表示顶层节点")
+    sort_order: Optional[int] = Field(default=0, description="同级节点排序值")
     item_code: Optional[str] = Field(default=None, description="表格多级序号编码")
     name: str = Field(..., description="项目/设备名称")
     spec_requirement: str = Field(default="", description="规格或说明")
@@ -296,10 +474,14 @@ class CostItemUpdateRequest(BaseModel):
     tree_level: Optional[int] = Field(default=1, description="层级深度（1=顶层主要标的物, 2=二级成套分项, 3=三级元器件）")
     per_set_qty: Optional[Any] = Field(default=None, description="单套设备定额数量")
     per_set_quantity: Optional[Any] = Field(default=None, description="单套设备定额数量别名")
+    part_name: Optional[str] = Field(default=None, description="表内 BOQ 一级分部/报价部分名称，仅用于分类")
+    group_path: List[str] = Field(default_factory=list, description="表内 BOQ 分组路径，仅用于分类展示")
     brand: Optional[str] = Field(default=None, description="品牌")
     model: Optional[str] = Field(default=None, description="规格型号")
     manufacturer: Optional[str] = Field(default=None, description="生产厂商")
     section_name: Optional[str] = Field(default=None, description="所属分标段/分区域/分项工程名称")
+    source_table_index: Optional[int] = Field(default=None, description="来源原始表格索引，仅用于保持表格边界")
+    grouping_mode: Optional[str] = Field(default=None, description="原始表格主分组模式，由解析阶段写入")
     is_parent_modified: Optional[bool] = Field(default=None, description="是否已被用户直接自定义修改父项价格/属性")
     is_child_modified: Optional[bool] = Field(default=None, description="是否已被用户直接修改子项价格/属性")
     is_custom_added: Optional[bool] = Field(default=None, description="是否为用户手动添加的新分项")
@@ -315,11 +497,11 @@ class CostItemUpdateRequest(BaseModel):
     raw_match_quality: Optional[str] = Field(default=None, description="原始置信度")
 
     @field_validator(
-        "item_code", "name", "spec_requirement", "unit", "matched_name",
+        "node_id", "parent_node_id", "item_code", "name", "spec_requirement", "unit", "matched_name",
         "matched_brand", "matched_model", "matched_manufacturer",
         "brand_requirements", "match_quality", "warning", "comparison_note",
         "remark", "parent_item", "root_item", "brand", "model", "manufacturer",
-        "section_name", "pricing_mode", "raw_name", "raw_brand", "raw_model", "raw_manufacturer",
+        "section_name", "grouping_mode", "pricing_mode", "raw_name", "raw_brand", "raw_model", "raw_manufacturer",
         "raw_spec", "raw_unit", "raw_match_quality", mode="before"
     )
     @classmethod
@@ -331,6 +513,15 @@ class CostItemUpdateRequest(BaseModel):
     @classmethod
     def normalize_key_parameters(cls, value: Any) -> List[str]:
         """将关键参数统一为字符串列表，保证前端展示和后续持久化稳定。"""
+        if value is None:
+            return []
+        values = value if isinstance(value, list) else [value]
+        return [text for item in values if (text := _normalize_cost_text(item))]
+
+    @field_validator("group_path", mode="before")
+    @classmethod
+    def normalize_group_path(cls, value: Any) -> List[str]:
+        """将表内 BOQ 分组路径统一为字符串列表，避免保存时丢失分类信息。"""
         if value is None:
             return []
         values = value if isinstance(value, list) else [value]
@@ -376,7 +567,11 @@ async def update_cost_analysis(
                     "root_item": eq.get("root_item"),
                     "tree_level": eq.get("tree_level"),
                     "per_set_qty": eq.get("per_set_quantity") or eq.get("per_set_qty"),
-                    "section_name": eq.get("section_name")
+                    "part_name": eq.get("part_name"),
+                    "group_path": eq.get("group_path") or [],
+                    "section_name": eq.get("section_name"),
+                    "source_table_index": eq.get("source_table_index"),
+                    "grouping_mode": eq.get("grouping_mode"),
                 }
 
     # 2. 补齐属性并执行自底向上树形层级汇总（防双重计费并计算成套母项小计与折合单价）
@@ -411,6 +606,14 @@ async def update_cost_analysis(
                 item_dict["per_set_qty"] = parent_map[name_key]["per_set_qty"]
             if not item_dict.get("section_name") and parent_map[name_key].get("section_name"):
                 item_dict["section_name"] = parent_map[name_key]["section_name"]
+            if not item_dict.get("part_name") and parent_map[name_key].get("part_name"):
+                item_dict["part_name"] = parent_map[name_key]["part_name"]
+            if not item_dict.get("group_path") and parent_map[name_key].get("group_path"):
+                item_dict["group_path"] = parent_map[name_key]["group_path"]
+            if item_dict.get("source_table_index") is None and parent_map[name_key].get("source_table_index") is not None:
+                item_dict["source_table_index"] = parent_map[name_key]["source_table_index"]
+            if not item_dict.get("grouping_mode") and parent_map[name_key].get("grouping_mode"):
+                item_dict["grouping_mode"] = parent_map[name_key]["grouping_mode"]
 
         try:
             qty = float(raw_qty) if raw_qty is not None else 1.0
@@ -647,7 +850,16 @@ async def download_opening_summary(
         content_disposition_type="attachment"
     )
 
-@router.api_route("/download/{task_id}", methods=["GET", "HEAD"])
+@router.head(
+    "/download/{task_id}",
+    include_in_schema=False,
+    name="download_original_file_analysis_head",
+)
+@router.get(
+    "/download/{task_id}",
+    operation_id="download_original_file_analysis",
+    summary="按分析路径下载原始文件",
+)
 async def download_original_file(
     task_id: str, 
     db: Session = Depends(get_db),
@@ -761,7 +973,19 @@ def export_bom_docx(
     if payload and payload.items is not None and len(payload.items) > 0:
         items = payload.items
     elif doc:
-        cost_rows = db.query(CostEstimate).filter(CostEstimate.document_id == document_id).order_by(CostEstimate.id.asc()).all()
+        cost_rows = (
+            db.query(CostEstimate)
+            .filter(
+                CostEstimate.document_id == document_id,
+                CostEstimate.tenant_id == current_user.tenant_id,
+            )
+            .order_by(
+                CostEstimate.sort_order.asc().nullslast(),
+                CostEstimate.created_at.asc(),
+                CostEstimate.id.asc(),
+            )
+            .all()
+        )
         if cost_rows:
             items = [
                 {
@@ -787,6 +1011,9 @@ def export_bom_docx(
             ]
         elif doc.parsed_metadata and isinstance(doc.parsed_metadata.get("cost_analysis"), dict):
             items = doc.parsed_metadata["cost_analysis"].get("items") or []
+
+        # 数据库实体暂未单独存储表内分组字段，导出前从当前文档快照补回分类上下文。
+        items = _enrich_export_group_context(db, document_id, doc, items)
 
     total_cost = payload.total_cost if (payload and payload.total_cost is not None) else None
     budget_limit = payload.budget_limit if (payload and payload.budget_limit) else (
@@ -850,7 +1077,19 @@ def export_bom_xlsx(
     if payload and payload.items is not None and len(payload.items) > 0:
         items = payload.items
     elif doc:
-        cost_rows = db.query(CostEstimate).filter(CostEstimate.document_id == document_id).order_by(CostEstimate.id.asc()).all()
+        cost_rows = (
+            db.query(CostEstimate)
+            .filter(
+                CostEstimate.document_id == document_id,
+                CostEstimate.tenant_id == current_user.tenant_id,
+            )
+            .order_by(
+                CostEstimate.sort_order.asc().nullslast(),
+                CostEstimate.created_at.asc(),
+                CostEstimate.id.asc(),
+            )
+            .all()
+        )
         if cost_rows:
             items = [
                 {
@@ -876,6 +1115,9 @@ def export_bom_xlsx(
             ]
         elif doc.parsed_metadata and isinstance(doc.parsed_metadata.get("cost_analysis"), dict):
             items = doc.parsed_metadata["cost_analysis"].get("items") or []
+
+        # 数据库实体暂未单独存储表内分组字段，导出前从当前文档快照补回分类上下文。
+        items = _enrich_export_group_context(db, document_id, doc, items)
 
     total_cost = payload.total_cost if (payload and payload.total_cost is not None) else None
     budget_limit = payload.budget_limit if (payload and payload.budget_limit) else (

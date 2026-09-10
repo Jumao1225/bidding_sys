@@ -2,14 +2,23 @@
 单章节重新生成与 Prompt 微调功能单元测试 (test_chapter_regenerate.py)
 """
 import os
+import json
 import tempfile
+from unittest.mock import patch
 from docx import Document
 from types import SimpleNamespace
 
 from app.schemas.bid_filler_schema import RegenerateChapterRequest, RegenerateChapterResponse
-from app.agents.bid_filler_workers import build_worker_prompt
+from app.agents.bid_filler_workers import (
+    build_worker_prompt,
+    _build_deterministic_pricing_proposal,
+    _map_pricing_headers_to_fields,
+)
 from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
-from app.api.endpoints.bid_generator import _restore_profile_slots_after_chapter_reset
+from app.api.endpoints.bid_generator import (
+    _restore_profile_slots_after_chapter_reset,
+    _verify_pricing_table_writeback,
+)
 
 
 def test_regenerate_chapter_request_schema_validation():
@@ -184,7 +193,8 @@ def test_build_worker_prompt_pricing_workflow_direct_matrix():
     # 1. 验证包含 2D 矩阵直通指引与字段说明
     assert "cost_estimates_json_matrix" in system_prompt
     assert "造价工程师与分项报价专家" in system_prompt
-    assert "严禁冗余查询" in system_prompt or "绝对禁止同时或重复调用" in system_prompt
+    assert "仅调用一次" in system_prompt
+    assert "禁止查询纯文本报价字段" in system_prompt
 
     # 2. 验证防重复扫描规则
     assert "严禁重复盲目查询" in system_prompt or "严禁重复查询" in system_prompt
@@ -192,3 +202,135 @@ def test_build_worker_prompt_pricing_workflow_direct_matrix():
     # 3. 验证严禁硬编码具体设备与数据（杜绝具体锚定）
     for forbidden_word in ["光伏组件", "逆变器", "并网柜", "彩钢瓦", "2235211", "1634971"]:
         assert forbidden_word not in system_prompt
+
+
+def test_map_pricing_headers_should_follow_runtime_table_columns():
+    """验证报价表真实表头能转换为数据库矩阵字段，且不依赖固定列号。"""
+    headers = ["序号", "标的物名称", "品牌、规格、型号", "生产厂家", "单位", "数量", "单价", "总价", "备注"]
+
+    assert _map_pricing_headers_to_fields(headers) == [
+        "__INDEX__",
+        "item_name",
+        "__BRAND_SPEC__",
+        "manufacturer",
+        "unit",
+        "quantity",
+        "unit_price",
+        "calculated_total",
+        "remark",
+    ]
+
+
+def test_deterministic_pricing_proposal_should_expand_table_and_preserve_footer():
+    """正常场景：后端按真实表头生成完整矩阵，并把明细扩写到模板表尾之前。"""
+    doc = Document()
+    doc.add_paragraph("五、投标配置及分项报价表")
+    doc.add_paragraph("投标报价分析表")
+    table = doc.add_table(rows=4, cols=9)
+    headers = ["序号", "标的物名称", "品牌、规格、型号", "生产厂家", "单位", "数量", "单价", "总价", "备注"]
+    for index, header in enumerate(headers):
+        table.rows[0].cells[index].text = header
+    table.rows[2].cells[0].text = "投标总报价："
+    table.rows[2].cells[1].text = "大写：元"
+    table.rows[3].cells[0].text = "交货期限："
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as file_handle:
+        temp_path = file_handle.name
+
+    matrix = [
+        ["1", "项目A", "品牌A 规格A", "厂家A", "套", "1", "10.00", "10.00", ""],
+        ["2", "项目B", "品牌B 规格B", "厂家B", "套", "2", "20.00", "40.00", ""],
+    ]
+
+    try:
+        doc.save(temp_path)
+        with patch(
+            "app.agents.tools.bid_db_tools.query_financial_quotation_tool.func",
+            return_value=json.dumps(matrix, ensure_ascii=False),
+        ) as query_mock:
+            proposal = _build_deterministic_pricing_proposal(
+                document_id="doc-pricing-test",
+                docx_path=temp_path,
+                chapter_title="投标配置及分项报价表",
+                prefetched_metadata={
+                    "total_price_str": "50.00 元",
+                    "total_price_words": "伍拾元整",
+                    "delivery_period": "60日内完成",
+                },
+            )
+
+        assert proposal is not None
+        assert proposal["path"] == "/body/tbl[1]"
+        proposal_matrix = json.loads(proposal["proposed_text"])
+        assert proposal_matrix[:2] == matrix
+        assert "50.00 元" in "".join(proposal_matrix[-2])
+        assert "60日内完成" in "".join(proposal_matrix[-1])
+        query_mock.assert_called_once()
+
+        count = fill_docx_proposals_in_dom(temp_path, [proposal])
+        assert count >= 4
+        verified, verify_message = _verify_pricing_table_writeback(
+            temp_path,
+            "投标配置及分项报价表",
+            [proposal],
+        )
+        assert verified, verify_message
+        result_table = Document(temp_path).tables[0]
+        assert len(result_table.rows) == 5
+        assert result_table.rows[1].cells[1].text.strip() == "项目A"
+        assert result_table.rows[2].cells[1].text.strip() == "项目B"
+        assert "50.00 元" in "".join(cell.text for cell in result_table.rows[-2].cells)
+        assert "60日内完成" in "".join(cell.text for cell in result_table.rows[-1].cells)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def test_fill_docx_proposals_in_dom_should_auto_redirect_when_path_shifted_to_title():
+    """
+    验证当绝对路径发生物理偏移命中固定标题时，写盘引擎能通用自愈重定向到真实槽位段落并成功写入。
+    场景模拟：
+    前面章节插入内容使得文档段落向后偏移 1 位：
+    p[1]: 前置章节段落
+    p[2]: 五、投标配置及分项报价表
+    p[3]: 投标报价分析表 (固定标题，无槽位)
+    p[4]: 招标编号：号                                 项目名称： (真实槽位)
+    提案因模板基准给出的路径是 /body/p[3]（误打在子标题上）。
+    期望：写盘引擎触发自愈纠偏，自动重定向到 /body/p[4]，成功写入招标编号与项目名称，且无漏填。
+    """
+    doc = Document()
+    doc.add_paragraph("前置章节内容")
+    doc.add_paragraph("五、投标配置及分项报价表")
+    doc.add_paragraph("投标报价分析表")
+    doc.add_paragraph("招标编号：号                                 项目名称：")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
+        doc.save(tmp_path)
+
+    fake_project_code = "TEST-BID-2026-X01号"
+    fake_project_name = "某某新能源分布式电站示范工程"
+    proposal_text = f"招标编号：{fake_project_code}                                 项目名称：{fake_project_name}"
+
+    proposals = [
+        {
+            "path": "/body/p[3]",  # 物理偏移导致路径打在 p[3]（标题行）
+            "proposed_text": proposal_text,
+            "value": proposal_text,
+            "type": "text",
+        }
+    ]
+
+    try:
+        count = fill_docx_proposals_in_dom(tmp_path, proposals)
+        assert count > 0
+
+        res_doc = Document(tmp_path)
+        all_texts = [p.text.strip() for p in res_doc.paragraphs if p.text.strip()]
+        # 验证招标编号与项目名称被成功填入，没有被误拦截跳过
+        assert any(fake_project_code in t and fake_project_name in t for t in all_texts)
+        # 验证模板原有未填的空白占位已被替换
+        assert "招标编号：号" not in "\n".join(all_texts)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)

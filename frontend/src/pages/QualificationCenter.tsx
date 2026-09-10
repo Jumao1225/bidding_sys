@@ -3,10 +3,12 @@ import { apiFetch } from '../utils/api';
 import { motion } from 'framer-motion';
 import type { Qualification } from '../components/qualifications/QualificationCard';
 import { QualificationUploadModal } from '../components/qualifications/QualificationUploadModal';
+import { useDialog } from '../components/DialogProvider';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
 export function QualificationCenter() {
+  const { confirm, alert } = useDialog();
   const [qualifications, setQualifications] = useState<Qualification[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -40,7 +42,12 @@ export function QualificationCenter() {
   }, []);
 
   const handleDelete = async (id: string) => {
-    if (!window.confirm('确认删除此资质文件？')) return;
+    const confirmed = await confirm('确认删除此资质文件？', {
+      title: '确认删除资质文件',
+      intent: 'danger',
+      confirmText: '删除资质',
+    });
+    if (!confirmed) return;
     try {
       const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
       const res = await apiFetch(`${baseUrl}/api/v1/qualifications/${id}`, {
@@ -62,7 +69,12 @@ export function QualificationCenter() {
 
   const handleBatchDelete = async () => {
     if (selectedIds.size === 0) return;
-    if (!window.confirm(`确认删除选中的 ${selectedIds.size} 个资质文件吗？`)) return;
+    const confirmed = await confirm(`确认删除选中的 ${selectedIds.size} 个资质文件吗？`, {
+      title: '确认批量删除资质',
+      intent: 'danger',
+      confirmText: '批量删除',
+    });
+    if (!confirmed) return;
     
     try {
       const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
@@ -82,7 +94,7 @@ export function QualificationCenter() {
       setSelectionMode(false);
     } catch (error) {
       console.error('Batch delete failed:', error);
-      alert('部分删除失败，请刷新页面后重试');
+      await alert('部分删除失败，请刷新页面后重试', { title: '批量删除失败', intent: 'danger' });
       fetchQualifications();
     }
   };

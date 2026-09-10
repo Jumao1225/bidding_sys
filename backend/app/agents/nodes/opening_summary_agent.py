@@ -26,6 +26,7 @@ from docx.oxml.ns import nsdecls, qn
 
 from app.db.session import SessionLocal
 from app.db.models.project import Document
+from app.services.cost_service import resolve_cost_total
 from app.utils.rmb_formatter import number_to_chinese_rmb
 from app.worker.tasks import emit_agent_log
 
@@ -511,7 +512,7 @@ def generate_opening_summary_node(state: dict) -> dict:
         # 深度联动 DB 直查 3: CostEstimate (报价算量结果)
         from app.db.models.ai_analysis import CostEstimate
         cost_estimates = db.query(CostEstimate).filter(CostEstimate.project_id == doc.project_id).all()
-        calc_total = sum(c.calculated_total for c in cost_estimates) if cost_estimates else 0.0
+        calc_total = resolve_cost_total(parsed_metadata.get("cost_analysis", {}), cost_estimates)
 
         # 深度联动 DB 直查 4: User (用户公司名称)
         user = db.query(User).filter(User.id == (user_id or doc.user_id)).first() if (user_id or doc.user_id) else None

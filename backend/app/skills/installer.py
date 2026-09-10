@@ -33,7 +33,7 @@ def _extract_skill_name_from_url(url: str, default_name: str = "custom_skill") -
 @tool
 def install_skill_from_url(url: str, skill_name: Optional[str] = None) -> str:
     """
-    [技能在线安装工具] 当用户提供一个技能的下载链接 (例如 Git 仓库地址、Zip 包链接或 SKILL.md 直链) 并要求安装时使用此工具。
+    [Skill 安装 Tool] 当用户提供一个 Skill 的下载链接（例如 Git 仓库地址、Zip 包链接或 SKILL.md 直链）并要求安装时使用此 Tool。
     系统会自动下载该技能文件，安装到 backend/app/skills/ 目录下并实时热加载生效。
 
     :param url: 技能的下载或 Git 仓库链接 (如 'https://github.com/user/my-skill' 或 'https://example.com/skill.zip')

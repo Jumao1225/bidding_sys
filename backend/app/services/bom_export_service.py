@@ -7,8 +7,10 @@ BOM 成本测算与对标清单 Word 与 Excel 导出服务 (bom_export_service.
 """
 
 import io
+import math
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 from docx import Document
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -21,6 +23,659 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from app.utils.rmb_formatter import number_to_chinese_rmb
+from app.utils.text_normalizer import normalize_markup_text
+
+
+@dataclass
+class _BomTreeNode:
+    """导出用的 BOM 树节点，避免直接修改前端传入的数据。"""
+
+    item: Dict[str, Any]
+    children: List["_BomTreeNode"] = field(default_factory=list)
+
+
+@dataclass
+class _BomExportRow:
+    """Word 与 Excel 共用的导出行描述。"""
+
+    item: Optional[Dict[str, Any]] = None
+    section_name: Optional[str] = None
+    hierarchy_number: str = ""
+    depth: int = 0
+    is_parent: bool = False
+    is_section_header: bool = False
+    group_name: Optional[str] = None
+    is_group_header: bool = False
+
+
+def _normalize_export_text(value: Any) -> str:
+    """将导出字段安全转换为去除首尾空白的文本。"""
+    if value is None:
+        return ""
+    normalized = normalize_markup_text(value)
+    return str(normalized).strip()
+
+
+def _strip_currency_symbols(value: Any) -> str:
+    """清理金额展示文本中的人民币符号，统一由字段单位表达币种。"""
+    return _normalize_export_text(value).replace("¥", "").replace("￥", "").strip()
+
+
+def _normalize_export_text_list(value: Any) -> List[str]:
+    """将分组路径兼容为稳定的非空字符串列表。"""
+    if value is None:
+        return []
+    values = value if isinstance(value, (list, tuple)) else [value]
+    result: List[str] = []
+    for item in values:
+        if isinstance(item, Mapping):
+            item = item.get("input") or item.get("value") or item.get("name")
+        text = _normalize_export_text(item)
+        if text:
+            result.append(text)
+    return result
+
+
+def _deduplicate_group_path(values: Sequence[str]) -> List[str]:
+    """去除分组路径中的连续重复节点，保留原始层级顺序。"""
+    result: List[str] = []
+    for value in values:
+        normalized_value = _normalize_export_text(value)
+        if not normalized_value:
+            continue
+        if result and result[-1] == normalized_value:
+            continue
+        result.append(normalized_value)
+    return result
+
+
+def _item_group_context(item: Mapping[str, Any]) -> tuple[str, ...]:
+    """读取表内 BOQ 分类路径，并避免父节点与路径首节点重复展示。"""
+    part_name = _normalize_export_text(item.get("part_name"))
+    group_path = _normalize_export_text_list(item.get("group_path"))
+    return tuple(_deduplicate_group_path([part_name, *group_path]))
+
+
+def _resolve_grouping_display_mode(items: Sequence[Any]) -> str:
+    """根据导出数据确定唯一主分组模式，兼容未带模式字段的历史结果。"""
+    modes: set[str] = set()
+
+    def collect(values: Sequence[Any]) -> None:
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            explicit_mode = _normalize_export_text(value.get("grouping_mode"))
+            if explicit_mode in {"external", "internal", "none"}:
+                modes.add(explicit_mode)
+            elif _normalize_export_text(value.get("section_name")):
+                modes.add("external")
+            elif _item_group_context(value):
+                modes.add("internal")
+            children = value.get("children")
+            if isinstance(children, list):
+                collect(children)
+
+    collect(items)
+    modes.discard("none")
+    if not modes:
+        return "none"
+    if len(modes) == 1:
+        return next(iter(modes))
+    return "mixed"
+
+
+def _build_root_group_contexts(
+    roots: Sequence[_BomTreeNode],
+    respect_sections: bool = True,
+) -> List[tuple[str, ...]]:
+    """按根项原始顺序补齐断开的表内分组上下文。
+
+    表格跨行或跨页解析时，后续明细可能没有重复携带分组字段。此时沿用最近的
+    有效上下文，直到遇到新的显式大分组或表外分区，模拟原表格的纵向连续关系。
+    """
+    contexts: List[tuple[str, ...]] = []
+    active_context: tuple[str, ...] = tuple()
+    active_part_name = ""
+    previous_section: object = object()
+
+    for root in roots:
+        section_name = _normalize_export_text(root.item.get("section_name"))
+        if respect_sections and section_name != previous_section:
+            active_context = tuple()
+            active_part_name = ""
+            previous_section = section_name
+
+        explicit_part_name = _normalize_export_text(root.item.get("part_name"))
+        raw_context = _item_group_context(root.item)
+        if explicit_part_name:
+            effective_context = raw_context or (explicit_part_name,)
+            active_part_name = explicit_part_name
+        elif raw_context:
+            if active_part_name and raw_context[0] != active_part_name:
+                effective_context = tuple(
+                    _deduplicate_group_path([active_part_name, *raw_context])
+                )
+            else:
+                effective_context = raw_context
+        else:
+            effective_context = active_context
+
+        contexts.append(effective_context)
+        if effective_context:
+            active_context = effective_context
+
+    logger.debug(
+        "BOM 导出根项分组上下文补齐完成: 根项数={}, 有效分组根项数={}",
+        len(roots),
+        sum(bool(context) for context in contexts),
+    )
+    return contexts
+
+
+def _node_numbering_group_key(node: _BomTreeNode) -> Optional[str]:
+    """读取节点所属的大分组键，仅使用明确的表内分组上下文。"""
+    group_context = _item_group_context(node.item)
+    if group_context:
+        return group_context[0]
+    for child in node.children:
+        child_group_key = _node_numbering_group_key(child)
+        if child_group_key:
+            return child_group_key
+    return None
+
+
+def _build_root_number_paths(
+    roots: Sequence[_BomTreeNode],
+    show_section_headers: bool,
+    root_group_contexts: Optional[Sequence[tuple[str, ...]]] = None,
+) -> List[List[int]]:
+    """为根节点生成分组内序号，并让内部表内分组占用一个同级序号。"""
+    effective_contexts = list(root_group_contexts or [])
+    group_keys = [
+        effective_contexts[index][0]
+        if index < len(effective_contexts) and effective_contexts[index]
+        else _node_numbering_group_key(root)
+        for index, root in enumerate(roots)
+    ]
+    if not any(group_keys):
+        if show_section_headers:
+            section_item_counts: Dict[Optional[str], int] = {}
+            number_paths: List[List[int]] = []
+            for root in roots:
+                section_key = _normalize_export_text(root.item.get("section_name")) or None
+                section_item_counts[section_key] = section_item_counts.get(section_key, 0) + 1
+                number_paths.append([section_item_counts[section_key]])
+            return number_paths
+        return [[index] for index in range(1, len(roots) + 1)]
+
+    group_indices: Dict[Optional[str], int] = {}
+    ungrouped_item_counts: Dict[Optional[str], int] = {}
+    sibling_counts: Dict[tuple[str, ...], int] = {}
+    group_number_paths: Dict[tuple[str, ...], List[int]] = {}
+    number_paths: List[List[int]] = []
+    for index, (root, group_key) in enumerate(zip(roots, group_keys)):
+        if group_key not in group_indices:
+            group_indices[group_key] = len(group_indices) + 1
+        group_index = group_indices[group_key]
+        group_context = (
+            effective_contexts[index]
+            if index < len(effective_contexts)
+            else _item_group_context(root.item)
+        )
+        if not group_context:
+            next_item_count = ungrouped_item_counts.get(group_key, 0) + 1
+            ungrouped_item_counts[group_key] = next_item_count
+            number_paths.append([group_index, next_item_count])
+            continue
+
+        for depth in range(1, len(group_context) + 1):
+            prefix_key = tuple(group_context[:depth])
+            if prefix_key in group_number_paths:
+                continue
+            if depth == 1:
+                group_number_paths[prefix_key] = [group_index]
+                continue
+            parent_key = tuple(group_context[:depth - 1])
+            next_sibling_number = sibling_counts.get(parent_key, 0) + 1
+            sibling_counts[parent_key] = next_sibling_number
+            group_number_paths[prefix_key] = [
+                *group_number_paths[parent_key],
+                next_sibling_number,
+            ]
+
+        context_key = tuple(group_context)
+        next_item_number = sibling_counts.get(context_key, 0) + 1
+        sibling_counts[context_key] = next_item_number
+        number_paths.append([
+            *group_number_paths[context_key],
+            next_item_number,
+        ])
+    return number_paths
+
+
+def _build_direct_tree_root_number_paths(
+    roots: Sequence[_BomTreeNode],
+) -> List[List[int]]:
+    """按前端树的根节点顺序生成根序号，不再插入后端虚拟分组层级。"""
+    return [[index] for index in range(1, len(roots) + 1)]
+
+
+def _format_number_path(path: Sequence[int]) -> str:
+    """将层级序号路径转换为导出文本。"""
+    return ".".join(str(value) for value in path)
+
+
+def _resolve_item_hierarchy_number(
+    item: Mapping[str, Any],
+    fallback_path: Sequence[int],
+) -> str:
+    """优先使用前端原始序号，缺失时才使用导出树路径兜底。"""
+    item_code = _normalize_export_text(item.get("item_code"))
+    return item_code or _format_number_path(fallback_path)
+
+
+def _is_dotted_child_number(value: str, parent_code: str) -> bool:
+    """判断序号是否为指定纯数字序号下的点号子序号。"""
+    prefix = f"{parent_code}."
+    if not parent_code.isdigit() or not value.startswith(prefix):
+        return False
+    suffix = value[len(prefix):]
+    return bool(suffix) and all(part.isdigit() for part in suffix.split("."))
+
+
+def _repair_duplicate_item_codes(
+    nested_rows: Sequence[Dict[str, Any]],
+    use_external_sections: bool,
+    use_internal_groups: bool,
+) -> None:
+    """修复跨行合并单元格造成的重复导出序号。
+
+    MinerU/HTML 展开 ``rowspan`` 时，会把合并单元格中的序号复制到每一条逻辑行。
+    这类重复值不能直接覆盖原始 ``item_code``，否则会影响后续匹配；这里只在同一
+    分区、同一父节点范围内修正导出行号。若后续已经存在 ``1.6`` 这样的点号编码，
+    说明重复的纯数字编码是其缺失的前序子序号，按 ``1.1``、``1.2`` 顺延补齐。
+    """
+    occurrences: Dict[tuple[Any, ...], Dict[str, List[Dict[str, Any]]]] = {}
+    codes_by_scope: Dict[tuple[Any, ...], set[str]] = {}
+
+    for row in nested_rows:
+        item = row["item"]
+        source_code = _normalize_export_text(item.get("item_code"))
+        if not source_code:
+            continue
+
+        # 父节点路径用于区分不同 BOM 分支；表内分组用于兼容同组内局部编号。
+        scope_key = (
+            row.get("sectionName") if use_external_sections else None,
+            tuple(row.get("treePath", [])[0:-1]),
+            tuple(row.get("groupContext", [])) if use_internal_groups else tuple(),
+        )
+        scope_occurrences = occurrences.setdefault(scope_key, {})
+        scope_occurrences.setdefault(source_code, []).append(row)
+        codes_by_scope.setdefault(scope_key, set()).add(source_code)
+
+    repaired_count = 0
+    for scope_key, scope_occurrences in occurrences.items():
+        scope_codes = codes_by_scope[scope_key]
+        for source_code, duplicate_rows in scope_occurrences.items():
+            if len(duplicate_rows) < 2:
+                continue
+
+            has_dotted_continuation = any(
+                _is_dotted_child_number(code, source_code)
+                for code in scope_codes
+                if code != source_code
+            )
+            if has_dotted_continuation:
+                # 后续已有 1.6 时，从最小未占用子序号开始补齐，保持现有 1.6 的稳定性。
+                next_suffix = 1
+                for row in duplicate_rows:
+                    while f"{source_code}.{next_suffix}" in scope_codes:
+                        next_suffix += 1
+                    row["hierarchyNumber"] = f"{source_code}.{next_suffix}"
+                    scope_codes.add(row["hierarchyNumber"])
+                    next_suffix += 1
+                    repaired_count += 1
+                logger.warning(
+                    "BOM 导出发现跨行重复序号，已按点号子序号修复: 原序号={}, 重复行数={}, 修复范围={}...",
+                    source_code,
+                    len(duplicate_rows),
+                    duplicate_rows[0]["hierarchyNumber"],
+                )
+                continue
+
+            # 没有点号续接证据时只修复后续重复项，首项继续保留原始编号，避免擅自改变合法根项。
+            used_numbers = set(scope_codes)
+            used_numbers.discard(source_code)
+            source_repaired_count = 0
+            for row in duplicate_rows[1:]:
+                candidate = row.get("hierarchyNumber") or ""
+                fallback_path = list(row.get("treePath", []))
+                if not candidate or candidate == source_code or candidate in used_numbers:
+                    candidate = _format_number_path(fallback_path)
+                while candidate == source_code or candidate in used_numbers:
+                    if not fallback_path:
+                        fallback_path = [1]
+                    fallback_path[-1] += 1
+                    candidate = _format_number_path(fallback_path)
+                row["hierarchyNumber"] = candidate
+                used_numbers.add(candidate)
+                repaired_count += 1
+                source_repaired_count += 1
+            if source_repaired_count:
+                logger.warning(
+                    "BOM 导出发现重复序号，已使用树路径修复后续重复项: 原序号={}, 重复行数={}",
+                    source_code,
+                    len(duplicate_rows),
+                )
+
+    if repaired_count:
+        logger.info("BOM 导出序号去重完成: 修复明细行数={}", repaired_count)
+
+
+def _normalize_quantity(value: Any) -> int | float:
+    """将数量规范为整数或真实小数，避免整数导出后出现多余小数点。"""
+    if value is None or value == "":
+        return 1
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        logger.warning("BOM 导出数量不是数字，按 1 处理: {}", value)
+        return 1
+    if not math.isfinite(numeric_value):
+        logger.warning("BOM 导出数量不是有限数字，按 1 处理: {}", value)
+        return 1
+    if numeric_value.is_integer():
+        return int(numeric_value)
+    return numeric_value
+
+
+def _item_name(item: Mapping[str, Any]) -> str:
+    """读取 BOM 节点名称，兼容成本分析和工程清单字段。"""
+    return _normalize_export_text(item.get("name") or item.get("item_name"))
+
+
+def _contains_nested_children(items: Sequence[Any]) -> bool:
+    """判断输入是否已经包含显式嵌套子项。"""
+    for value in items:
+        if not isinstance(value, Mapping):
+            continue
+        children = value.get("children")
+        if isinstance(children, list) and children:
+            return True
+        if isinstance(children, list) and _contains_nested_children(children):
+            return True
+    return False
+
+
+def _build_nested_nodes(
+    items: Sequence[Any],
+    inherited_section: Optional[str] = None,
+) -> List[_BomTreeNode]:
+    """递归复制显式树形数据，并让缺失分区的子项继承父项分区。"""
+    nodes: List[_BomTreeNode] = []
+    for value in items:
+        if not isinstance(value, Mapping):
+            logger.warning("忽略非对象 BOM 导出节点: {}", type(value).__name__)
+            continue
+
+        item = dict(value)
+        raw_children = item.pop("children", None)
+        section_name = _normalize_export_text(item.get("section_name")) or inherited_section
+        if section_name:
+            item["section_name"] = section_name
+
+        node = _BomTreeNode(item=item)
+        if isinstance(raw_children, list):
+            node.children = _build_nested_nodes(raw_children, section_name)
+        nodes.append(node)
+    return nodes
+
+
+def _section_matches(left: _BomTreeNode, right: _BomTreeNode) -> bool:
+    """限制平铺父子回挂只在同一分区内进行，避免同名设备串区。"""
+    left_section = _normalize_export_text(left.item.get("section_name"))
+    right_section = _normalize_export_text(right.item.get("section_name"))
+    return not left_section or not right_section or left_section == right_section
+
+
+def _link_flat_nodes(
+    nodes: List[_BomTreeNode],
+    respect_sections: bool = True,
+) -> List[_BomTreeNode]:
+    """将只有 parent_item 的平铺清单按原始顺序恢复为多级树。"""
+    roots: List[_BomTreeNode] = []
+    for index, node in enumerate(nodes):
+        parent_name = _normalize_export_text(node.item.get("parent_item"))
+        if not parent_name:
+            roots.append(node)
+            continue
+
+        parent: Optional[_BomTreeNode] = None
+        for candidate in reversed(nodes[:index]):
+            candidate_name = _item_name(candidate.item)
+            if (
+                candidate is not node
+                and (not respect_sections or _section_matches(node, candidate))
+                and (
+                    candidate_name == parent_name
+                    or parent_name in candidate_name
+                )
+            ):
+                parent = candidate
+                break
+
+        if parent is None:
+            logger.warning(
+                "BOM 导出未找到父项，保留为根节点: child={}, parent={}",
+                _item_name(node.item),
+                parent_name,
+            )
+            roots.append(node)
+            continue
+
+        if not _normalize_export_text(node.item.get("section_name")):
+            parent_section = _normalize_export_text(parent.item.get("section_name"))
+            if parent_section:
+                node.item["section_name"] = parent_section
+        parent.children.append(node)
+    return roots
+
+
+def _collect_export_rows(items: Sequence[Any]) -> List[_BomExportRow]:
+    """统一展开显式树和 parent_item 平铺数据，保留分区及任意层级。"""
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        logger.warning("BOM 导出 items 不是数组，按空清单处理")
+        return []
+
+    grouping_mode = _resolve_grouping_display_mode(items)
+    use_external_sections = grouping_mode == "external"
+    use_internal_groups = grouping_mode == "internal"
+    has_nested_tree = _contains_nested_children(items)
+    use_frontend_internal_tree = use_internal_groups and has_nested_tree
+    nodes = _build_nested_nodes(items)
+    roots = nodes if has_nested_tree else _link_flat_nodes(
+        nodes,
+        respect_sections=use_external_sections,
+    )
+
+    section_names: set[str] = set()
+
+    def collect_node_sections(node: _BomTreeNode) -> None:
+        section_name = _normalize_export_text(node.item.get("section_name"))
+        if use_external_sections and section_name:
+            section_names.add(section_name)
+        for child in node.children:
+            collect_node_sections(child)
+
+    for root in roots:
+        collect_node_sections(root)
+    show_section_headers = use_external_sections and len(section_names) > 1
+    rows: List[_BomExportRow] = []
+    nested_rows: List[Dict[str, Any]] = []
+    current_section: Optional[str] = None
+    current_group: Optional[tuple[str, ...]] = None
+    source_item_code_count = 0
+    root_group_contexts = (
+        _build_root_group_contexts(roots, respect_sections=False)
+        if use_internal_groups and not use_frontend_internal_tree
+        else [tuple() for _ in roots]
+    )
+    if use_frontend_internal_tree:
+        # 前端已经把表内分组组织成真实树节点，不能再次生成同名虚拟分组标题。
+        root_number_paths = _build_direct_tree_root_number_paths(roots)
+        logger.info(
+            "BOM 导出采用前端表内树结构: 根节点数={}，跳过后端分组重建",
+            len(roots),
+        )
+    else:
+        root_number_paths = _build_root_number_paths(
+            roots,
+            show_section_headers,
+            root_group_contexts,
+        )
+
+    def visit(
+        node: _BomTreeNode,
+        path: List[int],
+        depth: int,
+        inherited_section: Optional[str],
+        inherited_group_context: tuple[str, ...] = tuple(),
+        root_group_context: Optional[tuple[str, ...]] = None,
+    ) -> None:
+        nonlocal current_section, current_group, source_item_code_count
+        section_name = (
+            _normalize_export_text(node.item.get("section_name")) or inherited_section
+            if use_external_sections
+            else None
+        )
+        if show_section_headers and section_name != current_section:
+            rows.append(
+                _BomExportRow(
+                    section_name=section_name or "通用及其他分项",
+                    is_section_header=True,
+                )
+            )
+            current_section = section_name
+            current_group = None
+
+        if use_frontend_internal_tree:
+            # 表内分组标题已经由前端树节点承载，直接输出当前节点即可。
+            group_context = tuple()
+        else:
+            group_context = (
+                root_group_context
+                if use_internal_groups and depth == 0 and root_group_context is not None
+                else (
+                    _item_group_context(node.item) or inherited_group_context
+                    if use_internal_groups
+                    else tuple()
+                )
+            )
+            if not group_context:
+                current_group = None
+            elif group_context != current_group:
+                common_depth = 0
+                if current_group:
+                    while (
+                        common_depth < len(current_group)
+                        and common_depth < len(group_context)
+                        and current_group[common_depth] == group_context[common_depth]
+                    ):
+                        common_depth += 1
+                for group_depth in range(common_depth, len(group_context)):
+                    rows.append(
+                        _BomExportRow(
+                            section_name=section_name or None,
+                            hierarchy_number=_format_number_path(path[: group_depth + 1]),
+                            group_name=group_context[group_depth],
+                            is_group_header=True,
+                        )
+                    )
+                current_group = group_context
+
+        nested_rows.append(
+            {
+                "item": node.item,
+                "sectionName": section_name,
+                "hierarchyNumber": _resolve_item_hierarchy_number(node.item, path),
+                "treePath": list(path),
+                "depth": depth,
+                "isParent": bool(node.children),
+                "groupContext": list(group_context),
+            }
+        )
+        rows.append(
+            _BomExportRow(
+                item=node.item,
+                section_name=section_name or None,
+                hierarchy_number=nested_rows[-1]["hierarchyNumber"],
+                depth=depth,
+                is_parent=bool(node.children),
+            )
+        )
+        if _normalize_export_text(node.item.get("item_code")):
+            source_item_code_count += 1
+        for child_index, child in enumerate(node.children, start=1):
+            visit(
+                child,
+                path + [child_index],
+                depth + 1,
+                section_name or inherited_section if use_external_sections else None,
+                group_context,
+            )
+
+    for root_index, (root, root_number_path) in enumerate(zip(roots, root_number_paths)):
+        visit(
+            root,
+            root_number_path,
+            0,
+            None,
+            tuple(),
+            root_group_contexts[root_index],
+        )
+
+    _repair_duplicate_item_codes(
+        nested_rows,
+        use_external_sections=use_external_sections,
+        use_internal_groups=use_internal_groups,
+    )
+    item_rows = [row for row in rows if row.item is not None]
+    for export_row, nested_row in zip(item_rows, nested_rows):
+        export_row.hierarchy_number = nested_row["hierarchyNumber"]
+
+    logger.info(
+        "BOM 导出树展开完成: 输入节点={}, 导出行={}, 主分组模式={}, 分区数={}, 表内分组行={}, 含嵌套树={}",
+        sum(1 for row in rows if not row.is_section_header and not row.is_group_header),
+        len(rows),
+        grouping_mode,
+        len(section_names),
+        sum(1 for row in rows if row.is_group_header),
+        has_nested_tree,
+    )
+    logger.debug("BOM 导出序号来源统计: 使用前端原始 item_code 的明细行={}", source_item_code_count)
+    return rows
+
+
+def _calculate_export_total(rows: Sequence[_BomExportRow]) -> float:
+    """计算未显式传入总价时的金额，避免父项汇总与子项重复计费。"""
+    total = 0.0
+    for row in rows:
+        if row.is_section_header or row.is_group_header or not row.item:
+            continue
+        item = row.item
+        is_parent_custom = bool(
+            item.get("is_parent_modified") or item.get("pricing_mode") == "parent"
+        )
+        if row.is_parent and not is_parent_custom:
+            continue
+        quantity = _normalize_quantity(
+            item.get("qty") if item.get("qty") is not None else item.get("quantity")
+        )
+        price = float(item.get("ref_price") if item.get("ref_price") is not None else item.get("price") or 0)
+        subtotal = item.get("subtotal")
+        total += float(subtotal) if subtotal is not None else quantity * price
+    return total
 
 
 def _set_cell_background(cell, hex_color: str) -> None:
@@ -80,7 +735,8 @@ def generate_bom_docx(
     :return: 包含 Word 二进制数据的 BytesIO 对象
     """
     logger.info(f"开始生成 BOM 成本测算 Word 文档: {document_title}, 共 {len(items)} 项")
-    
+    export_rows = _collect_export_rows(items)
+
     doc = Document()
     
     # 设置页边距为标准公文窄边距 (0.5 英寸左右，使 9 列排版充分舒展)
@@ -93,12 +749,7 @@ def generate_bom_docx(
         
     # 计算实时总成本
     if total_cost is None:
-        computed_total = 0.0
-        for it in items:
-            q = float(it.get('qty') or it.get('quantity') or 1)
-            p = float(it.get('ref_price') or it.get('price') or 0)
-            computed_total += q * p
-        total_cost = computed_total
+        total_cost = _calculate_export_total(export_rows)
 
     total_cost_val = float(total_cost or 0.0)
     total_cost_upper = number_to_chinese_rmb(total_cost_val)
@@ -140,7 +791,7 @@ def generate_bom_docx(
         run_bgt_lbl.font.bold = True
         run_bgt_lbl.font.size = Pt(9.5)
         run_bgt_lbl.font.color.rgb = RGBColor(0x47, 0x55, 0x69)
-        run_bgt_val = info_p.add_run(f"{budget_limit}    ")
+        run_bgt_val = info_p.add_run(f"{_strip_currency_symbols(budget_limit)}    ")
         run_bgt_val.font.size = Pt(9.5)
 
     if status_text:
@@ -160,7 +811,7 @@ def generate_bom_docx(
         "单位", "数量", "单价(元)", "总价(元)", "备注"
     ]
 
-    total_rows = len(items) + 2  # 表头 1 行 + 数据 N 行 + 表尾合计 1 行
+    total_rows = len(export_rows) + 2  # 表头 1 行 + 分组/数据行 + 表尾合计 1 行
     table = doc.add_table(rows=total_rows, cols=len(headers))
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = False
@@ -188,13 +839,76 @@ def generate_bom_docx(
         run.font.bold = True
         run.font.color.rgb = RGBColor(0x33, 0x41, 0x55)
 
-    # 3.2 渲染数据行
-    for r_idx, item in enumerate(items, start=1):
+    # 3.2 渲染分区行与递归数据行
+    for r_idx, export_row in enumerate(export_rows, start=1):
         row = table.rows[r_idx]
-        name = str(item.get("name") or item.get("item_name") or "")
+        if export_row.is_section_header:
+            section_cell = row.cells[0]
+            for c_idx in range(1, len(headers)):
+                section_cell.merge(row.cells[c_idx])
+            header_color = "DBEAFE" if export_row.is_section_header else "EDE9FE"
+            text_color = RGBColor(0x1D, 0x4E, 0xD8) if export_row.is_section_header else RGBColor(0x6D, 0x28, 0xD9)
+            _set_cell_background(section_cell, header_color)
+            _set_cell_margins(section_cell, top=100, bottom=100, left=100, right=100)
+            _set_cell_borders(
+                section_cell,
+                top=header_border,
+                bottom=header_border,
+                left=border_style,
+                right=border_style,
+            )
+            section_p = section_cell.paragraphs[0]
+            section_p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            label = f"分区/部分：{export_row.section_name}"
+            section_run = section_p.add_run(label)
+            section_run.font.name = "微软雅黑"
+            section_run.font.size = Pt(9)
+            section_run.font.bold = True
+            section_run.font.color.rgb = text_color
+            continue
+
+        if export_row.is_group_header:
+            number_cell = row.cells[0]
+            group_cell = row.cells[1]
+            for c_idx in range(2, len(headers)):
+                group_cell.merge(row.cells[c_idx])
+
+            for cell in (number_cell, group_cell):
+                cell.width = Inches(col_widths[0] if cell is number_cell else sum(col_widths[1:]))
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                _set_cell_background(cell, "EDE9FE")
+                _set_cell_margins(cell, top=100, bottom=100, left=100, right=100)
+                _set_cell_borders(
+                    cell,
+                    top=header_border,
+                    bottom=header_border,
+                    left=border_style,
+                    right=border_style,
+                )
+
+            number_p = number_cell.paragraphs[0]
+            number_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            number_run = number_p.add_run(export_row.hierarchy_number)
+            number_run.font.name = "微软雅黑"
+            number_run.font.size = Pt(9)
+            number_run.font.bold = True
+            number_run.font.color.rgb = RGBColor(0x6D, 0x28, 0xD9)
+
+            group_p = group_cell.paragraphs[0]
+            group_p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            group_run = group_p.add_run(export_row.group_name or "")
+            group_run.font.name = "微软雅黑"
+            group_run.font.size = Pt(9)
+            group_run.font.bold = True
+            group_run.font.color.rgb = RGBColor(0x6D, 0x28, 0xD9)
+            continue
+
+        item = export_row.item or {}
+        # Word 已通过序号列表达层级关系，名称列不再写入树形装饰前缀。
+        name = _normalize_export_text(item.get("name") or item.get("item_name"))
         
-        brand = str(item.get("matched_brand") or item.get("brand") or "").strip()
-        model = str(item.get("matched_model") or item.get("model") or "").strip()
+        brand = _normalize_export_text(item.get("matched_brand") or item.get("brand"))
+        model = _normalize_export_text(item.get("matched_model") or item.get("model"))
         brand_spec_model_parts = []
         if brand and model:
             brand_spec_model_parts.append(f"{brand} {model}")
@@ -206,32 +920,32 @@ def generate_bom_docx(
             brand_spec_model_parts.append("--")
         brand_spec_model_text = "\n".join(brand_spec_model_parts)
 
-        manufacturer = str(item.get("matched_manufacturer") or item.get("manufacturer") or "--").strip()
-        unit = str(item.get("unit") or "项")
+        manufacturer = _normalize_export_text(item.get("matched_manufacturer") or item.get("manufacturer")) or "--"
+        unit = _normalize_export_text(item.get("unit")) or "项"
         raw_qty = item.get("qty") if item.get("qty") is not None else item.get("quantity")
-        qty_val = float(raw_qty) if raw_qty is not None else 1.0
+        qty_val = _normalize_quantity(raw_qty)
 
         raw_price = item.get("ref_price") if item.get("ref_price") is not None else item.get("price")
         price_val = float(raw_price or 0.0)
         subtotal_val = float(item.get("subtotal") or (qty_val * price_val))
 
         # 备注列：严格使用前端 BOM 清单的备注 (remark) 字段
-        remark_text = str(item.get("remark") or "").strip()
+        remark_text = _normalize_export_text(item.get("remark"))
 
-        is_parent = bool(item.get("isParent") or item.get("children"))
+        is_parent = export_row.is_parent
         bg_color = "F8FAFC" if r_idx % 2 == 1 else "FFFFFF"
         if is_parent:
             bg_color = "EFF6FF"
 
         row_data = [
-            (str(r_idx), WD_ALIGN_PARAGRAPH.CENTER),
+            (export_row.hierarchy_number, WD_ALIGN_PARAGRAPH.CENTER),
             (name, WD_ALIGN_PARAGRAPH.LEFT),
             (brand_spec_model_text, WD_ALIGN_PARAGRAPH.LEFT),
             (manufacturer, WD_ALIGN_PARAGRAPH.LEFT),
             (unit, WD_ALIGN_PARAGRAPH.CENTER),
             (f"{qty_val:g}", WD_ALIGN_PARAGRAPH.CENTER),
-            (f"¥{price_val:,.2f}" if price_val > 0 else "--", WD_ALIGN_PARAGRAPH.RIGHT),
-            (f"¥{subtotal_val:,.2f}" if subtotal_val > 0 else "¥0.00", WD_ALIGN_PARAGRAPH.RIGHT),
+            (f"{price_val:,.2f}" if price_val > 0 else "--", WD_ALIGN_PARAGRAPH.RIGHT),
+            (f"{subtotal_val:,.2f}" if subtotal_val > 0 else "0.00", WD_ALIGN_PARAGRAPH.RIGHT),
             (remark_text, WD_ALIGN_PARAGRAPH.LEFT),
         ]
 
@@ -303,7 +1017,7 @@ def generate_bom_docx(
     p_amount = cell_amount.paragraphs[0]
     p_amount.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     
-    run_tot_lower = p_amount.add_run(f"¥{total_cost_val:,.2f}")
+    run_tot_lower = p_amount.add_run(f"{total_cost_val:,.2f}")
     run_tot_lower.font.name = "微软雅黑"
     run_tot_lower.font.size = Pt(10)
     run_tot_lower.font.bold = True
@@ -358,7 +1072,7 @@ def generate_bom_xlsx(
     生成标准 Excel (.xlsx) 工作簿文档。
     严格对齐 9 列标准格式：
     【序号 | 标的物名称 | 品牌、规格、型号 | 生产厂家 | 单位 | 数量 | 单价(元) | 总价(元) | 备注】
-    包含单元格跨列合并、标准网格边框、数字货币格式与表尾大小写总价汇总。
+    包含单元格跨列合并、标准网格边框、数字格式与表尾大小写总价汇总。
 
     :param document_title: 招标文件名称
     :param items: BOM 成本明细列表
@@ -369,6 +1083,7 @@ def generate_bom_xlsx(
     :return: 包含 Excel 二进制数据的 BytesIO 对象
     """
     logger.info(f"开始生成 BOM 成本测算 Excel 文档: {document_title}, 共 {len(items)} 项")
+    export_rows = _collect_export_rows(items)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -391,12 +1106,7 @@ def generate_bom_xlsx(
 
     # 计算总成本
     if total_cost is None:
-        computed_total = 0.0
-        for it in items:
-            q = float(it.get('qty') or it.get('quantity') or 1)
-            p = float(it.get('ref_price') or it.get('price') or 0)
-            computed_total += q * p
-        total_cost = computed_total
+        total_cost = _calculate_export_total(export_rows)
 
     total_cost_val = float(total_cost or 0.0)
     total_cost_upper = number_to_chinese_rmb(total_cost_val)
@@ -441,16 +1151,76 @@ def generate_bom_xlsx(
         c.border = Border(left=thin_border_side, right=thin_border_side, top=medium_border_side, bottom=medium_border_side)
         c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
-    # 4. 数据行 (Row 6 ~ Row 6+N-1)
+    # 4. 分区行与递归数据行
     start_row = 6
-    for idx, item in enumerate(items, start=1):
-        current_row = start_row + idx - 1
+    for idx, export_row in enumerate(export_rows):
+        current_row = start_row + idx
+        if export_row.is_section_header:
+            ws.merge_cells(
+                start_row=current_row,
+                start_column=1,
+                end_row=current_row,
+                end_column=9,
+            )
+            section_cell = ws.cell(row=current_row, column=1)
+            is_section_header = export_row.is_section_header
+            section_cell.value = f"分区/部分：{export_row.section_name}"
+            section_cell.font = Font(
+                name=font_name,
+                size=10,
+                bold=True,
+                color='1D4ED8' if is_section_header else '6D28D9',
+            )
+            fill_color = 'DBEAFE' if is_section_header else 'EDE9FE'
+            section_cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type='solid')
+            section_cell.alignment = Alignment(horizontal='left', vertical='center')
+            section_cell.border = Border(
+                left=medium_border_side,
+                right=medium_border_side,
+                top=medium_border_side,
+                bottom=medium_border_side,
+            )
+            ws.row_dimensions[current_row].height = 24
+            continue
+
+        if export_row.is_group_header:
+            ws.merge_cells(
+                start_row=current_row,
+                start_column=2,
+                end_row=current_row,
+                end_column=9,
+            )
+            number_cell = ws.cell(row=current_row, column=1, value=export_row.hierarchy_number)
+            group_cell = ws.cell(
+                row=current_row,
+                column=2,
+                value=export_row.group_name or "",
+            )
+            group_fill = PatternFill(start_color='EDE9FE', end_color='EDE9FE', fill_type='solid')
+            for cell in (number_cell, group_cell):
+                cell.font = Font(name=font_name, size=10, bold=True, color='6D28D9')
+                cell.fill = group_fill
+                cell.alignment = Alignment(
+                    horizontal='center' if cell is number_cell else 'left',
+                    vertical='center',
+                )
+                cell.border = Border(
+                    left=medium_border_side,
+                    right=medium_border_side,
+                    top=medium_border_side,
+                    bottom=medium_border_side,
+                )
+            ws.row_dimensions[current_row].height = 24
+            continue
+
+        item = export_row.item or {}
         ws.row_dimensions[current_row].height = 24
 
-        name = str(item.get("name") or item.get("item_name") or "")
+        # Excel 已通过序号列表达层级关系，名称列不再写入树形装饰前缀。
+        name = _normalize_export_text(item.get("name") or item.get("item_name"))
         
-        brand = str(item.get("matched_brand") or item.get("brand") or "").strip()
-        model = str(item.get("matched_model") or item.get("model") or "").strip()
+        brand = _normalize_export_text(item.get("matched_brand") or item.get("brand"))
+        model = _normalize_export_text(item.get("matched_model") or item.get("model"))
         brand_parts = []
         if brand and model:
             brand_parts.append(f"{brand} {model}")
@@ -462,20 +1232,20 @@ def generate_bom_xlsx(
             brand_parts.append("--")
         brand_spec_model_text = " / ".join(brand_parts)
 
-        manufacturer = str(item.get("matched_manufacturer") or item.get("manufacturer") or "--").strip()
-        unit = str(item.get("unit") or "项")
+        manufacturer = _normalize_export_text(item.get("matched_manufacturer") or item.get("manufacturer")) or "--"
+        unit = _normalize_export_text(item.get("unit")) or "项"
         raw_qty = item.get("qty") if item.get("qty") is not None else item.get("quantity")
-        qty_val = float(raw_qty) if raw_qty is not None else 1.0
+        qty_val = _normalize_quantity(raw_qty)
 
         raw_price = item.get("ref_price") if item.get("ref_price") is not None else item.get("price")
         price_val = float(raw_price or 0.0)
         subtotal_val = float(item.get("subtotal") or (qty_val * price_val))
 
         # 备注列：严格使用前端 BOM 清单的备注 (remark) 字段
-        remark_text = str(item.get("remark") or "").strip()
+        remark_text = _normalize_export_text(item.get("remark"))
 
         # 写入 9 列数据
-        c1 = ws.cell(row=current_row, column=1, value=idx)
+        c1 = ws.cell(row=current_row, column=1, value=export_row.hierarchy_number)
         c2 = ws.cell(row=current_row, column=2, value=name)
         c3 = ws.cell(row=current_row, column=3, value=brand_spec_model_text)
         c4 = ws.cell(row=current_row, column=4, value=manufacturer)
@@ -496,11 +1266,12 @@ def generate_bom_xlsx(
         c8.alignment = Alignment(horizontal='right', vertical='center')
         c9.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
 
-        c6.number_format = '#,##0.##'
-        c7.number_format = '¥#,##0.00'
-        c8.number_format = '¥#,##0.00'
+        c6.number_format = '#,##0' if isinstance(qty_val, int) else '#,##0.##########'
+        # 表头已经标注“元”，金额单元格只保留数字，避免重复显示人民币符号。
+        c7.number_format = '#,##0.00'
+        c8.number_format = '#,##0.00'
 
-        is_zebra = (idx % 2 == 0)
+        is_zebra = (idx % 2 == 1)
         for c in (c1, c2, c3, c4, c5, c6, c7, c8, c9):
             c.font = Font(name=font_name, size=9, color='1E293B')
             c.border = cell_border
@@ -508,7 +1279,7 @@ def generate_bom_xlsx(
                 c.fill = zebra_fill
 
     # 5. 表尾统计行 (Row 6+N)
-    footer_row_idx = start_row + len(items)
+    footer_row_idx = start_row + len(export_rows)
     ws.row_dimensions[footer_row_idx].height = 30
 
     # 合并 A ~ F 列 (Col 1 ~ 6)
@@ -529,7 +1300,7 @@ def generate_bom_xlsx(
     foot_amount_cell = ws.cell(row=footer_row_idx, column=8, value=total_cost_val)
     foot_amount_cell.font = Font(name=font_name, size=11, bold=True, color='1D4ED8')
     foot_amount_cell.alignment = Alignment(horizontal='right', vertical='center')
-    foot_amount_cell.number_format = '¥#,##0.00'
+    foot_amount_cell.number_format = '#,##0.00'
     foot_amount_cell.fill = footer_amount_fill
 
     # 备注列 I (Col 9)

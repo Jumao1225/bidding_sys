@@ -1,8 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, User, Bot, Trash2, FileText, Download, Check, ExternalLink } from 'lucide-react';
+import { Plus, Trash2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { apiFetch } from '../utils/api';
+import { useDialog } from './DialogProvider';
+import {
+  ACTIVE_DOCUMENT_STORAGE_KEY,
+  DOCUMENT_CHANGED_EVENT,
+  clear_active_document_id,
+} from '../utils/documentIdentity';
 
 // ==================== 类型定义 ====================
 
@@ -10,6 +16,15 @@ import { apiFetch } from '../utils/api';
 interface Source {
   section_title: string;
   text_preview: string;
+}
+
+/** 服务端会话摘要 */
+interface ChatSession {
+  id: string;
+  document_id: string;
+  title: string;
+  status: 'active' | 'archived';
+  updated_at?: string | null;
 }
 
 /** 聊天消息 */
@@ -22,6 +37,58 @@ interface Message {
   isStreaming?: boolean;
   /** Agent 调用的工具思考日志 */
   toolCalls?: string[];
+  /** 模型明确返回的公开 reasoning 字段，不等同于隐藏思维链。 */
+  reasoningBlocks?: string[];
+  /** 网络重试或模型服务状态提示。 */
+  statusMessage?: string;
+  /** 是否存在可复用已完成工具结果的断点续答。 */
+  canResume?: boolean;
+}
+
+/** 服务端原始消息的展示字段 */
+interface PersistedMessage {
+  id: string;
+  sequence: number;
+  role: 'user' | 'ai' | 'assistant' | 'tool';
+  content: string;
+  sources?: Source[];
+  tool_calls?: Array<{
+    tool_name: string;
+    status?: string;
+    output_preview?: string;
+  }>;
+  status?: 'streaming' | 'completed' | 'failed';
+}
+
+/** 读取旧版按文档缓存的消息，用于一次性迁移 */
+function readLegacyMessages(documentId: string): Message[] {
+  const saved = localStorage.getItem(`chat_history_${documentId}`);
+  if (!saved) return [];
+  try {
+    const parsed = JSON.parse(saved);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 将服务端消息转换为前端展示消息 */
+function mapPersistedMessages(messages: PersistedMessage[]): Message[] {
+  return messages
+    // 工具消息已经通过助手的思考区或审计记录展示，避免直接渲染为普通对话气泡。
+    .filter(message => message.role !== 'tool')
+    .map(message => ({
+      role: message.role === 'user' ? 'user' : 'ai',
+      content: message.content,
+      sources: message.sources,
+      toolCalls: message.tool_calls?.flatMap(toolCall => [
+        `已调用工具：${toolCall.tool_name}`,
+        ...(toolCall.output_preview ? [`工具结果：${toolCall.output_preview}`] : []),
+      ]),
+      canResume: message.status === 'failed'
+        && Boolean(message.tool_calls?.some(toolCall => toolCall.status === 'completed')),
+      isStreaming: false,
+    }));
 }
 
 interface ChatPanelProps {
@@ -38,7 +105,6 @@ interface ChatPanelProps {
 // ==================== 辅助提取逻辑 ====================
 
 const extractThoughts = (text: string) => {
-  const jsonBlocks: string[] = [];
   const thinkBlocks: string[] = [];
   let cleanText = text;
 
@@ -121,9 +187,9 @@ const extractThoughts = (text: string) => {
 
 // ==================== 折叠面板组件 ====================
 
-function ThoughtProcessBlock({ toolCalls, inlineJson, thinkBlocks, isStreaming }: { toolCalls?: string[], inlineJson?: string[], thinkBlocks?: string[], isStreaming?: boolean }) {
-  const [isOpen, setIsOpen] = useState(false);
-  const hasContent = (toolCalls && toolCalls.length > 0) || (inlineJson && inlineJson.length > 0) || (thinkBlocks && thinkBlocks.length > 0);
+function ThoughtProcessBlock({ toolCalls, reasoningBlocks, inlineJson, thinkBlocks, isStreaming }: { toolCalls?: string[], reasoningBlocks?: string[], inlineJson?: string[], thinkBlocks?: string[], isStreaming?: boolean }) {
+  const [isOpen, setIsOpen] = useState(true);
+  const hasContent = (toolCalls && toolCalls.length > 0) || (reasoningBlocks && reasoningBlocks.length > 0) || (inlineJson && inlineJson.length > 0) || (thinkBlocks && thinkBlocks.length > 0);
   
   if (!hasContent) return null;
   
@@ -138,13 +204,19 @@ function ThoughtProcessBlock({ toolCalls, inlineJson, thinkBlocks, isStreaming }
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
           </svg>
-          Agent 思考与分析过程
+          执行过程与依据摘要
         </div>
         <svg className={`w-4 h-4 text-slate-400 transform transition-transform ${isOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"/></svg>
       </button>
       
       {isOpen && (
         <div className="p-3 pt-0 space-y-2 border-t border-slate-100 bg-slate-50/50">
+          {reasoningBlocks?.map((reasoning, idx) => (
+            <div key={`reasoning-${idx}`} className="text-xs text-indigo-700 bg-indigo-50 px-3 py-2 rounded-lg border border-indigo-100 shadow-sm leading-relaxed whitespace-pre-wrap break-all">
+              <div className="font-semibold mb-1">模型公开推理摘要</div>
+              {reasoning}
+            </div>
+          ))}
           {thinkBlocks?.map((tb, idx) => (
             <div key={`tb-${idx}`} className="text-xs text-slate-500 bg-white px-3 py-2 rounded-lg border border-slate-200 shadow-sm leading-relaxed whitespace-pre-wrap break-all italic font-serif">
               {tb}
@@ -159,7 +231,10 @@ function ThoughtProcessBlock({ toolCalls, inlineJson, thinkBlocks, isStreaming }
             let parsed;
             try {
               parsed = JSON.parse(jsonStr);
-            } catch(e) {}
+            } catch {
+              // 片段尚未形成合法 JSON 时保留原始文本展示。
+              parsed = undefined;
+            }
             return (
               <div key={`ij-${idx}`} className="text-[11px] text-slate-600 font-mono bg-white px-3 py-2 rounded-lg border border-slate-200 shadow-sm leading-relaxed overflow-x-auto">
                 {parsed ? (
@@ -179,23 +254,24 @@ function ThoughtProcessBlock({ toolCalls, inlineJson, thinkBlocks, isStreaming }
 // ==================== 主组件 ====================
 
 export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFullscreen, onClose }: ChatPanelProps) {
+  const { confirm } = useDialog();
   // 维护内部有效的 documentId，优先使用 prop 传入的 documentId，若无则尝试从 localStorage 获取
   const [activeDocId, setActiveDocId] = useState<string | null>(
-    () => propDocumentId || localStorage.getItem('bidding_document_id')
+    () => propDocumentId || localStorage.getItem(ACTIVE_DOCUMENT_STORAGE_KEY)
   );
 
   // 监听 prop 变化以及全局 bidding_document_changed 自定义事件
   useEffect(() => {
     const handleDocChange = () => {
-      const current = propDocumentId || localStorage.getItem('bidding_document_id');
+      const current = propDocumentId || localStorage.getItem(ACTIVE_DOCUMENT_STORAGE_KEY);
       setActiveDocId(current);
     };
 
     handleDocChange();
 
-    window.addEventListener('bidding_document_changed', handleDocChange);
+    window.addEventListener(DOCUMENT_CHANGED_EVENT, handleDocChange);
     return () => {
-      window.removeEventListener('bidding_document_changed', handleDocChange);
+      window.removeEventListener(DOCUMENT_CHANGED_EVENT, handleDocChange);
     };
   }, [propDocumentId]);
 
@@ -206,17 +282,20 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
       : '您好！我是您的专属标书解析助手。**目前您还没有上传或选择任何标书文件**。\n\n请先前往工作台上传标书，解析完成后我就可以基于文档内容回答您的任何问题了。',
   });
 
-  const [messages, setMessages] = useState<Message[]>(() => {
-    if (activeDocId) {
-      const saved = localStorage.getItem(`chat_history_${activeDocId}`);
-      if (saved) {
-        try {
-          return JSON.parse(saved);
-        } catch (e) {}
-      }
-    }
-    return [getDefaultGreeting(!!activeDocId)];
-  });
+  const [messages, setMessages] = useState<Message[]>(() => (
+    activeDocId ? readLegacyMessages(activeDocId) : []
+  ));
+  /** 当前文档下的服务端会话列表 */
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  /** 当前活动会话 ID，按文档独立保存最后一次选择 */
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(() => (
+    activeDocId ? localStorage.getItem(`active_chat_session_${activeDocId}`) : null
+  ));
+  /** 仅允许已完成加载的文档写入本地缓存，避免文档切换瞬间串写旧消息。 */
+  const [loadedSessionDocId, setLoadedSessionDocId] = useState<string | null>(null);
+  const [isSessionLoading, setIsSessionLoading] = useState(false);
+  /** 防止删除请求重复提交。 */
+  const [isDeletingSession, setIsDeletingSession] = useState(false);
   const [input, setInput] = useState('');
   /** true: 正在流式接收 AI 回复，此时禁止再次发送 */
   const [isStreaming, setIsStreaming] = useState(false);
@@ -236,40 +315,200 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
     }
   }, []);
 
-  // 当 activeDocId 变化时，重新加载对应的历史记录
+  // 当 activeDocId 变化时，从服务端加载会话和原始消息；localStorage 仅作为迁移和离线兜底。
   useEffect(() => {
-    if (activeDocId) {
-      const saved = localStorage.getItem(`chat_history_${activeDocId}`);
-      if (saved) {
-        try {
-          setMessages(JSON.parse(saved));
-          return;
-        } catch (e) {}
+    let cancelled = false;
+
+    const loadSessions = async () => {
+      setIsSessionLoading(true);
+      setSessions([]);
+      setActiveSessionId(null);
+      setLoadedSessionDocId(null);
+      setMessages([getDefaultGreeting(!!activeDocId)]);
+
+      if (!activeDocId) {
+        setIsSessionLoading(false);
+        return;
       }
-    }
-    setMessages([getDefaultGreeting(!!activeDocId)]);
+
+      const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+      try {
+        const listResponse = await apiFetch(
+          `${baseUrl}/api/v1/chat/sessions?document_id=${encodeURIComponent(activeDocId)}`
+        );
+        if (!listResponse.ok) {
+          if (listResponse.status === 403 || listResponse.status === 404) {
+            // 文档已失效或不属于当前用户时，停止后续重复请求。
+            clear_active_document_id(activeDocId);
+          }
+          throw new Error(`会话列表加载失败：HTTP ${listResponse.status}`);
+        }
+
+        const listPayload = await listResponse.json();
+        let loadedSessions: ChatSession[] = listPayload.data || [];
+        let targetSessionId = localStorage.getItem(`active_chat_session_${activeDocId}`);
+        let targetSession = loadedSessions.find(session => session.id === targetSessionId);
+        if (!targetSession && loadedSessions.length > 0) {
+          targetSession = loadedSessions[0];
+          targetSessionId = targetSession.id;
+        }
+
+        // 首次升级时将旧 localStorage 历史交给服务端创建接口迁移。
+        if (!targetSession) {
+          const legacyMessages = readLegacyMessages(activeDocId);
+          const createResponse = await apiFetch(`${baseUrl}/api/v1/chat/sessions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              document_id: activeDocId,
+              title: legacyMessages.find(message => message.role === 'user')?.content?.slice(0, 30) || '新会话',
+              history: legacyMessages.map(message => ({ role: message.role, content: message.content })),
+            }),
+          });
+          if (!createResponse.ok) throw new Error(`会话创建失败：HTTP ${createResponse.status}`);
+          const createPayload = await createResponse.json();
+          const createdSession = createPayload.data as ChatSession | undefined;
+          if (!createdSession?.id) throw new Error('会话创建接口未返回有效会话');
+          targetSession = createdSession;
+          loadedSessions = [createdSession, ...loadedSessions];
+          targetSessionId = createdSession.id;
+        }
+
+        if (cancelled || !targetSession) return;
+        const resolvedSessionId = targetSession.id;
+        setSessions(loadedSessions);
+        setActiveSessionId(resolvedSessionId);
+        localStorage.setItem(`active_chat_session_${activeDocId}`, resolvedSessionId);
+
+        const messageResponse = await apiFetch(
+          `${baseUrl}/api/v1/chat/sessions/${encodeURIComponent(resolvedSessionId)}/messages`
+        );
+        if (!messageResponse.ok) throw new Error(`会话消息加载失败：HTTP ${messageResponse.status}`);
+        const messagePayload = await messageResponse.json();
+        const persistedMessages = mapPersistedMessages(messagePayload.data || []);
+        if (!cancelled) {
+          setMessages(persistedMessages.length > 0 ? persistedMessages : [getDefaultGreeting(true)]);
+          setLoadedSessionDocId(activeDocId);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error('ChatAgent 会话加载失败，使用本地缓存兜底', error);
+          const legacyMessages = readLegacyMessages(activeDocId);
+          setMessages(legacyMessages.length > 0 ? legacyMessages : [getDefaultGreeting(true)]);
+          setLoadedSessionDocId(activeDocId);
+        }
+      } finally {
+        if (!cancelled) setIsSessionLoading(false);
+      }
+    };
+
+    void loadSessions();
+    return () => {
+      cancelled = true;
+    };
   }, [activeDocId]);
 
   // 同步 messages 到 localStorage（过滤掉 isStreaming 状态）
   useEffect(() => {
-    if (activeDocId) {
+    if (activeDocId && loadedSessionDocId === activeDocId) {
       // 只有在非流式传输中，且有实际对话（超过1条）时才保存
       if (!isStreaming && messages.length > 0) {
         const toSave = messages.map(m => ({ ...m, isStreaming: false }));
         localStorage.setItem(`chat_history_${activeDocId}`, JSON.stringify(toSave));
       }
     }
-  }, [messages, activeDocId, isStreaming]);
+  }, [messages, activeDocId, loadedSessionDocId, isStreaming]);
 
   useEffect(() => {
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
+  /** 加载指定会话的服务端原始消息 */
+  const selectSession = useCallback(async (sessionId: string) => {
+    if (!activeDocId || isStreaming) return;
+    setActiveSessionId(sessionId);
+    localStorage.setItem(`active_chat_session_${activeDocId}`, sessionId);
+    setMessages([getDefaultGreeting(true)]);
+
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+    try {
+      const response = await apiFetch(
+        `${baseUrl}/api/v1/chat/sessions/${encodeURIComponent(sessionId)}/messages`
+      );
+      if (!response.ok) throw new Error(`会话消息加载失败：HTTP ${response.status}`);
+      const payload = await response.json();
+      const loadedMessages = mapPersistedMessages(payload.data || []);
+      setMessages(loadedMessages.length > 0 ? loadedMessages : [getDefaultGreeting(true)]);
+    } catch (error) {
+      console.error('ChatAgent 会话切换失败', error);
+    }
+  }, [activeDocId, isStreaming]);
+
+  /** 在当前文档下创建一个空白新会话 */
+  const createNewSession = useCallback(async () => {
+    if (!activeDocId || isStreaming || isSessionLoading) return;
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+    try {
+      const response = await apiFetch(`${baseUrl}/api/v1/chat/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document_id: activeDocId, title: '新会话', history: [] }),
+      });
+      if (!response.ok) throw new Error(`新会话创建失败：HTTP ${response.status}`);
+      const payload = await response.json();
+      const newSession: ChatSession = payload.data;
+      setSessions(prev => [newSession, ...prev]);
+      await selectSession(newSession.id);
+    } catch (error) {
+      console.error('ChatAgent 新会话创建失败', error);
+    }
+  }, [activeDocId, isSessionLoading, isStreaming, selectSession]);
+
+  /** 删除当前会话并切换到其他会话，最后一个会话删除后创建空白会话。 */
+  const deleteCurrentSession = useCallback(async () => {
+    if (!activeDocId || !activeSessionId || isStreaming || isSessionLoading || isDeletingSession) return;
+
+    const currentSession = sessions.find(session => session.id === activeSessionId);
+    const sessionTitle = currentSession?.title || '当前会话';
+    const confirmed = await confirm(`确定删除“${sessionTitle}”吗？删除后该会话不会再出现在列表中。`, {
+      title: '确认删除会话',
+      intent: 'danger',
+      confirmText: '删除会话',
+    });
+    if (!confirmed) return;
+
+    setIsDeletingSession(true);
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+    try {
+      const response = await apiFetch(
+        `${baseUrl}/api/v1/chat/sessions/${encodeURIComponent(activeSessionId)}`,
+        { method: 'DELETE' },
+      );
+      if (!response.ok) throw new Error(`会话删除失败：HTTP ${response.status}`);
+
+      const remainingSessions = sessions.filter(session => session.id !== activeSessionId);
+      setSessions(remainingSessions);
+      localStorage.removeItem(`active_chat_session_${activeDocId}`);
+
+      if (remainingSessions.length > 0) {
+        await selectSession(remainingSessions[0].id);
+      } else {
+        setActiveSessionId(null);
+        setMessages([getDefaultGreeting(true)]);
+        await createNewSession();
+      }
+    } catch (error) {
+      console.error('ChatAgent 会话删除失败', error);
+    } finally {
+      setIsDeletingSession(false);
+    }
+  }, [activeDocId, activeSessionId, confirm, createNewSession, isDeletingSession, isSessionLoading, isStreaming, sessions, selectSession]);
+
   // ==================== 核心发送逻辑 ====================
 
   const handleSend = useCallback(async () => {
     const trimmedInput = input.trim();
-    if (!trimmedInput || isStreaming) return;
+    if (!trimmedInput || isStreaming || isSessionLoading) return;
 
     // 检查 document_id
     if (!activeDocId) {
@@ -292,14 +531,10 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
     setIsStreaming(true);
 
     // 追加空 AI 消息占位（流式填充）
-    const aiMessageIndex = messages.length + 1;
     setMessages(prev => [
       ...prev,
       { role: 'ai', content: '', isStreaming: true },
     ]);
-
-    // 构建历史记录（排除刚加入的占位 AI 消息）
-    const history = messages.map(m => ({ role: m.role, content: m.content }));
 
     // 发起 SSE 流式请求
     const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
@@ -312,7 +547,11 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
         body: JSON.stringify({
           document_id: activeDocId,
           question: trimmedInput,
-          history,
+          session_id: activeSessionId,
+          // 仅为旧版后端保留降级 history；正常路径由服务端按 session_id 读取消息。
+          ...(activeSessionId ? {} : {
+            history: messages.map(m => ({ role: m.role, content: m.content })),
+          }),
         }),
         signal: abortControllerRef.current.signal,
       });
@@ -327,8 +566,9 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
           } else if (errorData.message) {
             errorDetail = errorData.message;
           }
-        } catch (e) {
-          // 如果后端没返回 JSON，就使用默认状态码提示
+        } catch {
+          // 如果后端没返回 JSON，就使用默认状态码提示，并记录调试信息。
+          console.debug('ChatAgent 错误响应不是 JSON，使用默认状态码提示');
         }
         throw new Error(errorDetail);
       }
@@ -353,7 +593,22 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
 
           try {
             const event = JSON.parse(rawJson);
-            if (event.type === 'token') {
+            if (event.type === 'session' && event.session_id) {
+              setActiveSessionId(event.session_id);
+              localStorage.setItem(`active_chat_session_${activeDocId}`, event.session_id);
+            } else if (event.type === 'agent_status') {
+              setMessages(prev => {
+                const updated = [...prev];
+                const lastIdx = updated.length - 1;
+                if (updated[lastIdx]?.role === 'ai') {
+                  updated[lastIdx] = {
+                    ...updated[lastIdx],
+                    statusMessage: event.message || '正在准备回答…',
+                  };
+                }
+                return updated;
+              });
+            } else if (event.type === 'token') {
               aiContent += event.content;
               // 实时更新 AI 消息内容（打字机效果）
               setMessages(prev => {
@@ -364,6 +619,7 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
                     ...updated[lastIdx],
                     content: aiContent,
                     isStreaming: true,
+                    statusMessage: undefined,
                   };
                 }
                 return updated;
@@ -375,9 +631,53 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
                 const lastIdx = updated.length - 1;
                 if (updated[lastIdx]?.role === 'ai') {
                   const existing = updated[lastIdx].toolCalls || [];
+                    updated[lastIdx] = {
+                      ...updated[lastIdx],
+                      toolCalls: [...existing, event.content],
+                    };
+                }
+                return updated;
+              });
+            } else if (event.type === 'tool_result') {
+              // 展示工具的完成状态和短结果摘要，便于用户判断回答是否有数据依据。
+              setMessages(prev => {
+                const updated = [...prev];
+                const lastIdx = updated.length - 1;
+                if (updated[lastIdx]?.role === 'ai') {
+                  const existing = updated[lastIdx].toolCalls || [];
                   updated[lastIdx] = {
                     ...updated[lastIdx],
                     toolCalls: [...existing, event.content],
+                  };
+                }
+                return updated;
+              });
+            } else if (event.type === 'reasoning') {
+              // 仅接收服务端明确标记为 provider_visible 的 reasoning 增量。
+              setMessages(prev => {
+                const updated = [...prev];
+                const lastIdx = updated.length - 1;
+                if (updated[lastIdx]?.role === 'ai' && event.content) {
+                  const existing = updated[lastIdx].reasoningBlocks || [];
+                  const nextBlocks = existing.length > 0
+                    ? [...existing.slice(0, -1), `${existing[existing.length - 1]}${event.content}`]
+                    : [event.content];
+                  updated[lastIdx] = {
+                    ...updated[lastIdx],
+                    reasoningBlocks: nextBlocks,
+                  };
+                }
+                return updated;
+              });
+            } else if (event.type === 'llm_status') {
+              // 后端每次退避重试都会推送状态，避免前端长时间只显示转圈。
+              setMessages(prev => {
+                const updated = [...prev];
+                const lastIdx = updated.length - 1;
+                if (updated[lastIdx]?.role === 'ai') {
+                  updated[lastIdx] = {
+                    ...updated[lastIdx],
+                    statusMessage: event.message || '模型服务暂时不可用，正在自动重试…',
                   };
                 }
                 return updated;
@@ -395,12 +695,14 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
                     content: aiContent,
                     sources: aiSources,
                     isStreaming: false,
+                    statusMessage: undefined,
                   };
                 }
                 return updated;
               });
             } else if (event.type === 'error') {
               aiContent = `❌ ${event.content}`;
+              const canResume = Boolean(event.resumable);
               setMessages(prev => {
                 const updated = [...prev];
                 const lastIdx = updated.length - 1;
@@ -410,6 +712,8 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
                     role: 'ai',
                     content: aiContent,
                     isStreaming: false,
+                    canResume,
+                    statusMessage: canResume ? '已保存已完成的工具结果，可以继续生成。' : undefined,
                   };
                 }
                 return updated;
@@ -433,6 +737,7 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
             role: 'ai',
             content: `❌ ${errorMsg}`,
             isStreaming: false,
+            statusMessage: '请求未完成。你可以检查网络或模型服务地址后重试。',
           };
         }
         return updated;
@@ -443,7 +748,165 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
       // 聚焦回输入框
       setTimeout(() => inputRef.current?.focus(), 100);
     }
-  }, [input, isStreaming, activeDocId, messages]);
+  }, [input, isStreaming, isSessionLoading, activeDocId, activeSessionId, messages]);
+
+  /** 基于服务端保存的工具结果继续生成，避免重新执行原始查询。 */
+  const handleResume = useCallback(async (messageIndex: number) => {
+    if (!activeDocId || !activeSessionId || isStreaming || isSessionLoading) return;
+    if (!messages[messageIndex]?.canResume) return;
+
+    setIsStreaming(true);
+    setMessages(prev => {
+      const updated = [...prev];
+      const target = updated[messageIndex];
+      if (target?.role === 'ai') {
+        updated[messageIndex] = {
+          ...target,
+          content: '',
+          isStreaming: true,
+          canResume: false,
+          reasoningBlocks: [],
+          statusMessage: '正在基于已完成的工具结果继续生成…',
+        };
+      }
+      return updated;
+    });
+
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+    abortControllerRef.current = new AbortController();
+
+    try {
+      const response = await apiFetch(
+        `${baseUrl}/api/v1/chat/sessions/${encodeURIComponent(activeSessionId)}/resume`,
+        {
+          method: 'POST',
+          signal: abortControllerRef.current.signal,
+        },
+      );
+      if (!response.ok || !response.body) {
+        throw new Error(`断点续答失败: HTTP ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let aiContent = '';
+      let buffer = '';
+
+      const applyEvent = (event: Record<string, any>) => {
+        if (event.type === 'agent_status' || event.type === 'llm_status') {
+          setMessages(prev => {
+            const updated = [...prev];
+            const target = updated[messageIndex];
+            if (target?.role === 'ai') {
+              updated[messageIndex] = {
+                ...target,
+                statusMessage: event.message || '正在继续生成…',
+              };
+            }
+            return updated;
+          });
+        } else if (event.type === 'token') {
+          aiContent += event.content || '';
+          setMessages(prev => {
+            const updated = [...prev];
+            const target = updated[messageIndex];
+            if (target?.role === 'ai') {
+              updated[messageIndex] = {
+                ...target,
+                content: aiContent,
+                isStreaming: true,
+                statusMessage: undefined,
+              };
+            }
+            return updated;
+          });
+        } else if (event.type === 'reasoning' && event.content) {
+          setMessages(prev => {
+            const updated = [...prev];
+            const target = updated[messageIndex];
+            if (target?.role === 'ai') {
+              const existing = target.reasoningBlocks || [];
+              const nextBlocks = existing.length > 0
+                ? [...existing.slice(0, -1), `${existing[existing.length - 1]}${event.content}`]
+                : [event.content];
+              updated[messageIndex] = { ...target, reasoningBlocks: nextBlocks };
+            }
+            return updated;
+          });
+        } else if (event.type === 'done') {
+          setMessages(prev => {
+            const updated = [...prev];
+            const target = updated[messageIndex];
+            if (target?.role === 'ai') {
+              updated[messageIndex] = {
+                ...target,
+                content: aiContent,
+                sources: event.sources || [],
+                isStreaming: false,
+                canResume: false,
+                statusMessage: undefined,
+              };
+            }
+            return updated;
+          });
+        } else if (event.type === 'error') {
+          setMessages(prev => {
+            const updated = [...prev];
+            const target = updated[messageIndex];
+            if (target?.role === 'ai') {
+              updated[messageIndex] = {
+                ...target,
+                content: `❌ ${event.content || '断点续答失败'}`,
+                isStreaming: false,
+                canResume: true,
+                statusMessage: '网络恢复后可以再次点击“继续生成”。',
+              };
+            }
+            return updated;
+          });
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const rawJson = line.slice(6).trim();
+          if (!rawJson) continue;
+          try {
+            applyEvent(JSON.parse(rawJson));
+          } catch {
+            console.debug('断点续答收到无法解析的 SSE 数据，已忽略。');
+          }
+        }
+      }
+    } catch (err: any) {
+      if (err.name === 'AbortError') return;
+      const errorMsg = err.message || '断点续答失败，请检查网络或模型服务。';
+      setMessages(prev => {
+        const updated = [...prev];
+        const target = updated[messageIndex];
+        if (target?.role === 'ai') {
+          updated[messageIndex] = {
+            ...target,
+            content: `❌ ${errorMsg}`,
+            isStreaming: false,
+            canResume: true,
+            statusMessage: '网络恢复后可以再次点击“继续生成”。',
+          };
+        }
+        return updated;
+      });
+    } finally {
+      setIsStreaming(false);
+      abortControllerRef.current = null;
+      setTimeout(() => inputRef.current?.focus(), 100);
+    }
+  }, [activeDocId, activeSessionId, isSessionLoading, isStreaming, messages]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -453,16 +916,6 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
   };
 
   // ==================== 引文 Badge 解析 ====================
-
-  /**
-   * 将 AI 回复中的 [来源: XXX] 标记解析为对应 Source 对象（用于点击弹窗）
-   */
-  const findSourceByTitle = (title: string, sources: Source[]): Source | undefined => {
-    // 模糊匹配：比较章节名是否包含 title 关键词
-    return sources.find(s =>
-      s.section_title.includes(title) || title.includes(s.section_title)
-    );
-  };
 
   // ==================== 渲染 ====================
 
@@ -490,6 +943,45 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
           </div>
           {/* 快捷按钮与操作区 */}
           <div className="flex items-center gap-2">
+            {activeDocId && (
+              <div className="flex items-center gap-1.5">
+                <select
+                  aria-label="选择会话"
+                  value={activeSessionId || ''}
+                  onChange={event => { void selectSession(event.target.value); }}
+                  disabled={isStreaming || isSessionLoading || sessions.length === 0}
+                  className="max-w-[150px] rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-medium text-slate-600 outline-none focus:border-indigo-400 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {sessions.length === 0 ? (
+                    <option value="">暂无会话</option>
+                  ) : (
+                    sessions.map(session => (
+                      <option key={session.id} value={session.id}>
+                        {session.title || '新会话'}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <button
+                  aria-label="新建会话"
+                  onClick={() => { void createNewSession(); }}
+                  disabled={isStreaming || isSessionLoading}
+                  className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                  title="新建会话"
+                >
+                  <Plus className="w-4 h-4" />
+                </button>
+                <button
+                  aria-label="删除会话"
+                  onClick={() => { void deleteCurrentSession(); }}
+                  disabled={isStreaming || isSessionLoading || isDeletingSession || sessions.length === 0}
+                  className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                  title="删除会话"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            )}
             {activeDocId && (
               <button
                 onClick={() => setInput('最高投标限价是多少？')}
@@ -552,17 +1044,45 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
                 >
                   {msg.role === 'ai' ? (
                     <div className="flex flex-col gap-3">
-                      {/* Agent 工具调用思考区 */}
+                      {/* Agent 可审计执行过程区；不展示模型隐藏思维链。 */}
                       {(() => {
                         const { cleanText, inlineJson, thinkBlocks } = extractThoughts(msg.content || '');
                         return (
                           <>
                             <ThoughtProcessBlock 
                               toolCalls={msg.toolCalls} 
+                              reasoningBlocks={msg.reasoningBlocks}
                               inlineJson={inlineJson}
                               thinkBlocks={thinkBlocks}
                               isStreaming={msg.isStreaming} 
                             />
+
+                            {msg.statusMessage && (
+                              <div className="flex flex-wrap items-center gap-2">
+                                <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 whitespace-pre-wrap">
+                                  {msg.statusMessage}
+                                </div>
+                                {msg.canResume && !msg.isStreaming && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleResume(idx)}
+                                    className="text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 hover:bg-blue-100 transition-colors"
+                                  >
+                                    继续生成
+                                  </button>
+                                )}
+                              </div>
+                            )}
+
+                            {!msg.statusMessage && msg.canResume && !msg.isStreaming && (
+                              <button
+                                type="button"
+                                onClick={() => void handleResume(idx)}
+                                className="self-start text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 hover:bg-blue-100 transition-colors"
+                              >
+                                继续生成
+                              </button>
+                            )}
                             
                             {/* 最终回答区 */}
                             <div className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-strong:text-slate-800 [&_:not(pre)>code]:bg-slate-100 [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:rounded [&_:not(pre)>code]:text-blue-700 [&_:not(pre)>code]:font-medium prose-pre:bg-slate-800 prose-pre:text-slate-50 prose-table:w-full prose-table:border-collapse prose-th:border-b-2 prose-th:border-slate-200 prose-th:text-left prose-th:p-2 prose-td:border-b prose-td:border-slate-100 prose-td:p-2">
@@ -621,12 +1141,12 @@ export function ChatPanel({ documentId: propDocumentId, isFullscreen, onToggleFu
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder={activeDocId ? '询问标书细节... (Enter 发送)' : '请先上传招标文件...'}
-              disabled={isStreaming}
+              disabled={isStreaming || isSessionLoading}
               className="w-full pl-4 pr-14 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:bg-white transition-all shadow-inner font-medium text-slate-700 disabled:opacity-60 disabled:cursor-not-allowed text-sm"
             />
             <button
               onClick={handleSend}
-              disabled={!input.trim() || isStreaming || !activeDocId}
+              disabled={!input.trim() || isStreaming || isSessionLoading || !activeDocId}
               className="absolute right-2 top-1/2 -translate-y-1/2 bg-blue-600 disabled:bg-slate-300 hover:bg-blue-700 text-white p-2.5 rounded-xl transition-all shadow-md active:scale-95 disabled:cursor-not-allowed"
             >
               {isStreaming ? (

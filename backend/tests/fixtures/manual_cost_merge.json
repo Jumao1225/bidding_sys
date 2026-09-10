@@ -1,0 +1,133 @@
+{
+  "fresh_cost_analysis": {
+    "analysis_summary": "重新匹配结果",
+    "items": [
+      {
+        "node_id": "root-photovoltaic",
+        "name": "光伏",
+        "parent_node_id": null,
+        "parent_item": null,
+        "root_item": "光伏",
+        "tree_level": 1,
+        "qty": 1,
+        "unit": "项",
+        "ref_price": 0,
+        "match_quality": "未匹配"
+      },
+      {
+        "node_id": "cabinet-a",
+        "name": "10kV光伏进线柜",
+        "parent_node_id": "root-photovoltaic",
+        "parent_item": "光伏",
+        "root_item": "光伏",
+        "tree_level": 2,
+        "qty": 1,
+        "unit": "面",
+        "ref_price": 100,
+        "matched_name": "旧价格匹配",
+        "match_quality": "精准匹配"
+      },
+      {
+        "node_id": "cabinet-b",
+        "name": "10kV无功装置补偿进线柜",
+        "parent_node_id": "root-photovoltaic",
+        "parent_item": "光伏",
+        "root_item": "光伏",
+        "tree_level": 2,
+        "qty": 1,
+        "unit": "面",
+        "ref_price": 200,
+        "matched_name": "最新价格匹配",
+        "match_quality": "精准匹配"
+      },
+      {
+        "node_id": "custom-pending",
+        "name": "待匹配新增项",
+        "parent_node_id": null,
+        "parent_item": null,
+        "root_item": null,
+        "tree_level": 1,
+        "qty": 2,
+        "unit": "台",
+        "ref_price": 880,
+        "matched_name": "价格库新增项",
+        "matched_brand": "测试品牌",
+        "match_quality": "精准匹配"
+      }
+    ]
+  },
+  "saved_cost_analysis": {
+    "items": [
+      {
+        "node_id": "root-photovoltaic",
+        "name": "光伏",
+        "parent_node_id": null,
+        "parent_item": null,
+        "root_item": "光伏",
+        "tree_level": 1,
+        "qty": 1,
+        "unit": "项",
+        "ref_price": 0,
+        "match_quality": "未匹配",
+        "sort_order": 0
+      },
+      {
+        "node_id": "cabinet-b",
+        "name": "10kV无功装置补偿进线柜",
+        "parent_node_id": "root-photovoltaic",
+        "parent_item": "光伏",
+        "root_item": "光伏",
+        "tree_level": 2,
+        "qty": 1,
+        "unit": "面",
+        "ref_price": 50,
+        "matched_name": "人工调整前匹配",
+        "match_quality": "精准匹配",
+        "sort_order": 1
+      },
+      {
+        "node_id": "custom-item",
+        "name": "人工新增项",
+        "parent_node_id": "root-photovoltaic",
+        "parent_item": "光伏",
+        "root_item": "光伏",
+        "tree_level": 2,
+        "qty": 1,
+        "unit": "项",
+        "ref_price": 30,
+        "match_quality": "手动添加",
+        "is_custom_added": true,
+        "sort_order": 2
+      }
+    ]
+  },
+  "manual_price_item": {
+    "node_id": "cabinet-b",
+    "name": "10kV无功装置补偿进线柜",
+    "parent_node_id": "root-photovoltaic",
+    "parent_item": "光伏",
+    "root_item": "光伏",
+    "tree_level": 2,
+    "qty": 1,
+    "unit": "面",
+    "ref_price": 999,
+    "match_quality": "手动修改",
+    "is_child_modified": true,
+    "sort_order": 1
+  },
+  "pending_custom_saved_item": {
+    "node_id": "custom-pending",
+    "name": "待匹配新增项",
+    "parent_node_id": null,
+    "parent_item": null,
+    "root_item": null,
+    "tree_level": 1,
+    "qty": 2,
+    "unit": "台",
+    "ref_price": 0,
+    "match_quality": "手动添加",
+    "is_custom_added": true,
+    "is_child_modified": true,
+    "sort_order": 0
+  }
+}

@@ -15,6 +15,7 @@ import {
   FileText
 } from 'lucide-react';
 import { apiFetch } from '../utils/api';
+import { useDialog } from '../components/DialogProvider';
 
 export interface CompanyProfileItem {
   id?: string;
@@ -47,6 +48,7 @@ const emptyProfileForm: CompanyProfileItem = {
 };
 
 export const CompanyProfilePage: React.FC = () => {
+  const { confirm } = useDialog();
   const [profiles, setProfiles] = useState<CompanyProfileItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState<boolean>(false);
@@ -227,7 +229,12 @@ export const CompanyProfilePage: React.FC = () => {
       return;
     }
 
-    if (!window.confirm(`确定要删除企业档案「${current?.profile_name || '当前档案'}」吗？`)) {
+    const confirmed = await confirm(`确定要删除企业档案「${current?.profile_name || '当前档案'}」吗？`, {
+      title: '确认删除企业档案',
+      intent: 'danger',
+      confirmText: '删除档案',
+    });
+    if (!confirmed) {
       return;
     }
 

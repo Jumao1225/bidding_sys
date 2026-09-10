@@ -20,7 +20,7 @@ import shutil
 import tempfile
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Any, List, Optional, Sequence, Tuple, TypedDict
+from typing import Dict, Any, List, Optional, Sequence, Set, Tuple, TypedDict
 from loguru import logger
 from sqlalchemy.orm import Session
 from docx import Document
@@ -45,9 +45,11 @@ from app.schemas.bid_filler_schema import (
     BidFillPlan,
     CompanyProfile,
     FillingAuditItem,
+    ManualChapterItem,
     ReviewFinding,
 )
 from app.services.llm_service import llm_service
+from app.services.cost_service import resolve_cost_total
 from app.utils.date_formatter import format_date_only, normalize_date_only_text
 from app.utils.rmb_formatter import number_to_chinese_rmb
 from app.utils.table_utils import is_narrative_clause_or_lead_in
@@ -65,6 +67,7 @@ class BidFillerState(TypedDict):
     slot_analysis: Optional[List[Dict[str, Any]]]
     worker_proposals: Optional[List[Dict[str, Any]]]  # 保留兼容
     chapter_tasks: Optional[List[Dict[str, Any]]]  # 首轮缓存的可执行章节任务，供修复轮复用
+    manual_chapters: Optional[List[Dict[str, Any]]]  # needs_writing 章节，仅生成待办，不允许写盘
 
     db_session: Any
     company_profile: CompanyProfile
@@ -87,6 +90,42 @@ class BidFillerState(TypedDict):
     review_findings: Optional[List[Dict[str, Any]]]     # 终审发现列表
     audit_report: Optional[BidFillAuditReport]
     filled_docx_bytes: Optional[bytes]
+
+
+def _normalize_manual_chapters(chapters: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """将 Supervisor 识别出的 needs_writing 章节规范化为人工待办。"""
+    normalized: List[Dict[str, Any]] = []
+    seen_keys = set()
+    for chapter in chapters or []:
+        if not isinstance(chapter, dict):
+            continue
+        title = str(chapter.get("chapter_title", "")).strip()
+        if not title:
+            continue
+        key = (str(chapter.get("chapter_number", "")).strip(), title)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        normalized.append(
+            ManualChapterItem(
+                chapter_number=str(chapter.get("chapter_number", "")).strip(),
+                chapter_title=title,
+                template_text=str(chapter.get("template_text", "") or ""),
+                content_hint=str(chapter.get("content_hint", "") or ""),
+            ).model_dump()
+        )
+    return normalized
+
+
+def _is_manual_chapter_context(current_chapter: str, manual_chapters: List[Dict[str, Any]]) -> bool:
+    """判断当前 DOM 扫描上下文是否属于人工撰写章节。"""
+    context = str(current_chapter or "").strip()
+    if not context:
+        return False
+    return any(
+        title and (title in context or context in title)
+        for title in (str(item.get("chapter_title", "")).strip() for item in manual_chapters)
+    )
 
 
 def _select_repair_chapter_tasks(
@@ -196,6 +235,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
     repair_count = state.get("repair_count", 0)
     audit_items: List[FillingAuditItem] = list(state.get("audit_items") or [])
     dispatched_chapter_tasks: List[Dict[str, Any]] = []
+    manual_chapter_tasks: List[Dict[str, Any]] = _normalize_manual_chapters(state.get("manual_chapters"))
     cached_repair_tasks = _select_repair_chapter_tasks(
         state.get("chapter_tasks"),
         repair_instructions_map,
@@ -324,14 +364,21 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
             return "错误: 章节列表为空"
 
         tasks = [c for c in chapters if c.get("category") in ("needs_fill", "needs_data")]
-        skipped = [c for c in chapters if c.get("category") not in ("needs_fill", "needs_data")]
+        manual_chapter_tasks[:] = _normalize_manual_chapters(
+            [c for c in chapters if c.get("category") == "needs_writing"]
+        ) or manual_chapter_tasks
+        skipped = [c for c in chapters if c.get("category") not in ("needs_fill", "needs_data", "needs_writing")]
+        if manual_chapter_tasks:
+            logger.info("   📝 识别到 {} 个 needs_writing 人工待办章节，Agent 不写入正文", len(manual_chapter_tasks))
+            for manual_chapter in manual_chapter_tasks:
+                logger.info("      ✍️ 人工待办: {}", manual_chapter.get("chapter_title", ""))
         if skipped:
             logger.info(f"   ⏩ 跳过 {len(skipped)} 个章节:")
             for c in skipped:
                 logger.info(f"      ⊘ {c.get('chapter_title', '?')} (分类: {c.get('category', '?')})")
 
         if not tasks:
-            return "没有需要处理的章节（全部为 skip / needs_writing）"
+            return "没有需要 Agent 写盘的章节；needs_writing 已登记为人工待办，其他章节为 skip"
 
         # 修复轮只允许执行终审指出的章节，避免误传全量章节时扩大重试范围。
         if repair_count > 0 and repair_instructions_map:
@@ -355,6 +402,8 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
             outputs={
                 "summary": f"Supervisor 总控完成 Word DOM 分析，成功识别出 {len(chapters)} 个章节，正在并发派发 {len(tasks)} 个表单填报 Worker 节点。",
                 "proposals_count": len(tasks),
+                "manual_chapters": manual_chapter_tasks,
+                "manual_pending_count": len(manual_chapter_tasks),
                 "thought_steps": [
                     {"step": 1, "type": "thought", "content": f"深度扫描标书文档 DOM 结构，发现 {len(chapters)} 个章节，其中 {len(tasks)} 个核心格式表单/表格需原位改写。"},
                     {"step": 2, "type": "tool_call", "name": "dispatch_chapter_workers", "args": {"chapters_count": len(chapters), "active_workers": len(tasks)}}
@@ -416,14 +465,22 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 
                 from app.db.models.ai_analysis import CostEstimate
                 cost_items = db_meta.query(CostEstimate).filter(CostEstimate.document_id == doc_id).all()
-                if cost_items:
-                    total_val = sum(getattr(it, "calculated_total", 0.0) or 0.0 for it in cost_items)
-                    if total_val > 0:
-                        prefetched_metadata["total_price_str"] = f"{total_val:,.2f} 元"
-                        try:
-                            prefetched_metadata["total_price_words"] = number_to_chinese_rmb(float(total_val))
-                        except Exception:
-                            pass
+                cost_doc_query = db_meta.query(DocumentModel).filter(DocumentModel.id == doc_id)
+                if tenant_id:
+                    cost_doc_query = cost_doc_query.filter(DocumentModel.tenant_id == tenant_id)
+                cost_doc = cost_doc_query.first()
+                stored_cost_analysis = (
+                    (cost_doc.parsed_metadata or {}).get("cost_analysis", {})
+                    if cost_doc and isinstance(cost_doc.parsed_metadata, dict)
+                    else {}
+                )
+                total_val = resolve_cost_total(stored_cost_analysis, cost_items)
+                if total_val > 0:
+                    prefetched_metadata["total_price_str"] = f"{total_val:,.2f} 元"
+                    try:
+                        prefetched_metadata["total_price_words"] = number_to_chinese_rmb(float(total_val))
+                    except (TypeError, ValueError):
+                        logger.warning("成本总额转人民币大写失败：{}", total_val)
 
                 prefetched_metadata["quality_standard"] = "合格，完全符合国家及行业现行有关标准、规范要求"
             finally:
@@ -469,6 +526,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
                     repair_instructions=ch_repair_inst,
                     prefetched_metadata=prefetched_metadata,
                     tenant_id=tenant_id,
+                    profile_id=state.get("profile_id"),
                 )
                 future_map[future] = ch_title
 
@@ -498,7 +556,14 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 
         success = sum(1 for r in results if r.get("status") == "success")
         failed = sum(1 for r in results if r.get("status") != "success")
-        logger.info(f"   派发完成: {success} 成功 + {failed} 失败 + {len(skipped)} 跳过 = {len(chapters)} 章节")
+        logger.info(
+            "   派发完成: {} 成功 + {} 失败 + {} skip + {} 个人工待办 = {} 章节",
+            success,
+            failed,
+            len(skipped),
+            len(manual_chapter_tasks),
+            len(chapters),
+        )
         return json.dumps({"total": len(tasks), "success": success, "results": results}, ensure_ascii=False)
 
 
@@ -531,6 +596,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
                 "docx_temp_path": docx_temp_path,
                 "worker_proposals": worker_proposals,
                 "chapter_tasks": state.get("chapter_tasks") or repair_tasks,
+                "manual_chapters": manual_chapter_tasks,
             }
         except Exception as repair_error:
             logger.exception(f"   [专项修复直通失败] 将回退到 Supervisor 兼容流程: {repair_error}")
@@ -573,17 +639,18 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
 【四类分类规则】
 - needs_fill: 有 ____ 下划线/占位符的固定格式文书（投标函、授权书、承诺书）
 - needs_data: 有空白表格框架或材料清单（报价表、资质表、人员表、偏离表）
-- needs_writing: 只有标题+说明，无模板的长文方案 → 自动跳过
+- needs_writing: 只有标题+说明、需要完整方案论证的长文 → 登记为人工待办，禁止 Agent 修改正文
 - skip: 提示/免责说明/装订要求 → 自动跳过
 
 【派发原则】
 - dispatch_chapter_workers 会并发处理所有 needs_fill 和 needs_data 章节
-- needs_writing 和 skip 类自动跳过
+- needs_writing 只提取标题、原始说明和撰写要求，写入人工待办清单，不生成正文、不提交写盘提案
+- skip 类才是纯跳过，不进入人工待办清单
 - 传入 analyze_chapters 返回的完整 JSON 即可
 
 【约束】
 - 严格按 1→2→3→4→5 顺序执行；若无格式强调条款，样式核验可返回未找到后继续
-- dispatch_chapter_workers 完成后直接结束，回复: 投标书撰写完成"""
+- dispatch_chapter_workers 完成后直接结束；回复中必须说明人工待办章节数量，不得声称这些章节已由 Agent 完成"""
 
     user_prompt = f"""【任务】
 - 文档 ID: {doc_id}
@@ -764,6 +831,7 @@ def agent_fill_node(state: BidFillerState) -> Dict[str, Any]:
         "docx_temp_path": docx_temp_path,
         "worker_proposals": worker_proposals,
         "chapter_tasks": dispatched_chapter_tasks or state.get("chapter_tasks") or [],
+        "manual_chapters": manual_chapter_tasks,
     }
 
 
@@ -1294,6 +1362,109 @@ def _is_protected_template_overwrite(
     return True
 
 
+def _heal_shifted_paragraph_target(
+    doc: Document,
+    current_path: str,
+    current_p: Any,
+    proposed_val: str,
+    orig_ctx: str,
+    p_type: str,
+    handled_paragraphs: Optional[Set[Any]] = None,
+) -> Optional[Any]:
+    """
+    通用段落槽位偏移自愈寻址器：
+    当绝对路径 /body/p[N] 由于前面章节插入图片/表格/空行产生微小物理偏移，
+    导致原定位段落命中不可覆盖的固定标题或无槽位文本时，
+    在当前段落邻近窗口（前后各 1~3 个段落）内基于通用结构特征自愈探测真实的待填槽位段落。
+
+    【核心原则】：
+    1. 零业务硬编码：不硬编码任何具体业务字段，通用支持单字段、复合多字段及公文整句；
+    2. 防御性校验：候选段落必须自身具备可填槽位标记 (_has_fillable_slot_marker) 且不触发原文保护；
+    3. 语义与结构对齐：依据冒号标签集合重合度、原模板词段包含率及文本拓扑相似度打分，精准重定向。
+    """
+    if doc is None or not current_path or current_p is None:
+        return None
+
+    # 表格单元格路径具备独立二维坐标系，不走正文段落偏移纠偏
+    if "/tbl[" in current_path:
+        return None
+
+    p_match = re.search(r'/body/p\[(\d+)\]', current_path)
+    if not p_match:
+        return None
+
+    curr_idx = int(p_match.group(1)) - 1
+    if not (0 <= curr_idx < len(doc.paragraphs)):
+        return None
+
+    # 1. 提取提案及上下文中的通用冒号标签特征（如 "XXX："、"YYY："）
+    raw_labels = re.findall(r'([^:：\n\s]{2,20}[:：])', proposed_val)
+    if orig_ctx:
+        raw_labels.extend(re.findall(r'([^:：\n\s]{2,20}[:：])', orig_ctx))
+
+    proposal_labels = {
+        re.sub(r'[\s:：_＿\[\]［］()（）]', '', lbl)
+        for lbl in raw_labels
+        if lbl and len(re.sub(r'[\s:：_＿\[\]［］()（）]', '', lbl)) >= 2
+    }
+
+    best_candidate = None
+    best_score = 0.0
+
+    # 2. 在前后各 3 个段落的局部窗口内寻找最匹配的真实待填槽位段落
+    window_offsets = [1, -1, 2, -2, 3, -3]
+    for offset in window_offsets:
+        cand_idx = curr_idx + offset
+        if not (0 <= cand_idx < len(doc.paragraphs)):
+            continue
+
+        cand_p = doc.paragraphs[cand_idx]
+        if cand_p == current_p:
+            continue
+
+        if handled_paragraphs and cand_p in handled_paragraphs:
+            continue
+
+        cand_text = str(cand_p.text or "")
+        if not cand_text.strip():
+            continue
+
+        # 候选段落必须具备可填槽位依据，且不能触发原文保护
+        if _is_protected_template_overwrite(cand_text, orig_ctx, proposed_val, p_type):
+            continue
+
+        score = 0.0
+
+        # 特征 A：冒号标签重合度匹配（适用于键值对与复合多字段行）
+        cand_raw_labels = re.findall(r'([^:：\n\s]{2,20}[:：])', cand_text)
+        cand_labels = {
+            re.sub(r'[\s:：_＿\[\]［］()（）]', '', lbl)
+            for lbl in cand_raw_labels
+            if lbl and len(re.sub(r'[\s:：_＿\[\]［］()（）]', '', lbl)) >= 2
+        }
+
+        common_labels = proposal_labels.intersection(cand_labels)
+        if common_labels:
+            score += len(common_labels) * 100.0
+
+        # 特征 B：候选段落包含槽位标记加分
+        if _has_fillable_slot_marker(cand_text):
+            score += 30.0
+
+        # 特征 C：若无冒号标签但满足整句长句替换关系加分
+        if not proposal_labels and _is_full_paragraph_replacement(cand_text, proposed_val, p_type):
+            score += 80.0
+
+        # 距离衰减（越近越优先）
+        score -= abs(offset) * 5.0
+
+        if score > best_score and score >= 50.0:
+            best_score = score
+            best_candidate = cand_p
+
+    return best_candidate
+
+
 def _highlight_paragraph_yellow(paragraph: Any) -> bool:
     """将段落中已有的数据文字设置为 Word 黄色高亮。"""
     runs = [run for run in paragraph.runs if str(run.text or "")]
@@ -1645,18 +1816,96 @@ def _image_target_matches_anchor(paragraph, proposal: Dict[str, Any]) -> bool:
     return False
 
 
+def _resolve_image_anchor_paragraph(paragraph, proposal: Dict[str, Any], max_distance: int = 4):
+    """当图片提案指向章节标题时，在相邻正文中寻找真正包含材料名称的条款段落。"""
+    if _image_target_matches_anchor(paragraph, proposal):
+        return paragraph
+
+    # 当前节点必须先匹配原文锚点，随后才允许用图注在相邻段落中收窄目标，避免跨章节误插图片。
+    anchor_only = dict(proposal)
+    anchor_only["caption"] = ""
+    if not _image_target_matches_anchor(paragraph, anchor_only):
+        return None
+
+    caption = str(proposal.get("caption", "") or "").strip()
+    if not caption or not _anchor_terms(caption):
+        return None
+
+    from docx.text.paragraph import Paragraph
+
+    element = paragraph._element
+    parent = element.getparent()
+    if parent is None:
+        return None
+    siblings = list(parent)
+    try:
+        current_index = siblings.index(element)
+    except ValueError:
+        return None
+
+    # 优先向后找，因为 Word 模板通常把“特定资格要求”标题与具体要求拆成相邻两段。
+    candidate_indices = []
+    for offset in range(1, max_distance + 1):
+        candidate_indices.append(current_index + offset)
+    for candidate_index in candidate_indices:
+        if not 0 <= candidate_index < len(siblings):
+            continue
+        candidate_element = siblings[candidate_index]
+        if not str(candidate_element.tag).endswith("}p"):
+            continue
+        candidate = Paragraph(candidate_element, paragraph._parent)
+        if _image_target_matches_anchor(candidate, {"caption": caption}):
+            # 将自愈后的真实条款同步回提案，后续写盘复核和审计展示使用同一个锚点。
+            resolved_text = str(candidate.text or "").strip()
+            proposal["anchor_text"] = resolved_text
+            proposal["original_context"] = resolved_text
+            logger.info(
+                f"   [图片锚点邻段自愈] 原节点 '{str(paragraph.text or '')[:40]}' "
+                f"不含图注 '{caption[:40]}'，重定向至相邻条款 '{resolved_text[:60]}'",
+            )
+            return candidate
+    return None
+
+
+def _prepare_image_proposal_for_write(proposal: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """写盘前统一拆分图片路径与图注，兼容旧提案和模型追加的说明文字。"""
+    from app.agents.bid_filler_workers import _split_image_path_and_caption
+
+    normalized = dict(proposal)
+    raw_value = normalized.get("proposed_text")
+    if raw_value is None:
+        raw_value = normalized.get("value", "")
+    image_path, inferred_caption = _split_image_path_and_caption(
+        raw_value,
+        normalized.get("caption", ""),
+    )
+    normalized["proposed_text"] = image_path
+    normalized["value"] = image_path
+    if not str(normalized.get("caption", "") or "").strip() and inferred_caption:
+        normalized["caption"] = inferred_caption
+    return normalized, image_path
+
+
+def _set_image_write_status(proposal: Dict[str, Any], status: str, error: str = "") -> None:
+    """记录图片提案的真实写盘结果，供审计界面按结果展示状态。"""
+    proposal["write_status"] = status
+    if error:
+        proposal["write_error"] = error
+    else:
+        proposal.pop("write_error", None)
+
+
 def _insert_image_proposal(anchor_paragraph, source_paragraph, proposal: Dict[str, Any]):
     """在已校验的动态锚点后插入单张图片，并返回新的插入锚点。"""
-    image_path = str(
-        proposal.get("proposed_text")
-        if proposal.get("proposed_text") is not None
-        else proposal.get("value", "")
-    ).strip()
+    normalized_proposal, image_path = _prepare_image_proposal_for_write(proposal)
+    proposal.update(normalized_proposal)
     if not image_path or not os.path.exists(image_path):
+        _set_image_write_status(proposal, "failed", "图片文件不存在")
         logger.warning(f"   [图片写盘拦截] 图片文件不存在: {image_path}")
         return anchor_paragraph, 0
 
-    if not _image_target_matches_anchor(source_paragraph, proposal):
+    if not _image_target_matches_anchor(source_paragraph, normalized_proposal):
+        _set_image_write_status(proposal, "failed", "图注或原文锚点与目标段落不匹配")
         logger.warning(
             "   [图片写盘拦截] 图注/原文锚点与目标段落不匹配，拒绝插入: "
             f"target={str(source_paragraph.text or '')[:80]}"
@@ -1679,15 +1928,16 @@ def _insert_image_proposal(anchor_paragraph, source_paragraph, proposal: Dict[st
 
     target_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     image_run = target_paragraph.add_run()
-    image_run.add_picture(image_path, width=Inches(float(proposal.get("width_inches", 5.5))))
+    image_run.add_picture(image_path, width=Inches(float(normalized_proposal.get("width_inches", 5.5))))
 
-    caption = str(proposal.get("caption", "") or "").strip()
+    caption = str(normalized_proposal.get("caption", "") or "").strip()
     if caption:
         caption_run = target_paragraph.add_run(f"\n图：{caption}")
         caption_run.font.bold = True
         caption_run.font.size = Pt(10)
         caption_run.font.name = "宋体"
 
+    _set_image_write_status(proposal, "written")
     return target_paragraph, 1
 
 
@@ -2090,6 +2340,17 @@ def _is_full_paragraph_replacement(real_text: str, proposed_val: str, prop_type:
         if matched_count >= 2 and matched_count >= len(valid_static) * 0.6:
             return True
 
+    # 6. 多冒号复合字段行整体替换判定（如一行同时包含多个字段标签，例如 "字段A：" 与 "字段B："）
+    # 只要模板原文与提案同时包含 >= 2 个相同的冒号标签，且提案覆盖了这些标签，即视为整段替换
+    r_labels = [re.sub(r'[\s:：_＿\[\]［］()（）]', '', lbl) for lbl in re.findall(r'([^:：\n\s]{2,20}[:：])', r_strip)]
+    p_labels = [re.sub(r'[\s:：_＿\[\]［］()（）]', '', lbl) for lbl in re.findall(r'([^:：\n\s]{2,20}[:：])', p_strip)]
+    r_valid_labels = [lbl for lbl in r_labels if len(lbl) >= 2]
+    p_valid_labels = [lbl for lbl in p_labels if len(lbl) >= 2]
+    if len(r_valid_labels) >= 2 and len(p_valid_labels) >= 2:
+        common_labels = set(r_valid_labels).intersection(set(p_valid_labels))
+        if len(common_labels) >= 2:
+            return True
+
     return False
 
 
@@ -2319,7 +2580,17 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
 
     try:
         doc = Document(docx_path)
-        proposals = _collapse_redundant_paragraph_proposals(proposals or [])
+        raw_proposals = proposals or []
+        # 先规范化再做正文路径去重，避免同一张图片因“路径（图注）”格式不同被重复插入。
+        for proposal in raw_proposals:
+            if isinstance(proposal, dict) and str(proposal.get("type", "")).strip() == "image":
+                normalized_proposal, _ = _prepare_image_proposal_for_write(proposal)
+                proposal.update(normalized_proposal)
+        proposals = _collapse_redundant_paragraph_proposals(raw_proposals)
+        # 图片提案默认处于待写盘状态；成功或失败会在实际处理分支中覆盖。
+        for proposal in proposals:
+            if isinstance(proposal, dict) and str(proposal.get("type", "")).strip() == "image":
+                _set_image_write_status(proposal, "pending")
         if not proposals:
             subtitle_removed = _remove_redundant_pricing_subtitle(doc)
             if subtitle_removed:
@@ -2815,6 +3086,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                 if not re.search(r'/tbl\[\d+\]$', p_path):
                     path_groups[p_path].append(p)
 
+        handled_paragraphs = set()
         for path, group_items in path_groups.items():
             clean_path = _normalize_table_path(path.replace("`", "").strip())
             snapshot = table_cell_snapshots.get(clean_path)
@@ -2837,12 +3109,19 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
 
             # 同一条资格要求可能对应多张不同资质图片，统一以同一动态条款为锚点顺序插入。
             if group_items and all(item.get("type") == "image" for item in group_items):
+                resolved_anchor = None
                 insertion_anchor = p_elem
                 inserted_count = 0
                 for image_item in group_items:
+                    current_source = _resolve_image_anchor_paragraph(p_elem, image_item)
+                    if current_source is not None and resolved_anchor is None:
+                        resolved_anchor = current_source
+                        insertion_anchor = current_source
+                    if current_source is None:
+                        current_source = resolved_anchor or p_elem
                     insertion_anchor, current_count = _insert_image_proposal(
                         insertion_anchor,
-                        p_elem,
+                        current_source,
                         image_item,
                     )
                     inserted_count += current_count
@@ -2872,22 +3151,47 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                     not _is_footer_paragraph_target(doc, p_elem)
                     and _is_protected_template_overwrite(real_text, orig_ctx, proposed_val, p_type)
                 ):
-                    logger.warning(
-                        f"[投标格式原文保护] 拦截无槽位覆盖提案: 节点={clean_path}, "
-                        f"原文='{real_text[:80]}', 提案='{proposed_val[:80]}'"
+                    # 尝试自愈探测邻近由于图片/表格增减导致的段落槽位物理偏移
+                    healed_p = _heal_shifted_paragraph_target(
+                        doc=doc,
+                        current_path=clean_path,
+                        current_p=p_elem,
+                        proposed_val=proposed_val,
+                        orig_ctx=orig_ctx,
+                        p_type=p_type,
+                        handled_paragraphs=handled_paragraphs,
                     )
-                    continue
+                    if healed_p is not None and healed_p != p_elem:
+                        logger.info(
+                            f"🔄 [段落槽位偏移自愈] 路径 {clean_path} 原定位节点 '{real_text[:30]}' 触发原文保护，"
+                            f"已通用自愈重定向至匹配槽位段落: '{healed_p.text[:30]}'"
+                        )
+                        p_elem = healed_p
+                        real_text = p_elem.text or ""
+                    else:
+                        logger.warning(
+                            f"[投标格式原文保护] 拦截无槽位覆盖提案: 节点={clean_path}, "
+                            f"原文='{real_text[:80]}', 提案='{proposed_val[:80]}'"
+                        )
+                        continue
 
                 use_underline = (not is_in_table)
 
                 if p_item.get("type") == "image":
-                    image_path = proposed_val
+                    normalized_p_item, image_path = _prepare_image_proposal_for_write(p_item)
+                    p_item.update(normalized_p_item)
                     if os.path.exists(image_path):
+                        resolved_image_anchor = _resolve_image_anchor_paragraph(p_elem, p_item)
+                        if resolved_image_anchor is None:
+                            _set_image_write_status(p_item, "failed", "图注或原文锚点与目标段落不匹配")
+                            logger.warning(f"   [图片原位嵌入] 锚点校验失败，跳过节点 {clean_path}")
+                            continue
+                        p_elem = resolved_image_anchor
                         from docx.shared import Inches, Pt
                         from docx.enum.text import WD_ALIGN_PARAGRAPH
                         from docx.text.paragraph import Paragraph
-                        width = p_item.get("width_inches", 5.5)
-                        caption = p_item.get("caption", "")
+                        width = normalized_p_item.get("width_inches", 5.5)
+                        caption = normalized_p_item.get("caption", "")
                         
                         # 检查目标段落是否包含非空实质性条款标题（如 "1．法人或者其他组织的营业执照..."）
                         real_p_text = (p_elem.text or "").strip()
@@ -2921,7 +3225,11 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                             except Exception:
                                 pass
                         success_count += 1
+                        _set_image_write_status(p_item, "written")
                         logger.info(f"   [图片原位嵌入] 成功在节点 {clean_path} {'下方插入' if is_substantive else '原位替换'}证书图片并附加图注！")
+                    else:
+                        _set_image_write_status(p_item, "failed", "图片文件不存在")
+                        logger.warning(f"   [图片原位嵌入] 图片文件不存在，跳过节点 {clean_path}: {image_path}")
                     continue
                     
                 # [图片防字面量打印自愈] 检测正文或表格中是否被误填了图片路径字符串（形如 "资质证书（D:\...png）" 或含有 .png/.jpg）
@@ -3013,6 +3321,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
 
                 if not is_in_table and _is_full_paragraph_replacement(real_text, proposed_val, p_type):
                     _render_diff_paragraph_runs(p_elem, real_text, proposed_val, enable_underline_on_diff=True, is_table=False)
+                    handled_paragraphs.add(p_elem)
                     success_count += 1
                     continue
 
@@ -3116,6 +3425,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                         p_elem._element.clear_content()
                         _apply_run_style_xml(p_elem.add_run(prefix), enable_underline=False, is_table=False)
                         _apply_run_style_xml(p_elem.add_run(clean_val), enable_underline=use_underline, is_table=False)
+                        handled_paragraphs.add(p_elem)
                         success_count += 1
                         continue
 
@@ -3137,6 +3447,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                         )
                         if is_nested_dup or _is_full_paragraph_replacement(real_text, proposed_val, p_type):
                             _render_diff_paragraph_runs(p_elem, real_text, proposed_val, enable_underline_on_diff=True, is_table=False)
+                            handled_paragraphs.add(p_elem)
                             success_count += 1
                             continue
 
@@ -3146,6 +3457,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                         _apply_run_style_xml(p_elem.add_run(proposed_val), enable_underline=use_underline, is_table=False)
                         if after_text:
                             _apply_run_style_xml(p_elem.add_run(after_text), enable_underline=False, is_table=False)
+                        handled_paragraphs.add(p_elem)
                         success_count += 1
                     else:
                         prefix = _extract_prefix_from_text(real_text, orig_ctx)
@@ -3163,11 +3475,13 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                             p_elem._element.clear_content()
                             _apply_run_style_xml(p_elem.add_run(prefix), enable_underline=False, is_table=False)
                             _apply_run_style_xml(p_elem.add_run(clean_p_val), enable_underline=use_underline, is_table=False)
+                            handled_paragraphs.add(p_elem)
                             success_count += 1
                         else:
                             # 已经包含填报值则无需重复追加
                             if proposed_val in real_text:
                                 logger.info(f"   段落 {clean_path} 已包含填报值 '{proposed_val}'，安全保留")
+                                handled_paragraphs.add(p_elem)
                                 success_count += 1
                                 continue
                             # 过滤元数据说明性文本，严禁追加到正文句尾
@@ -3183,6 +3497,7 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
                             p_elem._element.clear_content()
                             _apply_run_style_xml(p_elem.add_run(real_text), enable_underline=False, is_table=False)
                             _apply_run_style_xml(p_elem.add_run(proposed_val), enable_underline=use_underline, is_table=False)
+                            handled_paragraphs.add(p_elem)
                             success_count += 1
             else:
                 # -----------------------------------------------------------------
@@ -3247,6 +3562,15 @@ def fill_docx_proposals_in_dom(docx_path: str, proposals: List[Dict]) -> int:
             # 每处修改地方均实时执行 R10 模板保留率校验与明细日志输出
             from app.agents.review_engine import check_and_rollback_single_node
             check_and_rollback_single_node(p_elem, real_text, path)
+
+        # 走到这里仍未完成的图片提案没有对应的可写入目标，不能在前端伪装成“已刷盘”。
+        for proposal in proposals:
+            if (
+                isinstance(proposal, dict)
+                and str(proposal.get("type", "")).strip() == "image"
+                and proposal.get("write_status") == "pending"
+            ):
+                _set_image_write_status(proposal, "failed", "未找到可写入的目标节点")
 
         # 表格扩行后，提案中的物理行号可能已经变化；更新为真实节点当前路径，
         # 供后续终审回读校验与修复轮继续准确定位。
@@ -3410,10 +3734,12 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
     """
     logger.info("[LangGraph Node 3/4] supervisor_audit_node: 启动 Supervisor 全局质量终审...")
     doc_id = state.get("document_id", "")
+    tenant_id = state.get("tenant_id") or "default-tenant"
     docx_temp_path = state.get("docx_temp_path")
     repair_count = state.get("repair_count", 0)
     max_repair_rounds = state.get("max_repair_rounds", 2)
     audit_items: List[FillingAuditItem] = list(state.get("audit_items") or [])
+    manual_chapters = _normalize_manual_chapters(state.get("manual_chapters"))
 
     if not docx_temp_path or not os.path.exists(docx_temp_path):
         logger.error("   临时 Word 文件不存在，阻断最终文件发布")
@@ -3431,6 +3757,7 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
                 "expected_value": "可回读的 Word 工作副本",
                 "auto_fixable": False,
             }],
+            "manual_chapters": manual_chapters,
         }
 
     unfilled_findings = []
@@ -3494,6 +3821,10 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
             if "Heading" in line_str or "标题" in line_str or line_str.startswith("#"):
                 current_chapter = line_str
 
+            # needs_writing 章节由人工完成，自动质检不得把其正文空白当成 Agent 漏填。
+            if _is_manual_chapter_context(current_chapter, manual_chapters):
+                continue
+
             # 1. 未填占位符检查与字段空盲检查
             has_unfilled = False
             for pat in unfilled_patterns:
@@ -3536,15 +3867,22 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
                 cost_items_for_validation = db_audit.query(CostEstimate).filter(
                     CostEstimate.document_id == doc_id
                 ).all()
-                if isinstance(cost_items_for_validation, (list, tuple)) and cost_items_for_validation:
-                    total_amount = Decimal("0.00")
-                    for cost_item in cost_items_for_validation:
-                        item_total = _parse_decimal_amount(str(getattr(cost_item, "calculated_total", "")))
-                        if item_total is not None:
-                            total_amount += item_total
-                    if total_amount > Decimal("0.00"):
-                        expected_total = total_amount.quantize(Decimal("0.01"))
-                        expected_total_words = number_to_chinese_rmb(str(expected_total))
+                cost_doc_query = db_audit.query(DocumentModel).filter(DocumentModel.id == doc_id)
+                if tenant_id:
+                    cost_doc_query = cost_doc_query.filter(DocumentModel.tenant_id == tenant_id)
+                cost_doc = cost_doc_query.first()
+                stored_cost_analysis = (
+                    (cost_doc.parsed_metadata or {}).get("cost_analysis", {})
+                    if cost_doc and isinstance(cost_doc.parsed_metadata, dict)
+                    else {}
+                )
+                resolved_total = resolve_cost_total(
+                    stored_cost_analysis,
+                    cost_items_for_validation,
+                )
+                if resolved_total > 0:
+                    expected_total = Decimal(str(resolved_total)).quantize(Decimal("0.01"))
+                    expected_total_words = number_to_chinese_rmb(str(expected_total))
 
                 profile = state.get("company_profile")
                 expected_company_name = str(
@@ -3645,7 +3983,7 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
                                 if empty_caps_cell is not None:
                                     cost_items = db_audit.query(CostEstimate).filter(CostEstimate.document_id == doc_id).all()
                                     if cost_items:
-                                        total_val = sum(it.calculated_total for it in cost_items)
+                                        total_val = resolve_cost_total(stored_cost_analysis, cost_items)
                                         upper_cn = number_to_chinese_rmb(total_val)
                                         empty_caps_cell.text = upper_cn
                                         doc_modified = True
@@ -3746,13 +4084,13 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
                 if not l_str:
                     continue
                 if "Heading" in l_str or "标题" in l_str or l_str.startswith("#"):
-                    if curr_lines:
+                    if curr_lines and not _is_manual_chapter_context(curr_ch, manual_chapters):
                         filled_chapter_samples.append(f"【章节: {curr_ch}】:\n" + "\n".join(curr_lines[:5]))
                     curr_ch = l_str
                     curr_lines = []
                 else:
                     curr_lines.append(l_str)
-            if curr_lines:
+            if curr_lines and not _is_manual_chapter_context(curr_ch, manual_chapters):
                 filled_chapter_samples.append(f"【章节: {curr_ch}】:\n" + "\n".join(curr_lines[:5]))
 
             filled_doc_summary = "\n\n".join(filled_chapter_samples[:8])
@@ -3803,6 +4141,9 @@ def supervisor_audit_node(state: BidFillerState) -> Dict[str, Any]:
         if chapter_unfilled_count:
             logger.warning(f"   [Supervisor 全局扫描完成] 在 {len(chapter_unfilled_count)} 个章节中检出 {len(unfilled_findings)} 处质量隐患/数据错配项:")
             for ch, count in chapter_unfilled_count.items():
+                if _is_manual_chapter_context(ch, manual_chapters):
+                    logger.info("   [人工章节隔离] 不为 needs_writing 章节生成自动修复任务: {}", ch)
+                    continue
                 logger.warning(f"      - [{ch}]: {count} 处待修项 (样例: {chapter_findings_summary[ch][:2]})")
                 repair_instructions_map[ch] = (
                     f"在【{ch}】章节的质量核实中检测出 {count} 处隐患：\n"
@@ -3935,6 +4276,8 @@ def blocked_docx_node(state: BidFillerState) -> Dict[str, Any]:
         audit_items=state.get("audit_items", []),
         review_findings=finding_models,
         review_summary=f"{error_count} errors, 0 warnings, 0 infos (已阻断发布)",
+        manual_chapters=[ManualChapterItem(**item) for item in _normalize_manual_chapters(state.get("manual_chapters"))],
+        manual_pending_count=len(_normalize_manual_chapters(state.get("manual_chapters"))),
         summary_note="标书产物未通过写盘后校验，已阻断自动发布；当前保留工作副本供下载，请根据审计问题修复后重试。",
     )
     logger.error(f"[产物发布阻断] document_id={doc_id}, errors={error_count}")
@@ -4006,10 +4349,11 @@ def _fallback_write_commands(
     commands = auto_repair_officecli_commands(commands)
 
 
+    actual_written_count = 0
     if proposals:
         try:
             logger.info(f"   [DOM 安全刷盘] 启动原位切片插值与表格装配引擎，安全刷盘 {len(proposals)} 条提案...")
-            fill_docx_proposals_in_dom(docx_temp_path, proposals)
+            actual_written_count = fill_docx_proposals_in_dom(docx_temp_path, proposals)
         except Exception as dom_err:
             logger.warning(f"   DOM 刷盘产生异常 ({dom_err})，降级尝试 OfficeCLI 全量批量写盘...")
             if commands:
@@ -4025,15 +4369,22 @@ def _fallback_write_commands(
         except Exception as cli_err:
             logger.error(f"   OfficeCLI 全量批量写盘失败: {cli_err}")
 
-    logger.info(f"   [写盘完成] 执行 {len(commands)} 条提案刷盘（{approved} 通过, {rejected} 拒绝）")
+    logger.info(
+        f"   [写盘完成] 实际写入 {actual_written_count} 条提案，"
+        f"收到 {len(commands)} 条命令（{approved} 通过, {rejected} 拒绝）"
+    )
     audit_items.append(FillingAuditItem(
         target_field="[Review 刷盘]", raw_requirement=f"安全刷盘: {approved}A+{rejected}R",
         format_style="Safe-DOM-Inplace", tool_called="fill_docx_proposals_in_dom", data_source_table="proposals",
-        db_raw_value="", final_filled_value=f"{approved} 写入",
+        db_raw_value="", final_filled_value=f"{actual_written_count} 实际写入",
         alignment_status="安全刷盘", has_underline=True, source_type="safe_dom",
         confidence=0.98, agent_reasoning="Safe in-place slot substitution engine"
     ))
-    return {"audit_items": audit_items, "docx_temp_path": docx_temp_path}
+    return {
+        "audit_items": audit_items,
+        "docx_temp_path": docx_temp_path,
+        "written_count": actual_written_count,
+    }
 
 
 # ============================================================
@@ -4110,6 +4461,8 @@ def write_docx_node(state: BidFillerState) -> Dict[str, Any]:
         audit_items=audit_items,
         review_findings=review_finding_models,
         review_summary=review_summary,
+        manual_chapters=[ManualChapterItem(**item) for item in _normalize_manual_chapters(state.get("manual_chapters"))],
+        manual_pending_count=len(_normalize_manual_chapters(state.get("manual_chapters"))),
         summary_note=f"BidFillerAgent Multi-Agent 标书撰写完成（数据源: {source_label}）",
     )
 
@@ -4222,6 +4575,7 @@ class BidFillerAgent:
             "profile_id": profile_id,
             "original_docx": original_docx, "docx_temp_path": None,
             "slot_analysis": None, "worker_proposals": None, "chapter_tasks": None,
+            "manual_chapters": None,
             "custom_instructions": custom_instructions,
             "category_hints": category_hints,
             "repair_count": 0,
@@ -4235,6 +4589,8 @@ class BidFillerAgent:
         final_state = bid_filler_graph_app.invoke(initial_state)
         audit_report = final_state.get("audit_report") or BidFillAuditReport(
             document_id=document_id, total_fields_count=0, audit_items=[],
+            manual_chapters=[ManualChapterItem(**item) for item in _normalize_manual_chapters(final_state.get("manual_chapters"))],
+            manual_pending_count=len(_normalize_manual_chapters(final_state.get("manual_chapters"))),
             summary_note="BidFillerAgent Multi-Agent 标书撰写完成"
         )
 

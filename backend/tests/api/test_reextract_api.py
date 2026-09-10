@@ -122,3 +122,42 @@ async def test_reextract_engineering_should_only_extract_equipment_without_cost_
     finally:
         object.__setattr__(extract_engineering_info, "invoke", original_invoke)
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_reextract_strategy_risk_should_return_saved_result():
+    """风险提示专项重试成功后应返回风险结果与状态，而不是通用元数据。"""
+    mock_user = MagicMock()
+    mock_user.id = "user-test-999"
+    mock_user.tenant_id = "tenant-test-888"
+    app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+    mock_doc = MagicMock()
+    mock_doc.parsed_metadata = {
+        "risks_analysis": [{"risk_type": "商务", "severity": "中"}],
+        "analysis_status": {"strategy_risk": {"status": "completed", "attempts": 1}},
+    }
+    fake_lock = MagicMock()
+    fake_lock.acquire.return_value = True
+    fake_redis = MagicMock()
+    fake_redis.lock.return_value = fake_lock
+    fake_risk_result = {
+        "risks_analysis": [{"risk_type": "商务", "severity": "中"}],
+        "worker_summaries": [{"worker": "strategy_risk", "status": "success"}],
+    }
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("app.agents.nodes.strategy_agent.identify_risks_node", return_value=fake_risk_result), \
+             patch("app.worker.tasks.redis_client", fake_redis):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                res = await ac.post("/api/v1/analysis/doc-123/reextract/strategy_risk")
+
+        assert res.status_code == 200
+        res_json = res.json()
+        assert res_json["code"] == 200
+        assert res_json["data"]["risks_analysis"][0]["severity"] == "中"
+        fake_lock.release.assert_called_once()
+    finally:
+        app.dependency_overrides.clear()

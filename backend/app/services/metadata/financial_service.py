@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from .base import BaseMetadataService
 from app.db.models.metadata import FinancialMetadata
+from app.utils.text_normalizer import normalize_markup_text
 
 class MoneyAmount(BaseModel):
     """资金金额统一结构（纯数字，方便 Agent 逻辑判断与计算）"""
@@ -95,7 +96,11 @@ def _find_money_after_terms(context: str, terms: tuple[str, ...]) -> Optional[fl
     for term_match in re.finditer(term_pattern, context):
         line_end = context.find("\n", term_match.end())
         candidate_text = context[term_match.end():line_end if line_end >= 0 else None]
-        money_match = MONEY_VALUE_PATTERN.search(candidate_text)
+        # DOCX 转 Markdown 后可能在金额和单位之间插入 <u> 等标签，先归一化再识别单位。
+        normalized_candidate_text = normalize_markup_text(candidate_text)
+        if normalized_candidate_text != candidate_text:
+            logger.debug("财务金额候选文本已清理格式标签，继续识别金额单位")
+        money_match = MONEY_VALUE_PATTERN.search(normalized_candidate_text)
         if not money_match:
             continue
 
@@ -107,7 +112,7 @@ def _find_money_after_terms(context: str, terms: tuple[str, ...]) -> Optional[fl
 
         # 无币种和单位的小数字通常是条款编号，不得误判为金额。
         raw_digits = money_match.group("amount").replace(",", "").split(".", 1)[0]
-        if not money_match.group("unit") and not candidate_text[:money_match.end()].strip().startswith(("人民币", "¥", "￥")) and len(raw_digits) < 4:
+        if not money_match.group("unit") and not normalized_candidate_text[:money_match.end()].strip().startswith(("人民币", "¥", "￥")) and len(raw_digits) < 4:
             continue
 
         if money_match.group("unit") in ("万", "万元"):

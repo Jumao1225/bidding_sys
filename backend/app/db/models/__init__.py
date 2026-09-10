@@ -13,6 +13,8 @@ from .metadata import (
 )
 from .bid_score import BidScoreResult, BidScoreItem
 from .model_config import TenantModelConfig
+from .bid_template import BidTemplate, BidTemplateBinding
+from .chat import ChatContextCheckpoint, ChatMessage, ChatSession
 
 __all__ = [
     "Base",
@@ -37,4 +39,9 @@ __all__ = [
     "BidScoreResult",
     "BidScoreItem",
     "TenantModelConfig",
+    "BidTemplate",
+    "BidTemplateBinding",
+    "ChatSession",
+    "ChatMessage",
+    "ChatContextCheckpoint",
 ]

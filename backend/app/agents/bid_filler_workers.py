@@ -6,7 +6,7 @@ Worker Agent 职责：读文档 → 查 DB → 产出结构化 FillProposal。
 """
 
 import json as _json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from loguru import logger
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -22,6 +22,48 @@ import re
 # 全局提案收集池（线程安全，key 为 document_id）
 _PROPOSALS_LOCK = _threading.Lock()
 _WORKER_PROPOSALS: Dict[str, List[Dict[str, Any]]] = {}
+PRICING_WORKER_MAX_OUTPUT_TOKENS = 50000
+PRICING_WORKER_RECURSION_LIMIT = 7
+
+
+def _split_image_path_and_caption(value: Any, caption: Any = "") -> Tuple[str, str]:
+    """从图片提案值中拆出真实文件路径和尾随图注，避免说明文字污染路径。"""
+    raw_value = str(value or "").strip().replace("`", "").replace("**", "")
+    explicit_caption = str(caption or "").strip()
+    if not raw_value:
+        return "", explicit_caption
+
+    # 优先匹配 Windows/Unix 绝对路径；模型常在路径后追加“（营业执照）”等说明。
+    image_match = re.search(
+        r"(?P<path>(?:[A-Za-z]:[\\/]|/)[^\r\n]*?\.(?:png|jpe?g|webp|bmp))(?P<suffix>.*)$",
+        raw_value,
+        re.IGNORECASE,
+    )
+    if image_match is None:
+        # 兼容测试文件或工具返回的相对路径。
+        image_match = re.search(
+            r"(?P<path>[^\r\n]+?\.(?:png|jpe?g|webp|bmp))(?P<suffix>.*)$",
+            raw_value,
+            re.IGNORECASE,
+        )
+    if image_match is None:
+        return raw_value, explicit_caption
+
+    image_path = image_match.group("path").strip().strip("\"'[]（）()【】 ")
+    suffix_caption = image_match.group("suffix").strip()
+    suffix_caption = re.sub(r"^[\s\[\]（）()【】,:：，;；|\-—]+", "", suffix_caption)
+    suffix_caption = re.sub(r"[\s\[\]（）()【】,:：，;；|\-—]+$", "", suffix_caption)
+    return image_path, explicit_caption or suffix_caption
+
+
+def _is_pricing_chapter(chapter_title: str = "", mapping_hint: str = "") -> bool:
+    """统一判断报价章节，避免工具裁剪、提示词和执行器使用不同分类结果。"""
+    hint = (mapping_hint or "").lower().strip()
+    title_lower = (chapter_title or "").lower().strip()
+    return hint in ("pricing", "cost") or any(
+        keyword in title_lower
+        for keyword in ["报价", "清单", "分项", "开标一览", "主要材料"]
+    )
 
 
 def get_worker_proposals(document_id: str) -> List[Dict[str, Any]]:
@@ -78,7 +120,8 @@ def _proposal_merge_key(proposal: Dict[str, Any]) -> str:
             if proposal.get("proposed_text") is not None
             else proposal.get("value", "")
         ).strip()
-        return f"{path}::image::{image_value}"
+        image_path, _ = _split_image_path_and_caption(image_value, proposal.get("caption"))
+        return f"{path}::image::{os.path.normcase(os.path.normpath(image_path))}"
     return path
 
 
@@ -143,6 +186,8 @@ def _build_worker_tools(
     collected_proposals: Optional[List[Dict[str, Any]]] = None,
     mapping_hint: str = "",
     category: str = "",
+    tenant_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
 ) -> List[Any]:
     """
     按填报范围的专属角色动态组装最精简的只读+直写工具集（Tool Pruning），
@@ -155,12 +200,15 @@ def _build_worker_tools(
     title_lower = (chapter_title or "").lower().strip()
     cat = (category or "").lower().strip()
 
-    is_pricing = (hint in ("pricing", "cost")) or any(k in title_lower for k in ["报价", "清单", "分项", "开标一览", "主要材料"])
+    is_pricing = _is_pricing_chapter(chapter_title, mapping_hint)
     is_qualification = (hint == "qualification") or any(k in title_lower for k in ["资格", "资质", "执照", "证明文件", "安全生产", "承装"])
     is_deviation = (hint in ("deviation", "technical")) or any(k in title_lower for k in ["偏离", "响应", "技术偏离", "商务偏离", "条款偏离"])
     is_letter_or_form = (not is_pricing and not is_qualification and not is_deviation)
 
-    from app.agents.tools.rag_tools import get_full_chapter_text, search_bidding_document
+    from app.agents.tools.rag_tools import (
+        create_search_bidding_document_tool,
+        get_full_chapter_text,
+    )
     from app.agents.tools.office_cli_agent_tools import (
         officecli_query_structure_tool,
         officecli_write_slot_value_tool,
@@ -334,7 +382,8 @@ def _build_worker_tools(
     @tool
     def officecli_fill_table_rows(table_path: str, rows_json_str: str, auto_index: bool = True) -> str:
         """
-        [表格全量追加填充提案工具] 批量填充表格行，自动保留 row[1] 表头不变，并在第一列自动生成 1..N 递增序号。
+        [表格全量覆写与扩写提案工具] 用完整二维矩阵覆盖表格数据区；当矩阵超过模板预留行时，
+        在模板汇总/落款行之前自动扩写数据行，保留表头和表尾，并在第一列自动生成 1..N 递增序号。
         参数 rows_json_str 格式：'[["数据项1", "数据项2"], ["数据项3", "数据项4"]]'
         """
         t_path = str(table_path).strip()
@@ -387,7 +436,7 @@ def _build_worker_tools(
 
     from app.agents.tools.style_extractor_tool import extract_text_by_style
     from app.agents.tools.bid_db_tools import (
-        query_company_profile_tool,
+        create_company_profile_query_tool,
         query_company_qualification_tool,
         query_project_metadata_tool,
         query_financial_quotation_tool,
@@ -395,7 +444,13 @@ def _build_worker_tools(
         query_evaluation_method_tool,
     )
 
+    # 显式绑定档案 ID，避免 LangChain 内部工具线程无法继承 ContextVar。
+    company_profile_query_tool = create_company_profile_query_tool(profile_id)
+
     # 按角色动态裁剪工具包（Tool Pruning），仅保留当前章节真正需要的 2~6 个核心工具
+    # 将租户 ID 固化到 Worker 的 RAG 工具中，避免 LangChain 工具线程丢失 ContextVar。
+    tenant_search_bidding_document = create_search_bidding_document_tool(tenant_id)
+
     if is_pricing:
         worker_tools = [
             officecli_query_structure,
@@ -404,7 +459,7 @@ def _build_worker_tools(
             officecli_batch_write_slots,
             officecli_write_slot_value,
             officecli_fill_table_rows,
-            query_company_profile_tool,
+            company_profile_query_tool,
             query_project_metadata_tool,
         ]
         logger.info(f"   🛠️ [Worker 工具包裁剪] 为报价章节 [{chapter_title}] 裁剪装配 8 个专用工具 (含样式识别 + pricing + company_info)")
@@ -413,7 +468,7 @@ def _build_worker_tools(
             officecli_query_structure,
             extract_text_by_style,
             get_full_chapter_text,
-            search_bidding_document,
+            tenant_search_bidding_document,
             officecli_fill_table_rows,
         ]
         logger.info(f"   🛠️ [Worker 工具包裁剪] 为偏离表章节 [{chapter_title}] 裁剪装配 5 个专用工具 (含样式识别 + RAG + fill_table_rows)")
@@ -422,7 +477,7 @@ def _build_worker_tools(
             officecli_query_structure,
             extract_text_by_style,
             query_company_qualification_tool,
-            query_company_profile_tool,
+            company_profile_query_tool,
             officecli_insert_image,
             officecli_batch_write_slots,
             officecli_batch_fill_sentence,
@@ -436,7 +491,7 @@ def _build_worker_tools(
             officecli_batch_write_slots,
             officecli_write_slot_value,
             officecli_batch_fill_sentence,
-            query_company_profile_tool,
+            company_profile_query_tool,
             query_project_metadata_tool,
         ]
         logger.info(f"   🛠️ [Worker 工具包裁剪] 为公文表单章节 [{chapter_title}] 裁剪装配 7 个专用轻量工具 (含样式识别 + batch_write_slots + basic_info)")
@@ -450,9 +505,9 @@ def _build_worker_tools(
             officecli_fill_table_rows,
             officecli_insert_image,
             get_full_chapter_text,
-            search_bidding_document,
+            tenant_search_bidding_document,
             extract_text_by_style,
-            query_company_profile_tool,
+            company_profile_query_tool,
             query_company_qualification_tool,
             query_project_metadata_tool,
             query_financial_quotation_tool,
@@ -548,7 +603,7 @@ def build_worker_prompt(
     tables_summary = extract_docx_tables_summary(docx_temp_path, chapter_title) if docx_temp_path else ""
 
     # 1. 判定专家角色类型
-    is_pricing = (hint in ("pricing", "cost")) or any(k in title_lower for k in ["报价", "清单", "分项", "开标一览", "主要材料"])
+    is_pricing = _is_pricing_chapter(chapter_title, mapping_hint)
     is_qualification = (hint == "qualification") or any(k in title_lower for k in ["资格", "资质", "执照", "证明文件", "安全生产", "承装"])
     is_deviation = (hint in ("deviation", "technical")) or any(k in title_lower for k in ["偏离", "响应", "技术偏离", "商务偏离", "条款偏离"])
     is_business_deviation = "商务" in title_lower and (
@@ -564,40 +619,18 @@ def build_worker_prompt(
     # 2. 差异化专家工作流与职责
     if is_pricing:
         role_title = "造价工程师与分项报价专家"
-        domain_workflow = f"""【造价工程师与分项报价专家工作流 — 场景分流与全量展开铁律】
+        domain_workflow = """【报价章节唯一执行协议】
 
-1. **【表格类型智能识别与填报原则】**：
-   - **固定格式表单（已有具体单元格填报要求）**：
-     * **特征**：表格预置总行数固定（如仅有 1 行标的物汇总行 + 1 行大写金额/落款合并行），或各单元格已有明确的预置描述与填报槽位；
-     * **填报规范**：**只需要原位填写空白单元格，绝对严禁增加行或插入新行！** 严禁将多条明细拆行插入到固定表单中；
-     * **填报方式**：必须调用 `officecli_batch_write_slots` 对空白单元格进行【原位赋值】：
-       - 项目汇总行：填入标的物名称、技术要求、阿拉伯数字总价金额（纯数字值，如金额数据）、备注；
-       - 大写金额行：对应单元格直接填入人民币汉字大写金额；
-   - **动态多行清单展开表（空位较大，需展开多条明细）**：
-     * **特征**：表格为分项清单、设备明细、偏离对照、人员清单等明细表格，模板中通常留有较大空白占位行；
-     * **填报规范**：**必须增加行并全量展开（Full Matrix Expand）！** 将数据库中的全部明细条目从第 1 项到第 N 项逐行完整展开列出；
-     * **执行步骤**：按以下第 2、3 步执行 2D 矩阵全量直查与覆写。
-
-2. **表头感知与 2D 数据矩阵一步直查（支持生产厂家与多列智能映射）**：
-   - 若 User Prompt 中【文档中检测到的实际表格与真实表头定义】已包含目标表格路径及真实表头，**严禁再次调用 `officecli_query_structure` 重复扫描结构**；
-   - 仔细研读真实表头各列名称，将其映射为 ORM 字段名称列表 JSON：
-     * 可用 ORM 字段：`__INDEX__`, `item_name`, `spec`, `manufacturer`, `brand`, `__BRAND_SPEC__`, `unit`, `quantity`, `unit_price`, `calculated_total`, `remark`；
-     * **【生产厂家映射要求】**：若表头包含“生产厂家”、“制造厂商”、“生产企业”、“制造商”等列，**必须明确映射为 `"manufacturer"`**，严禁映射为 remark 或留空！
-     * 示例：若表头为 [序号, 货物名称, 规格型号, 生产厂家, 单位, 数量, 单价, 合价, 备注]
-       → `header_columns_json = '["__INDEX__", "item_name", "spec", "manufacturer", "unit", "quantity", "unit_price", "calculated_total", "remark"]'`；
-   - **必须且仅调用一次** `query_financial_quotation_tool(document_id='{document_id}', field_key='cost_estimates_json_matrix', header_columns_json='...')` 获取与表头完全对齐的 2D 数据矩阵；
-   - **【严禁冗余查询】**：在分项清单表格填报任务中，**绝对禁止同时或重复调用 `field_key='cost_estimates'` 纯文本字段**，直接使用返回的 2D 矩阵！
-
-3. **【分项清单全量展开与对齐规范】**：
-   - **细项逐行展开**：若表格模板包含汇总大类及占位行，必须在汇总大类下方，将数据库中查得的全部具体标的物细项逐行完整展开并按顺序编号排列，严禁省略二级细项；
-   - **各列严格分离对齐**：第 1 列【序号】填入层级编号（如 1、2 等），第 2 列【项目/标的物名称】填纯名称（严禁重复前缀或序号）；
-   - **【单价】与【合价/总价】列严格分离**：
-     * **设备材料等采购细项**：【单价】列填单价数值，【分项总价】列填数量 × 单价之合价；
-     * **按项包干/工程安装/未细分单价项**：【单价】列填破折号 `"——"` 或留空，【分项总价】列填写该项的总金额，严禁将整项包干大额总金额错误复制到单价列；
-     * **包含在总价内/不单独计价项**：【单价】列填 `"——"`（或 `0.00`），【分项总价】列填 `0.00`；
-     * **各列严格独立对齐**：严格按表头列序逐列对应，确保【单价】与【分项总价】两列数据精准独立，绝不错列、串列；
-   - **金额层级平衡**：所有二级细项合价之和必须精准等于所属大类总额，所有一级大类总额之和必须精准等于表尾【合计总价】（大写与小写一致）。
-   - **整表 2D 矩阵一次性写盘**：确认矩阵数据完整后，直接调用 `officecli_fill_table_rows(table_path, rows_json_str)` 一次性提交写盘，原位覆盖并彻底清除模板原有的空白行和占位符！"""
+1. **只使用系统注入的真实表格契约**：User Prompt 中的表格路径、表头、列数和表格类型是唯一事实来源。若已注入目标表格，禁止再次扫描结构；若缺少表格契约，立即返回失败，不得凭章节名称猜测路径。
+2. **固定表单模式**：只有系统明确标记为“固定格式表单”时，才使用 `officecli_batch_write_slots` 原位填写，不得调用 `officecli_fill_table_rows`。
+3. **动态扩写模式**：系统明确标记为“动态多行清单展开表”时，必须支持扩写表格行，并严格执行以下闭环：
+   - 根据真实表头生成 ORM 字段映射；“生产厂家/制造厂商/生产企业/制造商”必须映射为 `manufacturer`，“品牌、规格、型号”映射为 `__BRAND_SPEC__`；
+   - **仅调用一次** `query_financial_quotation_tool(document_id, field_key='cost_estimates_json_matrix', header_columns_json)`；禁止查询纯文本报价字段；
+   - 查询成功后，不要在回复中复述、筛选或改写矩阵，下一步立即调用一次 `officecli_fill_table_rows(table_path, rows_json_str)`；rows_json_str 必须是查询结果对应的完整二维数组，每行列数与真实表头一致；
+   - 允许数据行超过模板预留行，写入引擎会在表尾汇总/落款行前扩写数据行；表头、分组结构行和表尾行必须保留；不得只选择“主要项目”或人为压缩为少数几行；
+   - 写表工具返回成功后立即结束工具流程，不再重复查询、不再重新生成矩阵。
+4. **数据真实性**：只使用数据库返回的真实值，不自行补全品牌、规格、数量、单价或总价；发现矩阵为空或格式非法时立即报告失败。
+5. **最终回复**：报价表数据以工具提案为准，最终只返回一行简短执行状态，不输出 Markdown 明细表、不复述 2D 矩阵、不解释中间取舍。"""
     elif is_qualification:
         role_title = "资格审查与资质证明专家"
         domain_workflow = f"""【资格审查与资质证明专项工作流 — 文字与图片全量填报】
@@ -659,6 +692,17 @@ def build_worker_prompt(
    - 绝对禁止针对每个槽位分别单独单次调用 `officecli_write_slot_value` 进行几十次工具往返！
    - 提交的数据必须是**纯数据值**（绝对不包含前缀标签），底层引擎会自动将冒号后的纯空格/下划线精准替换为该数据值并附带下划线。"""
 
+    if is_pricing:
+        output_contract = """【报价 Worker 输出协议】
+报价表的核心结果只能通过写入工具提案产生。完成工具调用后只允许返回一行简短状态，例如“报价矩阵已提交写盘校验”；禁止输出 Markdown 表格、完整矩阵、逐行解释、自我复盘或候选方案。若无法完成写入，必须明确返回失败，不得把自然语言当作成功结果。"""
+    else:
+        output_contract = """【输出总结格式要求 — 必须包含 Markdown 表格】
+在完成所有读写工具调用后，请给出一份操作总结，必须在总结末尾输出如下格式的 Markdown 明细表格：
+| 序号 | DOM 节点路径 | 替换前模板原文 | 实际填入/扩写结果 | 提议类型 | 写盘状态 |
+- 第 3 列 (替换前模板原文)：填入替换前未修饰的原始模板文本（如 `XXX属性：______` 或表格单元格原文）；
+- 第 4 列 (实际填入/扩写结果)：纯数据填充时仅填写纯数据值；图片填写图片绝对路径；sentence_batch 填写覆盖重写后的完整新段落；不得附加说明性括号；无修改的固定段落无需写入提案表格；
+- 第 5 列 (提议类型)：必须严格填写 `text`、`image`、`sentence_batch` 之一。"""
+
     system_prompt = f"""你是标书【{role_title}】，负责直接对 Word 标书文档的【{chapter_title}】填报范围进行深度信息检索与原位写盘操作。
 
 【格式样式识别工具 — 所有标书章节均可调用】
@@ -698,20 +742,25 @@ def build_worker_prompt(
 
 {domain_workflow}
 
-【输出总结格式要求 — 必须包含 Markdown 表格】
-在完成所有读写工具调用后，请给出一份操作总结，**必须在总结末尾输出如下格式的 Markdown 明细表格**：
-| 序号 | DOM 节点路径 | 替换前模板原文 | 实际填入/扩写结果 | 提议类型 | 写盘状态 |
-- 第 3 列 (替换前模板原文)：填入替换前未修饰的原始模板文本（如 `"XXX属性：______"` 或表格单元格原文）；
-- 第 4 列 (实际填入/扩写结果)：【纯数据填充】如果提议类型是 `text`，仅允许填写纯数据值；如果是 `image`，填入图片绝对路径；如果是 `sentence_batch`，填入覆盖重写后的完整新段落。**绝对禁止附加任何说明性括号（如“（原文无槽位，零改动保留）”）**；无修改的固定段落无需写入提案表格。严禁使用 `**` 加粗标记；
-- 第 5 列 (提议类型)：必须严格填写以下之一："text"、"image"、"sentence_batch"。"""
+{output_contract}"""
 
     if extra_instructions:
-        system_prompt += f"""
+        if is_pricing:
+            system_prompt += f"""
+
+【单章节报价微调指令】
+本次微调不得改变上方报价章节唯一执行协议，不得新增第二套表格规则。请在系统注入的真实表格契约和数据库矩阵范围内执行：
+- 动态扩写表：查询一次完整矩阵后立即提交 `officecli_fill_table_rows`；
+- 固定表单：只提交 `officecli_batch_write_slots`；
+- 不得以自然语言复述矩阵或选择少量“主要项目”。
+用户补充要求：{extra_instructions}"""
+        else:
+            system_prompt += f"""
 
 【用户单章节专属重新生成与微调指令 — 最高优先级】
 当前任务为单章节重新生成与覆写，必须与主流程初次生成完全一致：
 1. **源头全量检索**：根据具体的表格表头与章节要求，主动调用查原文工具（`get_full_chapter_text`、`search_bidding_document`）或企业数据库工具，从源头完整检索所有条款、技术参数与业务数据；
-2. **整表全量覆写**：针对表格章节，必须从序号 1 开始将所检索出的全部条文装配为完整的二维数据矩阵，调用 `officecli_fill_table_rows(table_path, rows_json_str)` 全量覆写原表格，严禁受历史半成品残留影响做局部打补丁！
+2. **整表全量覆写**：针对表格章节，必须从序号 1 开始将所检索出的全部条文装配为完整的二维数据矩阵，调用 `officecli_fill_table_rows(table_path, rows_json_str)` 全量覆写原表格，严禁受历史半成品残留影响做局部打补丁；
 3. **用户微调要求**：
 {extra_instructions}"""
 
@@ -766,12 +815,20 @@ Supervisor 在上一轮审核中发现以下问题。你必须先重新查询当
             meta_items.append(f"- 质量标准承诺: {prefetched_metadata['quality_standard']}")
 
         if meta_items:
-            prefetched_context_part = (
-                "\n\n【已定向提取的企业主档案与项目关键元数据 — 优先直接使用】\n"
-                + "\n".join(meta_items)
-                + "\n👉 核心指引：本章节待填的基础数据已在上方完整提供！"
-                + "请直接优先收集上方数据，调用 officecli_batch_write_slots 一次性批量提交所有槽位替换提案，无需重复调用数据库查询工具！"
-            )
+            if is_pricing:
+                prefetched_context_part = (
+                    "\n\n【已定向提取的报价校验元数据】\n"
+                    + "\n".join(meta_items)
+                    + "\n👉 以上数据只用于校验矩阵总价与表尾信息。报价明细必须按系统注入的表格契约查询完整矩阵，"
+                    + "不得因为已有总价而跳过报价查询，也不得在动态扩写表中改用 officecli_batch_write_slots。"
+                )
+            else:
+                prefetched_context_part = (
+                    "\n\n【已定向提取的企业主档案与项目关键元数据 — 优先直接使用】\n"
+                    + "\n".join(meta_items)
+                    + "\n👉 核心指引：本章节待填的基础数据已在上方完整提供！"
+                    + "请直接优先收集上方数据，调用 officecli_batch_write_slots 一次性批量提交所有槽位替换提案，无需重复调用数据库查询工具！"
+                )
 
     user_prompt = f"""【撰写任务】
 - 文档 ID: {document_id}
@@ -789,6 +846,184 @@ Supervisor 在上一轮审核中发现以下问题。你必须先重新查询当
 
     return system_prompt, user_prompt
 
+
+def _map_pricing_headers_to_fields(headers: List[str]) -> List[str]:
+    """将运行时报价表头映射为财务矩阵字段，避免让模型承担机械列映射。"""
+    mapped_fields: List[str] = []
+    for index, header in enumerate(headers):
+        header_text = re.sub(r"[\s\u3000()（）\[\]【】、，,:：/\\]+", "", str(header or "")).lower()
+        if not header_text:
+            mapped_fields.append("remark")
+            continue
+        if any(keyword in header_text for keyword in ["序号", "编号", "项次"]):
+            mapped_fields.append("__INDEX__")
+        elif "品牌" in header_text and any(keyword in header_text for keyword in ["规格", "型号"]):
+            mapped_fields.append("__BRAND_SPEC__")
+        elif any(keyword in header_text for keyword in ["生产厂家", "制造厂家", "制造厂商", "生产企业", "制造商", "厂家", "产地"]):
+            mapped_fields.append("manufacturer")
+        elif any(keyword in header_text for keyword in ["标的物", "项目名称", "项目费用", "设备名称", "货物名称", "品名", "名称"]):
+            mapped_fields.append("item_name")
+        elif any(keyword in header_text for keyword in ["单位", "计量单位"]):
+            mapped_fields.append("unit")
+        elif any(keyword in header_text for keyword in ["数量", "工程量"]):
+            mapped_fields.append("quantity")
+        elif any(keyword in header_text for keyword in ["单价", "综合价"]):
+            mapped_fields.append("unit_price")
+        elif any(keyword in header_text for keyword in ["总价", "合价", "小计", "金额"]):
+            mapped_fields.append("calculated_total")
+        elif any(keyword in header_text for keyword in ["备注", "说明"]):
+            mapped_fields.append("remark")
+        elif index == len(headers) - 1:
+            # 未识别的末列按备注处理，避免把未知列内容错写到金额列。
+            mapped_fields.append("remark")
+        else:
+            return []
+    return mapped_fields
+
+
+def _resolve_pricing_table_contract(docx_path: str, chapter_title: str) -> Optional[Dict[str, Any]]:
+    """从当前 Word 副本解析报价表路径、表头和扩写模式。"""
+    if not docx_path or not os.path.exists(docx_path):
+        return None
+
+    from docx import Document
+    from app.utils.table_utils import (
+        detect_table_header_rows,
+        get_chapter_specific_table_indices,
+        get_merged_header_texts,
+        is_fixed_slot_form_table,
+    )
+    from app.agents.bid_filler_agent import _get_footer_row_profile, _is_table_footer_row
+
+    document = Document(docx_path)
+    table_indices = get_chapter_specific_table_indices(document, chapter_title)
+    if not table_indices:
+        return None
+
+    table_index = table_indices[0]
+    if table_index < 0 or table_index >= len(document.tables):
+        return None
+    table = document.tables[table_index]
+    header_rows = detect_table_header_rows(table)
+    headers = get_merged_header_texts(table, header_rows)
+    header_fields = _map_pricing_headers_to_fields(headers)
+    if not headers or not header_fields or len(headers) != len(header_fields):
+        return None
+
+    # 保存模板表尾的结构轮廓，后端补齐矩阵时才能把总报价/交货期写回原合并行。
+    footer_profiles = []
+    for row in reversed(table.rows[header_rows:]):
+        if not _is_table_footer_row(row, len(table.rows[0].cells)):
+            break
+        unique_count, non_empty_count = _get_footer_row_profile(row)
+        footer_profiles.insert(
+            0,
+            {
+                "text": " ".join(str(cell.text or "").strip() for cell in row.cells).strip(),
+                "unique_count": unique_count,
+                "non_empty_count": non_empty_count,
+            },
+        )
+
+    return {
+        "table_path": f"/body/tbl[{table_index + 1}]",
+        "table_index": table_index,
+        "headers": headers,
+        "header_fields": header_fields,
+        "footer_profiles": footer_profiles,
+        "mode": "fixed_slots" if is_fixed_slot_form_table(table) else "dynamic_expand",
+    }
+
+
+def _build_pricing_footer_rows(
+    contract: Dict[str, Any],
+    prefetched_metadata: Optional[Dict[str, Any]],
+) -> List[List[str]]:
+    """按模板表尾结构生成总报价与交货期矩阵行，不虚构缺失数据。"""
+    if not prefetched_metadata or not contract.get("footer_profiles"):
+        return []
+
+    total_price = str(prefetched_metadata.get("total_price_str") or "").strip()
+    total_words = str(prefetched_metadata.get("total_price_words") or "").strip()
+    delivery_period = str(prefetched_metadata.get("delivery_period") or "").strip()
+    column_count = len(contract.get("header_fields") or [])
+    if not column_count:
+        return []
+
+    footer_rows: List[List[str]] = []
+    for profile in contract["footer_profiles"]:
+        footer_text = str(profile.get("text") or "")
+        unique_count = int(profile.get("unique_count") or 0)
+        if "总报价" in footer_text or "大写" in footer_text:
+            if not total_price:
+                return []
+            amount_text = total_price
+            if total_words:
+                amount_text = f"{amount_text}（大写：{total_words}）"
+            if unique_count >= 2:
+                row = ["投标总报价：", amount_text]
+            else:
+                row = [f"投标总报价：{amount_text}"]
+        elif any(keyword in footer_text for keyword in ["交货期", "交货期限", "工期"]):
+            if not delivery_period:
+                return []
+            row = [f"交货期限：{delivery_period}"]
+        else:
+            # 未识别的表尾不能用猜测值填充，交给模板原有内容继续保留。
+            return []
+
+        footer_rows.append((row + [""] * column_count)[:column_count])
+
+    return footer_rows
+
+
+def _build_deterministic_pricing_proposal(
+    document_id: str,
+    docx_path: str,
+    chapter_title: str,
+    prefetched_metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """查询完整报价矩阵并生成唯一表格提案，作为报价 Worker 的确定性闭环。"""
+    contract = _resolve_pricing_table_contract(docx_path, chapter_title)
+    if not contract or contract["mode"] != "dynamic_expand":
+        return None
+
+    from app.agents.tools.bid_db_tools import query_financial_quotation_tool
+
+    matrix_text = query_financial_quotation_tool.func(
+        document_id=document_id,
+        field_key="cost_estimates_json_matrix",
+        header_columns_json=_json.dumps(contract["header_fields"], ensure_ascii=False),
+    )
+    matrix = _json.loads(matrix_text) if isinstance(matrix_text, str) else matrix_text
+    if not isinstance(matrix, list) or not matrix or not all(isinstance(row, list) for row in matrix):
+        raise ValueError("报价数据库未返回合法的二维矩阵")
+
+    expected_columns = len(contract["header_fields"])
+    if any(len(row) != expected_columns for row in matrix):
+        raise ValueError(
+            f"报价矩阵列数与表头不一致: expected={expected_columns}, "
+            f"actual={sorted({len(row) for row in matrix})}"
+        )
+
+    # 详细矩阵之外，把已有真实元数据映射到模板表尾；没有真实数据时不填充、不编造。
+    matrix.extend(_build_pricing_footer_rows(contract, prefetched_metadata))
+
+    matrix_json = _json.dumps(matrix, ensure_ascii=False)
+    logger.info(
+        f"[Worker 确定性报价闭环] [{chapter_title}] 已查询并生成完整矩阵提案: "
+        f"table={contract['table_path']}, rows={len(matrix)}, cols={expected_columns}"
+    )
+    return {
+        "path": contract["table_path"],
+        "proposed_text": matrix_json,
+        "value": matrix_json,
+        "type": "table_rows",
+        "status": "success",
+        "chapter_title": chapter_title,
+        "original_context": "|".join(contract["headers"]),
+        "deterministic_closure": True,
+    }
 
 
 # ============================================================
@@ -808,6 +1043,7 @@ def run_chapter_worker(
     repair_instructions: str = "",
     prefetched_metadata: Optional[Dict[str, Any]] = None,
     tenant_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     为单个章节创建独立 ReAct Agent 并直接执行读写 Word 盘块操作。
@@ -816,9 +1052,13 @@ def run_chapter_worker(
     :param repair_instructions: Supervisor 质量审核反馈的专项修复指令
     :param prefetched_metadata: 预读取的企业档案与项目元数据（定向按需注入）
     :param tenant_id: 当前任务所属租户 ID，必须显式传入以支持并发线程安全读取模型配置
+    :param profile_id: 当前任务绑定的企业档案 ID，显式传入以支持跨线程查询
     :return: {chapter_title, mapping_hint, status, summary, error}
     """
     cat = (category or "needs_fill").lower().strip()
+    is_pricing_worker = _is_pricing_chapter(chapter_title, mapping_hint)
+    worker_max_output_tokens = PRICING_WORKER_MAX_OUTPUT_TOKENS if is_pricing_worker else None
+    worker_recursion_limit = PRICING_WORKER_RECURSION_LIMIT if is_pricing_worker else 50
     logger.info(f"[Worker Direct-Fill] 启动撰写 Agent → [{chapter_title}] (类别: {cat})")
     if repair_instructions:
         logger.warning(f"[Worker 专项修复模式] 接收到 Supervisor 反馈指令: {repair_instructions[:100]}...")
@@ -831,7 +1071,102 @@ def run_chapter_worker(
             "proposals": [], "summary": f"跳过 ({cat})",
         }
 
-    worker_llm = llm_service.get_llm(temperature=0.3, json_mode=False, tenant_id=tenant_id)
+    # 动态报价表不再让自由生成模型承担矩阵拼装，避免模型在大矩阵上反复输出自然语言。
+    # 固定格式报价表或无法解析真实表头时，继续使用下方受限 ReAct Worker。
+    if is_pricing_worker and docx_temp_path:
+        try:
+            contract = _resolve_pricing_table_contract(docx_temp_path, chapter_title)
+        except Exception as contract_error:
+            logger.exception(
+                f"[Worker 报价表契约解析] [{chapter_title}] 解析失败，将回退受限 Worker: {contract_error}"
+            )
+            contract = None
+        if contract and contract.get("mode") == "dynamic_expand":
+            try:
+                deterministic_start = time.time()
+                deterministic_proposal = _build_deterministic_pricing_proposal(
+                    document_id=document_id,
+                    docx_path=docx_temp_path,
+                    chapter_title=chapter_title,
+                    prefetched_metadata=prefetched_metadata,
+                )
+                if not deterministic_proposal:
+                    raise ValueError("未生成动态报价表确定性提案")
+
+                deterministic_proposal["chapter_title"] = chapter_title
+                deterministic_proposal["mapping_hint"] = mapping_hint
+                deterministic_proposals = [deterministic_proposal]
+                deterministic_summary = "报价矩阵已按真实表头生成，并提交表格扩写与写盘回读校验。"
+                with _PROPOSALS_LOCK:
+                    _WORKER_PROPOSALS.setdefault(document_id, []).extend(deterministic_proposals)
+
+                from app.services.audit_service import audit_service
+
+                audit_service.log_event(
+                    action_type="llm_call_worker",
+                    node_name=f"BidFillerWorker-{chapter_title}",
+                    inputs={
+                        "chapter_title": chapter_title,
+                        "category": cat,
+                        "document_id": document_id,
+                        "profile_id": profile_id,
+                    },
+                    outputs={
+                        "proposals_count": 1,
+                        "proposals": deterministic_proposals,
+                        "summary": deterministic_summary,
+                        "thought_steps": [],
+                        "deterministic_closure_used": True,
+                    },
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    execution_time_ms=int((time.time() - deterministic_start) * 1000),
+                    status="success",
+                )
+                _record_worker_context(
+                    doc_id=document_id,
+                    chapter_title=chapter_title,
+                    category=cat,
+                    system_prompt="报价章节确定性闭环：后端按真实表头查询矩阵并生成写盘提案。",
+                    user_prompt=f"document_id={document_id}; table={contract['table_path']}",
+                    final_msg=deterministic_summary,
+                    tool_calls=0,
+                    proposals=deterministic_proposals,
+                )
+                logger.info(
+                    f"[Worker 确定性报价闭环] [{chapter_title}] 跳过自由文本生成，直接提交完整矩阵提案"
+                )
+                return {
+                    "chapter_title": chapter_title,
+                    "mapping_hint": mapping_hint,
+                    "category": cat,
+                    "status": "success",
+                    "tool_calls": 0,
+                    "proposals_count": 1,
+                    "proposals": deterministic_proposals,
+                    "summary": deterministic_summary,
+                    "deterministic_closure_used": True,
+                }
+            except Exception as closure_error:
+                logger.exception(
+                    f"[Worker 确定性报价闭环] [{chapter_title}] 执行失败: {closure_error}"
+                )
+                return {
+                    "chapter_title": chapter_title,
+                    "mapping_hint": mapping_hint,
+                    "category": cat,
+                    "status": "failed",
+                    "proposals": [],
+                    "summary": f"报价表确定性闭环失败：{closure_error}",
+                    "error": str(closure_error)[:500],
+                }
+
+    worker_llm = llm_service.get_llm(
+        temperature=0.3,
+        json_mode=False,
+        tenant_id=tenant_id,
+        max_output_tokens=worker_max_output_tokens,
+    )
     if worker_llm is None:
         return {"chapter_title": chapter_title, "mapping_hint": mapping_hint,
                 "category": cat, "status": "failed", "proposals": [],
@@ -844,7 +1179,9 @@ def run_chapter_worker(
             chapter_title=chapter_title,
             collected_proposals=chapter_collected_proposals,
             mapping_hint=mapping_hint,
-            category=cat
+            category=cat,
+            tenant_id=tenant_id,
+            profile_id=profile_id,
         )
         system_prompt, user_prompt = build_worker_prompt(
             chapter_title=chapter_title, category=cat,
@@ -864,6 +1201,7 @@ def run_chapter_worker(
             temperature=target_temp,
             json_mode=False,
             tenant_id=tenant_id,
+            max_output_tokens=worker_max_output_tokens,
         )
         if not worker_llm:
             return {
@@ -886,7 +1224,10 @@ def run_chapter_worker(
             logger.info(f"   🎯 [注入的微调提示词]: '{extra_instructions}'")
 
         agent = create_react_agent(worker_llm, worker_tools)
-        import time
+        logger.info(
+            f"[Worker 执行上限] [{chapter_title}] 最大 Agent 轮次: {worker_recursion_limit}, "
+            f"最大输出 Token: {worker_max_output_tokens or '沿用全局配置'}"
+        )
         t_start = time.time()
 
         # 自动重试机制（针对网络波动与大模型 API 连接限流进行容错退避）
@@ -896,7 +1237,7 @@ def run_chapter_worker(
             try:
                 result = agent.invoke(
                     {"messages": [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]},
-                    config={"recursion_limit": 50}
+                    config={"recursion_limit": worker_recursion_limit}
                 )
                 break
             except Exception as err:
@@ -910,7 +1251,6 @@ def run_chapter_worker(
                 else:
                     raise err
 
-        t_end = time.time()
         final_msg = result["messages"][-1].content
         
         # 提取全量 ReAct 中间思考步骤 (Intermediate Thought Steps)
@@ -922,10 +1262,13 @@ def run_chapter_worker(
                 content = getattr(msg, "content", "")
                 tool_calls = getattr(msg, "tool_calls", [])
                 if content or tool_calls:
+                    content_text = str(content or "")
+                    if len(content_text) > 4000:
+                        content_text = content_text[:3000] + "\n[模型中间输出已截断]"
                     thought_steps.append({
                         "step": step_idx,
                         "type": "thought",
-                        "thought": content,
+                        "thought": content_text,
                         "tool_calls": tool_calls
                     })
                     step_idx += 1
@@ -938,6 +1281,37 @@ def run_chapter_worker(
                 })
 
         tool_calls_count = sum(1 for m in result["messages"] if hasattr(m, 'tool_calls') and m.tool_calls)
+
+        # 报价表必须形成“查询矩阵 -> 表格提案”的确定性闭环。
+        # 如果模型只查询不提交写表工具，则由后端按真实表头补生成完整扩写提案，
+        # 防止自然语言终止导致章节被重置后仍以空结果返回。
+        deterministic_closure_used = False
+        if is_pricing_worker:
+            try:
+                deterministic_proposal = _build_deterministic_pricing_proposal(
+                    document_id=document_id,
+                    docx_path=docx_temp_path,
+                    chapter_title=chapter_title,
+                    prefetched_metadata=prefetched_metadata,
+                )
+                if deterministic_proposal:
+                    # 动态报价表的最终矩阵由后端按真实表头重建，覆盖模型可能提交的局部或截断矩阵。
+                    chapter_collected_proposals[:] = [
+                        proposal
+                        for proposal in chapter_collected_proposals
+                        if str(proposal.get("type", "")).strip() != "table_rows"
+                    ]
+                    chapter_collected_proposals.append(deterministic_proposal)
+                    deterministic_closure_used = True
+                    logger.warning(
+                        f"[Worker 确定性报价闭环] [{chapter_title}] 已由后端生成权威完整扩写提案，覆盖模型表格输出"
+                    )
+            except Exception as closure_error:
+                logger.exception(
+                    f"[Worker 确定性报价闭环] [{chapter_title}] 补齐报价矩阵失败: {closure_error}"
+                )
+
+        t_end = time.time()
 
         # 1. 解析文本输出中的提案
         text_proposals = _parse_proposals(final_msg)
@@ -968,6 +1342,20 @@ def run_chapter_worker(
         logger.info(f"   [Worker 提案汇聚] [{chapter_title}] 工具捕获 {len(chapter_collected_proposals)} 条 + 文本解析 {len(text_proposals)} 条 -> 融合去重后共 {len(proposals)} 条有效写盘提案")
         n = len(proposals)
 
+        worker_status = "success"
+        if is_pricing_worker and not proposals:
+            worker_status = "failed"
+
+        summary = str(final_msg or "").strip()
+        if deterministic_closure_used:
+            summary = "报价矩阵已由后端确定性补齐，并提交表格扩写与回读校验。"
+        elif not summary:
+            summary = "报价 Worker 未返回可用执行摘要。"
+        if len(summary) > 4000:
+            summary = summary[:2500] + "\n[中间模型输出已截断]\n" + summary[-1000:]
+        if worker_status == "failed":
+            summary = "报价 Worker 未产生有效表格提案，未完成写盘。"
+
         # 2. 提取 Token 消耗与审计事件记录
         p_tok, c_tok = 0, 0
         for m in result.get("messages", []):
@@ -980,17 +1368,23 @@ def run_chapter_worker(
         audit_service.log_event(
             action_type="llm_call_worker",
             node_name=f"BidFillerWorker-{chapter_title}",
-            inputs={"chapter_title": chapter_title, "category": cat, "document_id": document_id},
+            inputs={
+                "chapter_title": chapter_title,
+                "category": cat,
+                "document_id": document_id,
+                "profile_id": profile_id,
+            },
             outputs={
                 "proposals_count": n,
                 "proposals": proposals,
-                "summary": final_msg,
-                "thought_steps": thought_steps
+                "summary": summary,
+                "thought_steps": thought_steps,
+                "deterministic_closure_used": deterministic_closure_used,
             },
             prompt_tokens=p_tok,
             completion_tokens=c_tok,
             execution_time_ms=int((t_end - t_start) * 1000),
-            status="success"
+            status=worker_status
         )
 
         # 记录 Worker 完整诊断上下文（供导出日志排查）
@@ -1000,7 +1394,7 @@ def run_chapter_worker(
             category=cat,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            final_msg=final_msg,
+            final_msg=summary,
             tool_calls=tool_calls_count,
             proposals=proposals
         )
@@ -1022,11 +1416,12 @@ def run_chapter_worker(
         )
         return {
             "chapter_title": chapter_title, "mapping_hint": mapping_hint,
-            "category": cat, "status": "success",
+            "category": cat, "status": worker_status,
             "tool_calls": tool_calls_count,
             "proposals_count": n,
             "proposals": proposals,
-            "summary": final_msg,
+            "summary": summary,
+            "deterministic_closure_used": deterministic_closure_used,
         }
 
     except Exception as e:
@@ -1036,7 +1431,12 @@ def run_chapter_worker(
             audit_service.log_event(
                 action_type="llm_call_worker",
                 node_name=f"BidFillerWorker-{chapter_title}",
-                inputs={"chapter_title": chapter_title, "category": cat, "document_id": document_id},
+                inputs={
+                    "chapter_title": chapter_title,
+                    "category": cat,
+                    "document_id": document_id,
+                    "profile_id": profile_id,
+                },
                 outputs={
                     "summary": f"Worker 章节填报发生异常: {str(e)[:200]}",
                     "error": str(e)[:500]
@@ -1079,6 +1479,11 @@ def _normalize_proposal_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     val_str = str(val).strip().replace("`", "").replace("**", "")
     prop_type = str(item.get("type", "")).strip()
 
+    # 图片路径和图注分开保存，防止“绝对路径（证书名称）”导致物理文件校验失败。
+    inferred_caption = ""
+    if prop_type == "image":
+        val_str, inferred_caption = _split_image_path_and_caption(val_str, item.get("caption"))
+
     # 剥离说明性元数据注释
     if prop_type != "image":
         val_str = clean_zero_change_annotations(val_str)
@@ -1096,6 +1501,8 @@ def _normalize_proposal_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     res["path"] = path
     res["proposed_text"] = val_str
     res["value"] = val_str
+    if prop_type == "image" and not str(res.get("caption", "") or "").strip() and inferred_caption:
+        res["caption"] = inferred_caption
     if "status" not in res:
         res["status"] = "success"
     return res

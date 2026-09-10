@@ -8,10 +8,18 @@ from app.services.metadata.engineering_service import (
     EquipmentItem,
     EngineeringSchema,
     EngineeringService,
+    _build_table_parts_with_internal_group_state,
+    _build_table_scoped_engineering_chunks,
     build_engineering_table_section_hints,
     extract_engineering_section_name_from_heading,
     normalize_engineering_section_name,
+    resolve_engineering_table_grouping_mode,
+    _extract_inner_section_candidates,
+    _collect_source_measurement_names,
+    _parse_source_composition_components,
     _source_rows_from_context,
+    _is_likely_external_table_continuation,
+    _deduplicate_equipment_items,
 )
 
 
@@ -113,9 +121,34 @@ def test_engineering_extraction_should_pass_tenant_to_table_scoped_llm_calls():
         " ".join(str(arg) for arg in call.args)
         for call in logger_info.call_args_list
     )
-    assert "大模型返回完整结构化结果" in log_text
+    assert "分块 1 结构化结果" in log_text
     assert "测试设备" in log_text
     assert "工程清单最终归一化结果" in log_text
+
+
+def test_resolve_engineering_table_grouping_mode_should_prioritize_external_heading():
+    """同一张表同时存在两类上下文时优先使用表格前置分区。"""
+    table = """
+    <table>
+      <tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>
+      <tr><td>1</td><td>表内分组</td><td></td><td></td></tr>
+      <tr><td>1.1</td><td>明细项</td><td>项</td><td>2</td></tr>
+    </table>
+    """
+
+    assert resolve_engineering_table_grouping_mode("表外上下文", table) == "external"
+
+
+def test_resolve_engineering_table_grouping_mode_should_use_external_heading_without_inner_groups():
+    """只有表格前置标题时应使用外置分区模式。"""
+    table = """
+    <table>
+      <tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>
+      <tr><td>1</td><td>明细项</td><td>项</td><td>2</td></tr>
+    </table>
+    """
+
+    assert resolve_engineering_table_grouping_mode("表外上下文", table) == "external"
 
 
 def test_engineering_extraction_with_empty_single_table_results_should_keep_model_empty():
@@ -155,6 +188,252 @@ def test_engineering_extraction_with_empty_table_scoped_results_should_degrade_t
     assert generate_mock.call_count == 2
     assert result.main_equipment_list == []
     save_mock.assert_called_once_with("document-a", result)
+
+
+def test_engineering_extraction_should_retry_only_failed_chunk_and_keep_source_context(monkeypatch):
+    """模型输出达到长度限制时，应按完整行重试并保留外部分区及原始表头。"""
+    monkeypatch.setenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", "true")
+    service = EngineeringService()
+    source_context = (
+        "## 外层部分\n"
+        "表格前置说明\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(一)</td><td>结构分类</td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>条目甲</td><td>项</td><td>1</td></tr>"
+        "<tr><td>2</td><td>条目乙</td><td>项</td><td>2</td></tr>"
+        "<tr><td>3</td><td>条目丙</td><td>项</td><td>3</td></tr>"
+        "<tr><td>4</td><td>条目丁</td><td>项</td><td>4</td></tr></table>"
+    )
+    rows = {
+        "条目甲": ("1", 1),
+        "条目乙": ("2", 2),
+        "条目丙": ("3", 3),
+        "条目丁": ("4", 4),
+    }
+    prompts: list[str] = []
+
+    def generate_result(*, prompt: str, **_: object) -> EngineeringSchema:
+        """模拟首个分块超限，后续子块按其可见原始行返回结果。"""
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            raise ValueError(
+                "Could not parse response content as the length limit was reached"
+            )
+        items = [
+            EquipmentItem(
+                item_code=code,
+                item_name=name,
+                quantity=quantity,
+                unit="项",
+            )
+            for name, (code, quantity) in rows.items()
+            if name in prompt
+        ]
+        return EngineeringSchema(main_equipment_list=items)
+
+    with patch.object(
+        service, "_save_to_db"
+    ), patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        side_effect=generate_result,
+    ):
+        result = service.extract_metadata(source_context, "document-length-retry")
+
+    assert len(prompts) > 1
+    assert all("外层部分" in prompt for prompt in prompts[1:])
+    assert all("序号" in prompt for prompt in prompts[1:])
+    assert [item.item_name for item in result.main_equipment_list] == [
+        "结构分类",
+        "条目甲",
+        "条目乙",
+        "条目丙",
+        "条目丁",
+    ]
+    assert result.main_equipment_list[0].parent_item is None
+    assert all(
+        item.parent_item == "结构分类"
+        for item in result.main_equipment_list[1:]
+    )
+    assert all(item.grouping_mode == "external" for item in result.main_equipment_list)
+
+
+def test_engineering_extraction_should_keep_model_bom_hierarchy_when_source_postprocessing_disabled(monkeypatch):
+    """默认关闭源表后处理时，应保留模型识别的父子关系且不恢复源表遗漏节点。"""
+    monkeypatch.delenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", raising=False)
+    service = EngineeringService()
+    source_context = (
+        "## 外层部分\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(一)</td><td>源表结构父项</td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>模型父项</td><td>套</td><td>1</td></tr>"
+        "<tr><td>1.1</td><td>模型子项</td><td>台</td><td>2</td></tr></table>"
+    )
+    model_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(
+                item_code="1",
+                item_name="模型父项",
+                quantity=1,
+                unit="套",
+                root_item="模型父项",
+                tree_level=1,
+                grouping_mode="external",
+            ),
+            EquipmentItem(
+                item_code="1.1",
+                item_name="模型子项",
+                quantity=2,
+                unit="台",
+                parent_item="模型父项",
+                root_item="模型父项",
+                tree_level=2,
+                grouping_mode="external",
+            ),
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=model_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-model-hierarchy")
+
+    items = result.main_equipment_list
+    assert [item.item_name for item in items] == ["模型父项", "模型子项"]
+    assert items[0].parent_item is None
+    assert items[1].parent_item == "模型父项"
+    assert items[0].root_item == "模型父项"
+    assert items[1].root_item == "模型父项"
+    assert all(item.item_name != "源表结构父项" for item in items)
+
+
+def test_engineering_extraction_should_not_retry_unsplittable_length_limited_chunk():
+    """长度超限但只有一条清单行时，应安全结束，避免无限重试。"""
+    service = EngineeringService()
+    source_context = (
+        "## 外层部分\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>1</td><td>单条目</td><td>项</td><td>1</td></tr></table>"
+    )
+
+    with patch.object(
+        service, "_save_to_db"
+    ), patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        side_effect=ValueError(
+            "Could not parse response content as the length limit was reached"
+        ),
+    ) as generate_mock:
+        result = service.extract_metadata(source_context, "document-length-boundary")
+
+    assert generate_mock.call_count == 1
+    assert result.main_equipment_list == []
+
+
+def test_deduplicate_equipment_items_should_merge_retry_metadata_without_reordering():
+    """同一来源行被重复返回时，应保留一项并合并补充层级字段。"""
+    current = EquipmentItem(
+        item_code="1",
+        item_name="清单项",
+        quantity=1,
+        unit="项",
+        source_table_index=0,
+        key_parameters=["已有参数"],
+    )
+    duplicate = EquipmentItem(
+        item_code="1",
+        item_name="清单项",
+        quantity=1,
+        unit="项",
+        source_table_index=0,
+        parent_item="父项",
+        root_item="根项",
+        tree_level=2,
+    )
+    # 模拟模型或历史对象在校验后仍携带 null，验证合并层的防御性处理。
+    duplicate.key_parameters = None
+
+    result = _deduplicate_equipment_items([current, duplicate])
+
+    assert len(result) == 1
+    assert result[0].parent_item == "父项"
+    assert result[0].root_item == "根项"
+    assert result[0].tree_level == 2
+    assert result[0].key_parameters == ["已有参数"]
+
+
+def test_deduplicate_equipment_items_should_keep_identical_uncoded_rows_separate():
+    """没有原始编码时，即使内容相同也不能证明来自同一行。"""
+    first = EquipmentItem(
+        item_name="无编码清单项",
+        specifications="相同规格",
+        quantity=1,
+        unit="项",
+        source_table_index=0,
+    )
+    second = EquipmentItem(
+        item_name="无编码清单项",
+        specifications="相同规格",
+        quantity=1,
+        unit="项",
+        source_table_index=0,
+    )
+
+    result = _deduplicate_equipment_items([first, second])
+
+    assert len(result) == 2
+    assert result[0] is first
+    assert result[1] is second
+
+
+def test_deduplicate_equipment_items_should_keep_same_code_across_bom_roots():
+    """不同 BOM 根项下的同编码同名节点不能被错误合并。"""
+    first = EquipmentItem(
+        item_code="1",
+        item_name="一级组件",
+        quantity=2,
+        unit="套",
+        parent_item="根设备甲",
+        root_item="根设备甲",
+        tree_level=2,
+        source_table_index=0,
+    )
+    second = EquipmentItem(
+        item_code="1",
+        item_name="一级组件",
+        quantity=2,
+        unit="套",
+        parent_item="根设备乙",
+        root_item="根设备乙",
+        tree_level=2,
+        source_table_index=0,
+    )
+
+    result = _deduplicate_equipment_items([first, second])
+
+    assert len(result) == 2
+    assert [item.root_item for item in result] == [
+        "根设备甲",
+        "根设备乙",
+    ]
+
+
+def test_parse_source_composition_components_should_merge_parameter_continuations():
+    """成套设备中的型号和性能续行应并入前一设备规格，不能生成伪物料节点。"""
+    components = _parse_source_composition_components(
+        "组件甲:;型号A-100;10.5±2*2.5%/0.4kV;"
+        "参数=4%;冷却方式:自然冷却;组件乙:100A/4P,1只"
+    )
+
+    assert [component[0] for component in components] == [
+        "组件甲",
+        "组件乙",
+    ]
+    assert "型号A-100" in components[0][1]
+    assert "参数=4%" in components[0][1]
+    assert "冷却方式:自然冷却" in components[0][1]
+    assert components[1][2] == 1.0
+    assert components[1][3] == "只"
 
 
 def test_engineering_schema_with_unknown_field_should_raise_validation_error():
@@ -251,6 +530,280 @@ def test_build_engineering_table_section_hints_should_include_inner_group_priori
     assert "外层候选分区=某外层部分" in hints[0]
     assert "编码 (一) / 名称 某功能系统" in hints[0]
     assert "编码 9 / 名称 其它" in hints[0]
+
+
+def test_extract_inner_section_candidates_should_support_chinese_and_dotted_groups():
+    """表内中文大序号和点号目录在有递进子行时应识别为结构分组。"""
+    table = (
+            "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+            "<tr><td>一</td><td>安装分部</td><td></td><td></td></tr>"
+            "<tr><td>1.1</td><td>安装明细</td><td>项</td><td>1</td></tr>"
+            "<tr><td>二</td><td>材料分部</td><td></td><td></td></tr>"
+        "<tr><td>2.1</td><td>电缆分类</td><td></td><td></td></tr>"
+        "<tr><td>2.1.1</td><td>电缆明细</td><td>米</td><td>10</td></tr>"
+        "<tr><td>2.6.1</td><td>普通明细</td><td>米</td><td>20</td></tr></table>"
+    )
+
+    candidates = _extract_inner_section_candidates(table)
+
+    assert candidates == [("一", "安装分部"), ("二", "材料分部"), ("2.1", "电缆分类")]
+
+
+def test_table_parts_should_inherit_previous_internal_group_state():
+    """表格拆块后，后续分块应继承前序行确定的有效内部分组。"""
+    table = (
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>二</td><td>材料分部</td><td></td><td></td></tr>"
+        "<tr><td>2.1</td><td>电缆分类</td><td></td><td></td></tr>"
+        "<tr><td>2.1.1</td><td>电缆A</td><td>米</td><td>10</td></tr>"
+        "<tr><td>2.1.2</td><td>电缆B</td><td>米</td><td>20</td></tr>"
+        "<tr><td>2.2</td><td>接头分类</td><td></td><td></td></tr>"
+        "<tr><td>2.2.1</td><td>接头A</td><td>只</td><td>2</td></tr>"
+        "<tr><td>2.2.2</td><td>接头B</td><td>只</td><td>3</td></tr></table>"
+    )
+
+    parts = _build_table_parts_with_internal_group_state(table, max_chars=1000, max_rows=2)
+
+    assert len(parts) == 4
+    assert "表内分区状态（由当前表格前序行继承）" not in parts[0]
+    assert "编码 二 / 名称 材料分部" in parts[1]
+    assert "编码 2.1 / 名称 电缆分类" in parts[1]
+    assert "编码 2.2 / 名称 接头分类" in parts[3]
+
+
+def test_table_scoped_chunks_should_inherit_group_state_between_page_fragments():
+    """相邻页面被解析成独立表格时，后页明细仍应带上前页分组状态。"""
+    context = (
+        "原始清单\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>二</td><td>材料分部</td><td></td><td></td></tr>"
+        "<tr><td>2.1</td><td>电缆分类</td><td></td><td></td></tr>"
+        "<tr><td>2.1.1</td><td>电缆A</td><td>米</td><td>10</td></tr></table>"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>2.1.2</td><td>电缆B</td><td>米</td><td>20</td></tr></table>"
+    )
+    table_matches = list(re.finditer(r"<table[\s\S]*?</table>", context, re.IGNORECASE))
+
+    chunks, _, table_indexes = _build_table_scoped_engineering_chunks(
+        context,
+        table_matches,
+        max_chars=1000,
+    )
+
+    assert table_indexes == [0, 1]
+    assert "编码 2.1 / 名称 电缆分类" in chunks[1]
+
+
+def test_table_scoped_chunks_should_not_inject_internal_state_for_external_section():
+    """表格外分区模式拆分时不应注入表内分组状态。"""
+    context = (
+        "项目清单（外层分区）\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>一</td><td>分类行</td><td></td><td></td></tr>"
+        "<tr><td>1.1</td><td>明细A</td><td>台</td><td>1</td></tr></table>"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>1.2</td><td>明细B</td><td>台</td><td>2</td></tr></table>"
+    )
+    table_matches = list(re.finditer(r"<table[\s\S]*?</table>", context, re.IGNORECASE))
+
+    chunks, _, table_indexes = _build_table_scoped_engineering_chunks(
+        context,
+        table_matches,
+        max_chars=1000,
+        table_grouping_modes={0: "external", 1: "external"},
+    )
+
+    assert table_indexes == [0, 1]
+    assert all("表内分区状态（由当前表格前序行继承）" not in chunk for chunk in chunks)
+
+
+def test_table_scoped_chunks_should_stop_group_state_at_unrelated_table():
+    """工程量清单后的非计量表不应继承上一张清单的表内分组状态。"""
+    context = (
+        "项目需求清单（某分部）\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>二</td><td>材料分部</td><td></td><td></td></tr>"
+        "<tr><td>2.1</td><td>电缆分类</td><td></td><td></td></tr>"
+        "<tr><td>2.1.1</td><td>电缆A</td><td>米</td><td>10</td></tr></table>"
+        "<table><tr><th>列A</th><th>列B</th></tr>"
+        "<tr><td>值A</td><td>值B</td></tr></table>"
+    )
+    table_matches = list(re.finditer(r"<table[\s\S]*?</table>", context, re.IGNORECASE))
+
+    chunks, _, table_indexes = _build_table_scoped_engineering_chunks(
+        context,
+        table_matches,
+        max_chars=1000,
+    )
+
+    assert table_indexes == [0, 1]
+    assert "编码 2.1 / 名称 电缆分类" not in chunks[1]
+
+
+def test_table_scoped_chunks_should_not_leak_internal_state_into_unclassified_table():
+    """不同表头的普通表格即使含点号编码，也不得继承上一张表的分组状态。"""
+    context = (
+        "<table><tr><th>编码</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>1</td><td>groupA</td><td></td><td></td></tr>"
+        "<tr><td>1.1</td><td>itemA</td><td>项</td><td>1</td></tr></table>"
+        "<table><tr><th>编码</th><th>名称</th><th>属性</th><th>值</th></tr>"
+        "<tr><td>1.1</td><td>recordB</td><td>类型</td><td>2</td></tr></table>"
+    )
+    table_matches = list(re.finditer(r"<table[\s\S]*?</table>", context, re.IGNORECASE))
+
+    chunks, _, table_indexes = _build_table_scoped_engineering_chunks(
+        context,
+        table_matches,
+        max_chars=1000,
+    )
+
+    assert table_indexes == [0, 1]
+    assert "groupA" not in chunks[1]
+
+
+def test_extract_inner_section_candidates_should_ignore_standalone_marker():
+    """没有后续结构行的括号编码不能单独触发表内分组模式。"""
+    table = (
+        "<table><tr><th>编码</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(1)</td><td>root</td><td></td><td></td></tr></table>"
+    )
+
+    assert _extract_inner_section_candidates(table) == []
+    assert resolve_engineering_table_grouping_mode(None, table) == "none"
+
+
+def test_collect_source_measurement_names_should_ignore_non_measurement_table():
+    """原文计量行审计应保留尾部数值行，忽略没有计量列的相邻表。"""
+    context = (
+        "<table><tr><th>列A</th><th>列B</th><th>列C</th><th>列D</th></tr>"
+        "<tr><td>编码A</td><td>项目A</td><td>说明A</td><td>1</td></tr></table>"
+        "<table><tr><th>列E</th><th>列F</th></tr>"
+        "<tr><td>值E</td><td>值F</td></tr></table>"
+    )
+
+    assert _collect_source_measurement_names(context) == ["项目A"]
+
+
+def test_markdown_source_rows_should_support_structure_repair_and_measurement_audit():
+    """Markdown 清单应与 HTML 清单一样参与源表对齐和计量行审计。"""
+    context = (
+        "| 序号 | 名称 | 规格型号 | 单位 | 数量 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| 1 | itemA | modelA | ea | 2 |"
+    )
+
+    source_tables = _source_rows_from_context(context)
+
+    assert len(source_tables) == 1
+    assert source_tables[0][0].item_code == "1"
+    assert source_tables[0][0].item_name == "itemA"
+    assert source_tables[0][0].quantity == 2
+    assert _collect_source_measurement_names(context) == ["itemA"]
+
+
+def test_boq_group_context_should_not_become_cost_parent():
+    """表内报价分部和材料分类应回写路径，不能把明细挂成 BOM 子项。"""
+    source_context = (
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>一</td><td>安装分部</td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>设备A</td><td>项</td><td>1</td></tr>"
+        "<tr><td>二</td><td>材料分部</td><td></td><td></td></tr>"
+        "<tr><td>2.1</td><td>材料分类</td><td></td><td></td></tr>"
+        "<tr><td>2.1.1</td><td>材料A</td><td>米</td><td>10</td></tr></table>"
+    )
+    items = [
+        EquipmentItem(item_code="一", item_name="安装分部"),
+        EquipmentItem(
+            item_code="1",
+            item_name="设备A",
+            quantity=1,
+            unit="项",
+            parent_item=None,
+            root_item=None,
+            tree_level=2,
+        ),
+        EquipmentItem(item_code="二", item_name="材料分部"),
+        EquipmentItem(item_code="2.1", item_name="材料分类"),
+        EquipmentItem(
+            item_code="2.1.1",
+            item_name="材料A",
+            quantity=10,
+            unit="米",
+            parent_item="材料分类",
+            root_item="材料分部",
+            tree_level=3,
+        ),
+    ]
+
+    normalized = EngineeringService._normalize_model_boq_group_context(
+        items,
+        source_context,
+    )
+
+    assert [item.item_name for item in normalized] == ["安装分部", "设备A", "材料分部", "材料分类", "材料A"]
+    assert normalized[0].parent_item is None
+    assert normalized[1].parent_item is None
+    assert normalized[4].parent_item is None
+    assert normalized[0].tree_level == 1
+    assert normalized[1].part_name == "安装分部"
+    assert normalized[1].group_path == []
+    assert normalized[4].part_name == "材料分部"
+    assert normalized[4].group_path == ["材料分类"]
+
+
+def test_boq_group_context_should_cross_blank_code_fragments_and_switch_groups():
+    """无首列编码的续表行应继承旧分组，遇到新分组编码后应切换路径。"""
+    source_context = (
+        "<table><tr><th>序号</th><th>名称</th><th>说明</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>一</td><td>分部A</td><td></td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>明细A</td><td>说明A</td><td>项</td><td>1</td></tr></table>"
+        "<table><tr><td></td><td>明细B</td><td>说明B</td><td>项</td><td>2</td></tr></table>"
+        "<table><tr><td>二</td><td>分部B</td><td></td><td></td><td></td></tr>"
+        "<tr><td>2.1</td><td>分类B</td><td></td><td></td><td></td></tr>"
+        "<tr><td>2.1.1</td><td>明细C</td><td>说明C</td><td>项</td><td>3</td></tr></table>"
+    )
+    items = [
+        EquipmentItem(item_code="1", item_name="明细A", quantity=1, unit="项"),
+        EquipmentItem(item_name="明细B", quantity=2, unit="项"),
+        EquipmentItem(item_code="2.1.1", item_name="明细C", quantity=3, unit="项"),
+    ]
+
+    normalized = EngineeringService._normalize_model_boq_group_context(
+        items,
+        source_context,
+    )
+
+    assert normalized[0].part_name == "分部A"
+    assert normalized[1].part_name == "分部A"
+    assert normalized[2].part_name == "分部B"
+    assert normalized[2].group_path == ["分类B"]
+
+
+def test_boq_group_context_should_match_source_after_markup_normalization():
+    """续表规格含公式标记时，仍应按同一清单行继承前序顶层分组。"""
+    source_context = (
+        "<table><tr><th>序号</th><th>名称</th><th>说明</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>一</td><td>顶层分部</td><td></td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>首项</td><td>说明</td><td>项</td><td>1</td></tr></table>"
+        "<table><tr><td></td><td>续项 $100 \\times 50$</td><td>说明</td><td>m</td><td>2</td></tr></table>"
+    )
+    items = [
+        EquipmentItem(
+            item_name="续项 100 × 50",
+            quantity=2,
+            unit="m",
+            part_name="内部分类",
+            group_path=["内部分类"],
+        )
+    ]
+
+    normalized = EngineeringService._normalize_model_boq_group_context(
+        items,
+        source_context,
+    )
+
+    assert normalized[0].part_name == "顶层分部"
+    assert normalized[0].group_path == ["内部分类"]
 
 
 def test_engineering_extraction_should_fallback_invalid_section_to_source_heading():
@@ -410,6 +963,565 @@ def test_engineering_extraction_should_keep_outer_section_over_inner_group():
     assert result.main_equipment_list[1].section_evidence == "一次侧部分"
 
 
+def test_external_section_extraction_should_preserve_bom_hierarchy_and_skip_internal_cleanup():
+    """表格外分区模式不应把真实 BOM 结构父项清理成表内分类。"""
+    service = EngineeringService()
+    source_context = (
+        "## 外层分区\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(一)</td><td>主成套项</td><td>套</td><td>1</td></tr>"
+        "<tr><td>1</td><td>中间结构项</td><td></td><td></td></tr>"
+        "<tr><td>1.1</td><td>底层明细</td><td>台</td><td>2</td></tr></table>"
+    )
+    mock_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(
+                item_code="(一)",
+                item_name="主成套项",
+                quantity=1,
+                unit="套",
+                root_item="主成套项",
+                tree_level=1,
+            ),
+            EquipmentItem(
+                item_code="1",
+                item_name="中间结构项",
+                parent_item="主成套项",
+                root_item="主成套项",
+                tree_level=2,
+            ),
+            EquipmentItem(
+                item_code="1.1",
+                item_name="底层明细",
+                quantity=2,
+                unit="台",
+                parent_item="中间结构项",
+                root_item="主成套项",
+                tree_level=3,
+            ),
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=mock_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-external-bom")
+
+    items = result.main_equipment_list
+    assert [item.item_name for item in items] == ["主成套项", "中间结构项", "底层明细"]
+    assert items[1].parent_item == "主成套项"
+    assert items[2].parent_item == "中间结构项"
+    assert all(item.section_name == "外层分区" for item in items)
+    assert all(item.grouping_mode == "external" for item in items)
+    assert all(item.part_name is None and item.group_path == [] for item in items)
+
+
+def test_external_section_extraction_should_restore_priced_marker_parent_from_source(monkeypatch):
+    """表格外分区下，模型漏返回带计量分组父行时应依据原表恢复。"""
+    monkeypatch.setenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", "true")
+    service = EngineeringService()
+    source_context = (
+        "## 外层部分\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(一)</td><td>计价汇总项</td><td>项</td><td>1</td></tr>"
+        "<tr><td>1</td><td>明细项甲</td><td>台</td><td>2</td></tr>"
+        "<tr><td>2</td><td>明细项乙</td><td>台</td><td>3</td></tr></table>"
+    )
+    model_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(item_code="1", item_name="明细项甲", quantity=2, unit="台"),
+            EquipmentItem(item_code="2", item_name="明细项乙", quantity=3, unit="台"),
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=model_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-external-priced-marker")
+
+    items = result.main_equipment_list
+    assert [item.item_name for item in items] == ["计价汇总项", "明细项甲", "明细项乙"]
+    assert items[0].item_code == "(一)"
+    assert items[0].quantity == 1
+    assert items[0].unit == "项"
+    assert items[0].root_item == "计价汇总项"
+    assert items[0].grouping_mode == "external"
+    assert all(item.section_name == "外层部分" for item in items)
+    assert items[1].parent_item == "计价汇总项"
+    assert items[2].parent_item == "计价汇总项"
+
+
+def test_external_section_extraction_should_restore_unpriced_structural_parent_from_source(monkeypatch):
+    """表格外分区下，无计量但承载连续明细的结构行也应保留。"""
+    monkeypatch.setenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", "true")
+    service = EngineeringService()
+    source_context = (
+        "## 外层部分\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(一)</td><td>结构分类</td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>明细项甲</td><td>台</td><td>2</td></tr>"
+        "<tr><td>2</td><td>明细项乙</td><td>台</td><td>3</td></tr></table>"
+    )
+    model_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(item_code="1", item_name="明细项甲", quantity=2, unit="台"),
+            EquipmentItem(item_code="2", item_name="明细项乙", quantity=3, unit="台"),
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=model_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-external-structural")
+
+    items = result.main_equipment_list
+    assert [item.item_name for item in items] == ["结构分类", "明细项甲", "明细项乙"]
+    assert items[0].item_code == "(一)"
+    assert items[0].quantity is None
+    assert items[0].unit is None
+    assert items[0].root_item == "结构分类"
+    assert items[0].tree_level == 1
+    assert items[0].grouping_mode == "external"
+    assert items[1].parent_item == "结构分类"
+    assert items[2].parent_item == "结构分类"
+    assert all(item.tree_level == level for item, level in zip(items, [1, 2, 2]))
+
+
+def test_external_section_extraction_should_restore_numeric_structural_parent_from_source(monkeypatch):
+    """表格外分区下，遗漏的普通整数结构父项应恢复并挂接递进明细。"""
+    monkeypatch.setenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", "true")
+    service = EngineeringService()
+    source_context = (
+        "4、项目需求清单（直流侧太阳能板、逆变器等）\n"
+        "<table><tr><th>序号</th><th>名称</th><th>规格</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>1</td><td colspan=\"4\">光伏发电设备</td></tr>"
+        "<tr><td>1.1</td><td>太阳能光伏组件</td><td>720Wp</td><td>块</td><td>15110</td></tr>"
+        "<tr><td>1.2</td><td>逆变器</td><td>320kW</td><td>台</td><td>34</td></tr></table>"
+    )
+    model_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(
+                item_code="1.1",
+                item_name="太阳能光伏组件",
+                specifications="720Wp",
+                quantity=15110,
+                unit="块",
+            ),
+            EquipmentItem(
+                item_code="1.2",
+                item_name="逆变器",
+                specifications="320kW",
+                quantity=34,
+                unit="台",
+            ),
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=model_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-external-numeric-parent")
+
+    items = result.main_equipment_list
+    assert [item.item_name for item in items] == ["光伏发电设备", "太阳能光伏组件", "逆变器"]
+    assert items[0].item_code == "1"
+    assert items[0].quantity is None
+    assert items[0].unit is None
+    assert items[0].parent_item is None
+    assert items[0].root_item == "光伏发电设备"
+    assert items[1].parent_item == "光伏发电设备"
+    assert items[2].parent_item == "光伏发电设备"
+    assert all(item.root_item == "光伏发电设备" for item in items)
+    assert all(item.tree_level == level for item, level in zip(items, [1, 2, 2]))
+    assert all(item.section_name == "直流侧太阳能板、逆变器等" for item in items)
+    assert all(item.grouping_mode == "external" for item in items)
+
+
+def test_external_section_extraction_should_restore_rowspan_parent_names_from_source(monkeypatch):
+    """表格外分区下，rowspan 父名称遗漏时应恢复父项并将规格行挂接到父项。"""
+    monkeypatch.setenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", "true")
+    service = EngineeringService()
+    source_context = (
+        "## 二次侧部分\n"
+        "<table><tr><th>序号</th><th>设备名称</th><th>型号和规格</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(六)</td><td colspan=\"4\">其他</td></tr>"
+        "<tr><td rowspan=\"2\">1</td><td rowspan=\"2\">屏蔽控制电缆</td><td>ZC-A 汇总</td><td>米</td><td></td></tr>"
+        "<tr><td>ZC-A 4X2.5</td><td>米</td><td></td></tr>"
+        "<tr><td rowspan=\"2\">2</td><td rowspan=\"2\">主要标的物低压电力电缆</td><td>NH-A 汇总</td><td>米</td><td></td></tr>"
+        "<tr><td>NH-A 2X4</td><td>米</td><td></td></tr>"
+        "<tr><td>3</td><td>普通明细</td><td>TMY</td><td>米</td><td></td></tr></table>"
+    )
+    model_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(item_name="ZC-A 汇总", unit="米"),
+            EquipmentItem(item_name="ZC-A 4X2.5", unit="米"),
+            EquipmentItem(item_name="NH-A 汇总", unit="米"),
+            EquipmentItem(item_name="NH-A 2X4", unit="米"),
+            EquipmentItem(item_code="3", item_name="普通明细", unit="米"),
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=model_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-external-rowspan-parent")
+
+    items = result.main_equipment_list
+    names = [item.item_name for item in items]
+    assert names[:3] == ["其他", "屏蔽控制电缆", "ZC-A 汇总"]
+    assert "主要标的物低压电力电缆" in names
+    screen_parent = next(item for item in items if item.item_name == "屏蔽控制电缆")
+    low_voltage_parent = next(
+        item for item in items if item.item_name == "主要标的物低压电力电缆"
+    )
+    other_parent = items[0]
+    assert other_parent.item_name == "其他"
+    assert screen_parent.parent_item == "其他"
+    assert low_voltage_parent.parent_item == "其他"
+    assert screen_parent.quantity is None and screen_parent.unit is None
+    assert low_voltage_parent.quantity is None and low_voltage_parent.unit is None
+    assert any(item.parent_item == "屏蔽控制电缆" for item in items)
+    assert any(item.parent_item == "主要标的物低压电力电缆" for item in items)
+    assert all(item.section_name == "二次侧部分" for item in items)
+    assert all(item.grouping_mode == "external" for item in items)
+
+
+def test_external_section_extraction_should_restore_missing_explicit_bom_rows_from_source(monkeypatch):
+    """外部分区下模型只返回箱变根项时，应依据每套包含恢复完整组成。"""
+    monkeypatch.setenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", "true")
+    service = EngineeringService()
+    source_context = (
+        "## 一次侧部分\n"
+        "<table><tr><th>序号</th><th>名称</th><th>规格</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(三)</td><td>1600kVA光伏升压箱变</td><td></td><td>套</td><td>2</td></tr>"
+        "<tr><td></td><td></td><td>每套包含:</td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>环网柜</td><td></td><td>套</td><td>1</td></tr>"
+        "<tr><td>1.1</td><td>高压真空断路器</td><td>630,25kA</td><td>组</td><td>1</td></tr>"
+        "<tr><td>1.2</td><td>隔离开关</td><td>630A</td><td>组</td><td>1</td></tr>"
+        "<tr><td>2</td><td>10kV变压器</td><td></td><td></td><td></td></tr>"
+        "<tr><td>2.1</td><td>10kV升压变压器</td><td>SCB14-1600/10.5</td><td>台</td><td>1</td></tr>"
+        "<tr><td>3</td><td>辅助配电柜</td><td></td><td>套</td><td>1</td></tr></table>"
+    )
+    model_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(
+                item_code="(三)",
+                item_name="1600kVA光伏升压箱变",
+                quantity=2,
+                unit="套",
+            )
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=model_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-explicit-bom")
+
+    items = result.main_equipment_list
+    assert [item.item_name for item in items] == [
+        "1600kVA光伏升压箱变",
+        "环网柜",
+        "高压真空断路器",
+        "隔离开关",
+        "10kV变压器",
+        "10kV升压变压器",
+        "辅助配电柜",
+    ]
+    root, ring, breaker, isolator, transformer_group, transformer, cabinet = items
+    assert root.quantity == 2 and root.tree_level == 1 and root.parent_item is None
+    assert ring.parent_item == root.item_name and ring.quantity == 2
+    assert ring.per_set_quantity == 1 and ring.tree_level == 2
+    assert breaker.parent_item == ring.item_name and breaker.quantity == 2
+    assert breaker.per_set_quantity == 1 and breaker.tree_level == 3
+    assert isolator.parent_item == ring.item_name and isolator.quantity == 2
+    assert transformer_group.parent_item == root.item_name
+    assert transformer_group.quantity is None and transformer_group.tree_level == 2
+    assert transformer.parent_item == transformer_group.item_name
+    assert transformer.quantity == 2 and transformer.tree_level == 3
+    assert cabinet.parent_item == root.item_name and cabinet.quantity == 2
+    assert all(item.root_item == root.item_name for item in items)
+    assert all(item.section_name == "一次侧部分" for item in items)
+    assert all(item.grouping_mode == "external" for item in items)
+
+
+def test_external_bom_should_restore_rowspan_composition_components_under_generic_parent(monkeypatch):
+    """成套父项名称和组成提示来自源表时，应恢复通用三级组成项。"""
+    monkeypatch.setenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", "true")
+    service = EngineeringService()
+    source_context = (
+        "<table><tr><th>项目名称</th><th>技术要求</th></tr>"
+        "<tr><td></td><td></td></tr></table>"
+        "## 一次侧部分\n"
+        "<table><tr><th>序号</th><th>设备名称</th><th>型号规格</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(一)</td><td>10kV高压设备</td><td></td><td></td><td></td></tr>"
+        "<tr><td rowspan='3'>1</td><td rowspan='3'>10kV并网开关柜,每套包含:</td>"
+        "<td>金属铠装移开式高压开关柜,12kV,630A,25kA;</td><td>面</td><td>2</td></tr>"
+        "<tr><td>真空断路器:12kV,630A,25kA,1台;</td><td></td><td></td></tr>"
+        "<tr><td>电流互感器:500/5,5P30,3只;</td><td></td><td></td></tr></table>"
+    )
+    model_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(item_code="(一)", item_name="10kV高压设备")
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=model_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-rowspan-bom")
+
+    items = result.main_equipment_list
+    assert [item.item_name for item in items] == [
+        "10kV高压设备",
+        "10kV并网开关柜",
+        "金属铠装移开式高压开关柜",
+        "真空断路器",
+        "电流互感器",
+    ]
+    root, parent, cabinet, breaker, current_transformer = items
+    assert parent.parent_item == root.item_name
+    assert parent.quantity == 2 and parent.unit == "面"
+    assert cabinet.parent_item == parent.item_name
+    assert cabinet.quantity == 2 and cabinet.unit == "面"
+    assert cabinet.per_set_quantity is None
+    assert breaker.parent_item == parent.item_name
+    assert breaker.quantity == 2 and breaker.per_set_quantity == 1
+    assert current_transformer.parent_item == parent.item_name
+    assert current_transformer.quantity == 6 and current_transformer.per_set_quantity == 3
+    assert all(item.root_item == root.item_name for item in items)
+
+
+def test_external_bom_should_merge_rowspan_specification_continuations_into_one_component(monkeypatch):
+    """同一 rowspan 组成组中的型号与参数续行应合并到对应组件，而不是生成平级节点。"""
+    monkeypatch.setenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", "true")
+    service = EngineeringService()
+    source_context = (
+        "## 外部分区\n"
+        "<table><tr><th>序号</th><th>设备名称</th><th>规格</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(一)</td><td>成套设备甲</td><td></td><td></td><td></td></tr>"
+        "<tr><td rowspan='5'>1</td><td rowspan='5'>总成组件甲,每套包含:</td>"
+        "<td>组件甲:</td><td>件</td><td>2</td></tr>"
+        "<tr><td>型号A-100</td><td></td><td></td></tr>"
+        "<tr><td>参数=4%</td><td></td><td></td></tr>"
+        "<tr><td>功能说明:远程控制</td><td></td><td></td></tr>"
+        "<tr><td>组件乙:100A/4P,1只</td><td></td><td></td></tr></table>"
+    )
+    model_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(
+                item_code="(一)",
+                item_name="成套设备甲",
+                quantity=2,
+                unit="套",
+            )
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=model_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-rowspan-spec-continuation")
+
+    items = result.main_equipment_list
+    assert [item.item_name for item in items] == [
+        "成套设备甲",
+        "总成组件甲",
+        "组件甲",
+        "组件乙",
+    ]
+    component_a = items[2]
+    assert "型号A-100" in component_a.specifications
+    assert "参数=4%" in component_a.specifications
+    assert "功能说明:远程控制" in component_a.specifications
+    assert component_a.quantity == 2 and component_a.unit == "件"
+    assert items[3].quantity == 2 and items[3].unit == "只"
+    assert all(item.parent_item for item in items[1:])
+
+
+def test_external_bom_should_isolate_duplicate_children_by_parent_branch_range():
+    """两个箱变分支出现同名同编码子项时，不应互相覆盖父级关系。"""
+    source_context = (
+        "<table><tr><th>项目名称</th><th>技术要求</th></tr>"
+        "<tr><td></td><td></td></tr></table>"
+        "## 一次侧部分\n"
+        "<table><tr><th>序号</th><th>名称</th><th>规格</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(二)</td><td>2000kVA光伏升压箱变</td><td></td><td>套</td><td>4</td></tr>"
+        "<tr><td></td><td></td><td>每套包含:</td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>环网柜</td><td></td><td>套</td><td>1</td></tr>"
+        "<tr><td>1.4</td><td>电流互感器</td><td>200/5A</td><td>只</td><td>3</td></tr>"
+        "<tr><td>(三)</td><td>1600kVA光伏升压箱变</td><td></td><td>套</td><td>2</td></tr>"
+        "<tr><td></td><td></td><td>每套包含:</td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>环网柜</td><td></td><td>套</td><td>1</td></tr>"
+        "<tr><td>1.4</td><td>电流互感器</td><td>150/5A</td><td>只</td><td>3</td></tr></table>"
+    )
+    root_2000 = EquipmentItem(
+        item_code="(二)", item_name="2000kVA光伏升压箱变", quantity=4, unit="套"
+    )
+    ring_2000 = EquipmentItem(
+        item_code="1", item_name="环网柜", quantity=1, unit="套", root_item="1600kVA光伏升压箱变"
+    )
+    current_2000 = EquipmentItem(
+        item_code="1.4", item_name="电流互感器", specifications="200/5A", quantity=3, unit="只"
+    )
+    root_1600 = EquipmentItem(
+        item_code="(三)", item_name="1600kVA光伏升压箱变", quantity=2, unit="套"
+    )
+    ring_1600 = EquipmentItem(
+        item_code="1", item_name="环网柜", quantity=1, unit="套", root_item="2000kVA光伏升压箱变"
+    )
+    current_1600 = EquipmentItem(
+        item_code="1.4", item_name="电流互感器", specifications="150/5A", quantity=3, unit="只"
+    )
+    items = [root_2000, ring_2000, current_2000, root_1600, ring_1600, current_1600]
+    for item in items:
+        item.source_table_index = 0
+    table_indexes = {id(item): 0 for item in items}
+
+    structural_items = [item.model_copy(deep=True) for item in items]
+    structural_indexes = {id(item): 0 for item in structural_items}
+    structural_result = EngineeringService._restore_missing_structural_nodes_from_source(
+        structural_items,
+        source_context,
+        item_table_indexes=structural_indexes,
+        allowed_table_indexes={0},
+    )
+    assert len(structural_result) == len(structural_items)
+
+    result = EngineeringService._restore_missing_explicit_bom_rows_from_source(
+        items,
+        source_context,
+        item_table_indexes=table_indexes,
+        allowed_table_indexes={0},
+    )
+
+    result_by_name_and_spec = {
+        (item.item_name, item.specifications): item
+        for item in result
+        if item.item_name in {"环网柜", "电流互感器"}
+    }
+    # 同名环网柜通过位置隔离后仍需保留两行，规格项分别归属对应箱变。
+    ring_items = [item for item in result if item.item_name == "环网柜"]
+    assert len(ring_items) == 2
+    assert ring_items[0].parent_item == root_2000.item_name
+    assert ring_items[1].parent_item == root_1600.item_name
+    assert result_by_name_and_spec[("电流互感器", "200/5A")].root_item == root_2000.item_name
+    assert result_by_name_and_spec[("电流互感器", "150/5A")].root_item == root_1600.item_name
+
+
+def test_external_section_extraction_should_drop_bare_chinese_boq_category_from_items(monkeypatch):
+    """外部分区表中的无计量中文大序号分类不应被保留为清单或 BOM 根项。"""
+    monkeypatch.setenv("ENGINEERING_SOURCE_BOM_POSTPROCESSING_ENABLED", "true")
+    service = EngineeringService()
+    source_context = (
+        "## 一次侧部分\n"
+        "<table><tr><th>序号</th><th>设备名称</th><th>规格</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>一</td><td colspan=\"4\">光伏</td></tr>"
+        "<tr><td>(一)</td><td>10kV高压设备</td><td></td><td></td><td></td></tr>"
+        "<tr><td>1</td><td>10kV并网开关柜</td><td>12kV</td><td>套</td><td>2</td></tr></table>"
+    )
+    model_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(item_code="一", item_name="光伏"),
+            EquipmentItem(item_code="(一)", item_name="10kV高压设备"),
+            EquipmentItem(
+                item_code="1",
+                item_name="10kV并网开关柜",
+                specifications="12kV",
+                quantity=2,
+                unit="套",
+            ),
+        ]
+    )
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        return_value=model_result,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-drop-boq-category")
+
+    items = result.main_equipment_list
+    assert [item.item_name for item in items] == ["10kV高压设备", "10kV并网开关柜"]
+    assert items[0].parent_item is None
+    assert items[1].parent_item == "10kV高压设备"
+    assert all(item.item_name != "光伏" for item in items)
+
+
+def test_external_section_extraction_should_inherit_context_to_repeated_header_continuation():
+    """外部分区清单分页后重复表头时，续表仍应沿用外部分区模式。"""
+    service = EngineeringService()
+    source_context = (
+        "## 外层部分\n"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>(一)</td><td>主项</td><td>套</td><td>1</td></tr></table>"
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>1.1</td><td>续表明细</td><td>台</td><td>2</td></tr></table>"
+    )
+    first_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(
+                item_code="(一)",
+                item_name="主项",
+                quantity=1,
+                unit="套",
+                root_item="主项",
+                tree_level=1,
+            )
+        ]
+    )
+    second_result = EngineeringSchema(
+        main_equipment_list=[
+            EquipmentItem(
+                item_code="1.1",
+                item_name="续表明细",
+                quantity=2,
+                unit="台",
+                parent_item="主项",
+                root_item="主项",
+                tree_level=2,
+            )
+        ]
+    )
+
+    def result_for_chunk(prompt: str, **_kwargs: object) -> EngineeringSchema:
+        """根据当前分块中的原文标识返回对应的通用模拟结果。"""
+        return second_result if "续表明细" in prompt else first_result
+
+    with patch(
+        "app.services.metadata.engineering_service.llm_service.generate_structured_output",
+        side_effect=result_for_chunk,
+    ), patch.object(service, "_save_to_db"):
+        result = service.extract_metadata(source_context, "document-external-continuation")
+
+    assert len(result.main_equipment_list) == 2
+    continuation_item = result.main_equipment_list[1]
+    assert continuation_item.section_name == "外层部分"
+    assert continuation_item.grouping_mode == "external"
+    assert continuation_item.parent_item == "主项"
+
+
+def test_external_table_continuation_should_accept_increasing_plain_integer_code():
+    """重复表头且编号递增的外部分区续表应继续继承外部分区。"""
+    previous_table = (
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>1</td><td>项目A</td><td>项</td><td>1</td></tr></table>"
+    )
+    current_table = (
+        "<table><tr><th>序号</th><th>名称</th><th>单位</th><th>数量</th></tr>"
+        "<tr><td>2</td><td>项目B</td><td>项</td><td>1</td></tr></table>"
+    )
+
+    assert _is_likely_external_table_continuation(previous_table, current_table)
+
+
 def test_equipment_item_section_name_should_clear_non_string_or_sentence():
     """所属分项字段不是标题型字符串时，应统一置空。"""
     non_string_item = EquipmentItem(item_name="设备A", section_name=["二次侧部分"])
@@ -464,6 +1576,9 @@ def test_engineering_prompt_should_keep_construction_and_service_boq_rows():
     assert "逐行核对要求（必须执行）" in prompt
     assert "缺少数量或单位不等于该行无效" in prompt
     assert "后端不会根据原始表格另行补造清单项" in prompt
+    assert "rowspan" in prompt
+    assert "每套包含/每套含有/每套包括" in prompt
+    assert "表内 BOQ 分组与 BOM 父项必须分开" in prompt
     assert "安全生产制度、文明施工要求、岗位职责、人员分工" in prompt
     assert "在一级动火区域内使用二级动火工作票" not in prompt
     assert "原文没有数量时必须为 `null`" in prompt

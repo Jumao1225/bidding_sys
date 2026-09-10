@@ -26,15 +26,16 @@ def build_supervisor_prompt(completed: List[str], running: List[str], retry_coun
 4. cost_estimation：成本核算专家，计算物料成本底价与 BOM 清单匹配。【前置条件】：依赖 master_agent。
 
 【当前执行状态】：
-- ✅ 已成功完成的 Worker：{json.dumps(completed, ensure_ascii=False)}
+- ✅ 已结束的 Worker（成功或失败）：{json.dumps(completed, ensure_ascii=False)}
 - 🔄 正在运行中的 Worker：{json.dumps(running, ensure_ascii=False)}
 - 📊 各 Worker 失败重试次数：{json.dumps(retry_counts, ensure_ascii=False)} （上限 {MAX_RETRIES} 次）
+- 📝 Worker 执行摘要：{json.dumps(summaries, ensure_ascii=False)}
 
 【决策规则 (Autonomous Orchestration)】：
-1. 请根据前置条件，决定下一步的动作。绝不能重复调度已经在【已成功完成】或【正在运行中】的 Worker。
+1. 请根据前置条件，决定下一步的动作。绝不能重复调度已经在【已结束】或【正在运行中】的 Worker；Worker 返回失败也视为本轮已结束，不要因业务结果为空再次调度。
 2. 【自主并发】：如果你发现有多个未开始的任务，它们的前置条件都已满足，请你自主决定将它们作为一个数组同时返回（例如：`["strategy_qual", "strategy_risk", "cost_estimation"]`），开启并发执行。
 3. 【自主等待】：如果某些任务的前置条件还未满足，且你需要等待【正在运行中】的 Worker 跑完，请你自主决定返回 `["WAIT"]`，什么都不做，等待下一回合。
-4. 只有当上述 4 个 Worker 全部【已成功完成】（或因重试超限被跳过）时，才能返回 `["FINISH"]`。
+4. 只有当上述 4 个 Worker 全部【已结束】（成功或已记录失败）时，才能返回 `["FINISH"]`。专项 Worker 的失败不应阻断其他已完成结果的保存和返回。
 
 请提供你的决策理由和下一步要调度的 Worker 数组。
 """
@@ -47,7 +48,12 @@ def supervisor_node(state: BiddingState) -> dict:
     from app.worker.tasks import emit_agent_log
     task_id = state.get("task_id")
     completed = state.get("completed_steps", [])
-    running = state.get("running_steps", [])
+    # 已回报完成的 Worker 不再属于运行中，避免历史 running_steps 导致重复派发。
+    running = [
+        worker
+        for worker in state.get("running_steps", [])
+        if worker not in completed
+    ]
     retry_counts = state.get("retry_counts", {})
     summaries = state.get("worker_summaries", [])
     tenant_id = state.get("tenant_id")
@@ -66,7 +72,11 @@ def supervisor_node(state: BiddingState) -> dict:
     reasoning = decision_obj.reasoning
 
     # 过滤掉 WAIT
-    next_workers = [w for w in next_workers if w != "WAIT"]
+    next_workers = [
+        worker
+        for worker in next_workers
+        if worker != "WAIT" and worker not in completed and worker not in running
+    ]
 
     # 更新 running_steps 状态，防止重复派发
     current_running = list(set(running + next_workers))

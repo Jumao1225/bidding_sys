@@ -92,6 +92,32 @@ export function build_analysis_error_info(
     };
   }
 
+  const is_model_service_unavailable = (
+    (
+      normalized_message.includes('模型不可用')
+      || normalized_message.includes('模型服务不可用')
+    )
+    && (
+      normalized_message.includes('连接失败')
+      || normalized_message.includes('服务连接')
+      || normalized_message.includes('连接异常')
+    )
+  ) || (
+    normalized_message.includes('model service')
+    && (
+      normalized_message.includes('connection')
+      || normalized_message.includes('disconnected')
+    )
+  );
+  if (is_model_service_unavailable) {
+    return {
+      title: '模型服务不可用',
+      message: '模型服务连接失败，请检查模型地址、网络或服务状态。',
+      suggestion: '请前往“模型配置”检查 API 地址、密钥和服务状态后重试。',
+      code: 'MODEL_SERVICE_UNAVAILABLE',
+    };
+  }
+
   const is_model_unavailable = MODEL_UNAVAILABLE_PATTERNS.some((pattern) =>
     normalized_message.includes(pattern),
   ) || (

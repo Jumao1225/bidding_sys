@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { apiFetch } from '../utils/api';
+import { useDialog } from '../components/DialogProvider';
 
 export interface DocumentRecord {
   id: string;
@@ -33,6 +34,7 @@ export function deduplicate_documents(documents: DocumentRecord[]): DocumentReco
 }
 
 export function Home() {
+  const { confirm, alert } = useDialog();
   const navigate = useNavigate();
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [activeTab, setActiveTab] = useState<'all' | 'tender' | 'bid'>('all');
@@ -94,7 +96,7 @@ export function Home() {
       window.URL.revokeObjectURL(url);
     } catch (err: any) {
       console.error('Download original file error:', err);
-      alert(err.message || '下载出错，请稍后重试');
+      await alert(err.message || '下载出错，请稍后重试', { title: '下载失败', intent: 'danger' });
     } finally {
       setDownloadingDocId(null);
     }
@@ -102,7 +104,12 @@ export function Home() {
 
   const handleDelete = async (e: React.MouseEvent, docId: string) => {
     e.stopPropagation(); // 阻止点击卡片跳转
-    if (!window.confirm('确定要删除这条解析记录吗？相关的分析数据和聊天历史都会被清除。')) {
+    const confirmed = await confirm('确定要删除这条解析记录吗？相关的分析数据和聊天历史都会被清除。', {
+      title: '确认删除解析记录',
+      intent: 'danger',
+      confirmText: '删除记录',
+    });
+    if (!confirmed) {
       return;
     }
 
@@ -117,11 +124,11 @@ export function Home() {
         // 清理本地聊天的缓存
         localStorage.removeItem(`chat_history_${docId}`);
       } else {
-        alert('删除失败，请稍后重试');
+        await alert('删除失败，请稍后重试', { title: '删除解析记录失败', intent: 'danger' });
       }
     } catch (err) {
       console.error('Failed to delete document', err);
-      alert('删除出错');
+      await alert('删除出错', { title: '删除解析记录失败', intent: 'danger' });
     }
   };
 

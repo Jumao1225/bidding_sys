@@ -1,13 +1,11 @@
-import logging
 from typing import List, Optional
+from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
 from app.db.crud.document import document_crud
 from app.services.llm_service import llm_service
-
-logger = logging.getLogger(__name__)
 
 class RoutingDecision(BaseModel):
     is_global_search: bool = Field(

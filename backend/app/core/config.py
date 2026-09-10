@@ -43,6 +43,32 @@ class Settings(BaseSettings):
     OPENAI_API_BASE: str = os.getenv("OPENAI_API_BASE", "")
     LLM_MODEL_NAME: str = os.getenv("LLM_MODEL_NAME", "gpt-4o")
 
+    # 所有 LLM 模型共用的输出上限；调用层传入 max_output_tokens 时可单独覆盖。
+    LLM_MAX_OUTPUT_TOKENS: int = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "50000"))
+    # BOM 等结构化提取默认关闭思考模式，避免 reasoning token 挤占 JSON 输出空间。
+    DEEPSEEK_THINKING_ENABLED: bool = os.getenv("DEEPSEEK_THINKING_ENABLED", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+    # ChatAgent 国内模型应用侧上下文压缩配置，不依赖 provider 的原生 compaction 能力。
+    CHAT_CONTEXT_SUMMARY_TRIGGER_TOKENS: int = int(
+        os.getenv("CHAT_CONTEXT_SUMMARY_TRIGGER_TOKENS", "12000")
+    )
+    CHAT_CONTEXT_KEEP_RECENT_MESSAGES: int = int(
+        os.getenv("CHAT_CONTEXT_KEEP_RECENT_MESSAGES", "8")
+    )
+
+    # ChatAgent 主链路的网络重试配置；采用有上限的重试，避免请求永久占用连接和重复执行工具。
+    CHAT_LLM_MAX_RETRIES: int = int(os.getenv("CHAT_LLM_MAX_RETRIES", "5"))
+    CHAT_LLM_RETRY_BACKOFF_SECONDS: float = float(
+        os.getenv("CHAT_LLM_RETRY_BACKOFF_SECONDS", "2")
+    )
+    CHAT_LLM_RETRY_BACKOFF_MAX_SECONDS: float = float(
+        os.getenv("CHAT_LLM_RETRY_BACKOFF_MAX_SECONDS", "30")
+    )
+
     # ======= VLM 双引擎配置 =======
     VLM_PROVIDER: str = os.getenv("VLM_PROVIDER", "ali")
     
@@ -63,8 +89,8 @@ class Settings(BaseSettings):
 
     # Multi-Agent 标书起草长流程开关 (false: 开启; true: 跳过)
     SKIP_BID_FILLER: bool = os.getenv("SKIP_BID_FILLER", "false").lower() in ("true", "1", "yes")
-    # 标书撰写由 Celery 独立进程执行，默认同时只处理一份以保护数据库与 Word 写盘资源。
-    BID_FILL_MAX_CONCURRENCY: int = int(os.getenv("BID_FILL_MAX_CONCURRENCY", 1))
+    # 标书撰写由独立子进程执行，默认允许两份不同标书并行，仍由文档锁阻止同文档重复写入。
+    BID_FILL_MAX_CONCURRENCY: int = int(os.getenv("BID_FILL_MAX_CONCURRENCY", 2))
     BID_FILL_LOCK_TTL_SECONDS: int = int(os.getenv("BID_FILL_LOCK_TTL_SECONDS", 14400))
 
 

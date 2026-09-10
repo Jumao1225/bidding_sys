@@ -69,6 +69,26 @@
     scrollbar-width: none;
   }
 
+  /* 数量输入框不显示浏览器默认的上下调节箭头，避免遮挡较长数量。 */
+  .quantity-input input::-webkit-outer-spin-button,
+  .quantity-input input::-webkit-inner-spin-button,
+  .number-input input::-webkit-outer-spin-button,
+  .number-input input::-webkit-inner-spin-button,
+  input.quantity-input::-webkit-outer-spin-button,
+  input.quantity-input::-webkit-inner-spin-button,
+  input.number-input::-webkit-outer-spin-button,
+  input.number-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  .quantity-input input[type='number'],
+  input.quantity-input[type='number'],
+  .number-input input[type='number'],
+  input.number-input[type='number'] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+
   /* GPU 硬件加速与滚动渲染隔离 */
   .gpu-layer {
     transform: translateZ(0);

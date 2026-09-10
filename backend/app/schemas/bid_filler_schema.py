@@ -95,6 +95,25 @@ class BidFillRequest(BaseModel):
         description="按章节类别的额外指令（key 为 category 或 mapping_hint，value 为额外指令）。"
                     "例如：{'pricing': '报价表中所有单价上浮 X%', 'bid_letter': '投标函落款日期填 YYYY年MM月DD日'}"
     )
+    template_id: Optional[str] = Field(
+        default=None,
+        description="指定已上传的外部 DOCX 空白模板 ID；不传则使用该招标文档当前绑定的模板",
+    )
+
+
+class ManualChapterItem(BaseModel):
+    """需要人工撰写的章节待办，不允许 Agent 修改章节正文。"""
+
+    chapter_number: str = Field(default="", description="章节编号")
+    chapter_title: str = Field(description="章节标题")
+    category: Literal["needs_writing"] = Field(default="needs_writing", description="人工撰写分类")
+    template_text: str = Field(default="", description="章节原始模板内容")
+    content_hint: str = Field(default="", description="招标文件对该章节的撰写要求")
+    status: Literal["manual_pending"] = Field(default="manual_pending", description="人工待办状态")
+    agent_action: str = Field(
+        default="仅提取要求，不修改正文",
+        description="Agent 对该章节采取的动作",
+    )
 
 
 class BidFillAuditReport(BaseModel):
@@ -108,6 +127,11 @@ class BidFillAuditReport(BaseModel):
     review_summary: str = Field(
         default="", description="质检审查摘要统计（如: 2 errors, 3 warnings, 5 infos）"
     )
+    manual_chapters: List[ManualChapterItem] = Field(
+        default_factory=list,
+        description="需要人工完成的 needs_writing 章节清单",
+    )
+    manual_pending_count: int = Field(default=0, description="人工待办章节数量")
     summary_note: str = ""
 
 
@@ -129,7 +153,8 @@ class RegenerateChapterResponse(BaseModel):
     chapter_title: str = Field(..., description="章节名称")
     status: str = Field(default="success", description="执行状态（success / failed）")
     summary: str = Field(default="", description="Worker Agent 执行与推导总结")
-    proposals_count: int = Field(default=0, description="产出并已写盘的提案项数")
+    proposals_count: int = Field(default=0, description="Worker 产出的提案项数")
+    written_count: int = Field(default=0, description="经过 DOM 写盘并成功落到文档的提案项数")
     execution_time_ms: int = Field(default=0, description="本次单章重生成耗时（毫秒）")
     total_tokens: int = Field(default=0, description="消耗的总 Token 数量")
     worker_item: Optional[Dict[str, Any]] = Field(default=None, description="更新后的 Worker 审计履历项详情")

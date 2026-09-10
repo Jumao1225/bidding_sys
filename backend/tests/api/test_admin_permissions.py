@@ -8,6 +8,7 @@ from app.db.crud import user as crud_user
 from app.db.session import SessionLocal
 from app.main import app
 from app.schemas.user import TenantCreate, UserCreate
+from app.services.model_connectivity_service import model_connectivity_service
 from app.services.model_config_service import MODEL_CONFIG_KEYS, model_config_service
 
 
@@ -275,6 +276,44 @@ async def test_tenant_admin_should_update_own_model_config_only(admin_test_data)
         tenant_id=tenant_admin.tenant_id,
         values=config_values,
         updated_by_user_id=tenant_admin.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tenant_admin_should_test_current_model_draft_without_cross_tenant_access(admin_test_data):
+    """模型接口测试应使用当前草稿值，并将越权租户参数收敛到当前租户。"""
+    _, tenant_b, _, tenant_admin, _ = admin_test_data
+    test_result = {
+        "model_type": "llm",
+        "model_name": "draft-llm",
+        "available": True,
+        "latency_ms": 42,
+        "message": "接口可用",
+    }
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        token = await _login(client, tenant_admin.email)
+        with patch.object(model_connectivity_service, "test", return_value=test_result) as test_mock:
+            response = await client.post(
+                f"/api/v1/admin/model-config/test?tenant_id={tenant_b.id}",
+                json={
+                    "model_type": "llm",
+                    "api_key": "draft-key",
+                    "api_base": "https://llm.example/v1",
+                    "model_name": "draft-llm",
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == test_result
+    test_mock.assert_called_once_with(
+        model_type="llm",
+        api_key="draft-key",
+        api_base="https://llm.example/v1",
+        model_name="draft-llm",
+        tenant_id=tenant_admin.tenant_id,
     )
 
 

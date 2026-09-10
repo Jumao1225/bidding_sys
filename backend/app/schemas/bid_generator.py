@@ -115,7 +115,7 @@ class BidFormatStructure(BaseModel):
     )
     extraction_mode: str = Field(
         default="native_docx", 
-        description="提取模式：native_docx (原生 Word 切片) 或 llm_rebuilt (LLM 重建)"
+        description="提取模式：native_docx (原生 Word 切片)、llm_located_native_docx (LLM 定位后原生切片) 或 llm_rebuilt (LLM 重建)"
     )
 
     @field_validator("sections", mode="before")
@@ -128,6 +128,20 @@ class BidFormatStructure(BaseModel):
         if not isinstance(v, list):
             return [v]
         return v
+
+
+class BidFormatLocatorResult(BaseModel):
+    """
+    大模型返回的 Word 章节定位结果。
+
+    大模型只能从系统提供的候选标题 ID 中选择起止节点，不能返回需要重新生成的
+    Word 正文，从而避免模型改写原始格式。
+    """
+    matched: bool = Field(default=False, description="是否定位到投标文件格式章节")
+    start_candidate_id: Optional[str] = Field(None, description="章节起始标题候选 ID")
+    end_candidate_id: Optional[str] = Field(None, description="章节结束标题候选 ID，可为空表示到文档末尾")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="定位置信度")
+    reason: str = Field(default="", description="定位依据，仅用于日志和审计")
 
 
 class BidFormatExtractResponse(BaseModel):

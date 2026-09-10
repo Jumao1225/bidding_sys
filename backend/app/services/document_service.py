@@ -3,6 +3,7 @@ from loguru import logger
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from app.db.crud.document import document_crud
+from app.services.cost_service import resolve_cost_total
 
 class DocumentService:
     def get_documents_list(self, db: Session, user_id: str, tenant_id: str, doc_type: str = None):
@@ -63,8 +64,8 @@ class DocumentService:
 
         cost_analysis = dict(doc_obj.parsed_metadata.get("cost_analysis", {})) if doc_obj.parsed_metadata else {}
 
-        # cost_estimates 是项目 BOM 成本报价的主表；parsed_metadata 中的
-        # cost_analysis 仅作为兼容旧数据和保存汇总状态的 JSON 快照。
+        # 当前 BOM 结构可能包含稳定节点 ID、人工排序和增删结果，优先使用最新 JSON 快照；
+        # 只有历史数据没有快照时，才回退读取 cost_estimates 兼容旧数据。
         from app.db.models.ai_analysis import CostEstimate
         cost_rows = (
             db.query(CostEstimate)
@@ -75,7 +76,11 @@ class DocumentService:
             .order_by(CostEstimate.sort_order.asc(), CostEstimate.created_at.asc())
             .all()
         )
-        if cost_rows:
+        has_saved_cost_snapshot = bool(
+            isinstance(cost_analysis.get("items"), list)
+            and cost_analysis.get("items")
+        )
+        if cost_rows and not has_saved_cost_snapshot:
             cost_analysis["items"] = [
                 {
                     "id": row.id,
@@ -108,7 +113,8 @@ class DocumentService:
                 }
                 for row in cost_rows
             ]
-            cost_analysis["total_cost"] = sum(row.calculated_total or 0.0 for row in cost_rows)
+            # 历史数据同时保存父节点和子节点，只能按顶层节点统计项目总价。
+            cost_analysis["total_cost"] = resolve_cost_total(cost_analysis, cost_rows)
         # 自动校验与修复 cost_analysis 中的 parent_item 树形关联与 section_name 区域标签
         if cost_analysis and isinstance(cost_analysis.get("items"), list):
             eng_obj = metadata_objs.get("engineering")
@@ -119,7 +125,11 @@ class DocumentService:
                         eng_meta_map[eq["item_name"].strip()] = {
                             "parent_item": eq.get("parent_item"),
                             "per_set_qty": eq.get("per_set_quantity") or eq.get("per_set_qty"),
-                            "section_name": eq.get("section_name")
+                            "part_name": eq.get("part_name"),
+                            "group_path": eq.get("group_path") or [],
+                            "section_name": eq.get("section_name"),
+                            "source_table_index": eq.get("source_table_index"),
+                            "grouping_mode": eq.get("grouping_mode"),
                         }
                 for itm in cost_analysis["items"]:
                     if isinstance(itm, dict):
@@ -131,6 +141,36 @@ class DocumentService:
                                 itm["per_set_qty"] = eng_meta_map[nm]["per_set_qty"]
                             if not itm.get("section_name") and eng_meta_map[nm].get("section_name"):
                                 itm["section_name"] = eng_meta_map[nm]["section_name"]
+                            if not itm.get("part_name") and eng_meta_map[nm].get("part_name"):
+                                itm["part_name"] = eng_meta_map[nm]["part_name"]
+                            if not itm.get("group_path") and eng_meta_map[nm].get("group_path"):
+                                itm["group_path"] = eng_meta_map[nm]["group_path"]
+                            if itm.get("source_table_index") is None and eng_meta_map[nm].get("source_table_index") is not None:
+                                itm["source_table_index"] = eng_meta_map[nm]["source_table_index"]
+                            if not itm.get("grouping_mode") and eng_meta_map[nm].get("grouping_mode"):
+                                itm["grouping_mode"] = eng_meta_map[nm]["grouping_mode"]
+
+        analysis_status = (
+            doc_obj.parsed_metadata.get("analysis_status", {})
+            if doc_obj.parsed_metadata
+            else {}
+        )
+        failed_workers = [
+            worker_name
+            for worker_name, worker_status in analysis_status.items()
+            if isinstance(worker_status, dict) and worker_status.get("status") == "failed"
+        ] if isinstance(analysis_status, dict) else []
+        has_analysis_results = any(
+            key in (doc_obj.parsed_metadata or {})
+            for key in ("qualifications_analysis", "risks_analysis", "cost_analysis")
+        )
+        overall_status = (
+            "completed_with_warnings"
+            if failed_workers
+            else "completed"
+            if has_analysis_results
+            else "incomplete"
+        )
 
         result = {
             "document_id": doc_id,
@@ -139,6 +179,8 @@ class DocumentService:
             "qualifications_analysis": doc_obj.parsed_metadata.get("qualifications_analysis", {}) if doc_obj.parsed_metadata else {},
             "risks_analysis": doc_obj.parsed_metadata.get("risks_analysis", []) if doc_obj.parsed_metadata else [],
             "cost_analysis": cost_analysis,
+            "analysis_status": analysis_status,
+            "overall_status": overall_status,
             "metadata": metadata_dict
         }
         

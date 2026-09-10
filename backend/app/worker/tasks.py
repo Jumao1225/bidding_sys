@@ -9,6 +9,7 @@ from app.core.context import current_task_id
 
 # 初始化 redis 客户端用于 pub/sub
 redis_client = redis.from_url(settings.REDIS_URL)
+PROGRESS_CACHE_TTL_SECONDS = 3600
 
 def publish_progress(task_id: str, status: str, progress: int, result: dict = None):
     """
@@ -26,8 +27,16 @@ def publish_progress(task_id: str, status: str, progress: int, result: dict = No
             return obj.isoformat()
         raise TypeError(f"Type {type(obj)} not serializable")
 
-    # ensure_ascii=False：保证中文直接以 UTF-8 写入，禁止输出 \uXXXX 转义
-    redis_client.publish(f"channel:{task_id}", json.dumps(message, ensure_ascii=False, default=json_serial))
+    # ensure_ascii=False：保证中文直接以 UTF-8 写入，禁止输出 \uXXXX 转义。
+    serialized_message = json.dumps(message, ensure_ascii=False, default=json_serial)
+
+    # Pub/Sub 不会保留历史消息，先缓存最新状态，供稍后建立的 SSE 连接补读最终结果。
+    redis_client.setex(
+        f"progress:{task_id}",
+        PROGRESS_CACHE_TTL_SECONDS,
+        serialized_message,
+    )
+    redis_client.publish(f"channel:{task_id}", serialized_message)
 
 def emit_agent_log(log_type: str, content: str, extra: dict = None):
     """
@@ -135,7 +144,11 @@ def analyze_bidding_doc(task_id: str, file_path: str, filename: str, company_qua
             "doc_text": "",
             "company_quals": company_quals,
             "status": "RUNNING",
-            "error": ""
+            "error": "",
+            "running_steps": [],
+            "completed_steps": [],
+            "worker_summaries": [],
+            "retry_counts": {},
         }
         
         # 注入 ContextVar
@@ -198,22 +211,44 @@ def analyze_bidding_doc(task_id: str, file_path: str, filename: str, company_qua
             metadata_dict["evaluation"] = {k: v for k, v in eval_md.__dict__.items() if not k.startswith('_')}
 
         # 将 strategy agent 和 cost agent 产出的策略分析数据统一写回数据库持久化，与其他数据共存
+        current_meta = {}
         if doc_obj:
             current_meta = dict(doc_obj.parsed_metadata) if doc_obj.parsed_metadata else {}
-            current_meta["qualifications_analysis"] = final_state.get("qualifications_analysis", {})
-            current_meta["risks_analysis"] = final_state.get("risks_analysis", [])
-            current_meta["cost_analysis"] = final_state.get("cost_analysis", {})
+            # Worker 已经在完成时即时保存；最终汇总只覆盖本轮明确返回的字段，避免失败 Worker 清空已有结果。
+            for result_key in ("qualifications_analysis", "risks_analysis", "cost_analysis"):
+                if result_key in final_state:
+                    current_meta[result_key] = final_state[result_key]
             doc_obj.parsed_metadata = current_meta
             db.commit()
+
+        analysis_status = current_meta.get("analysis_status", {}) if doc_obj else {}
+        failed_workers = [
+            worker_name
+            for worker_name, worker_status in analysis_status.items()
+            if isinstance(worker_status, dict) and worker_status.get("status") == "failed"
+        ]
+        has_analysis_results = any(
+            key in current_meta
+            for key in ("qualifications_analysis", "risks_analysis", "cost_analysis")
+        ) if doc_obj else bool(final_state)
+        overall_status = (
+            "completed_with_warnings"
+            if failed_workers
+            else "completed"
+            if has_analysis_results
+            else "incomplete"
+        )
 
         # 提取结果用于前端展示
         # document_id 需随 result 一并下发，供 ChatPanel 聊天接口使用
         result = {
             "document_id": doc_id,
             "extracted_text": doc_text,
-            "qualifications_analysis": final_state.get("qualifications_analysis", {}),
-            "risks_analysis": final_state.get("risks_analysis", []),
-            "cost_analysis": final_state.get("cost_analysis", {}),
+            "qualifications_analysis": current_meta.get("qualifications_analysis", {}) if doc_obj else final_state.get("qualifications_analysis", {}),
+            "risks_analysis": current_meta.get("risks_analysis", []) if doc_obj else final_state.get("risks_analysis", []),
+            "cost_analysis": current_meta.get("cost_analysis", {}) if doc_obj else final_state.get("cost_analysis", {}),
+            "analysis_status": analysis_status,
+            "overall_status": overall_status,
             "metadata": metadata_dict  # 注入面板所需的核心数据
         }
         

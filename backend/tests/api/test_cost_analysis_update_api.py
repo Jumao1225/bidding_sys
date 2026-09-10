@@ -159,6 +159,8 @@ async def test_update_cost_analysis_with_section_name():
                 "unit": "块",
                 "ref_price": 880.0,
                 "section_name": "斜桥工业二区",
+                "part_name": "设备采购",
+                "group_path": ["设备采购", "光伏组件"],
                 "match_quality": "精准匹配"
             },
             {
@@ -191,12 +193,16 @@ async def test_update_cost_analysis_with_section_name():
                 assert data["items"][0]["qty"] == 956
                 assert data["items"][1]["section_name"] == "斜桥工业园区"
                 assert data["items"][1]["qty"] == 384
+                assert data["items"][0]["part_name"] == "设备采购"
+                assert data["items"][0]["group_path"] == ["设备采购", "光伏组件"]
                 # 956*880 + 384*880 = (956+384)*880 = 1340*880 = 1179200.0
                 assert data["total_cost"] == 1179200.0
                 
                 saved_cost = mock_doc.parsed_metadata["cost_analysis"]
                 assert saved_cost["items"][0]["section_name"] == "斜桥工业二区"
                 assert saved_cost["items"][1]["section_name"] == "斜桥工业园区"
+                assert saved_cost["items"][0]["part_name"] == "设备采购"
+                assert saved_cost["items"][0]["group_path"] == ["设备采购", "光伏组件"]
     finally:
         app.dependency_overrides.clear()
 
@@ -551,6 +557,5 @@ async def test_update_cost_analysis_with_raw_baseline_and_mutex_fields_persisten
         assert child_item["parent_item"] == "箱式变电站"
     finally:
         app.dependency_overrides.clear()
-
 
 

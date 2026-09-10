@@ -422,8 +422,26 @@ def get_chapter_specific_table_indices(doc, chapter_title: str) -> List[int]:
             best_score = score
             best_entry = entry
 
-    if best_entry and best_entry.get("table_indices"):
-        return best_entry["table_indices"]
+    if best_entry:
+        direct_indices = list(best_entry.get("table_indices") or [])
+
+        # 一级章节的表格通常挂在其下方的子标题（例如“报价分析表”）上。
+        # 这里沿拓扑继续收集同一一级章节范围内的子表，避免调用方拿不到真实表格，
+        # 进而只能把不带表格类型的原始 DOM 文本交给模型自行猜测。
+        if best_entry.get("is_major"):
+            best_position = next(
+                (idx for idx, entry in enumerate(mapping) if entry is best_entry),
+                -1,
+            )
+            if best_position >= 0:
+                for child_entry in mapping[best_position + 1:]:
+                    if child_entry.get("is_major"):
+                        break
+                    direct_indices.extend(child_entry.get("table_indices") or [])
+
+        unique_indices = list(dict.fromkeys(direct_indices))
+        if unique_indices:
+            return unique_indices
 
     # 2. 如果拓扑映射未直接命中表格，按表头关键词二级回退（严格要求强相关）
     header_matches = []

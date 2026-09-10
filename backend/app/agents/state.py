@@ -20,6 +20,7 @@ class BiddingState(TypedDict):
     
     # --- Supervisor 调度所需 (新增) ---
     next: List[str]                # Supervisor 决定的下一步节点名数组（支持并发）
+    running_steps: List[str]       # 当前已派发但尚未收到完成回报的 Worker
     dispatched_steps: Annotated[list, operator.add]  # 已派发步骤（用于计算 running_steps）
     completed_steps: Annotated[list, operator.add]   # 已完成步骤
     worker_summaries: Annotated[list, operator.add]  # Worker 执行摘要

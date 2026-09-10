@@ -1,13 +1,13 @@
-import React from 'react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
+import { format_analysis_value } from '../../utils/displayValue';
 
 interface EvaluationProps {
   evaluation?: {
     evaluation_method?: string | null;
     total_score?: number | null;
-    weight_distribution?: Record<string, number>;
-    score_tree?: any[];
-    hard_service_requirements?: Record<string, string>;
+    weight_distribution?: Record<string, unknown>;
+    score_tree?: unknown[];
+    hard_service_requirements?: Record<string, unknown>;
   };
   onReextract?: () => void;
   isRetrying?: boolean;
@@ -16,11 +16,17 @@ interface EvaluationProps {
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444', '#ec4899', '#06b6d4'];
 
 export function EvaluationCard({ evaluation = {}, onReextract, isRetrying = false }: EvaluationProps) {
-  const evaluation_method = evaluation.evaluation_method || '综合评分法';
-  const total_score = evaluation.total_score || 100;
-  const weight_distribution = evaluation.weight_distribution || {};
-  const score_tree = evaluation.score_tree || [];
-  const hard_service_requirements = evaluation.hard_service_requirements || {};
+  const evaluation_method = format_analysis_value(evaluation.evaluation_method) || '综合评分法';
+  const total_score = format_analysis_value(evaluation.total_score) || '100';
+  const weight_distribution = evaluation.weight_distribution && typeof evaluation.weight_distribution === 'object'
+    ? evaluation.weight_distribution
+    : {};
+  const score_tree = Array.isArray(evaluation.score_tree)
+    ? evaluation.score_tree.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+    : [];
+  const hard_service_requirements = evaluation.hard_service_requirements && typeof evaluation.hard_service_requirements === 'object' && !Array.isArray(evaluation.hard_service_requirements)
+    ? evaluation.hard_service_requirements
+    : {};
 
   const data = Object.entries(weight_distribution).map(([name, value]) => ({
     name,
@@ -86,14 +92,14 @@ export function EvaluationCard({ evaluation = {}, onReextract, isRetrying = fals
                   dataKey="value"
                   stroke="none"
                 >
-                  {chartData.map((entry, index) => (
+                  {chartData.map((_entry, index) => (
                     <Cell key={`cell-${index}`} fill={hasValidWeights ? COLORS[index % COLORS.length] : '#cbd5e1'} />
                   ))}
                 </Pie>
                 {hasValidWeights && (
                   <Tooltip 
                     contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)', fontSize: '12px', fontWeight: 'bold' }}
-                    formatter={(value: any, name: string) => [`${value}分`, name]}
+                    formatter={(value, name) => [`${value}分`, name ?? '']}
                   />
                 )}
               </PieChart>
@@ -143,25 +149,23 @@ export function EvaluationCard({ evaluation = {}, onReextract, isRetrying = fals
                 <div key={`score-${idx}`} className="bg-white p-2.5 rounded-xl border border-purple-100/80 shadow-xs hover:border-purple-200 transition-colors">
                   <div className="flex items-center justify-between gap-2 mb-1">
                     <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-[10px] font-bold rounded-md shrink-0">
-                      {item.category || '通用'}
+                      {format_analysis_value(item.category) || '通用'}
                     </span>
-                    <span className="text-xs font-bold text-slate-800 truncate flex-1">{item.title}</span>
-                    {item.max_score && (
+                    <span className="text-xs font-bold text-slate-800 truncate flex-1">{format_analysis_value(item.title)}</span>
+                    {item.max_score !== null && item.max_score !== undefined && (
                       <span className="text-xs font-extrabold text-purple-600 shrink-0 bg-purple-50 px-2 py-0.5 rounded-full border border-purple-200">
-                        {item.max_score}分
+                        {format_analysis_value(item.max_score)}分
                       </span>
                     )}
                   </div>
-                  {item.scoring_criteria && (
-                    <p className="text-[11px] text-slate-500 leading-normal line-clamp-2">{item.scoring_criteria}</p>
+                  {format_analysis_value(item.scoring_criteria) && (
+                    <p className="text-[11px] text-slate-500 leading-normal line-clamp-2">{format_analysis_value(item.scoring_criteria)}</p>
                   )}
-                  {item.rules_summary && item.rules_summary.length > 0 && (
+                  {format_analysis_value(item.rules_summary) && (
                     <div className="flex flex-wrap gap-1 mt-1.5">
-                      {item.rules_summary.map((rule: string, rIdx: number) => (
-                        <span key={rIdx} className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded font-medium">
-                          {rule}
-                        </span>
-                      ))}
+                      <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded font-medium">
+                        {format_analysis_value(item.rules_summary)}
+                      </span>
                     </div>
                   )}
                 </div>
@@ -193,11 +197,7 @@ export function EvaluationCard({ evaluation = {}, onReextract, isRetrying = fals
                     </span>
                   </div>
                   <div className="text-slate-600 leading-normal text-[11px] font-medium">
-                    {Array.isArray(desc) ? (
-                      <ul className="list-disc pl-3 space-y-0.5">
-                        {desc.map((item, i) => <li key={i}>{item}</li>)}
-                      </ul>
-                    ) : desc}
+                    {format_analysis_value(desc)}
                   </div>
                 </div>
               ))

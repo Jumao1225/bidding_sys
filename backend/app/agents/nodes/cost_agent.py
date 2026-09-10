@@ -12,7 +12,9 @@ from app.db.models.business import MarketPriceReference
 from app.core.audit_decorator import audit_node
 from app.agents.tools.rag_tools import search_bidding_document
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, List, Optional
+
+from app.services.cost_service import is_cost_price_unset
 
 class ItemMatchOutput(BaseModel):
     item_index: int = Field(default=0, description="当前批次内设备的数字索引编号 (从 0 开始)")
@@ -35,7 +37,11 @@ class ItemMatchOutput(BaseModel):
     root_item: Optional[str] = None
     tree_level: Optional[int] = None
     per_set_qty: Optional[float] = None
+    part_name: Optional[str] = None
+    group_path: Optional[List[str]] = None
     section_name: Optional[str] = None
+    source_table_index: Optional[int] = None
+    grouping_mode: Optional[str] = None
     key_parameters: Optional[List[str]] = None
     brand_requirements: Optional[str] = None
 
@@ -53,7 +59,11 @@ class CostItem(BaseModel):
     root_item: Optional[str] = Field(default=None, description="所属顶层主要标的物名称")
     tree_level: Optional[int] = Field(default=1, description="层级深度：1=顶层主要标的物, 2=二级成套总成, 3=三级核心元器件, 4+=更细分子项")
     per_set_qty: Optional[float] = Field(default=None, description="单套定额数量")
+    part_name: Optional[str] = Field(default=None, description="表内 BOQ 一级分部/报价部分名称，仅用于分类")
+    group_path: List[str] = Field(default_factory=list, description="表内 BOQ 分组路径，仅用于分类展示")
     section_name: Optional[str] = Field(default=None, description="所属工程大类分部名称")
+    source_table_index: Optional[int] = Field(default=None, description="来源原始表格索引，仅用于隔离不同表格的层级关系")
+    grouping_mode: Optional[str] = Field(default=None, description="当前原始表格的主分组模式，由工程清单解析阶段写入")
     key_parameters: Optional[List[str]] = Field(default_factory=list, description="关键星号(*)技术指标参数明细")
     brand_requirements: Optional[str] = Field(default="", description="要求的品牌或产地要求")
     matched_name: Optional[str] = Field(default="", description="价格参考库中匹配到的设备名称")
@@ -322,6 +332,71 @@ def find_local_price_reference(item: dict, price_book: list[dict]) -> Optional[d
     result["match_score"] = score
     return result
 
+
+def _get_pending_custom_cost_items(document: object) -> list[dict]:
+    """提取已保存但尚未定价的手动新增项，供批量价格匹配使用。"""
+    parsed_metadata = getattr(document, "parsed_metadata", None)
+    if not isinstance(parsed_metadata, dict):
+        return []
+
+    saved_cost_analysis = parsed_metadata.get("cost_analysis")
+    saved_items = saved_cost_analysis.get("items") if isinstance(saved_cost_analysis, dict) else None
+    if not isinstance(saved_items, list):
+        return []
+
+    pending_items: list[dict] = []
+    for saved_item in saved_items:
+        if not isinstance(saved_item, dict) or not saved_item.get("is_custom_added"):
+            continue
+        if not is_cost_price_unset(saved_item.get("ref_price")):
+            continue
+        # 明确编辑过的项应继续由用户控制，避免把改名后的内容误判为自动匹配目标。
+        if saved_item.get("is_parent_modified") or saved_item.get("match_quality") == "手动修改":
+            continue
+
+        item_name = str(saved_item.get("name") or saved_item.get("item_name") or "").strip()
+        if not item_name:
+            logger.warning("跳过无名称的待匹配手动新增项：{}", saved_item)
+            continue
+
+        specification = str(
+            saved_item.get("spec_requirement")
+            or saved_item.get("specifications")
+            or saved_item.get("raw_spec")
+            or saved_item.get("model")
+            or ""
+        ).strip()
+        quantity = saved_item.get("qty")
+        if quantity is None:
+            quantity = saved_item.get("quantity", 1)
+
+        pending_items.append({
+            "item_code": saved_item.get("item_code"),
+            "item_name": item_name,
+            "name": item_name,
+            "specifications": specification,
+            "spec_requirement": specification,
+            "quantity": quantity,
+            "qty": quantity,
+            "unit": saved_item.get("unit"),
+            "parent_item": saved_item.get("parent_item"),
+            "root_item": saved_item.get("root_item"),
+            "tree_level": saved_item.get("tree_level") or 1,
+            "per_set_qty": saved_item.get("per_set_qty") or saved_item.get("per_set_quantity"),
+            "part_name": saved_item.get("part_name"),
+            "group_path": saved_item.get("group_path") or [],
+            "section_name": saved_item.get("section_name"),
+            "source_table_index": saved_item.get("source_table_index"),
+            "grouping_mode": saved_item.get("grouping_mode"),
+            "key_parameters": saved_item.get("key_parameters") or [],
+            "brand_requirements": saved_item.get("brand_requirements") or saved_item.get("brand") or "",
+            "node_id": saved_item.get("node_id"),
+            "parent_node_id": saved_item.get("parent_node_id"),
+            "is_custom_added": True,
+        })
+
+    return pending_items
+
 @audit_node(name="CostAgent-CalculateCost")
 def cost_node(state: BiddingState) -> dict:
     """
@@ -416,6 +491,25 @@ def cost_node(state: BiddingState) -> dict:
                     item if isinstance(item, dict) else (item.model_dump() if hasattr(item, "model_dump") else item)
                     for item in raw_list
                 ]
+
+        # 批量重匹配时补充尚未定价的手动新增项；已填写价格或明确手动修改的项不进入此分支。
+        pending_custom_items = _get_pending_custom_cost_items(document)
+        existing_node_ids = {
+            str(item.get("node_id") or "").strip()
+            for item in equipment_list_from_db
+            if isinstance(item, dict) and str(item.get("node_id") or "").strip()
+        }
+        appended_custom_items = [
+            item for item in pending_custom_items
+            if not item.get("node_id") or item.get("node_id") not in existing_node_ids
+        ]
+        if appended_custom_items:
+            equipment_list_from_db.extend(appended_custom_items)
+            logger.info(
+                "CostAgent 已补充 {} 个未定价手动新增项参与批量匹配：{}",
+                len(appended_custom_items),
+                [item.get("item_name") for item in appended_custom_items],
+            )
     except Exception as e:
         logger.warning(f"CostAgent 数据库数据读取出现异常: {e}")
     finally:
@@ -577,7 +671,11 @@ def cost_node(state: BiddingState) -> dict:
                     "root_item": getattr(m, "root_item", None),
                     "tree_level": getattr(m, "tree_level", 1) or 1,
                     "per_set_qty": getattr(m, "per_set_qty", None),
+                    "part_name": getattr(m, "part_name", None),
+                    "group_path": getattr(m, "group_path", []) or [],
                     "section_name": normalize_section_name(getattr(m, "section_name", None)),
+                    "source_table_index": getattr(m, "source_table_index", None),
+                    "grouping_mode": getattr(m, "grouping_mode", None),
                     "key_parameters": getattr(m, "key_parameters", []) or [],
                     "brand_requirements": getattr(m, "brand_requirements", "") or "",
                     "matched_name": getattr(m, "matched_name", "") or m_name,
@@ -614,7 +712,11 @@ def cost_node(state: BiddingState) -> dict:
                 root = orig_item.get("root_item")
                 tree_lvl = orig_item.get("tree_level") or 1
                 per_set = orig_item.get("per_set_quantity") if orig_item.get("per_set_quantity") is not None else orig_item.get("per_set_qty")
+                part_name = orig_item.get("part_name")
+                group_path = orig_item.get("group_path") or []
                 sec_name = normalize_section_name(orig_item.get("section_name"))
+                source_table_index = orig_item.get("source_table_index")
+                grouping_mode = orig_item.get("grouping_mode")
                 key_params = orig_item.get("key_parameters") or []
                 brand_req = orig_item.get("brand_requirements") or ""
 
@@ -685,6 +787,8 @@ def cost_node(state: BiddingState) -> dict:
                 total_cost += subtotal
 
                 item_dict = {
+                    "node_id": orig_item.get("node_id"),
+                    "parent_node_id": orig_item.get("parent_node_id"),
                     "item_code": orig_item.get("item_code"),
                     "name": item_name,
                     "spec_requirement": spec_req,
@@ -694,7 +798,11 @@ def cost_node(state: BiddingState) -> dict:
                     "root_item": root,
                     "tree_level": tree_lvl,
                     "per_set_qty": per_set,
+                    "part_name": part_name,
+                    "group_path": group_path,
                     "section_name": sec_name,
+                    "source_table_index": source_table_index,
+                    "grouping_mode": grouping_mode,
                     "key_parameters": key_params,
                     "brand_requirements": brand_req,
                     "is_structural": is_structural_node,
@@ -708,6 +816,7 @@ def cost_node(state: BiddingState) -> dict:
                     "warning": warning,
                     "comparison_note": note,
                     "remark": remark,
+                    "is_custom_added": bool(orig_item.get("is_custom_added")),
                 }
                 calculated_items.append(item_dict)
 

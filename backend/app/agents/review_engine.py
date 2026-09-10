@@ -20,6 +20,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from loguru import logger
 from docx import Document
 
+from app.services.cost_service import sum_root_cost_items
 from app.utils.rmb_formatter import number_to_chinese_rmb
 
 
@@ -314,7 +315,7 @@ def check_financial_accuracy(
                 return findings
 
             # 计算分项报价之和
-            db_total = sum(item.calculated_total for item in cost_items)
+            db_total = sum_root_cost_items(cost_items)
         finally:
             db.close()
     except Exception as exc:

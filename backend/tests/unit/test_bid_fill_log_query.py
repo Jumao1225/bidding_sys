@@ -1,8 +1,12 @@
 """标书撰写日志查询的并发隔离测试。"""
 
+import json
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.api.endpoints.bid_generator import (
+    _build_bid_fill_stream_payload,
     _get_first_bid_fill_duration_ms,
     _persist_first_bid_fill_duration,
     _query_bid_fill_logs,
@@ -121,6 +125,38 @@ def test_query_bid_fill_logs_without_logs_should_return_empty_list() -> None:
 
     assert result == []
     assert session.closed is True
+
+
+def test_build_bid_fill_stream_payload_should_serialize_snapshot_off_event_loop() -> None:
+    """正常场景：Worker 日志快照应由同步辅助函数完成组装和序列化。"""
+    log = SimpleNamespace(
+        id=1,
+        created_at=datetime.now(),
+        status="in_progress",
+        execution_time_ms=120,
+        action_type="llm_call_worker",
+        node_name="BidFillerWorker-投标函",
+        inputs={"chapter_title": "投标函", "category": "needs_fill"},
+        outputs={"summary": "正在填报"},
+        total_tokens=30,
+        prompt_tokens=20,
+        completion_tokens=10,
+    )
+
+    with patch(
+        "app.api.endpoints.bid_generator._query_bid_fill_logs",
+        return_value=[log],
+    ), patch(
+        "app.api.endpoints.bid_generator._query_first_bid_fill_duration_ms",
+        return_value=0,
+    ):
+        payload_str, is_completed = _build_bid_fill_stream_payload("document-1")
+
+    payload = json.loads(payload_str)
+    assert is_completed is False
+    assert payload["pipeline_status"] == "processing"
+    assert payload["worker_items"][0]["chapter_title"] == "投标函"
+    assert payload["worker_items"][0]["total_tokens"] == 30
 
 
 def test_get_first_bid_fill_duration_should_return_persisted_value() -> None:

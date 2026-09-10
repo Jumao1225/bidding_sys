@@ -54,6 +54,70 @@ def test_query_company_profile_with_contextvar():
         current_profile_id.reset(token)
 
 
+def test_bound_company_profile_tool_should_prefer_explicit_profile_id():
+    """正常场景：固定工具必须使用显式档案，不受当前线程上下文影响。"""
+    from types import SimpleNamespace
+    from app.agents.tools.bid_db_tools import create_company_profile_query_tool, current_profile_id
+
+    db = MagicMock()
+    selected_profile = SimpleNamespace(company_name="四川石楠建设工程有限公司")
+    token = current_profile_id.set("default-profile")
+    try:
+        with patch("app.agents.tools.bid_db_tools.SessionLocal", return_value=db), patch(
+            "app.agents.tools.bid_db_tools.resolve_company_profile",
+            return_value=selected_profile,
+        ) as resolve_mock:
+            bound_tool = create_company_profile_query_tool("selected-profile")
+            result = bound_tool.invoke({"field_key": "投标人名称"})
+    finally:
+        current_profile_id.reset(token)
+
+    assert bound_tool.name == "query_company_profile_tool"
+    assert result == "四川石楠建设工程有限公司"
+    resolve_mock.assert_called_once_with(db, "selected-profile")
+    db.close.assert_called_once_with()
+
+
+def test_bound_company_profile_tool_should_keep_context_fallback_when_profile_id_empty():
+    """边界场景：未绑定档案时保留旧的 ContextVar 兼容路径。"""
+    from types import SimpleNamespace
+    from app.agents.tools.bid_db_tools import create_company_profile_query_tool, current_profile_id
+
+    db = MagicMock()
+    default_profile = SimpleNamespace(company_name="默认企业")
+    token = current_profile_id.set("context-profile")
+    try:
+        with patch("app.agents.tools.bid_db_tools.SessionLocal", return_value=db), patch(
+            "app.agents.tools.bid_db_tools.resolve_company_profile",
+            return_value=default_profile,
+        ) as resolve_mock:
+            bound_tool = create_company_profile_query_tool()
+            result = bound_tool.invoke({"field_key": "company_name"})
+    finally:
+        current_profile_id.reset(token)
+
+    assert result == "默认企业"
+    resolve_mock.assert_called_once_with(db, "context-profile")
+
+
+def test_bound_company_profile_tool_should_return_query_error_when_resolver_fails():
+    """异常场景：档案解析失败时返回可识别错误并记录资源清理。"""
+    db = MagicMock()
+    with patch("app.agents.tools.bid_db_tools.SessionLocal", return_value=db), patch(
+        "app.agents.tools.bid_db_tools.resolve_company_profile",
+        side_effect=RuntimeError("profile database unavailable"),
+    ):
+        from app.agents.tools.bid_db_tools import create_company_profile_query_tool
+
+        result = create_company_profile_query_tool("selected-profile").invoke(
+            {"field_key": "投标人名称"}
+        )
+
+    assert "查询异常" in result
+    assert "profile database unavailable" in result
+    db.close.assert_called_once_with()
+
+
 def _create_profile_test_session():
     """创建仅包含企业档案表的内存数据库，隔离主体解析单元测试。"""
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -163,27 +227,24 @@ def test_query_company_qualification_tool_basic():
     assert isinstance(res, str)
 
 
-def test_sort_cost_items_by_scope_and_hierarchy_pure_generic():
-    """测试纯通用区域/标段聚合算法（零行业与零具体数据硬编码）"""
+def test_sort_cost_items_by_section_name_keeps_section_order_and_item_order():
+    """测试按结构化 section_name 聚类，并保持分区内原始顺序。"""
     from app.agents.tools.bid_db_tools import sort_cost_items_by_scope_and_hierarchy
     from types import SimpleNamespace
 
-    # 构造通用抽象的跨区域乱序清单条目（包含二标段、一标段等抽象标识）
+    # 使用结构化分区字段，名称本身不承担分区语义。
     raw_items = [
-        SimpleNamespace(item_name="标的物C（第2标段）", section_name="", brand="品牌C", spec="参数C", calculated_total=100),
-        SimpleNamespace(item_name="标的物A（第1标段）", section_name="", brand="品牌A", spec="参数A", calculated_total=500),
-        SimpleNamespace(item_name="标的物D（第2标段）", section_name="", brand="品牌D", spec="参数D", calculated_total=200),
-        SimpleNamespace(item_name="标的物B（第1标段）", section_name="", brand="品牌B", spec="参数B", calculated_total=300),
+        SimpleNamespace(item_name="清单项C", section_name="外层分区乙", sort_order=2, calculated_total=100),
+        SimpleNamespace(item_name="清单项A", section_name="外层分区甲", sort_order=1, calculated_total=500),
+        SimpleNamespace(item_name="清单项D", section_name="外层分区乙", sort_order=4, calculated_total=200),
+        SimpleNamespace(item_name="清单项B", section_name="外层分区甲", sort_order=3, calculated_total=300),
     ]
 
     sorted_res = sort_cost_items_by_scope_and_hierarchy(raw_items)
     names = [it.item_name for it in sorted_res]
 
-    # 1. 验证第1标段全部聚合在第2标段之前
-    assert names[0] == "标的物A（第1标段）"
-    assert names[1] == "标的物B（第1标段）"
-    assert names[2] == "标的物C（第2标段）"
-    assert names[3] == "标的物D（第2标段）"
+    # 分区顺序按首次出现顺序，分区内按 sort_order 排列。
+    assert names == ["清单项C", "清单项D", "清单项A", "清单项B"]
 
 
 def test_sort_cost_items_prefers_frontend_sort_order_when_present():
@@ -200,25 +261,20 @@ def test_sort_cost_items_prefers_frontend_sort_order_when_present():
     assert [item.item_name for item in sorted_res] == ["前显示项", "后显示项"]
 
 
-def test_sort_cost_items_clusters_scopes_but_keeps_frontend_order_inside_scope():
-    """多区域时先聚类，区域内仍按前端 sort_order 排列。"""
+def test_sort_cost_items_without_section_name_preserves_original_order():
+    """没有结构化分区时保持原始顺序，不从名称猜测分区。"""
     from app.agents.tools.bid_db_tools import sort_cost_items_by_scope_and_hierarchy
     from types import SimpleNamespace
 
     raw_items = [
-        SimpleNamespace(item_name="区域二-后项（第2标段）", sort_order=3),
-        SimpleNamespace(item_name="区域一-后项（第1标段）", sort_order=2),
-        SimpleNamespace(item_name="区域二-前项（第2标段）", sort_order=1),
-        SimpleNamespace(item_name="区域一-前项（第1标段）", sort_order=0),
+        SimpleNamespace(item_name="清单项D", sort_order=3),
+        SimpleNamespace(item_name="清单项B", sort_order=2),
+        SimpleNamespace(item_name="清单项C", sort_order=1),
+        SimpleNamespace(item_name="清单项A", sort_order=0),
     ]
 
     sorted_res = sort_cost_items_by_scope_and_hierarchy(raw_items)
-    assert [item.item_name for item in sorted_res] == [
-        "区域一-前项（第1标段）",
-        "区域一-后项（第1标段）",
-        "区域二-前项（第2标段）",
-        "区域二-后项（第2标段）",
-    ]
+    assert [item.item_name for item in sorted_res] == ["清单项A", "清单项C", "清单项B", "清单项D"]
 
 
 def test_build_dynamic_matrix_for_header_with_auto_clustering():
@@ -227,30 +283,30 @@ def test_build_dynamic_matrix_for_header_with_auto_clustering():
     from types import SimpleNamespace
 
     raw_items = [
-        SimpleNamespace(item_name="标的物B（二区）", brand="品牌B", spec="规格B", unit="项", quantity=1, unit_price=200, calculated_total=200, remark=""),
-        SimpleNamespace(item_name="标的物A（一区）", brand="品牌A", spec="规格A\n带换行", unit="项", quantity=2, unit_price=100, calculated_total=200, remark=""),
+        SimpleNamespace(item_name="清单项A", section_name="外层分区甲", brand="品牌A", spec="规格A\n带换行", unit="项", quantity=2, unit_price=100, calculated_total=200, remark="", sort_order=0),
+        SimpleNamespace(item_name="清单项B", section_name="外层分区乙", brand="品牌B", spec="规格B", unit="项", quantity=1, unit_price=200, calculated_total=200, remark="", sort_order=1),
     ]
 
     header_cols = ["__INDEX__", "item_name", "__BRAND_SPEC__", "unit", "quantity", "unit_price", "calculated_total"]
     matrix = build_dynamic_matrix_for_header(raw_items, header_cols)
 
-    # 多区域时应生成：一区标题行、1.1明细行、一区小计行、二区标题行、2.1明细行、二区小计行（共 6 行）
+    # 多外层分区时应生成：分区标题、明细和小计行（共 6 行）。
     assert len(matrix) == 6
 
-    # 1. 验证一区标题行与明细
-    assert matrix[0][0] == "一、"
-    assert "一区" in matrix[0][1]
+    # 1. 验证第一个外层分区标题与明细
+    assert matrix[0][0] == "1、"
+    assert "外层分区甲" in matrix[0][1]
     assert matrix[1][0] == "1.1"
-    assert "标的物A" in matrix[1][1]
+    assert "清单项A" in matrix[1][1]
     assert matrix[1][2] == "品牌A 规格A 带换行"
-    assert "一区 小计" in matrix[2][1]
+    assert "外层分区甲 小计" in matrix[2][1]
 
-    # 2. 验证二区标题行与明细
-    assert matrix[3][0] == "二、"
-    assert "二区" in matrix[3][1]
+    # 2. 验证第二个外层分区标题与明细
+    assert matrix[3][0] == "2、"
+    assert "外层分区乙" in matrix[3][1]
     assert matrix[4][0] == "2.1"
-    assert "标的物B" in matrix[4][1]
-    assert "二区 小计" in matrix[5][1]
+    assert "清单项B" in matrix[4][1]
+    assert "外层分区乙 小计" in matrix[5][1]
 
 
 def test_build_dynamic_matrix_manufacturer_support():
@@ -300,3 +356,135 @@ def test_build_dynamic_matrix_brand_spec_dedup_and_formatting():
     assert matrix[0][2] == "天合光能 TSM-DEG21C.20 635Wp"
     assert matrix[1][2] == "华为 SUN2000-110KTL (110kW)"  # 自动去重
     assert matrix[2][2] == "0.5mm厚 热镀锌"
+
+
+def test_build_dynamic_matrix_preserves_internal_boq_group_rows():
+    """表外分区只有一层时，表内 BOQ 分组仍应生成结构行且不参与计价。"""
+    from app.agents.tools.bid_db_tools import build_dynamic_matrix_for_header
+    from types import SimpleNamespace
+
+    raw_items = [
+        SimpleNamespace(
+            item_name="清单项甲",
+            section_name="外层分区甲",
+            part_name="报价部分甲",
+            group_path=["报价部分甲", "分类甲"],
+            quantity=2,
+            unit="项",
+            unit_price=10.0,
+            calculated_total=20.0,
+            sort_order=0,
+        ),
+        SimpleNamespace(
+            item_name="清单项乙",
+            section_name="外层分区甲",
+            part_name="报价部分乙",
+            group_path=["报价部分乙"],
+            quantity=3,
+            unit="项",
+            unit_price=15.0,
+            calculated_total=45.0,
+            sort_order=1,
+        ),
+    ]
+
+    matrix = build_dynamic_matrix_for_header(
+        raw_items,
+        ["__INDEX__", "item_name", "unit", "quantity", "unit_price", "calculated_total"],
+    )
+
+    assert len(matrix) == 5
+    assert matrix[0][1] == "报价部分甲"
+    assert matrix[0][0] == ""
+    assert matrix[0][-1] == ""
+    assert matrix[1][1] == "分类甲"
+    assert matrix[2][0] == "1"
+    assert matrix[2][1] == "清单项甲"
+    assert matrix[3][1] == "报价部分乙"
+    assert matrix[4][0] == "2"
+    assert matrix[4][1] == "清单项乙"
+
+
+def test_build_dynamic_matrix_keeps_nonstandard_external_sections_and_all_items():
+    """外层分区名称不含编号时也应按 section_name 分组，且不丢失无分区历史项。"""
+    from app.agents.tools.bid_db_tools import build_dynamic_matrix_for_header
+    from types import SimpleNamespace
+
+    raw_items = [
+        SimpleNamespace(item_name="分区乙明细", section_name="分区乙", calculated_total=2.0, sort_order=2),
+        SimpleNamespace(item_name="无分区历史项", section_name=None, calculated_total=3.0, sort_order=3),
+        SimpleNamespace(item_name="分区甲明细", section_name="分区甲", calculated_total=1.0, sort_order=0),
+    ]
+
+    matrix = build_dynamic_matrix_for_header(raw_items, ["__INDEX__", "item_name", "calculated_total"])
+    names = [row[1] for row in matrix if row[1] and not row[1].endswith("小计")]
+
+    assert "分区甲" in names
+    assert "分区乙" in names
+    assert "无分区历史项" in names
+    assert sum("明细" in name or "历史项" in name for name in names) == 3
+
+
+def test_build_dynamic_matrix_without_section_name_does_not_infer_external_groups():
+    """没有 section_name 时不从项目名称猜测外层分组。"""
+    from app.agents.tools.bid_db_tools import build_dynamic_matrix_for_header
+    from types import SimpleNamespace
+
+    raw_items = [
+        SimpleNamespace(item_name="清单项甲", section_name=None, calculated_total=1.0),
+        SimpleNamespace(item_name="清单项乙", section_name=None, calculated_total=2.0),
+    ]
+
+    matrix = build_dynamic_matrix_for_header(raw_items, ["__INDEX__", "item_name", "calculated_total"])
+
+    assert len(matrix) == 2
+    assert matrix[0][0] == "1"
+    assert matrix[1][0] == "2"
+
+
+def test_enrich_cost_items_with_saved_group_context_before_bid_filling():
+    """成本关系表缺少表内分组列时，应从已保存快照优先补回结构字段。"""
+    from app.agents.tools.bid_db_tools import _enrich_cost_items_with_structure
+    from types import SimpleNamespace
+
+    document = SimpleNamespace(
+        parsed_metadata={
+            "cost_analysis": {
+                "items": [
+                    {
+                        "item_code": "A-1",
+                        "name": "清单项甲",
+                        "part_name": "报价部分甲",
+                        "group_path": ["报价部分甲", "分类甲"],
+                        "section_name": "外层分区甲",
+                    }
+                ]
+            }
+        }
+    )
+    engineering = SimpleNamespace(
+        main_equipment_list=[
+            {
+                "item_code": "A-1",
+                "item_name": "清单项甲",
+                "part_name": "工程元数据部分",
+                "group_path": ["工程元数据部分"],
+            }
+        ]
+    )
+    query_result = MagicMock()
+    query_result.filter.return_value.first.side_effect = [document, engineering]
+    db = MagicMock()
+    db.query.return_value = query_result
+    cost_item = SimpleNamespace(
+        item_code="A-1",
+        item_name="清单项甲",
+        quantity=1,
+        calculated_total=5.0,
+    )
+
+    enriched = _enrich_cost_items_with_structure(db, "doc-1", [cost_item])
+
+    assert enriched[0].part_name == "报价部分甲"
+    assert enriched[0].group_path == ["报价部分甲", "分类甲"]
+    assert enriched[0].section_name == "外层分区甲"

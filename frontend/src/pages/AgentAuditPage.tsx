@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { apiFetch, API_BASE_URL } from '../utils/api';
+import { build_analysis_error_info } from '../utils/analysisError';
+import { BidTemplatePanel } from '../components/BidTemplatePanel';
 
 interface WorkerItem {
   id: string;
@@ -14,6 +16,7 @@ interface WorkerItem {
   completion_tokens: number;
   summary: string;
   proposals_count: number;
+  written_count?: number | null;
   proposals?: any[];
   tools_used?: string[];
   thought_steps?: Array<{
@@ -26,6 +29,49 @@ interface WorkerItem {
   }>;
   created_at: string | null;
 }
+
+interface ManualChapterItem {
+  chapter_number?: string;
+  chapter_title: string;
+  content_hint?: string;
+  template_text?: string;
+  status?: string;
+  agent_action?: string;
+}
+
+/**
+ * 将标书填报终态及 Supervisor 摘要转换为用户可理解的失败提示。
+ * 后端历史日志可能只有摘要，不能只依赖 pipeline_message 判断具体原因。
+ */
+const resolveBidFillFailureMessage = (
+  pipelineMessage: unknown,
+  workerItems: WorkerItem[] = [],
+): string => {
+  const supervisorMessages = workerItems
+    .filter((item) => (
+      item.node_name.includes('Supervisor')
+      && ['failed', 'error'].includes((item.status || '').toLowerCase())
+    ))
+    .map((item) => item.summary)
+    .filter(Boolean);
+  const candidates = [...supervisorMessages, pipelineMessage];
+
+  // 优先识别模型服务连接失败，避免被通用“流程异常”消息覆盖。
+  const modelServiceError = candidates
+    .map((candidate) => build_analysis_error_info(candidate, 'task'))
+    .find((errorInfo) => (
+      errorInfo.code === 'MODEL_SERVICE_UNAVAILABLE'
+      || errorInfo.code === 'MODEL_UNAVAILABLE'
+    ));
+  if (modelServiceError) {
+    return `${modelServiceError.title}：${modelServiceError.message}`;
+  }
+
+  if (typeof pipelineMessage === 'string' && pipelineMessage.trim()) {
+    return pipelineMessage.trim();
+  }
+  return '后台标书填报流程异常结束，请查看审计日志。';
+};
 
 export const AgentAuditPage: React.FC = () => {
   const { documentId: paramDocId } = useParams<{ documentId: string }>();
@@ -40,11 +86,13 @@ export const AgentAuditPage: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [isDownloadingRaw, setIsDownloadingRaw] = useState(false);
+  const [isExtractingRaw, setIsExtractingRaw] = useState(false);
   const [customInstruction, setCustomInstruction] = useState('');
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [workers, setWorkers] = useState<WorkerItem[]>([]);
+  const [manualChapters, setManualChapters] = useState<ManualChapterItem[]>([]);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
   // 审计日志每次刷新/微调都会生成新的 id，章节名才是稳定的选中键。
   const [selectedChapterTitle, setSelectedChapterTitle] = useState<string | null>(null);
@@ -175,6 +223,7 @@ export const AgentAuditPage: React.FC = () => {
     const targetId = typeof docIdToFetch === 'string' ? docIdToFetch : activeDocId;
     if (!targetId) {
       setWorkers([]);
+      setManualChapters([]);
       setLoading(false);
       return;
     }
@@ -188,6 +237,7 @@ export const AgentAuditPage: React.FC = () => {
       if (response.status === 404) {
         // 该文档尚未运行 Agent 填报，容错处理为空履历
         setWorkers([]);
+        setManualChapters([]);
         setError(null);
         return;
       }
@@ -196,6 +246,7 @@ export const AgentAuditPage: React.FC = () => {
 
       const items: WorkerItem[] = data.worker_items || [];
       setWorkers(items);
+      setManualChapters(Array.isArray(data.manual_chapters) ? data.manual_chapters : []);
       // 后端返回的首次完成耗时是永久基准，后续微调产生的日志耗时不得覆盖它。
       const firstDurationMs = typeof data.first_bid_fill_duration_ms === 'number'
         ? data.first_bid_fill_duration_ms
@@ -207,10 +258,15 @@ export const AgentAuditPage: React.FC = () => {
         setServerWallTimeMs(prev => firstDurationMs > 0 ? firstDurationMs : (prev > 0 ? prev : totalWallTimeMs));
       }
       syncWorkerSelection(items);
-      setError(null);
+      if (data.pipeline_status === 'failed') {
+        setError(resolveBidFillFailureMessage(data.pipeline_message, items));
+      } else {
+        setError(null);
+      }
     } catch (err: any) {
       console.warn('获取 Agent 履历数据出差/暂无履历:', err);
       setWorkers([]);
+      setManualChapters([]);
     } finally {
       setLoading(false);
     }
@@ -238,6 +294,9 @@ export const AgentAuditPage: React.FC = () => {
           setLoading(false);
           syncWorkerSelection(data.worker_items as WorkerItem[]);
         }
+        if (Array.isArray(data.manual_chapters)) {
+          setManualChapters(data.manual_chapters as ManualChapterItem[]);
+        }
         // 只接受首次全量撰写基准值；后续 SSE 中的临时日志耗时不参与累计撰写耗时展示。
         const firstDurationMs = typeof data.first_bid_fill_duration_ms === 'number'
           ? data.first_bid_fill_duration_ms
@@ -261,7 +320,7 @@ export const AgentAuditPage: React.FC = () => {
           setIsLivePolling(false);
           setIsGenerating(false);
           setLoading(false);
-          setError(data.pipeline_message || '后台标书填报流程异常结束，请查看审计日志。');
+          setError(resolveBidFillFailureMessage(data.pipeline_message, data.worker_items || []));
           setNotice('⚠️ 后台流程已结束，但未成功完成最终发布。');
           es.close();
         }
@@ -316,6 +375,7 @@ export const AgentAuditPage: React.FC = () => {
 
     // 清空历史旧履历，重置呈现最新一轮 Agent 思考与原位落盘弹增过程
     setWorkers([]);
+    setManualChapters([]);
     setSelectedWorkerId(null);
     setSelectedChapterTitle(null);
     selectedWorkerIdRef.current = null;
@@ -354,7 +414,12 @@ export const AgentAuditPage: React.FC = () => {
       // POST 成功仅表示后台线程已启动，非撰写完成；SSE onmessage 中的 is_completed 逻辑会自动控制生命周期
       setNotice('⚡ Agent 团队后台全自主撰写已启动，正在通过 SSE 实时推流监听进度...');
     } catch (err: any) {
-      setError(`撰写生成失败: ${err.message}`);
+      const friendlyError = resolveBidFillFailureMessage(err?.message, []);
+      setError(
+        friendlyError.startsWith('模型服务不可用') || friendlyError.startsWith('当前模型不可用')
+          ? friendlyError
+          : `撰写生成失败: ${friendlyError}`,
+      );
       // 仅在请求失败时才关闭 SSE 连接并重置状态，正常情况交由 SSE is_completed 回调自动关闭
       setIsGenerating(false);
       setIsLivePolling(false);
@@ -373,12 +438,34 @@ export const AgentAuditPage: React.FC = () => {
   const handleDownloadWord = async () => {
     if (!activeDocId || isDownloading) return;
 
+    // 撰写尚未完成时直接提示，避免无意义地请求下载接口。
+    if (isGenerating) {
+      const message = '标书正在填写中，请完成后再下载。';
+      console.warn('[标书下载] 拦截下载请求:', message);
+      setNotice(`⚠️ ${message}`);
+      setError(message);
+      return;
+    }
+
     setIsDownloading(true);
-    setNotice('📥 正在从服务器提取生成好的 Word 文档，准备下载...');
+    setError(null);
+    setNotice('📥 正在读取已生成的 Word 文档，准备下载...');
 
     try {
       const response = await apiFetch(`${API_BASE_URL}/api/v1/bidding/agent-fill-bid-format/${activeDocId}/download`);
-      if (!response.ok) throw new Error('下载标书 Word 失败');
+      if (!response.ok) {
+        let errorMessage = '下载标书 Word 失败';
+        try {
+          const errorData = await response.json();
+          if (typeof errorData.detail === 'string' && errorData.detail.trim()) {
+            errorMessage = errorData.detail;
+          }
+        } catch (parseError) {
+          console.warn('[标书下载] 解析后端错误响应失败:', parseError);
+        }
+        console.warn('[标书下载] 后端拒绝下载:', response.status, errorMessage);
+        throw new Error(errorMessage);
+      }
 
       const blob = await response.blob();
       const contentDisposition = response.headers.get('Content-Disposition') || '';
@@ -405,39 +492,90 @@ export const AgentAuditPage: React.FC = () => {
     }
   };
 
-  // 下载原格式标书文件 (投标文件格式原始模板 .docx)
+  // 统一读取后端错误，确保“模型不可用”等业务提示不会被前端泛化覆盖。
+  const readApiErrorMessage = async (response: Response, fallback: string): Promise<string> => {
+    try {
+      const errorData = await response.json();
+      if (typeof errorData.detail === 'string' && errorData.detail.trim()) {
+        return errorData.detail;
+      }
+    } catch (parseError) {
+      console.warn('[投标文件模板] 解析后端错误响应失败:', parseError);
+    }
+    return fallback;
+  };
+
+  // 统一处理投标文件模板下载响应，后端返回的模型不可用提示会原样传递到界面。
+  const downloadRawTemplateFile = async (endpoint: string): Promise<string | null> => {
+    const response = await apiFetch(endpoint);
+    if (!response.ok) {
+      const errorMessage = await readApiErrorMessage(response, '投标文件模板处理失败');
+      throw new Error(errorMessage);
+    }
+
+    const blob = await response.blob();
+    const contentDisposition = response.headers.get('Content-Disposition') || '';
+    let filename = '【原格式】投标文件格式模板.docx';
+    const match = contentDisposition.match(/filename\*=UTF-8''(.+)/);
+    if (match && match[1]) {
+      filename = decodeURIComponent(match[1]);
+    }
+
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+    return response.headers.get('X-Extraction-Mode');
+  };
+
+  // 强制重新提取投标文件模板，跳过已有缓存并覆盖最新提取结果。
+  const handleReextractRawTemplate = async () => {
+    if (!activeDocId || isExtractingRaw || isDownloadingRaw) return;
+
+    setIsExtractingRaw(true);
+    setError(null);
+    setNotice('🔄 正在重新提取《投标文件格式》模板，请稍候...');
+    try {
+      const response = await apiFetch(
+        `${API_BASE_URL}/api/v1/bidding/reextract-bid-format/${activeDocId}`,
+        { method: 'POST' },
+      );
+      if (!response.ok) {
+        throw new Error(await readApiErrorMessage(response, '投标文件模板重新提取失败'));
+      }
+      const result = await response.json().catch(() => ({})) as { message?: string };
+      setNotice(`✅ ${result.message || '《投标文件格式》模板重新提取成功！'}`);
+    } catch (err: any) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message.includes('模型不可用') ? message : `重新提取投标文件模板失败: ${message}`);
+    } finally {
+      setIsExtractingRaw(false);
+    }
+  };
+
+  // 下载已有模板；首次下载时由后端自动完成一次提取并缓存。
   const handleDownloadRawTemplate = async () => {
-    if (!activeDocId || isDownloadingRaw) return;
+    if (!activeDocId || isDownloadingRaw || isExtractingRaw) return;
 
     setIsDownloadingRaw(true);
-    setNotice('📥 正在从服务器提取《投标文件格式》原格式标书模板，准备下载...');
-
+    setError(null);
+    setNotice('📥 正在检查已提取的投标文件模板...');
     try {
-      const response = await apiFetch(`${API_BASE_URL}/api/v1/bidding/extract-bid-format/${activeDocId}`);
-      if (!response.ok) throw new Error('提取原格式标书文件失败');
-
-      const blob = await response.blob();
-      const contentDisposition = response.headers.get('Content-Disposition') || '';
-      let filename = '【原格式】投标文件格式模板.docx';
-      const match = contentDisposition.match(/filename\*=UTF-8''(.+)/);
-      if (match && match[1]) {
-        filename = decodeURIComponent(match[1]);
-      }
-
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      const modeHeader = response.headers.get('X-Extraction-Mode');
-      if (modeHeader === 'fallback_template') {
-        setNotice('⚠️ 《投标文件格式》原标书章节未精准命中，已下载通用托底格式模板！');
+      const modeHeader = await downloadRawTemplateFile(
+        `${API_BASE_URL}/api/v1/bidding/download-bid-format-template/${activeDocId}`,
+      );
+      if (modeHeader?.startsWith('cached_')) {
+        setNotice('✅ 已直接下载之前提取的《投标文件格式》模板！');
       } else {
-        setNotice('✅ 《投标文件格式》标书格式文件已成功下载！');
+        setNotice('✅ 首次提取完成，《投标文件格式》模板已下载！');
       }
     } catch (err: any) {
-      setError(`下载原格式标书失败: ${err.message}`);
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message.includes('模型不可用') ? message : `下载投标文件模板失败: ${message}`);
     } finally {
       setIsDownloadingRaw(false);
     }
@@ -722,23 +860,42 @@ export const AgentAuditPage: React.FC = () => {
               </div>
             </div>
 
-            {/* 右侧: 3 大操作按钮 */}
+            {/* 右侧: 4 大操作按钮 */}
             <div className="flex flex-wrap items-center gap-2.5 shrink-0 xl:justify-end">
               <button
                 type="button"
+                onClick={handleReextractRawTemplate}
+                disabled={isExtractingRaw || isDownloadingRaw || !activeDocId}
+                className="px-3.5 py-2.5 rounded-xl bg-amber-700/90 hover:bg-amber-600 active:scale-98 text-amber-50 text-xs font-bold shadow-md border border-amber-500/60 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
+                title="跳过缓存，重新提取未经过 AI 扩写的原格式投标文件模板"
+              >
+                {isExtractingRaw ? (
+                  <>
+                    <span className="animate-spin w-3.5 h-3.5 border-2 border-amber-100 border-t-transparent rounded-full"></span>
+                    <span>正在重新提取...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>🔄 重新提取模板</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
                 onClick={handleDownloadRawTemplate}
-                disabled={isDownloadingRaw || !activeDocId}
+                disabled={isDownloadingRaw || isExtractingRaw || !activeDocId}
                 className="px-3.5 py-2.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 active:scale-98 text-slate-200 hover:text-white text-xs font-bold shadow-md border border-slate-700/70 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
-                title="提取并下载未经过 AI 扩写的原格式《投标文件格式》Word 模板"
+                title="下载已提取的投标文件模板；首次下载时会先自动提取"
               >
                 {isDownloadingRaw ? (
                   <>
                     <span className="animate-spin w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full"></span>
-                    <span>正在提取...</span>
+                    <span>正在下载模板...</span>
                   </>
                 ) : (
                   <>
-                    <span>📄 原格式模板</span>
+                    <span>📄 下载投标文件模板</span>
                   </>
                 )}
               </button>
@@ -914,6 +1071,73 @@ export const AgentAuditPage: React.FC = () => {
             </div>
           </div>
         </div>
+
+        {activeDocId && <BidTemplatePanel documentId={activeDocId} />}
+
+        {manualChapters.length > 0 && (
+          <section
+            data-testid="manual-chapters-panel"
+            className="border-t border-amber-500/20 bg-gradient-to-r from-amber-950/50 via-slate-950/90 to-orange-950/40 px-4 py-4"
+          >
+            <div className="flex flex-col gap-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-sm font-extrabold text-amber-100">✍️ 人工撰写待办</h2>
+                    <span className="rounded-full border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-[10px] font-bold text-amber-200">
+                      {manualChapters.length} 项待处理
+                    </span>
+                  </div>
+                  <p className="mt-1 text-[11px] leading-relaxed text-amber-100/65">
+                    这些章节被标记为 needs_writing，Agent 只提取要求和模板提示，不会修改正文；请人工完成后再复核并上传最终文件。
+                  </p>
+                </div>
+                <span className="rounded-lg border border-amber-500/30 bg-slate-950/50 px-2.5 py-1.5 text-[10px] font-semibold text-amber-200">
+                  Agent 动作：仅提取要求，不修改正文
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 gap-2.5 xl:grid-cols-2">
+                {manualChapters.map((chapter, index) => (
+                  <article
+                    key={`${chapter.chapter_title}-${index}`}
+                    className="rounded-xl border border-amber-500/20 bg-slate-950/65 p-3 shadow-inner"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-slate-100">
+                          {chapter.chapter_number ? `${chapter.chapter_number} ` : ''}{chapter.chapter_title}
+                        </div>
+                        <div className="mt-1 text-[10px] font-bold text-amber-300">待人工撰写</div>
+                      </div>
+                      <span className="shrink-0 rounded-md border border-amber-500/25 bg-amber-500/10 px-2 py-1 text-[10px] text-amber-200">
+                        {chapter.status || 'manual_pending'}
+                      </span>
+                    </div>
+
+                    {chapter.content_hint && (
+                      <div className="mt-2 rounded-lg border border-slate-800 bg-slate-900/70 p-2.5">
+                        <div className="mb-1 text-[10px] font-bold text-slate-400">招标要求/填写提示</div>
+                        <div className="whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-200">
+                          {chapter.content_hint}
+                        </div>
+                      </div>
+                    )}
+
+                    {chapter.template_text && (
+                      <details className="mt-2 rounded-lg border border-slate-800 bg-slate-900/40 p-2.5">
+                        <summary className="cursor-pointer text-[10px] font-bold text-slate-400">查看原始模板片段</summary>
+                        <div className="mt-1.5 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-300">
+                          {chapter.template_text}
+                        </div>
+                      </details>
+                    )}
+                  </article>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
 
         {/* 4. 主工作台面板：左侧 Worker 列表 + 右侧思考与提案可视化 (固定对称高 720px) */}
         <div className="flex flex-col xl:flex-row h-[720px] bg-slate-950">
@@ -1118,7 +1342,11 @@ export const AgentAuditPage: React.FC = () => {
                           <span>原位修改与写盘落盘明细 (DOM Modifications & Write-Back)</span>
                         </h4>
                         <span className="text-xs font-mono text-purple-300 bg-purple-950/50 border border-purple-800/40 px-2.5 py-0.5 rounded-full font-bold">
-                          写盘槽位: {selectedWorker.proposals_count} 处
+                          提案: {selectedWorker.proposals_count} 项
+                          {' / '}
+                          {typeof selectedWorker.written_count === 'number'
+                            ? `实际写入: ${selectedWorker.written_count} 项`
+                            : '实际写入: 待回读核验'}
                         </span>
                       </div>
 
@@ -1140,6 +1368,27 @@ export const AgentAuditPage: React.FC = () => {
                                   const pathCell = p.path || p.node_path || p.chapter_title || `/body/p[${idx + 1}]`;
                                   const origCell = p.original_context || p.original_text || p.template_text;
                                   const propCell = p.proposed_text ?? p.value ?? p.text ?? p;
+                                  // 只有后端明确返回 written 才显示绿色“已刷盘”，旧日志统一标记为未核验。
+                                  const writeStatus = String(p.write_status || '').toLowerCase();
+                                  const statusConfig = writeStatus === 'written'
+                                    ? {
+                                      label: '✅ 已刷盘',
+                                      className: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40',
+                                    }
+                                    : writeStatus === 'failed'
+                                      ? {
+                                        label: '❌ 写盘失败',
+                                        className: 'bg-red-500/20 text-red-400 border-red-500/40',
+                                      }
+                                      : writeStatus === 'pending'
+                                        ? {
+                                          label: '⏳ 待写盘',
+                                          className: 'bg-amber-500/20 text-amber-300 border-amber-500/40',
+                                        }
+                                        : {
+                                          label: '📨 已提交（未核验）',
+                                          className: 'bg-slate-500/20 text-slate-300 border-slate-500/40',
+                                        };
                                   return (
                                     <tr key={idx} className="hover:bg-slate-900/50 transition-colors">
                                       <td className="p-3.5 text-center text-slate-500 font-mono text-xs">{idx + 1}</td>
@@ -1155,9 +1404,14 @@ export const AgentAuditPage: React.FC = () => {
                                         {renderProposalValue(propCell)}
                                       </td>
                                       <td className="p-3.5 text-center align-top">
-                                        <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 text-[10px] font-bold border border-emerald-500/40 whitespace-nowrap inline-flex items-center gap-1 shadow-xs">
-                                          ✅ 已刷盘
+                                        <span className={`px-2.5 py-1 rounded-full ${statusConfig.className} text-[10px] font-bold border whitespace-nowrap inline-flex items-center gap-1 shadow-xs`} title={p.write_error || undefined}>
+                                          {statusConfig.label}
                                         </span>
+                                        {p.write_error && (
+                                          <div className="mt-1 max-w-[150px] text-[10px] leading-4 text-red-300 break-words">
+                                            {p.write_error}
+                                          </div>
+                                        )}
                                       </td>
                                     </tr>
                                   );
@@ -1301,19 +1555,38 @@ export const AgentAuditPage: React.FC = () => {
 
                   <button
                     type="button"
+                    onClick={handleReextractRawTemplate}
+                    disabled={isExtractingRaw || isDownloadingRaw || !activeDocId}
+                    className="px-4 py-3 rounded-2xl bg-amber-700 hover:bg-amber-600 active:bg-amber-800 text-amber-50 text-xs font-bold border border-amber-500/60 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    title="跳过缓存，重新提取未经过 AI 扩写的原格式投标文件模板"
+                  >
+                    {isExtractingRaw ? (
+                      <>
+                        <span className="animate-spin w-3.5 h-3.5 border-2 border-amber-100 border-t-transparent rounded-full"></span>
+                        <span>正在重新提取...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>🔄 重新提取模板</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={handleDownloadRawTemplate}
-                    disabled={isDownloadingRaw || !activeDocId}
+                    disabled={isDownloadingRaw || isExtractingRaw || !activeDocId}
                     className="px-4 py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 text-xs font-bold border border-slate-700 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
-                    title="提取并下载未经过 AI 扩写的原格式《投标文件格式》Word 模板"
+                    title="下载已提取的投标文件模板；首次下载时会先自动提取"
                   >
                     {isDownloadingRaw ? (
                       <>
                         <span className="animate-spin w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full"></span>
-                        <span>正在提取...</span>
+                        <span>正在下载模板...</span>
                       </>
                     ) : (
                       <>
-                        <span>📄 下载原格式标书</span>
+                        <span>📄 下载投标文件模板</span>
                       </>
                     )}
                   </button>

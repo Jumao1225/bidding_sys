@@ -38,8 +38,18 @@ export default function MainLayout({ children }: MainLayoutProps) {
 
   const getLinkClass = (path: string) => 
     isActive(path) 
-      ? "flex items-center px-4 py-3 bg-gradient-to-r from-blue-600/20 to-indigo-600/10 text-blue-400 rounded-xl font-bold border border-blue-500/20 transition-all shadow-[inset_2px_0_0_#3b82f6] group relative overflow-hidden"
-      : "flex items-center px-4 py-3 text-slate-400 hover:bg-white/5 hover:text-slate-200 rounded-xl font-medium transition-all group";
+      ? "flex items-center px-4 py-3 bg-gradient-to-r from-blue-600/20 to-indigo-600/10 !text-blue-400 rounded-xl font-bold border border-blue-500/20 transition-all shadow-[inset_2px_0_0_#3b82f6] group relative overflow-hidden"
+      : "flex items-center px-4 py-3 !text-slate-400 hover:bg-white/5 hover:!text-slate-200 rounded-xl font-medium transition-all group";
+
+  // 将通用导航项的颜色直接绑定到标签，避免链接默认颜色覆盖旧版侧栏配色。
+  // 明确恢复侧栏导航文字尺寸，避免被全局组件样式继承后显示得过小。
+  const getNavLabelClass = (path: string) => isActive(path)
+    ? 'relative z-10 text-base text-blue-400'
+    : 'relative z-10 text-base text-slate-400 group-hover:text-slate-200 group-hover:translate-x-1 transition-transform duration-300';
+
+  const getNavIconClass = (path: string) => isActive(path)
+    ? 'text-blue-400'
+    : 'text-slate-400 opacity-60 group-hover:text-slate-200 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300';
 
   return (
     <div className="min-h-screen w-full flex text-slate-900 bg-transparent selection:bg-blue-200">
@@ -65,26 +75,26 @@ export default function MainLayout({ children }: MainLayoutProps) {
           
           <Link to="/" className={getLinkClass('/')}>
             {isActive('/') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
-            <svg className={`w-5 h-5 mr-3 ${isActive('/') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className={`w-5 h-5 mr-3 ${getNavIconClass('/')}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
-            <span className={isActive('/') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>系统总览</span>
+            <span className={getNavLabelClass('/')}>系统总览</span>
           </Link>
           
           <Link to="/analysis/new" className={getLinkClass('/analysis')}>
             {isActive('/analysis') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
-            <svg className={`w-5 h-5 mr-3 ${isActive('/analysis') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className={`w-5 h-5 mr-3 ${getNavIconClass('/analysis')}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
             </svg>
-            <span className={isActive('/analysis') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>智能解析</span>
+            <span className={getNavLabelClass('/analysis')}>智能解析</span>
           </Link>
           
           <Link to="/price-book" className={getLinkClass('/price-book')}>
             {isActive('/price-book') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
-            <svg className={`w-5 h-5 mr-3 ${isActive('/price-book') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className={`w-5 h-5 mr-3 ${getNavIconClass('/price-book')}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
-            <span className={isActive('/price-book') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>成本报价</span>
+            <span className={getNavLabelClass('/price-book')}>成本报价</span>
           </Link>
 
           <Link to="/bid-scorer" className={getLinkClass('/bid-scorer')}>
@@ -92,7 +102,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
             <svg className={`w-5 h-5 mr-3 ${isActive('/bid-scorer') ? 'text-emerald-400 font-extrabold' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300 text-emerald-300/80'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z" />
             </svg>
-            <span className={isActive('/bid-scorer') ? "relative z-10 font-bold text-emerald-300" : "group-hover:translate-x-1 transition-transform duration-300 text-slate-200"}>智能评标打分</span>
+            <span className={isActive('/bid-scorer') ? "relative z-10 text-base font-bold text-emerald-300" : "group-hover:translate-x-1 transition-transform duration-300 text-base text-slate-200"}>智能评标打分</span>
           </Link>
 
           <Link to="/agent-audit" className={getLinkClass('/agent-audit')}>
@@ -100,7 +110,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
             <svg className={`w-5 h-5 mr-3 ${isActive('/agent-audit') ? 'text-purple-400 font-extrabold' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300 text-purple-300/80'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
             </svg>
-            <span className={isActive('/agent-audit') ? "relative z-10 font-bold text-purple-300" : "group-hover:translate-x-1 transition-transform duration-300 text-slate-200"}>标书生成与撰写控制台</span>
+            <span className={isActive('/agent-audit') ? "relative z-10 text-base font-bold text-purple-300" : "group-hover:translate-x-1 transition-transform duration-300 text-base text-slate-200"}>标书生成与撰写控制台</span>
           </Link>
 
 
@@ -109,18 +119,18 @@ export default function MainLayout({ children }: MainLayoutProps) {
 
           <Link to="/company-profile" className={getLinkClass('/company-profile')}>
             {isActive('/company-profile') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
-            <svg className={`w-5 h-5 mr-3 ${isActive('/company-profile') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className={`w-5 h-5 mr-3 ${getNavIconClass('/company-profile')}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5m0 0h4m-4 0V11m0 4h4" />
             </svg>
-            <span className={isActive('/company-profile') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>企业档案</span>
+            <span className={getNavLabelClass('/company-profile')}>企业档案</span>
           </Link>
 
           <Link to="/qualifications" className={getLinkClass('/qualifications')}>
             {isActive('/qualifications') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
-            <svg className={`w-5 h-5 mr-3 ${isActive('/qualifications') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className={`w-5 h-5 mr-3 ${getNavIconClass('/qualifications')}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
             </svg>
-            <span className={isActive('/qualifications') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>资质中心</span>
+            <span className={getNavLabelClass('/qualifications')}>资质中心</span>
           </Link>
 
           {['admin', 'platform_admin', 'tenant_admin'].includes(user?.role || '') && (
@@ -129,7 +139,7 @@ export default function MainLayout({ children }: MainLayoutProps) {
               <svg className={`w-5 h-5 mr-3 ${isActive('/model-config') ? 'text-indigo-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.75 3.75h4.5m-7.5 3h10.5m-12 3h13.5m-11.25 3h9m-6.75 3h4.5m-8.25 3h12.75" />
               </svg>
-              <span className={isActive('/model-config') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>模型配置</span>
+              <span className={getNavLabelClass('/model-config')}>模型配置</span>
             </Link>
           )}
 
@@ -137,10 +147,10 @@ export default function MainLayout({ children }: MainLayoutProps) {
             <>
             <Link to="/admin" className={getLinkClass('/admin')}>
               {isActive('/admin') && <div className="absolute inset-0 bg-blue-500/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>}
-              <svg className={`w-5 h-5 mr-3 ${isActive('/admin') ? 'text-blue-400' : 'opacity-60 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg className={`w-5 h-5 mr-3 ${getNavIconClass('/admin')}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
               </svg>
-              <span className={isActive('/admin') ? "relative z-10" : "group-hover:translate-x-1 transition-transform duration-300"}>系统管理</span>
+              <span className={isActive('/admin') ? "relative z-10 text-base" : "group-hover:translate-x-1 transition-transform duration-300 text-base text-slate-400 group-hover:text-slate-200"}>系统管理</span>
             </Link>
             </>
           )}

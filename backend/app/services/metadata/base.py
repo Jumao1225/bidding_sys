@@ -1,13 +1,11 @@
 import json
-import logging
 from typing import Type, TypeVar, Any, Optional
+from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.services.llm_service import llm_service
 from app.db.session import SessionLocal
-
-logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 

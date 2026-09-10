@@ -124,6 +124,7 @@ def run_bid_fill_task_in_process(
     category_hints: Optional[dict],
     reservation_data: dict[str, str],
     profile_id: Optional[str] = None,
+    template_id: Optional[str] = None,
 ) -> None:
     """在独立 Python 进程中执行撰写，并在结束后释放 Redis 槽位。"""
     from app.api.endpoints.bid_generator import _run_agent_bid_filling_in_background
@@ -137,6 +138,7 @@ def run_bid_fill_task_in_process(
             custom_instructions=custom_instructions,
             category_hints=category_hints,
             profile_id=profile_id,
+            template_id=template_id,
         )
     finally:
         bid_fill_task_service.release(reservation)
@@ -150,6 +152,7 @@ def start_bid_fill_process(
     category_hints: Optional[dict],
     reservation_data: dict[str, str],
     profile_id: Optional[str] = None,
+    template_id: Optional[str] = None,
 ) -> int:
     """启动与 Web 服务隔离的标书撰写子进程并返回其进程 ID。"""
     process_context = multiprocessing.get_context("spawn")
@@ -163,6 +166,7 @@ def start_bid_fill_process(
             "category_hints": category_hints,
             "reservation_data": reservation_data,
             "profile_id": profile_id,
+            "template_id": template_id,
         },
         daemon=False,
     )

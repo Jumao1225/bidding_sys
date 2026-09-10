@@ -19,6 +19,7 @@ import os
 import re
 import json
 from contextvars import ContextVar
+from types import SimpleNamespace
 from typing import Dict, Any, List, Optional, Tuple, Set
 from loguru import logger
 from sqlalchemy.orm import Session
@@ -36,11 +37,227 @@ from app.db.models.metadata import (
 from app.db.models.project import Project as ProjectModel, Document as DocumentModel
 from app.db.models.ai_analysis import QualificationMatch, RiskItem, CostEstimate
 from app.db.models.user import User as UserModel
+from app.services.cost_service import is_root_cost_item, resolve_cost_total
 from app.utils.rmb_formatter import number_to_chinese_rmb
 
 # 运行时上下文变量：标书撰写时指定使用的企业档案 ID
 # 由 BidFillerAgent 入口设置，Worker 子进程/线程继承
 current_profile_id: ContextVar[Optional[str]] = ContextVar("current_profile_id", default=None)
+
+
+def _read_cost_item_value(item: Any, field_name: str, default: Any = None) -> Any:
+    """兼容 ORM 对象、字典和运行时包装对象读取成本清单字段。"""
+    if isinstance(item, dict):
+        return item.get(field_name, default)
+    return getattr(item, field_name, default)
+
+
+def _normalize_structure_text(value: Any) -> str:
+    """归一化结构匹配文本，只消除空白差异，不改变业务内容。"""
+    return re.sub(r"\s+", "", str(value or "").strip()).casefold()
+
+
+def _as_structure_mapping(item: Any) -> Dict[str, Any]:
+    """将 JSON、Pydantic 对象或普通对象转换为可读取的结构上下文。"""
+    if isinstance(item, dict):
+        return item
+    if hasattr(item, "model_dump"):
+        return item.model_dump()
+    if hasattr(item, "__dict__"):
+        return {
+            key: value
+            for key, value in vars(item).items()
+            if not key.startswith("_")
+        }
+    return {}
+
+
+def _structure_item_keys(item: Any) -> List[str]:
+    """生成结构上下文匹配键，优先编码，其次名称、规格和单位组合。"""
+    item_map = _as_structure_mapping(item)
+    item_code = _normalize_structure_text(item_map.get("item_code"))
+    item_name = _normalize_structure_text(
+        item_map.get("item_name") or item_map.get("name")
+    )
+    specification = _normalize_structure_text(
+        item_map.get("spec")
+        or item_map.get("specification")
+        or item_map.get("specifications")
+        or item_map.get("spec_requirement")
+        or item_map.get("model")
+    )
+    unit = _normalize_structure_text(item_map.get("unit"))
+
+    keys: List[str] = []
+    if item_code:
+        keys.append(f"code:{item_code}")
+    if item_name and specification and unit:
+        keys.append(f"name-spec-unit:{item_name}|{specification}|{unit}")
+    if item_name and specification:
+        keys.append(f"name-spec:{item_name}|{specification}")
+    if item_name:
+        keys.append(f"name:{item_name}")
+    return keys
+
+
+def _build_structure_context_index(items: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """为一组清单上下文建立候选索引，并保留重复键以避免错配。"""
+    index: Dict[str, List[Dict[str, Any]]] = {}
+    if not isinstance(items, list):
+        return index
+
+    for item in items:
+        item_map = _as_structure_mapping(item)
+        if not item_map:
+            continue
+        for key in _structure_item_keys(item_map):
+            index.setdefault(key, []).append(item_map)
+    return index
+
+
+def _find_structure_context(
+    item: Any,
+    context_index: Dict[str, List[Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """仅使用唯一候选回填结构信息，避免同名清单被错误串联。"""
+    for key in _structure_item_keys(item):
+        candidates = context_index.get(key, [])
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
+def _enrich_cost_items_with_structure(
+    db: Session,
+    document_id: str,
+    cost_items: List[Any],
+) -> List[Any]:
+    """从文档快照和工程元数据补回投标填表所需的分组上下文。
+
+    CostEstimate 是报价数值的关系表，当前没有新增表内 BOQ 分组列。
+    因此这里按清单编码、名称/规格/单位组合和唯一名称逐级匹配，
+    只在投标书填表运行时生成包装对象，不修改数据库结构或原 ORM 行。
+    """
+    if not cost_items:
+        return cost_items
+
+    document = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+    saved_items: Any = []
+    if document and isinstance(document.parsed_metadata, dict):
+        cost_analysis = document.parsed_metadata.get("cost_analysis") or {}
+        if isinstance(cost_analysis, dict):
+            saved_items = cost_analysis.get("items") or []
+
+    engineering_metadata = db.query(EngineeringMetadata).filter(
+        EngineeringMetadata.document_id == document_id,
+    ).first()
+    engineering_items = getattr(engineering_metadata, "main_equipment_list", None)
+
+    context_indexes = [
+        _build_structure_context_index(saved_items),
+        _build_structure_context_index(engineering_items),
+    ]
+    if not any(context_indexes):
+        return cost_items
+
+    enriched_items: List[Any] = []
+    enriched_count = 0
+    enriched_fields: Set[str] = set()
+    model_columns = [column.key for column in CostEstimate.__table__.columns]
+    structure_fields = (
+        "section_name",
+        "part_name",
+        "group_path",
+        "parent_item",
+        "root_item",
+        "tree_level",
+        "per_set_qty",
+        "per_set_quantity",
+    )
+
+    for cost_item in cost_items:
+        merged_context: Dict[str, Any] = {}
+        for context_index in context_indexes:
+            context = _find_structure_context(cost_item, context_index)
+            if not context:
+                continue
+            for field_name in structure_fields:
+                current_value = merged_context.get(field_name)
+                context_value = context.get(field_name)
+                if current_value in (None, "", []):
+                    if context_value not in (None, "", []):
+                        merged_context[field_name] = context_value
+
+        if not merged_context:
+            enriched_items.append(cost_item)
+            continue
+
+        payload = {
+            column_name: _read_cost_item_value(cost_item, column_name)
+            for column_name in model_columns
+        }
+        for field_name in structure_fields:
+            existing_value = _read_cost_item_value(cost_item, field_name)
+            payload[field_name] = (
+                existing_value
+                if existing_value not in (None, "", [])
+                else merged_context.get(field_name)
+            )
+        payload["group_path"] = payload.get("group_path") or []
+        enriched_items.append(SimpleNamespace(**payload))
+        enriched_count += 1
+        enriched_fields.update(
+            field_name
+            for field_name in structure_fields
+            if payload.get(field_name) not in (None, "", [])
+        )
+
+    if enriched_count:
+        logger.info(
+            "[投标填表] 运行时补回清单结构上下文: document_id={}, 命中={}, 字段={}",
+            document_id,
+            enriched_count,
+            sorted(enriched_fields),
+        )
+    return enriched_items
+
+
+def _query_company_profile_value(
+    field_key: str,
+    profile_id: Optional[str] = None,
+) -> str:
+    """查询企业档案字段，支持显式档案绑定并兼容旧的上下文调用方式。"""
+    effective_profile_id = profile_id or current_profile_id.get()
+    logger.info(
+        "🛠️ [DB Tool] query_company_profile_tool 被调用, 字段请求: '{}', profile_id='{}'",
+        field_key,
+        effective_profile_id,
+    )
+    std_key = _match_alias_key(field_key)
+    logger.debug("🛠️ [DB Tool] 别名归一化对齐结果: '{}' -> '{}'", field_key, std_key)
+
+    db: Session = SessionLocal()
+    try:
+        # Worker 的 LangChain 工具可能运行在新的线程中，显式 profile_id 优先于 ContextVar。
+        profile = resolve_company_profile(db, effective_profile_id)
+
+        if profile:
+            value = getattr(profile, std_key, None)
+            if value and str(value).strip():
+                logger.info(
+                    "🛠️ [DB Tool] 成功从数据库 (company_profiles.{}) 查询到真实数据: '{}'",
+                    std_key,
+                    value,
+                )
+                return str(value).strip()
+
+        logger.warning("🛠️ [DB Tool] 字段 '{}' 在企业档案数据库中尚未录入", field_key)
+        return f"[待补充: {field_key}]"
+    except Exception as error:
+        logger.exception("🛠️ [DB Tool] query_company_profile_tool 执行异常: {}", error)
+        return f"[查询异常: {error}]"
+    finally:
+        db.close()
 
 
 def resolve_company_profile(
@@ -203,29 +420,22 @@ def query_company_profile_tool(field_key: str) -> str:
     :param field_key: 欲查询的字段名或中文引导词 (如 'company_name', '统一社会信用代码', '开户银行')
     :return: 数据库中存储的真实原值字符串
     """
-    logger.info(f"🛠️ [DB Tool] query_company_profile_tool 被调用, 字段请求: '{field_key}'")
-    std_key = _match_alias_key(field_key)
-    logger.debug(f"🛠️ [DB Tool] 别名归一化对齐结果: '{field_key}' -> '{std_key}'")
+    return _query_company_profile_value(field_key, current_profile_id.get())
 
-    db: Session = SessionLocal()
-    try:
-        # 按运行时主体上下文解析，禁止使用无序查询结果作为主体依据。
-        profile = resolve_company_profile(db, current_profile_id.get())
 
-        if profile:
-            val = getattr(profile, std_key, None)
-            if val and str(val).strip():
-                logger.info(f"🛠️ [DB Tool] 成功从数据库 (company_profiles.{std_key}) 查询到真实数据: '{val}'")
-                return str(val).strip()
+def create_company_profile_query_tool(profile_id: Optional[str] = None) -> Any:
+    """创建固定企业档案的 Worker 工具，避免内部线程丢失主体上下文。"""
 
-        logger.warning(f"🛠️ [DB Tool] 字段 '{field_key}' 在企业档案数据库中尚未录入")
-        return f"[待补充: {field_key}]"
+    @tool("query_company_profile_tool")
+    def bound_query_company_profile_tool(field_key: str) -> str:
+        """查询本次标书任务绑定的企业档案字段。"""
+        return _query_company_profile_value(field_key, profile_id)
 
-    except Exception as e:
-        logger.exception(f"🛠️ [DB Tool] query_company_profile_tool 执行异常: {str(e)}")
-        return f"[查询异常: {str(e)}]"
-    finally:
-        db.close()
+    logger.info(
+        "🛠️ [DB Tool] 创建企业档案绑定工具: profile_id='{}'",
+        profile_id,
+    )
+    return bound_query_company_profile_tool
 
 
 def resolve_qualification_image_path(file_url: Optional[str]) -> Tuple[Optional[str], bool]:
@@ -635,7 +845,7 @@ def auto_embed_qualification_images_in_docx(docx_path: str, tenant_id: Optional[
                         grouped_by_img[img_p_key] = []
                     grouped_by_img[img_p_key].append(item)
 
-                # 限制单个段落下方最多只挑选 1 个最匹配的图片组落盘，防止连续砸入多张独立大图
+                # 同一条款可能同时要求营业执照、资质证书等多类材料，按图片路径去重后全部落盘。
                 available_img_groups = [
                     (img_key, items) for img_key, items in grouped_by_img.items()
                     if img_key not in embedded_image_paths_in_doc
@@ -643,36 +853,38 @@ def auto_embed_qualification_images_in_docx(docx_path: str, tenant_id: Optional[
                 if not available_img_groups:
                     continue
 
-                img_p_key, items = available_img_groups[0]
                 last_p = p
+                for img_p_key, items in available_img_groups:
+                    # 若同一条款匹配到了同一张证书上的多个资质，合并渲染一张图片与综合图注。
+                    if len(items) > 1:
+                        merged_names = " / ".join(list(dict.fromkeys([it["name"] for it in items])))
+                        merged_levels = " / ".join(list(dict.fromkeys([it["level"] for it in items if it["level"] and it["level"] != "通用"]))) or "通用"
+                        composite_item = {
+                            "name": f"综合资质证书（涵盖: {merged_names}）",
+                            "level": merged_levels,
+                            "image_path": img_p_key,
+                            "used_paragraphs": set()
+                        }
+                        img_p = insert_paragraph_after(last_p, doc)
+                        replace_paragraph_with_image(img_p, composite_item)
+                        embedded_image_paths_in_doc.add(img_p_key)
+                        for it in items:
+                            it["used_paragraphs"].add(p)
+                            it["used"] = True
+                        embedded_count += 1
+                        logger.info(f"   🖼️ 已在条款 '{text[:30]}' 下方插入一证多资质证书图片: {composite_item['name']}")
+                    else:
+                        q_item = items[0]
+                        img_p = insert_paragraph_after(last_p, doc)
+                        replace_paragraph_with_image(img_p, q_item)
+                        embedded_image_paths_in_doc.add(img_p_key)
+                        q_item["used_paragraphs"].add(p)
+                        q_item["used"] = True
+                        embedded_count += 1
+                        logger.info(f"   🖼️ 已在条款 '{text[:30]}' 下方自动附带插入资质图片: {q_item['name']}")
 
-                # 若同一条款匹配到了同一张证书上的多个资质，合并渲染一张图片与综合图注
-                if len(items) > 1:
-                    merged_names = " / ".join(list(dict.fromkeys([it["name"] for it in items])))
-                    merged_levels = " / ".join(list(dict.fromkeys([it["level"] for it in items if it["level"] and it["level"] != "通用"]))) or "通用"
-                    composite_item = {
-                        "name": f"综合资质证书（涵盖: {merged_names}）",
-                        "level": merged_levels,
-                        "image_path": img_p_key,
-                        "used_paragraphs": set()
-                    }
-                    img_p = insert_paragraph_after(last_p, doc)
-                    replace_paragraph_with_image(img_p, composite_item)
-                    embedded_image_paths_in_doc.add(img_p_key)
-                    for it in items:
-                        it["used_paragraphs"].add(p)
-                        it["used"] = True
-                    embedded_count += 1
-                    logger.info(f"   🖼️ 已在条款 '{text[:30]}' 下方插入一证多资质证书图片: {composite_item['name']}")
-                else:
-                    q_item = items[0]
-                    img_p = insert_paragraph_after(last_p, doc)
-                    replace_paragraph_with_image(img_p, q_item)
-                    embedded_image_paths_in_doc.add(img_p_key)
-                    q_item["used_paragraphs"].add(p)
-                    q_item["used"] = True
-                    embedded_count += 1
-                    logger.info(f"   🖼️ 已在条款 '{text[:30]}' 下方自动附带插入资质图片: {q_item['name']}")
+                    # 下一张图片继续插入在上一张图片之后，保持同一条款的阅读顺序。
+                    last_p = img_p
 
             # 2. 扫描表格单元格
             for tbl in doc.tables:
@@ -807,67 +1019,48 @@ def query_project_metadata_tool(document_id: str, field_key: str) -> str:
 
 def sort_cost_items_by_scope_and_hierarchy(cost_items: List[Any]) -> List[Any]:
     """
-    【区域聚类优先、区域内保持前端顺序的排序算法 — 零行业与零设备硬编码】
-    检测到多个区域/标段时，先按区域/标段聚类，再在每个区域内严格按照
-    前端 BOM 的 sort_order 排序；没有多个区域时，完全保持前端顺序。
-    对没有 sort_order 的历史数据，使用原始列表位置作为区域内顺序。
-    根据清单项的通用区域/标段结构特征（如第X标段、第X包、第X期、第X区等）进行聚合，
-    并严格保持同区域/标段内部原招标文件抽取时的自然相对次序（Original Relative Order），
-    使同区域/同标段项目连续聚合，杜绝多标段交叉穿插，适用于任何招投标行业与品类。
+    【按已提取 section_name 聚类、分区内保持原始顺序的排序算法】
+    只使用清单结构化字段 section_name 识别外层分区，不从 item_name 推测业务含义。
+    检测到多个 section_name 时，先按其首次出现顺序聚类，再在每个分区内按
+    前端 BOM 的 sort_order 排序；没有多个 section_name 时，完全保持前端顺序。
+    对没有 sort_order 的历史数据，使用原始列表位置作为稳定顺序。
     """
     if not cost_items or len(cost_items) <= 1:
         return cost_items
 
-    import re
-
-    def _extract_scope_key(item: Any) -> tuple:
-        name = str(getattr(item, 'item_name', '') or '')
-        sec = str(getattr(item, 'section_name', '') or '')
-        combined = f"{sec} {name}"
-
-        scope_num = 999
-        scope_str = ""
-
-        # 通用区域/标段结构模式匹配（支持中英文括号或词尾区划标识，如 1标段、包2、一期、二区等）
-        scope_match = re.search(r'[\(（]([^\)）]*(?:区|期|标|包|段|厂|站)[^\)）]*)[\)）]', combined)
-        if not scope_match:
-            scope_match = re.search(r'([一二三四五六七八九十\d]+(?:区|期|标段|包|标|分厂|车间))', combined)
-
-        if scope_match:
-            scope_str = scope_match.group(1).strip()
-            # 通用中文数字映射
-            cn_num_map = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
-            digit_m = re.search(r'(\d+)', scope_str)
-            if digit_m:
-                scope_num = int(digit_m.group(1))
-            else:
-                for cn_char, val in cn_num_map.items():
-                    if cn_char in scope_str:
-                        scope_num = val
-                        break
-
-        return (scope_num, scope_str)
+    def _explicit_section(item: Any) -> str:
+        value = _read_cost_item_value(item, "section_name", "")
+        return value.strip() if isinstance(value, str) else ""
 
     # cost_estimates.sort_order 是前端 CostTable 的原始列表索引。
-    # 先按区域聚类，再用 sort_order 作为区域内的稳定顺序，避免聚类破坏前端顺序。
-    has_explicit_order = any(getattr(item, "sort_order", None) is not None for item in cost_items)
-    has_scope = any(_extract_scope_key(item)[1] for item in cost_items)
+    # 只要存在明确的多 section_name，就以它为唯一外层分区依据，
+    # 防止物料名称中偶然出现编号时覆盖表格真实分区。
+    has_explicit_order = any(
+        _read_cost_item_value(item, "sort_order") is not None
+        for item in cost_items
+    )
+    explicit_section_order: Dict[str, int] = {}
+    for item in cost_items:
+        section_name = _explicit_section(item)
+        if section_name and section_name not in explicit_section_order:
+            explicit_section_order[section_name] = len(explicit_section_order)
+
+    has_multiple_explicit_sections = len(explicit_section_order) > 1
 
     def _frontend_order(item: Any, original_index: int) -> tuple:
-        raw_order = getattr(item, "sort_order", None)
+        raw_order = _read_cost_item_value(item, "sort_order")
         if raw_order is None:
-            return (1, original_index)
+            return 1, original_index
         try:
-            return (0, int(raw_order))
+            return 0, int(raw_order)
         except (TypeError, ValueError):
-            return (1, original_index)
+            return 1, original_index
 
-    # 没有区域/标段时，完全按前端顺序；有区域时才执行聚类。
     indexed_items = list(enumerate(cost_items))
-    if has_scope:
+    if has_multiple_explicit_sections:
+        # 可靠 section_name 的顺序按原清单首次出现顺序保留，避免对任意中文分区名做字典序臆测。
         indexed_items.sort(key=lambda pair: (
-            _extract_scope_key(pair[1])[0],
-            _extract_scope_key(pair[1])[1],
+            explicit_section_order.get(_explicit_section(pair[1]), len(explicit_section_order)),
             _frontend_order(pair[1], pair[0]) if has_explicit_order else (0, pair[0]),
         ))
     elif has_explicit_order:
@@ -877,7 +1070,7 @@ def sort_cost_items_by_scope_and_hierarchy(cost_items: List[Any]) -> List[Any]:
 
 def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optional[List[str]] = None) -> List[List[str]]:
     """
-    【纯 ORM 字段名直映射引擎 — 语义映射由 Worker LLM 负责】
+    【动态表头直映射与结构行生成引擎 — 语义映射由 Worker LLM 负责】
     接收 Worker LLM 预推理好的 ORM 物理字段名列表 (header_columns)，
     直接按列名顺序从 CostEstimate 实体中提取数据生成二维矩阵。
     
@@ -886,12 +1079,11 @@ def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optio
       - "__BRAND_SPEC__" → 将 brand 和 spec 字段合并为一列
     
     此函数不包含任何中文关键字映射逻辑，所有中文表头→ORM字段名的
-    语义推理全部由上游 Worker LLM Agent 在调用前完成。
+    语义推理全部由上游 Worker LLM Agent 在调用前完成；表外分区与表内
+    BOQ 分组来自清单行已保存的结构上下文，不依赖具体项目名称。
     """
     if not cost_items:
         return []
-
-    import re
 
     # 0. 自动执行区域与分项智能聚类排序
     cost_items = sort_cost_items_by_scope_and_hierarchy(cost_items)
@@ -908,24 +1100,56 @@ def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optio
     if not header_columns:
         sample = cost_items[0]
         header_columns = [col for col in model_columns
-                          if hasattr(sample, col) and getattr(sample, col) is not None]
+                          if _read_cost_item_value(sample, col) is not None]
         if not header_columns:
             header_columns = model_columns
 
-    # 3. 按区域进行通用聚合分组
+    # 3. 只按已提取的 section_name 生成外层分区
     from itertools import groupby
-    def _get_scope_name(it: Any) -> str:
-        name = str(getattr(it, 'item_name', '') or '')
-        sec = str(getattr(it, 'section_name', '') or '')
-        combined = f"{sec} {name}"
-        scope_match = re.search(r'[\(（]([^\)）]*(?:区|期|标|包|段|厂|站)[^\)）]*)[\)）]', combined)
-        if not scope_match:
-            scope_match = re.search(r'([一二三四五六七八九十\d]+(?:区|期|标段|包|标|分厂|车间))', combined)
-        return scope_match.group(1).strip() if scope_match else ""
 
-    groups = []
-    for k, g in groupby(cost_items, key=_get_scope_name):
-        groups.append((k, list(g)))
+    def _get_section_name(it: Any) -> str:
+        """读取已由上游解析得到的表格外层分区。"""
+        value = _read_cost_item_value(it, "section_name", "")
+        return value.strip() if isinstance(value, str) else ""
+
+    explicit_sections = []
+    for item in cost_items:
+        section_name = _get_section_name(item)
+        if section_name and section_name not in explicit_sections:
+            explicit_sections.append(section_name)
+
+    if len(explicit_sections) > 1:
+        groups = [
+            (section_name, list(group_items))
+            for section_name, group_items in groupby(cost_items, key=_get_section_name)
+        ]
+        # 保留没有 section_name 的历史漏项，不能为了生成结构标题而丢失清单行。
+        has_multi_scopes = len(explicit_sections) > 1
+    else:
+        groups = [("", cost_items)]
+        has_multi_scopes = False
+
+    def _internal_group_label(it: Any) -> str:
+        """将表内一级分部和递进路径合并为可读的结构行标题。"""
+        raw_part_name = _read_cost_item_value(it, "part_name", "")
+        part_name = raw_part_name.strip() if isinstance(raw_part_name, str) else ""
+        raw_path = _read_cost_item_value(it, "group_path", []) or []
+        path_values = raw_path if isinstance(raw_path, list) else [raw_path]
+        group_path = [
+            value.strip()
+            for value in path_values
+            if isinstance(value, str) and value.strip()
+        ]
+        if part_name and (not group_path or group_path[0] != part_name):
+            group_path.insert(0, part_name)
+        return " / ".join(group_path)
+
+    def _split_internal_groups(items: List[Any]) -> List[Tuple[str, List[Any]]]:
+        """保留原始顺序切分连续的表内分组，不跨越无关明细强行合并。"""
+        return [
+            (group_label, list(group_items))
+            for group_label, group_items in groupby(items, key=_internal_group_label)
+        ]
 
     # 识别名称列与总价列索引
     name_col_idx = 1
@@ -950,8 +1174,8 @@ def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optio
 
         # 2. 品牌规格型号合并列
         if col_key == "__BRAND_SPEC__" or ("品牌" in col_lower and ("规格" in col_lower or "型号" in col_lower)):
-            brand = str(getattr(item, 'brand', '') or '').strip()
-            spec = str(getattr(item, 'spec', '') or '').strip()
+            brand = str(_read_cost_item_value(item, 'brand', '') or '').strip()
+            spec = str(_read_cost_item_value(item, 'spec', '') or '').strip()
             spec_clean = re.sub(r'[\r\n\t]+', ' ', spec).strip()
             if brand and spec_clean:
                 if spec_clean.startswith(brand):
@@ -961,42 +1185,42 @@ def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optio
 
         # 3. 生产厂家列（支持多级回溯解析：item.manufacturer -> item.brand）
         if col_key in ("manufacturer", "mfg", "producer", "factory") or any(kw in col_lower for kw in ["生产厂家", "制造厂家", "制造厂商", "生产厂商", "制造商", "厂家", "生产企业", "制造企业", "产地"]):
-            mfg_val = str(getattr(item, 'manufacturer', '') or '').strip()
+            mfg_val = str(_read_cost_item_value(item, 'manufacturer', '') or '').strip()
             if not mfg_val:
-                mfg_val = str(getattr(item, 'brand', '') or '').strip()
+                mfg_val = str(_read_cost_item_value(item, 'brand', '') or '').strip()
             return mfg_val
 
         # 4. 品牌列
         if col_key in ("brand", "trademark") or any(kw in col_lower for kw in ["品牌", "商标"]):
-            b_val = str(getattr(item, 'brand', '') or '').strip()
+            b_val = str(_read_cost_item_value(item, 'brand', '') or '').strip()
             if not b_val:
-                b_val = str(getattr(item, 'manufacturer', '') or '').strip()
+                b_val = str(_read_cost_item_value(item, 'manufacturer', '') or '').strip()
             return b_val
 
         # 5. 名称/标的物/货物列
         if col_key in ("item_name", "product_name", "name") or any(kw in col_lower for kw in ["标的物", "货物名称", "设备名称", "材料名称", "项目名称", "品名", "名称"]):
-            val = getattr(item, 'item_name', '') or ''
+            val = _read_cost_item_value(item, 'item_name', '') or ''
             return re.sub(r'[\r\n\t]+', ' ', str(val)).strip()
 
         # 6. 规格型号列
         if col_key in ("spec", "specification") or any(kw in col_lower for kw in ["规格型号", "规格及型号", "规格", "型号", "技术参数", "技术要求"]):
-            val = getattr(item, 'spec', '') or ''
+            val = _read_cost_item_value(item, 'spec', '') or ''
             return re.sub(r'[\r\n\t]+', ' ', str(val)).strip()
 
         # 7. 计量单位列
         if col_key in ("unit", "measure_unit") or any(kw in col_lower for kw in ["单位", "计量单位"]):
-            return str(getattr(item, 'unit', '') or '').strip()
+            return str(_read_cost_item_value(item, 'unit', '') or '').strip()
 
         # 8. 数量/工程量列
         if col_key in ("quantity", "qty", "amount_count") or any(kw in col_lower for kw in ["数量", "工程量", "采购量"]):
-            val = getattr(item, 'quantity', None)
+            val = _read_cost_item_value(item, 'quantity')
             if val is not None:
                 return f"{val:g}" if isinstance(val, (int, float)) else str(val).strip()
             return ""
 
         # 9. 单价列
         if col_key in ("unit_price", "price") or any(kw in col_lower for kw in ["单价", "综合单价", "投标单价", "参考单价"]):
-            val = getattr(item, 'unit_price', None)
+            val = _read_cost_item_value(item, 'unit_price')
             if val is not None:
                 if isinstance(val, (int, float)):
                     return f"{val:,.2f}"
@@ -1005,7 +1229,7 @@ def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optio
 
         # 10. 合价/总价列
         if col_key in ("calculated_total", "total_price", "amount", "total") or any(kw in col_lower for kw in ["合价", "总价", "分项总价", "金额", "小计"]):
-            val = getattr(item, 'calculated_total', None)
+            val = _read_cost_item_value(item, 'calculated_total')
             if val is not None:
                 if isinstance(val, (int, float)):
                     return f"{val:,.2f}"
@@ -1014,50 +1238,88 @@ def build_dynamic_matrix_for_header(cost_items: List[Any], header_columns: Optio
 
         # 11. 备注/说明列
         if col_key in ("remark", "note", "desc") or any(kw in col_lower for kw in ["备注", "说明"]):
-            val = getattr(item, 'remark', '') or ''
+            val = _read_cost_item_value(item, 'remark', '') or ''
             return re.sub(r'[\r\n\t]+', ' ', str(val)).strip()
 
         # 12. 反射模型属性兜底
-        if hasattr(item, col_key):
-            val = getattr(item, col_key, None)
-            if val is not None:
-                return re.sub(r'[\r\n\t]+', ' ', str(val)).strip()
+        val = _read_cost_item_value(item, col_key)
+        if val is not None:
+            return re.sub(r'[\r\n\t]+', ' ', str(val)).strip()
 
         return ""
 
     matrix = []
 
-    # 4. 单一区域降级模式（无分部结构）
+    def _append_internal_group_headers(group_label: str) -> None:
+        """按表内分组路径逐级追加结构行，结构行不携带计量和金额数据。"""
+        if not group_label:
+            return
+        group_names = [name.strip() for name in group_label.split(" / ") if name.strip()]
+        for group_name in group_names:
+            group_header_row = ["" for _ in header_columns]
+            if 0 <= name_col_idx < len(header_columns):
+                group_header_row[name_col_idx] = group_name
+            matrix.append(group_header_row)
+
+    def _append_group_items(
+        group_items: List[Any],
+        row_prefix: str = "",
+    ) -> float:
+        """按原始顺序追加明细，并返回当前外层分组的金额小计。"""
+        group_total = 0.0
+        item_index = 0
+        for internal_label, internal_items in _split_internal_groups(group_items):
+            _append_internal_group_headers(internal_label)
+            for item in internal_items:
+                item_index += 1
+                raw_total = _read_cost_item_value(item, "calculated_total", 0) or 0
+                try:
+                    item_total = float(raw_total)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[投标填表] 清单合价不是可计算数字，按零计入结构小计: item_name={}, value={}",
+                        _read_cost_item_value(item, "item_name", ""),
+                        raw_total,
+                    )
+                    item_total = 0.0
+                # 父节点金额已经包含子节点汇总，分区小计也只能统计顶层节点。
+                if is_root_cost_item(item):
+                    group_total += item_total
+                row = [
+                    _extract_cell_value(item, col_name, item_index, g_prefix=row_prefix)
+                    for col_name in header_columns
+                ]
+                matrix.append(row)
+        return group_total
+
+    # 4. 单一区域降级模式：仍保留表内 BOQ 分组结构行。
     if not has_multi_scopes:
-        for idx, item in enumerate(cost_items, start=1):
-            row = [_extract_cell_value(item, col_name, idx) for col_name in header_columns]
-            matrix.append(row)
+        _append_group_items(cost_items)
         return matrix
 
-    # 5. 多区域模式：插入区域分部标题行、分部层级序号与小计行
-    cn_nums = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
+    # 5. 多 section_name 模式：插入外层分区标题、层级序号与小计行。
 
     for g_i, (scope_name, group_items) in enumerate(groups):
-        section_cn = cn_nums[g_i] if g_i < len(cn_nums) else str(g_i + 1)
-        scope_display = scope_name or f"分部工程 {section_cn}"
+        if not scope_name:
+            # 没有结构化分区的历史行只保留原始明细，不合成分区名称。
+            _append_group_items(group_items)
+            continue
 
-        # 5.1 区域分部标题行
+        section_index = str(g_i + 1)
+        scope_display = scope_name
+
+        # 5.1 外层分区标题行
         sec_header_row = ["" for _ in header_columns]
         if "__INDEX__" in header_columns:
-            sec_header_row[header_columns.index("__INDEX__")] = f"{section_cn}、"
+            sec_header_row[header_columns.index("__INDEX__")] = f"{section_index}、"
         if 0 <= name_col_idx < len(header_columns):
             sec_header_row[name_col_idx] = f"{scope_display}"
         matrix.append(sec_header_row)
 
-        # 5.2 区域明细数据行
-        group_total = 0.0
-        for item_i, item in enumerate(group_items, start=1):
-            item_total = float(getattr(item, 'calculated_total', 0) or 0)
-            group_total += item_total
-            row = [_extract_cell_value(item, col_name, item_i, g_prefix=f"{g_i + 1}.") for col_name in header_columns]
-            matrix.append(row)
+        # 5.2 外层分区明细数据行
+        group_total = _append_group_items(group_items, row_prefix=f"{g_i + 1}.")
 
-        # 5.3 区域分部小计行
+        # 5.3 外层分区小计行
         sec_subtotal_row = ["" for _ in header_columns]
         if 0 <= name_col_idx < len(header_columns):
             sec_subtotal_row[name_col_idx] = f"{scope_display} 小计"
@@ -1118,8 +1380,17 @@ def query_financial_quotation_tool(document_id: str, field_key: str = "cost_esti
             )
             .all()
         )
-        # 有 sort_order 时由排序函数严格保持前端顺序；旧数据仍兼容区域聚类。
+        # 关系表保存报价数值，表内 BOQ 分组可能仍位于文档 JSON 快照或工程元数据中。
+        # 在进入排序和矩阵生成前补回上下文，保证投标书填表与页面/导出使用同一份结构信息。
+        cost_items = _enrich_cost_items_with_structure(db, document_id, cost_items)
+        # 有 sort_order 时由排序函数严格保持前端顺序；外层分区只使用 section_name。
         cost_items = sort_cost_items_by_scope_and_hierarchy(cost_items)
+        cost_document = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+        stored_cost_analysis = (
+            (cost_document.parsed_metadata or {}).get("cost_analysis", {})
+            if cost_document and isinstance(cost_document.parsed_metadata, dict)
+            else {}
+        )
         
         # 针对分项清单、BOM 表或分项单价/合价查询，返回每行精细列表
         if any(k in key_lower for k in ["cost", "bom", "item", "清单", "明细", "分项", "配置", "设备", "sub", "quote", "报价"]):
@@ -1153,7 +1424,7 @@ def query_financial_quotation_tool(document_id: str, field_key: str = "cost_esti
         if not cost_items:
             return "[待补充: 财务总报价与分项测算数据尚未录入]"
 
-        total_price = sum(item.calculated_total for item in cost_items)
+        total_price = resolve_cost_total(stored_cost_analysis, cost_items)
 
         if any(k in key_lower for k in ["大写", "chinese"]):
             chinese_upper = number_to_chinese_rmb(total_price)

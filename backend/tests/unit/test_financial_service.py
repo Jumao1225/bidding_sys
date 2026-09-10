@@ -25,6 +25,17 @@ def test_reconcile_core_financial_amounts_should_keep_budget_and_limit_separate(
     assert reconciled.max_price_limit.amount == 1181380.0
 
 
+def test_reconcile_core_financial_amounts_should_convert_markup_wan_to_yuan():
+    """DOCX 金额和单位被 HTML 标签拆开时，仍应准确换算为元。"""
+    result = FinancialSchema()
+    context = "项目报价方式：总价最高限价：<u>2600</u><u> 万元</u>"
+
+    reconciled = reconcile_core_financial_amounts(result, context)
+
+    assert reconciled.max_price_limit is not None
+    assert reconciled.max_price_limit.amount == 26000000.0
+
+
 def test_reconcile_core_financial_amounts_should_not_infer_limit_from_budget():
     """原文只有采购预算时，不得推导或伪造最高投标限价。"""
     result = FinancialSchema()

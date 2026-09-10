@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../utils/api';
 import { motion } from 'framer-motion';
+import { useDialog } from '../components/DialogProvider';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
@@ -29,6 +30,7 @@ const emptyFormData = {
 };
 
 export function PriceBookCenter() {
+  const { confirm, alert } = useDialog();
   const [items, setItems] = useState<PriceReference[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -58,7 +60,12 @@ export function PriceBookCenter() {
   }, []);
 
   const handleDelete = async (id: string) => {
-    if (!window.confirm('确认删除此价格项？')) return;
+    const confirmed = await confirm('确认删除此价格项？', {
+      title: '确认删除价格项',
+      intent: 'danger',
+      confirmText: '删除价格项',
+    });
+    if (!confirmed) return;
     try {
       const res = await apiFetch(`${API_BASE_URL}/api/v1/business/price-references/${id}`, {
         method: 'DELETE'
@@ -94,7 +101,7 @@ export function PriceBookCenter() {
 
   const handleSave = async () => {
     if (!formData.item_name || formData.unit_price <= 0) {
-      alert("请输入设备名称并设置有效的单价");
+      await alert('请输入设备名称并设置有效的单价', { title: '无法保存价格项', intent: 'warning' });
       return;
     }
     
@@ -117,11 +124,11 @@ export function PriceBookCenter() {
         handleModalClose();
         fetchItems();
       } else {
-        alert("保存失败");
+        await alert('保存失败', { title: '保存价格项失败', intent: 'danger' });
       }
     } catch (e) {
       console.error(e);
-      alert("保存失败");
+      await alert('保存失败', { title: '保存价格项失败', intent: 'danger' });
     }
   };
 

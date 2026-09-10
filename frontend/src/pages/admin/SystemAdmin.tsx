@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { apiFetch } from '../../utils/api';
 import { useAuth } from '../../contexts/AuthContext';
+import { useDialog } from '../../components/DialogProvider';
 
 interface Tenant {
   id: string;
@@ -44,6 +45,7 @@ interface User {
 
 export function SystemAdmin() {
   const { user } = useAuth();
+  const { alert, confirm } = useDialog();
   const isPlatformAdmin = user?.role === 'admin' || user?.role === 'platform_admin';
   const isTenantAdmin = user?.role === 'tenant_admin';
   const [activeTab, setActiveTab] = useState<'tenants' | 'users'>(isPlatformAdmin ? 'tenants' : 'users');
@@ -151,7 +153,7 @@ export function SystemAdmin() {
         setShowTenantModal(false);
         setNewTenantName('');
         fetchData();
-        alert('🎉 企业租户创建成功！');
+        await alert('🎉 企业租户创建成功！', { title: '租户创建成功', intent: 'success' });
       } else {
         const errorData = await res.json().catch(() => ({}));
         let errMsg = '未知错误';
@@ -162,10 +164,10 @@ export function SystemAdmin() {
         } else if (errorData.message) {
           errMsg = errorData.message;
         }
-        alert(`开通租户失败: ${errMsg}`);
+        await alert(`开通租户失败: ${errMsg}`, { title: '租户创建失败', intent: 'danger' });
       }
     } catch (err: any) {
-      alert(`网络或服务请求错误: ${err.message || err}`);
+      await alert(`网络或服务请求错误: ${err.message || err}`, { title: '租户创建失败', intent: 'danger' });
     }
   };
 
@@ -174,7 +176,7 @@ export function SystemAdmin() {
     try {
       const targetTenantId = isTenantAdmin ? (user?.tenant_id || '') : newUserTenantId;
       if (!targetTenantId) {
-        alert('请选择要分配的目标企业租户！');
+        await alert('请选择要分配的目标企业租户！', { title: '无法创建账号', intent: 'warning' });
         return;
       }
       const res = await apiFetch(`${baseUrl}/api/v1/admin/users`, {
@@ -195,7 +197,7 @@ export function SystemAdmin() {
         setNewUserTenantId(isTenantAdmin ? (user?.tenant_id || '') : '');
         setNewUserRole('user');
         fetchData();
-        alert('🎉 新账号分配成功！');
+        await alert('🎉 新账号分配成功！', { title: '账号创建成功', intent: 'success' });
       } else {
         const errorData = await res.json().catch(() => ({}));
         let errMsg = '未知错误';
@@ -206,10 +208,10 @@ export function SystemAdmin() {
         } else if (errorData.message) {
           errMsg = errorData.message;
         }
-        alert(`创建账号失败: ${errMsg}`);
+        await alert(`创建账号失败: ${errMsg}`, { title: '账号创建失败', intent: 'danger' });
       }
     } catch (err: any) {
-      alert(`网络或服务请求错误: ${err.message || err}`);
+      await alert(`网络或服务请求错误: ${err.message || err}`, { title: '账号创建失败', intent: 'danger' });
     }
   };
 
@@ -225,14 +227,14 @@ export function SystemAdmin() {
         setShowPasswordModal(false);
         setResetPasswordValue('');
         setSelectedUserId('');
-        alert('密码修改成功');
+        await alert('密码修改成功', { title: '密码修改成功', intent: 'success' });
       } else {
         const errorData = await res.json().catch(() => ({}));
         const errMsg = typeof errorData.detail === 'string' ? errorData.detail : (errorData.message || '未知错误');
-        alert(`修改密码失败: ${errMsg}`);
+        await alert(`修改密码失败: ${errMsg}`, { title: '密码修改失败', intent: 'danger' });
       }
     } catch (err: any) {
-      alert(`网络错误: ${err.message || err}`);
+      await alert(`网络错误: ${err.message || err}`, { title: '密码修改失败', intent: 'danger' });
     }
   };
 
@@ -254,21 +256,26 @@ export function SystemAdmin() {
         setResetUserRole(null);
         setSelectedUserId('');
         fetchData();
-        alert('租户变更成功');
+        await alert('租户变更成功', { title: '租户变更成功', intent: 'success' });
       } else {
         const errorData = await res.json().catch(() => ({}));
         const errMsg = typeof errorData.detail === 'string' ? errorData.detail : (errorData.message || '未知错误');
-        alert(`变更租户失败: ${errMsg}`);
+        await alert(`变更租户失败: ${errMsg}`, { title: '租户变更失败', intent: 'danger' });
       }
     } catch (err: any) {
-      alert(`网络错误: ${err.message || err}`);
+      await alert(`网络错误: ${err.message || err}`, { title: '租户变更失败', intent: 'danger' });
     }
   };
 
   const handleToggleStatus = async (targetUser: User) => {
     const nextStatus = !targetUser.is_active;
     const actionText = nextStatus ? '启用' : '停用';
-    if (!window.confirm(`确定要${actionText}账号 "${targetUser.email}" 吗？`)) {
+    const confirmed = await confirm(`确定要${actionText}账号 "${targetUser.email}" 吗？`, {
+      title: `${actionText}账号确认`,
+      intent: nextStatus ? 'info' : 'warning',
+      confirmText: actionText,
+    });
+    if (!confirmed) {
       return;
     }
     // 立即乐观更新本地状态
@@ -286,16 +293,21 @@ export function SystemAdmin() {
         // 回滚
         setUsers(prev => prev.map(u => u.id === targetUser.id ? { ...u, is_active: !nextStatus } : u));
         const data = await res.json().catch(() => ({}));
-        alert(`操作失败: ${data.detail || '未知错误'}`);
+        await alert(`操作失败: ${data.detail || '未知错误'}`, { title: '账号状态更新失败', intent: 'danger' });
       }
     } catch (err) {
       setUsers(prev => prev.map(u => u.id === targetUser.id ? { ...u, is_active: !nextStatus } : u));
-      alert('网络错误');
+      await alert('网络错误', { title: '账号状态更新失败', intent: 'danger' });
     }
   };
 
   const handleDeleteUser = async (targetUser: User) => {
-    if (!window.confirm(`⚠️ 警告：确定要彻底删除账号 "${targetUser.email}" 吗？此操作不可逆！`)) {
+    const confirmed = await confirm(`⚠️ 警告：确定要彻底删除账号 "${targetUser.email}" 吗？此操作不可逆！`, {
+      title: '确认彻底删除账号',
+      intent: 'danger',
+      confirmText: '彻底删除',
+    });
+    if (!confirmed) {
       return;
     }
     try {
@@ -306,19 +318,25 @@ export function SystemAdmin() {
         setUsers(prev => prev.filter(u => u.id !== targetUser.id));
       } else {
         const data = await res.json().catch(() => ({}));
-        alert(`删除失败: ${data.detail || '未知错误'}`);
+        await alert(`删除失败: ${data.detail || '未知错误'}`, { title: '账号删除失败', intent: 'danger' });
       }
     } catch (err) {
-      alert('网络错误');
+      await alert('网络错误', { title: '账号删除失败', intent: 'danger' });
     }
   };
 
   const handleToggleTenantStatus = async (targetTenant: Tenant) => {
     const nextStatus = !targetTenant.is_active;
+    const actionText = nextStatus ? '启用' : '停用';
     const warningText = nextStatus 
       ? `确定要启用租户 "${targetTenant.name}" 吗？`
       : `⚠️ 警告：确定要停用租户 "${targetTenant.name}" 吗？停用后该租户下的所有普通用户和管理员将无法登录系统！`;
-    if (!window.confirm(warningText)) {
+    const confirmed = await confirm(warningText, {
+      title: `${actionText}租户确认`,
+      intent: nextStatus ? 'info' : 'danger',
+      confirmText: actionText,
+    });
+    if (!confirmed) {
       return;
     }
     // 立即乐观更新本地状态，防止重新拉取时的分页顺序变动或丢失
@@ -336,11 +354,11 @@ export function SystemAdmin() {
         // 回滚
         setTenants(prev => prev.map(t => t.id === targetTenant.id ? { ...t, is_active: !nextStatus } : t));
         const data = await res.json().catch(() => ({}));
-        alert(`操作失败: ${data.detail || '未知错误'}`);
+        await alert(`操作失败: ${data.detail || '未知错误'}`, { title: '租户状态更新失败', intent: 'danger' });
       }
     } catch (err) {
       setTenants(prev => prev.map(t => t.id === targetTenant.id ? { ...t, is_active: !nextStatus } : t));
-      alert('网络错误');
+      await alert('网络错误', { title: '租户状态更新失败', intent: 'danger' });
     }
   };
 

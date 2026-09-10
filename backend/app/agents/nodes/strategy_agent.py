@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.db.crud.document import document_crud
 from app.services.rag_service import rag_service
+from app.services.analysis_result_service import persist_worker_analysis_result
 from app.core.audit_decorator import audit_node
 import logging
 
@@ -12,6 +13,49 @@ logger = logging.getLogger(__name__)
 
 @audit_node(name="StrategyAgent-AnalyzeQualifications")
 def analyze_qualifications_node(state: BiddingState) -> dict:
+    """执行履约盘点；专项失败时降级为部分成功并保留失败状态。"""
+
+    try:
+        return _analyze_qualifications_node(state)
+    except Exception as error:
+        document_id = state.get("document_id")
+        tenant_id = state.get("tenant_id") or "default-tenant"
+        logger.exception("履约盘点专项执行失败，将保留其他 Worker 结果并标记为失败")
+
+        # 失败状态也要落库，防止前端把“分析失败”误判为“未发现资质要求”。
+        persist_worker_analysis_result(
+            document_id=document_id,
+            tenant_id=tenant_id,
+            user_id=state.get("user_id"),
+            worker_name="strategy_qual",
+            status="failed",
+            error_type=_get_analysis_error_type(error),
+        )
+
+        from app.worker.tasks import emit_agent_log
+
+        emit_agent_log(
+            "error",
+            "履约盘点分析失败，其他专项结果已保留，可稍后单独重试。",
+            extra={
+                "type": "worker_complete",
+                "worker": "strategy_qual",
+                "status": "failed",
+                "summary": "履约盘点分析失败，可单独重试",
+                "document_id": document_id,
+            },
+        )
+        return {
+            "completed_steps": ["strategy_qual"],
+            "worker_summaries": [{
+                "worker": "strategy_qual",
+                "status": "failed",
+                "summary": "履约盘点分析失败，可单独重试",
+            }],
+        }
+
+
+def _analyze_qualifications_node(state: BiddingState) -> dict:
     """
     将招标文件文本和公司已有资质发给大模型，进行三级评估。
     自动查询资质中心 DB (CompanyQualification) 中的已上传证书并进行精确匹配。
@@ -20,7 +64,6 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
     company_quals = state.get("company_quals", "")
     tenant_id = state.get("tenant_id") or "default-tenant"
     document_id = state.get("document_id")
-    task_id = state.get("task_id")
 
     from app.worker.tasks import emit_agent_log
     from app.agents.tools.writer_tools import get_company_qualifications_tool
@@ -99,6 +142,15 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
     """
     
     res = llm_service.generate_structured_json(prompt, temperature=0.0, tenant_id=tenant_id)
+
+    # 资质结果在 Worker 成功后立即保存，避免后续风险或成本 Worker 失败导致结果丢失。
+    persist_worker_analysis_result(
+        document_id=document_id,
+        tenant_id=tenant_id,
+        user_id=state.get("user_id"),
+        worker_name="strategy_qual",
+        result_updates={"qualifications_analysis": res},
+    )
     
     summary = f"完成资质评估，得分 {res.get('match_score', 0)}"
     emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "strategy_qual", "status": "success", "summary": summary, "document_id": document_id})
@@ -113,8 +165,64 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
         }]
     }
 
+def _get_analysis_error_type(error: Exception) -> str:
+    """将底层异常归一为不暴露敏感信息的分析错误类型。"""
+
+    error_text = str(error).lower()
+    if "connection" in error_text:
+        return "llm_connection_error"
+    if "timeout" in error_text:
+        return "llm_timeout"
+    if "rate limit" in error_text or "429" in error_text:
+        return "llm_rate_limit"
+    return type(error).__name__
+
+
 @audit_node(name="StrategyAgent-IdentifyRisks")
 def identify_risks_node(state: BiddingState) -> dict:
+    """执行风险分析；风险专项失败时降级为部分成功并保留失败状态。"""
+
+    try:
+        return _identify_risks_node(state)
+    except Exception as error:
+        document_id = state.get("document_id")
+        tenant_id = state.get("tenant_id") or "default-tenant"
+        logger.exception("风险提示专项执行失败，将保留其他 Worker 结果并标记为失败")
+
+        # 失败状态也需要落库，前端才能区分“没有风险”和“尚未完成风险分析”。
+        persist_worker_analysis_result(
+            document_id=document_id,
+            tenant_id=tenant_id,
+            user_id=state.get("user_id"),
+            worker_name="strategy_risk",
+            status="failed",
+            error_type=_get_analysis_error_type(error),
+        )
+
+        from app.worker.tasks import emit_agent_log
+
+        emit_agent_log(
+            "error",
+            "风险提示分析失败，其他专项结果已保留，可稍后单独重试。",
+            extra={
+                "type": "worker_complete",
+                "worker": "strategy_risk",
+                "status": "failed",
+                "summary": "风险提示分析失败，可单独重试",
+                "document_id": document_id,
+            },
+        )
+        return {
+            "completed_steps": ["strategy_risk"],
+            "worker_summaries": [{
+                "worker": "strategy_risk",
+                "status": "failed",
+                "summary": "风险提示分析失败，可单独重试",
+            }],
+        }
+
+
+def _identify_risks_node(state: BiddingState) -> dict:
     """
     扫描文本中的法律、财务、商务风险项
     """
@@ -189,6 +297,15 @@ def identify_risks_node(state: BiddingState) -> dict:
         risks = response.get("risks", [])
     else:
         risks = []
+
+    # 风险结果在 Worker 成功后立即保存，避免其他并发 Worker 异常造成结果整体回滚。
+    persist_worker_analysis_result(
+        document_id=document_id,
+        tenant_id=tenant_id,
+        user_id=state.get("user_id"),
+        worker_name="strategy_risk",
+        result_updates={"risks_analysis": risks},
+    )
         
     summary = f"排查出 {len(risks)} 项风险"
     emit_agent_log("info", summary, extra={"type": "worker_complete", "worker": "strategy_risk", "status": "success", "summary": summary, "document_id": document_id})

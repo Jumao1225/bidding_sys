@@ -22,11 +22,19 @@ api_router.include_router(bid_scorer.router, prefix="/bid-scorer", tags=["标书
 api_router.add_api_route(
     "/download/{task_id}",
     analysis.download_original_file,
-    methods=["GET", "HEAD"],
+    methods=["GET"],
+    operation_id="download_original_file_global",
+    summary="按全局兼容路径下载原始文件",
     tags=["download"]
 )
-
-
+api_router.add_api_route(
+    "/download/{task_id}",
+    analysis.download_original_file,
+    methods=["HEAD"],
+    include_in_schema=False,
+    name="download_original_file_global_head",
+    tags=["download"],
+)
 
 
 

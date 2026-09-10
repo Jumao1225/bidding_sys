@@ -5,9 +5,6 @@ from app.agents.supervisor import master_agent_node
 from app.agents.nodes.strategy_agent import analyze_qualifications_node, identify_risks_node
 from app.agents.nodes.cost_agent import cost_node
 from app.agents.orchestrator import supervisor_node
-# [已迁移至方案C] 原 writer_agent_node 已被 BidFillerAgent 替代
-# from app.agents.nodes.writer_agent_node import writer_agent_node
-from app.agents.bid_filler_agent import bid_filler_orchestrator_node
 
 def route_after_parser(state: BiddingState) -> str:
     """如果解析节点失败，直接终止编排图，否则进入 Supervisor 调度"""

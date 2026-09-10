@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+from app.core.config import settings
 from app.services.bid_fill_task_service import BidFillTaskService, start_bid_fill_process
 
 
@@ -52,6 +53,41 @@ def test_acquire_capacity_reached_should_reject_another_document(monkeypatch) ->
     assert second_reservation is None
     assert second_status == "capacity_reached"
     assert "bid-fill:document:document-2" not in fake_redis.values
+
+
+def test_default_bid_fill_concurrency_should_allow_different_documents() -> None:
+    """默认配置应允许不同标书同时进入两个独立并发槽位。"""
+    fake_redis = FakeRedis()
+    service = BidFillTaskService(redis_factory=lambda: fake_redis)
+
+    first_reservation, first_status = service.acquire("document-1")
+    second_reservation, second_status = service.acquire("document-2")
+
+    assert settings.BID_FILL_MAX_CONCURRENCY >= 2
+    assert first_reservation is not None
+    assert first_status == "accepted"
+    assert second_reservation is not None
+    assert second_status == "accepted"
+
+
+def test_acquire_different_documents_with_two_slots_should_accept_both(monkeypatch) -> None:
+    """不同标书在有两个槽位时应分别获得任务锁。"""
+    fake_redis = FakeRedis()
+    service = BidFillTaskService(redis_factory=lambda: fake_redis)
+    monkeypatch.setattr(
+        "app.services.bid_fill_task_service.settings.BID_FILL_MAX_CONCURRENCY",
+        2,
+    )
+
+    first_reservation, first_status = service.acquire("document-1")
+    second_reservation, second_status = service.acquire("document-2")
+
+    assert first_reservation is not None
+    assert first_status == "accepted"
+    assert second_reservation is not None
+    assert second_status == "accepted"
+    assert fake_redis.values["bid-fill:capacity:0"] == first_reservation.token
+    assert fake_redis.values["bid-fill:capacity:1"] == second_reservation.token
 
 
 def test_release_valid_reservation_should_free_document_and_capacity_locks() -> None:

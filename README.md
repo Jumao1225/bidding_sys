@@ -1,98 +1,326 @@
-# 智能投标辅助系统 (AI Bidding Assistant)
+# 智能投标辅助系统
 
-这是一个利用 AI 技术深度解析招标文件并辅助撰写投标书的 Web 应用程序。不仅作为独立的效率工具，更是面向未来的完整“企业级多智能体协同 (Agentic Workflow) 平台”的核心引擎。
+智能投标辅助系统（AI Bidding Assistant）是一个面向招投标业务的全栈 Web 应用，负责解析招标文件、提取结构化要求、生成工程量/BOM 清单、辅助成本核算，并通过多智能体协作完成标书填报与审计。
 
-## 🌟 核心特性
+项目当前采用 React + Vite 前端、FastAPI 后端、PostgreSQL + pgvector 数据库、Redis 消息中间件，以及 LangGraph 多智能体工作流。
 
-- **Epic Design 极致视觉交互**：前端采用现代 SaaS 旗舰级视觉规范，全体系 Glassmorphism 毛玻璃质感、流体渐变环境与细腻微交互。
-- **流式异步解析引擎**：后端采用 Celery 作为分布式队列调度，结合 SSE (Server-Sent Events) 向前端实时反馈各阶段多智能体的思考进度。
-- **LangGraph 多智能体工作流**：将原本线性刻板的逻辑重塑为灵活的有向状态图，各专业 Agent（资质比对、风险扫描、成本核算）协同作战。
-- **高可用大模型底座**：技能库由统一轻量的 `@tool` 组成，核心调用嵌有 `Tenacity` 指数退避自动重试，无惧网络波动。
+## 功能概览
 
-## 🚀 核心架构与目录结构
+- **招标文件解析**：支持 PDF、DOCX 等文件的上传、解析、预览和原文下载；可接入 Docling、MinerU 及视觉模型处理复杂版式。
+- **结构化信息提取**：按工程清单、资格条件、评标办法、财务要求、工期要求等领域提取要求，并保留来源证据和上下文。
+- **工程量与 BOM 分析**：识别表格内分组、表格外分区、跨分页续表、父子层级和跨行合并单元格，支持数量、单位、规格及关键参数整理。
+- **成本核算与导出**：结合价格参考库生成成本分析；前端展示层级清单，并导出 DOCX 和 XLSX。导出时支持表格外分区、表格内分组及无分组模式。
+- **标书模板与自动填报**：上传并绑定外部 Word 模板，提取模板章节和填报槽位；Agent 执行可填字段，`needs_writing` 章节明确保留为人工撰写待办。
+- **多智能体协作**：基于 LangGraph 编排解析、资格、策略、成本、撰写和审计 Agent；当前由 FastAPI 内部线程/线程池执行长任务，通过 Redis Pub/Sub + SSE 实时反馈任务进度和 Agent 日志。
+- **审计与可观测性**：记录模型调用、工具调用、Token 消耗、章节填报结果和 Supervisor 终审结果，支持从前端查看审计报告。
+- **标书打分实验室**：支持评分文件上传、评审条目管理、分类评分、结果查询和 Ragas 评测。
+- **企业与业务数据管理**：提供登录认证、多租户隔离、企业档案、资质库、价格参考库和管理员模型配置页面。
+- **Word 工具链**：提供目录、修订、批注、隐私清洗等 DOCX 调试和处理能力；标书填报链路通过 OfficeCLI 查询 Word DOM 并执行受控写盘。
 
-本项目采用**高内聚、低耦合**的模块化设计，完美融合了**领域驱动设计 (DDD)** 思想。最新代码结构如下：
+## 业务流程
+
+```text
+上传招标文件
+    ↓
+文档解析与原文证据保留
+    ↓
+领域 Agent 提取：工程量 / 资格 / 评标 / 财务 / 工期
+    ↓
+成本核算、BOM 层级整理与前端审阅
+    ↓
+绑定 Word 模板并提取填报章节
+    ↓
+章节 Agent 填报 → Supervisor 审计
+    ↓
+人工补写待办确认 → 下载 DOCX / XLSX / 审计结果
+```
+
+## 系统架构
 
 ```text
 bidding_sys/
-├── docker-compose.yml         # 编排前后端、PostgreSQL 与 Redis
+├── docker-compose.yml             # PostgreSQL(pgvector) 与 Redis（SSE 消息）
+├── .env.example                   # 环境变量模板
 ├── README.md
-├── docs/                      # 核心设计文档库 (Architecture, Database, Changelog)
-│
-├── frontend/                  # React + Vite 前端 (Epic TailwindCSS 设计)
-│   ├── package.json
-│   └── src/
-│       ├── main.tsx           
-│       ├── App.tsx            # 全局工作台视图 (Cinematic Banner, 悬浮浮窗)
-│       ├── index.css          # 全局样式 (Inter 字体, 极光渐变背景, 微动画)
-│       ├── components/        # 核心交互组件 (SSE 流式上传、成本面板、AI 对话)
-│       └── layouts/           # 页面布局 (暗色玻璃态侧边栏)
-│
-└── backend/                   # Python FastAPI 后端 (DDD 架构)
-    ├── tests/                 # 测试隔离层
-    │   ├── conftest.py
-    │   ├── unit/              # Agent 节点单元测试
-    │   ├── integration/       # 数据库聚合测试
-    │   ├── api/               # 纯异步接口 HTTPX 测试
-    │   └── fixtures/          # 解耦的假数据源 (Mock JSON)
-    │
-    └── app/                   # 核心业务
-        ├── main.py            # FastAPI 启动入口
-        ├── core/              # 核心配置 (Config, Security, Celery 初始化)
-        ├── db/                # 数据访问层 (Models, Session, CRUD)
-        ├── schemas/           # 数据校验层 (Pydantic DTOs)
-        ├── api/               # 接入层 (路由控制与 SSE 接口)
-        ├── worker/            # 异步任务层 (Celery Tasks)
-        ├── graph/             # [★ 核心] LangGraph 状态图的组装与编译
-        ├── agents/            # [★ 核心] 多智能体
-        │   ├── state.py       # 全局 TypedDict (BiddingState)
-        │   └── nodes/         # 拆解后的具体执行域 (strategy_agent, cost_agent 等)
-        └── skills/            # [★ 核心] 沉淀的专用技能库 (@tool 插件)
+├── docs/                          # 设计文档、需求文档与变更日志
+│   └── changelog/YYYY-MM-DD.md
+├── models/                        # 本地 Embedding 模型目录
+├── output/                        # 生成的导出文件
+├── uploads/                       # 根目录兼容/辅助文件目录
+├── backend/
+│   ├── uploads/                   # 当前后端主流程的上传、模板和草稿目录
+│   ├── outputs/                   # 后端生成的上下文日志等输出目录
+│   ├── app/
+│   │   ├── main.py                # FastAPI 入口与 /health
+│   │   ├── api/                   # 路由层及 SSE 接口
+│   │   ├── agents/                # 多智能体、节点、工具与审计流程
+│   │   ├── graph/                 # LangGraph 构建与执行
+│   │   ├── mcp/                   # OfficeCLI MCP Server/Client 封装
+│   │   ├── middleware/            # FastAPI 中间件
+│   │   ├── core/                  # 配置、日志、安全与沙箱
+│   │   ├── db/                    # SQLAlchemy 模型、会话与数据访问
+│   │   ├── schemas/               # Pydantic 请求/响应模型
+│   │   ├── services/              # 解析、提取、成本、填报、导出等业务服务
+│   │   ├── utils/                 # 通用业务辅助工具
+│   │   ├── uploads/               # 应用包内的兼容目录
+│   │   ├── worker/tasks.py        # 分析任务、进度发布与 Agent 日志工具
+│   │   └── skills/                # 可复用的领域技能
+│   ├── alembic/                   # 数据库迁移
+│   ├── requirements.txt
+│   └── tests/
+│       ├── unit/                  # 单元测试
+│       ├── integration/           # 集成测试
+│       ├── api/                   # 异步 API 测试
+│       └── fixtures/              # 测试数据
+└── frontend/
+    ├── src/
+    │   ├── assets/                # 静态资源
+    │   ├── pages/                 # 首页、分析、成本、填报审计、打分等页面
+    │   ├── components/            # 上传、成本表、模板面板、Agent 终端等组件
+    │   ├── contexts/              # 登录与全局状态上下文
+    │   ├── layouts/               # 主布局
+    │   ├── api/                   # 前端 API 封装
+    │   └── utils/                 # 导出、文本归一化、错误处理等工具
+    └── package.json
 ```
 
-## 🛠️ 开发与运行指南
+## 本地启动
 
-### 1. 启动后端 (Python FastAPI)
-本环境依赖 `fastapi` 的 conda 环境，且需要预先配置好 Redis（用于 Celery 和 SSE 通信）。
+### 运行前提
 
-```bash
+- Conda，并创建可用的 `fastapi` 环境。
+- Docker Desktop，用于启动 PostgreSQL 和 Redis。
+- Node.js 与 npm，用于启动前端。
+- 可访问的 OpenAI 兼容大模型服务；复杂文档场景可额外配置 MinerU、VLM。
+
+项目后端命令约定在 `fastapi` conda 环境中执行：
+
+```powershell
 conda activate fastapi
-cd backend
+```
+
+### 1. 配置环境变量
+
+```powershell
+Copy-Item .env.example .env
+```
+
+复制模板后仍需检查并填写数据库配置。使用本地 Docker 时，`.env.example` 中的默认地址与 `docker-compose.yml` 的 PostgreSQL 服务一致；使用外部 PostgreSQL 时，必须提前创建数据库和账号并替换 `DATABASE_URL`。项目不支持退化到 SQLite。
+
+至少检查并填写以下配置：
+
+| 变量 | 作用 |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL 连接地址，必须使用 `postgresql://` |
+| `REDIS_URL` | SSE 和后台任务进度消息地址 |
+| `OPENAI_API_KEY` | OpenAI 兼容模型密钥 |
+| `OPENAI_API_BASE` | 模型服务地址，例如 `https://api.openai.com/v1` |
+| `LLM_MODEL_NAME` | 默认文本模型名称 |
+| `ALI_VLM_API_KEY` / `LOCAL_VLM_API_KEY` | 可选，视觉模型密钥 |
+| `MINERU_API_TOKEN` | 可选，MinerU 在线解析服务令牌 |
+
+使用 DeepSeek 结构化提取时，可通过 `DEEPSEEK_MAX_OUTPUT_TOKENS` 和 `DEEPSEEK_THINKING_ENABLED` 调整输出上限及思考模式。`SKIP_BID_FILLER=true` 仅适合调试时跳过长流程，生产环境应保持为 `false`。
+
+### 2. 启动基础设施
+
+```powershell
+docker compose up -d postgres redis
+```
+
+确认服务健康后，在后端目录安装依赖并执行迁移：
+
+```powershell
+conda activate fastapi
+Set-Location backend
 pip install -r requirements.txt
-# 启动 Celery Worker
-celery -A app.core.celery_app worker --loglevel=info -P solo
-# 启动 API 服务器
-uvicorn app.main:app --reload
-```
-
-### 2. 数据库迁移与表结构管理 (Alembic)
-系统采用 PostgreSQL 并通过 Alembic 进行结构追踪。当您修改了 `app/db/models/` 下的 Python 模型后，只需执行标准的“三步走”工作流即可同步数据库：
-
-```bash
-cd backend
-# 1. 对比模型变更，自动生成带有描述的迁移脚本
-python -m alembic revision --autogenerate -m "描述您的更改，例如 add_age_to_user"
-# 2. 将迁移脚本中的 SQL 真正应用到 PostgreSQL
 python -m alembic upgrade head
-
-# 附加：如果刚才升级错了想要撤销回退一个版本，可执行：
-python -m alembic downgrade -1
 ```
 
-### 3. 执行自动化测试 (100% 覆盖核心流)
-系统集成了异步支持与数据解耦的单元测试：
-```bash
-cd backend
-python -m pytest tests
+### 3. 启动 FastAPI
+
+在一个终端中执行：
+
+```powershell
+conda activate fastapi
+Set-Location backend
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 3. 启动前端 (React Vite)
-```bash
-cd frontend
+后端地址：
+
+- 健康检查：<http://127.0.0.1:8000/health>
+- Swagger：<http://127.0.0.1:8000/docs>
+- OpenAPI JSON：<http://127.0.0.1:8000/openapi.json>
+
+当前分析和标书填报流程由 FastAPI 进程内部的后台线程或线程池执行，不需要单独启动 Celery Worker。`backend/app/core/celery_app.py` 仍保留为 Celery 配置模块，但不是当前本地运行的必需进程。
+
+Redis 仍然需要启动，因为分析进度、Agent 日志和 SSE 订阅依赖 Redis Pub/Sub。
+
+### 4. 启动前端
+
+```powershell
+Set-Location frontend
 npm install
 npm run dev
 ```
 
-## 📈 演进路线
-- 2026-07-09: **Epic Design 与工作流重构**（前后端彻底拥抱流式 SSE 与 LangGraph 智能体网络）。
-- 后续规划: 引入真实数据库持久化、接入 RAG 向量检索与 `pgvector` 以强化 Chat 问答能力。
+默认访问地址：<http://127.0.0.1:5173>。前端通过 `VITE_API_BASE_URL` 指定后端地址；未配置时会自动使用当前主机的 `8000` 端口。
+
+### 5. 服务器部署启动（Linux）
+
+服务器上使用项目自带的 Python 虚拟环境 `.venv312` 启动后端，不使用 Conda。以下命令假设项目位于 `~/opt/bidding_sys`，后端和前端分别在两个终端中启动。
+
+先确认 PostgreSQL、Redis 和 OfficeCLI 已按前文完成配置，并确认服务器防火墙或安全组已按需开放 `8000`、`5173` 端口。
+
+后端终端：
+
+```bash
+cd ~/opt/bidding_sys/backend/
+source ../.venv312/bin/activate
+PYTHONPATH=. uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+前端终端：
+
+```bash
+cd ~/opt/bidding_sys/frontend/
+npm run dev
+```
+
+如果服务器尚未安装前端依赖，首次启动前先在 `frontend` 目录执行 `npm install`。启动后，浏览器访问 `http://服务器IP:5173`；后端健康检查地址为 `http://服务器IP:8000/health`。前端 Vite 已配置为监听 `0.0.0.0`，并通过 `VITE_API_BASE_URL` 或当前访问主机的 `8000` 端口连接后端。
+
+## OfficeCLI 文档处理链路
+
+OfficeCLI 是项目标书填报流程使用的外部 Office 文档操作引擎。后端由 `OfficeCLIService` 调用本机 `officecli` 可执行文件；Supervisor 通过 `backend/app/mcp/office_cli_client.py` 调用 MCP 封装，章节 Worker 则使用 `backend/app/agents/tools/office_cli_agent_tools.py` 的 Agent 工具。两条路径最终共享 `backend/app/services/office_cli_service.py` 的底层实现。
+
+### 主要用途
+
+- 查询 Word 文档的段落、表格和完整 DOM 结构，定位 `/body/p[N]`、`/body/tbl[N]` 等物理路径。
+- 按 JSON 指令批量原位替换段落或单元格内容，减少多次写盘造成的格式风险。
+- 追加表格行、批量填充表格二维数据，并保护表头、处理模板空白行和序号列。
+- 将键值数据合并到 Word 模板中的 `{{占位符}}`，生成新的 DOCX 文件。
+- 在资质章节的指定节点插入证书图片；写入前校验原文锚点，避免图片错插。
+- 当 OfficeCLI 写盘遇到节点路径或文件占用问题时，自动清理残留进程、重试，并对部分文本提案回退到 `python-docx` DOM 写盘。
+
+### Agent 工具
+
+标书填报 Agent 可使用以下 OfficeCLI 工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| `officecli_query_structure` | 查询 DOCX 段落、表格或全部 DOM 结构 |
+| `officecli_write_slot_value` | 原位写入单个文本槽位 |
+| `officecli_batch_write_slots` | 批量写入多个文本槽位 |
+| `officecli_batch_fill_sentence` | 批量替换长句或段落 |
+| `officecli_fill_table_rows` | 覆写/追加表格数据行并清理多余空行 |
+| `officecli_add_table_row` | 追加一行并按表格格式填充单元格 |
+| `officecli_insert_image` | 在指定 Word 节点插入资质证明图片 |
+
+### 安装与检查
+
+OfficeCLI 不由 `requirements.txt` 或 `npm install` 安装，需要在运行后端的主机上单独安装。**本项目硬性要求只能使用 OfficeCLI `1.0.145`，其他版本不得接入。** Linux 和 Windows 都应直接下载官方 `v1.0.145` 发布二进制，不要使用会追踪最新版本的安装器。
+
+```bash
+mkdir -p "$HOME/.local/bin"
+curl -fL https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.145/officecli-linux-x64 -o "$HOME/.local/bin/officecli"
+chmod +x "$HOME/.local/bin/officecli"
+export PATH="$HOME/.local/bin:$PATH"
+test "$(officecli --version)" = "1.0.145" || { echo "OfficeCLI 版本必须为 1.0.145" >&2; exit 1; }
+```
+
+Windows x64 使用 PowerShell 下载 `https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.145/officecli-win-x64.exe` 到 `%LOCALAPPDATA%\OfficeCLI\officecli.exe`，Windows ARM64 使用 `officecli-win-arm64.exe`；Linux ARM64 使用 `officecli-linux-arm64`。下载地址中的 `v1.0.145` 是版本锁定的一部分，不得替换成 `latest` 或其他版本。
+
+安装完成后必须通过 `officecli --version` 做等值校验。仓库没有通过依赖文件管理 OfficeCLI，因此不得使用未锁版本的 npm、Homebrew 或最新版本安装脚本替代上述二进制安装方式。安装渠道必须保持单一。
+
+注意：`backend/app/skills/officecli/fix-officecli-env.sh` 在发现已有 `officecli` 且未设置 `OFFICECLI_REFRESH_BINARY=1` 时会复用现有二进制；但在缺少二进制或启用刷新时会调用未锁版本的安装脚本，不能保证安装出 `1.0.145`。因此它不能作为本项目的严格版本安装器。当前 skill 的部分检查命令与 1.0.145 的 CLI 命令面存在差异，最终验收以 `officecli --version` 等值校验和 OfficeCLI DOCX 回归为准。
+
+项目会按以下顺序查找：PATH 中的 `officecli`，以及 Windows 的 `%LOCALAPPDATA%\\OfficeCLI\\officecli.exe`。该查找逻辑位于 `backend/app/services/office_cli_service.py`。
+
+```powershell
+Get-Command officecli
+officecli --version
+officecli --help
+```
+
+如果命令不可用，请参考项目内的 [OfficeCLI Skill](backend/app/skills/officecli/README.md) 和检查脚本。当前 1.0.145 不支持 `whoami`、`doctor` 和 `config runtime`，不要将这些旧命令作为本项目的必检项；也不得通过升级到其他版本来绕过 `1.0.145` 版本锁定。
+
+### 运行方式
+
+正常启动 FastAPI 后，标书填报 Agent 会在同一后端进程内调用 OfficeCLI，不需要手动启动 MCP Server。若需要为外部 MCP 客户端提供 stdio 服务，可在 `backend` 目录执行：
+
+```powershell
+conda activate fastapi
+python -m app.mcp.office_cli_server
+```
+
+OfficeCLI 相关底层命令包括 `create`、`query`、`batch`、`close` 和 `merge`；具体参数以本机 `officecli --help` 为准。
+
+## 主要 API 分组
+
+所有业务 API 默认挂载在 `/api/v1` 下，完整参数和响应格式以 Swagger 为准。
+
+| 分组 | 前缀 | 用途 |
+| --- | --- | --- |
+| 分析 | `/api/v1/analysis` | 文件上传、领域提取、成本分析、BOM DOCX/XLSX 导出 |
+| 文档 | `/api/v1/documents` | 文档列表、原文下载、结果查询和删除 |
+| 实时任务 | `/api/v1/sse` | 订阅后台任务进度和 Agent 日志 |
+| 标书填报 | `/api/v1/bidding` | 模板上传、模板绑定、章节提取、自动/人工填报和审计 |
+| 标书打分 | `/api/v1/bid-scorer` | 评分文件、评分结果和 Ragas 评测 |
+| 企业与资质 | `/api/v1/company`、`/api/v1/qualifications` | 企业档案和资质库管理 |
+| 业务数据 | `/api/v1/business` | 价格参考库管理 |
+| 认证与管理 | `/api/v1/auth`、`/api/v1/admin` | 登录、租户、用户和模型配置 |
+| 文档工具 | `/api/v1/docx`、`/api/v1/mineru` | DOCX 调试及 MinerU 解析能力 |
+
+统一响应通常包含 `code`、`message` 和 `data` 字段；前端请求封装会自动带上 `bidding_token` Bearer Token。
+
+## 测试与质量检查
+
+后端：
+
+```powershell
+conda activate fastapi
+Set-Location backend
+python -m pytest tests
+```
+
+按目录运行专项测试：
+
+```powershell
+python -m pytest tests/unit
+python -m pytest tests/api
+python -m pytest tests/integration
+```
+
+前端：
+
+```powershell
+Set-Location frontend
+npx vitest run
+npm run lint
+npm run build
+```
+
+前端测试位于 `frontend/tests/`，后端测试严格按 `unit/`、`integration/`、`api/` 和 `fixtures/` 分层。OfficeCLI 相关回归测试可单独运行：
+
+```powershell
+conda activate fastapi
+Set-Location backend
+python -m pytest tests/unit/test_office_cli_mcp.py tests/unit/test_bid_filler_worker.py
+```
+
+涉及文档解析、LLM 或导出逻辑时，建议同时运行对应专项测试和 `git diff --check`。
+
+## 本地模型与文件目录
+
+`backend/app/services/llm_service.py` 会查找项目根目录下的 `models/bge-m3` 作为本地 Embedding 模型。模型不存在时，系统会记录提示；如需下载，可按项目根目录 `download_model.py` 的逻辑准备模型文件。
+
+当前后端主流程的上传和生成文件主要写入 `backend/uploads/` 及其子目录，包括 `tenders/`、`bids/`、`templates/`、`qualifications/`、`drafts/`、`temp_mineru/`、`mineru_output/`、`docx_output/` 和 `docling_output/`；后端 Agent 上下文日志及辅助输出主要写入 `backend/outputs/`，其中包括 `human_fill_results/` 和 `scratch/`。仓库中的根目录 `uploads/`、`output/` 仍作为兼容或辅助目录存在，但不是当前后端主流程的默认落盘位置。部署时应为实际使用的目录配置持久化存储和访问权限。不要将真实 API Key、投标文件或企业数据提交到版本库。
+
+## 相关文档
+
+- [需求文档](docs/README_REQUIREMENT.md)
+- [Agent 记忆与演化设计](docs/AGENT_MEMORY_AND_EVOLUTION_DESIGN.md)
+- [Agent 升级计划](docs/AGENT_UPGRADE_PLAN.md)
+- [变更日志](docs/changelog/)
+
+每次代码、配置、Prompt、测试或文档改动，都应在 `docs/changelog/YYYY-MM-DD.md` 追加可追踪记录。

@@ -1,6 +1,7 @@
 from langchain_core.tools import tool
 import json
 import re
+from html import unescape
 from typing import Any, Callable, Optional, Sequence
 
 from loguru import logger
@@ -25,20 +26,120 @@ FINANCIAL_FALLBACK_KEYWORDS = ("预算", "限价", "控制价")
 FINANCIAL_CORE_MATCH_LIMIT = 4
 
 
+def _normalize_table_cell(value: str) -> str:
+    """清理表格单元格标签和空白，便于执行通用结构判断。"""
+    text = unescape(re.sub(r"<[^>]+>", " ", value or ""))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_table_rows(table_content: str) -> list[list[str]]:
+    """从单个 HTML 或 Markdown 表格中提取逻辑行，不解释具体表头含义。"""
+    html_rows = re.findall(
+        r"<tr[\s\S]*?</tr>",
+        table_content,
+        flags=re.IGNORECASE,
+    )
+    if html_rows:
+        return [
+            [
+                _normalize_table_cell(cell)
+                for cell in re.findall(
+                    r"<t[dh][^>]*>[\s\S]*?</t[dh]>",
+                    row,
+                    flags=re.IGNORECASE,
+                )
+            ]
+            for row in html_rows
+        ]
+
+    lines = [line.strip() for line in table_content.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return []
+    return [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in [lines[0], *lines[2:]]
+    ]
+
+
+def _is_numeric_table_cell(value: str) -> bool:
+    """判断单元格是否为独立数值，不绑定货币、计量单位或业务字段。"""
+    return bool(
+        re.fullmatch(
+            r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?",
+            value.strip(),
+        )
+    )
+
+
+def _score_engineering_table_shape(table_content: str) -> int:
+    """依据表格几何和数据分布筛选候选，不依赖固定表头或语义相似度。"""
+    html_tables = re.findall(
+        r"<table[\s\S]*?</table>",
+        table_content,
+        flags=re.IGNORECASE,
+    )
+    markdown_tables = re.findall(
+        r"(?:(?:^|\n)\|[^\n]+\|\n\|[-:\s|]+\|\n(?:\|[^\n]+\|\n?)+)",
+        table_content,
+        flags=re.MULTILINE,
+    )
+    candidate_tables = html_tables or markdown_tables or [table_content]
+
+    best_score = 0
+    for table in candidate_tables:
+        rows = _extract_table_rows(table)
+        if len(rows) < 2:
+            continue
+
+        data_rows = rows[1:]
+        column_count = max((len(row) for row in data_rows), default=0)
+        if column_count < 3:
+            continue
+
+        numeric_columns: set[int] = set()
+        short_text_columns: dict[int, list[str]] = {}
+        has_long_text = False
+        for row in data_rows:
+            for column_index, cell in enumerate(row):
+                if not cell:
+                    continue
+                if _is_numeric_table_cell(cell):
+                    if column_index > 0:
+                        numeric_columns.add(column_index)
+                    continue
+                if len(cell) > 12:
+                    has_long_text = True
+                elif len(cell) <= 12:
+                    short_text_columns.setdefault(column_index, []).append(cell)
+
+        has_repeated_short_values = any(
+            len(values) > len(set(values))
+            for values in short_text_columns.values()
+        )
+        if not numeric_columns or not (has_long_text or has_repeated_short_values):
+            continue
+
+        score = len(numeric_columns)
+        if has_long_text:
+            score += 2
+        if has_repeated_short_values:
+            score += 2
+        best_score = max(best_score, score)
+
+    return best_score
+
+
 def _discover_table_chapter_titles(
     document_id: str,
     search_keywords: str,
     tenant_id: Optional[str],
 ) -> list[str]:
-    """从当前文档的表格分块中发现相关章节，不依赖固定章节名称。"""
+    """从当前文档中筛选具有工程清单形状的表格章节，不依赖固定表头或业务关键词。"""
     from app.db.models.project import DocChunk
     from app.db.session import SessionLocal
 
-    query_tokens = [
-        token
-        for token in re.split(r"[\s,，、;；|]+", search_keywords or "")
-        if len(token.strip()) >= 2
-    ]
+    # 保留 search_keywords 参数以兼容既有工具调用，但章节发现不再使用它做硬筛选。
+    del search_keywords
     db = SessionLocal()
     try:
         query = db.query(DocChunk).filter(
@@ -50,7 +151,7 @@ def _discover_table_chapter_titles(
         if tenant_id:
             query = query.filter(DocChunk.tenant_id == tenant_id)
 
-        section_scores: dict[str, tuple[int, int]] = {}
+        table_section_scores: dict[str, int] = {}
         for chunk in query.order_by(DocChunk.chunk_index).all():
             content = str(chunk.content or "")
             has_html_table = bool(re.search(r"<table[\s\S]*?</table>", content, re.IGNORECASE))
@@ -63,50 +164,83 @@ def _discover_table_chapter_titles(
             section_title = str(chunk.section_title or "").strip()
             if not section_title:
                 continue
-            keyword_score = sum(content.count(token) for token in query_tokens)
-            table_score, previous_keyword_score = section_scores.get(section_title, (0, 0))
-            section_scores[section_title] = (
-                table_score + 1,
-                previous_keyword_score + keyword_score,
+            shape_score = _score_engineering_table_shape(content)
+            if shape_score <= 0:
+                continue
+            table_section_scores[section_title] = max(
+                table_section_scores.get(section_title, 0),
+                shape_score,
             )
 
-        if not section_scores:
-            logger.info("未发现包含结构化表格的章节，继续使用 RAG 召回上下文：文档ID={}", document_id)
+        if not table_section_scores:
+            logger.info(
+                "未发现符合通用工程清单形状的结构化表格，继续使用 RAG 召回上下文：文档ID={}",
+                document_id,
+            )
             return []
 
-        # 优先选择同时命中查询词的表格章节；没有关键词命中时再保留所有表格章节。
-        relevant_sections = [
-            section
-            for section, (_, keyword_score) in section_scores.items()
-            if keyword_score > 0
-        ]
-        if relevant_sections:
-            # 只保留与最高相关章节接近的候选，避免“设备、规格、数量”等通用词把投标格式/合同表格带入工程上下文。
-            highest_keyword_score = max(section_scores[section][1] for section in relevant_sections)
-            minimum_keyword_score = max(1, highest_keyword_score * 0.75)
-            selected_sections = [
-                section
-                for section in relevant_sections
-                if section_scores[section][1] >= minimum_keyword_score
-            ]
-        else:
-            selected_sections = list(section_scores)
-        selected_sections.sort(
-            key=lambda section: (
-                section_scores[section][1],
-                section_scores[section][0],
-            ),
-            reverse=True,
-        )
+        # 仅将通用数据形状符合候选条件的章节交给模型，陌生表头不会因词表缺失而被排除。
+        selected_sections = list(table_section_scores)
         logger.info(
-            "从文档表格分块发现工程清单候选章节：文档ID={}，章节={}",
+            "从文档表格分块发现工程清单候选章节：文档ID={}，章节={}，形状评分={}",
             document_id,
             selected_sections,
+            {section: table_section_scores[section] for section in selected_sections},
         )
         return selected_sections
     except SQLAlchemyError:
         logger.exception("发现工程清单候选章节失败，继续使用 RAG 召回上下文：文档ID={}", document_id)
         return []
+    finally:
+        db.close()
+
+
+def _load_engineering_table_context(
+    document_id: str,
+    section_title: Optional[str | list[str]],
+    tenant_id: Optional[str],
+) -> str:
+    """直接读取候选工程表格分块，避免工程清单依赖向量相似度召回。"""
+    from app.db.models.project import DocChunk
+    from app.db.session import SessionLocal
+
+    section_titles = (
+        [section_title]
+        if isinstance(section_title, str)
+        else [str(item).strip() for item in (section_title or []) if str(item).strip()]
+    )
+    db = SessionLocal()
+    try:
+        query = db.query(DocChunk).filter(
+            DocChunk.document_id == document_id,
+            DocChunk.chunk_index > 0,
+            or_(DocChunk.content_type.is_(None), DocChunk.content_type != "toc_block"),
+        )
+        if tenant_id:
+            query = query.filter(DocChunk.tenant_id == tenant_id)
+        if section_titles:
+            query = query.filter(DocChunk.section_title.in_(section_titles))
+
+        table_contexts: list[str] = []
+        for chunk in query.order_by(DocChunk.chunk_index).all():
+            content = str(chunk.content or "")
+            if _score_engineering_table_shape(content) <= 0:
+                continue
+            source_section = str(chunk.section_title or "").strip() or "未标注章节"
+            table_contexts.append(f"【来源章节：{source_section}】\n{content}")
+
+        context = "\n\n".join(table_contexts)
+        logger.info(
+            "工程清单直接读取候选表格分块：文档ID={}，章节={}，表格块数={}，上下文字符数={}",
+            document_id,
+            section_titles or "全部候选章节",
+            len(table_contexts),
+            len(context),
+        )
+        return context
+    except SQLAlchemyError:
+        logger.exception("直接读取工程清单表格分块失败，将回退 RAG：文档ID={}", document_id)
+        return ""
     finally:
         db.close()
 
@@ -188,6 +322,8 @@ def _extract_and_format(
     context_mode: str = "window",
     context_enricher: Optional[Callable[[str, Optional[str]], str]] = None,
     prefer_full_chapter: bool = False,
+    bypass_routing_for_table_chapters: bool = False,
+    direct_table_context: bool = False,
 ) -> str:
     """内部通用辅助方法：执行 RAG、补齐必要章节上下文并提取元数据。"""
     try:
@@ -200,8 +336,12 @@ def _extract_and_format(
         if not validate_document_access(document_id):
             return f"拒绝访问：您无权提取文档 {document_id} 的信息。"
 
+        has_explicit_section = bool(section_title)
+
         # 兜底补全逻辑：如果未传入限定章节，调用路由引擎进行动态意图识别
-        if not section_title:
+        if not section_title and not (
+            prefer_full_chapter and bypass_routing_for_table_chapters
+        ):
             emit_agent_log("info", "检测到未传入章节限定，正在启动 Routing 智能决策引擎...")
             decision = routing_service.analyze_intent_and_route(
                 document_id,
@@ -214,6 +354,12 @@ def _extract_and_format(
             elif decision.target_chapters:
                 section_title = decision.target_chapters
                 emit_agent_log("info", f"Routing 引擎决策为【局部锁定】，目标章节: {section_title}")
+
+        if not section_title and prefer_full_chapter and bypass_routing_for_table_chapters:
+            emit_agent_log(
+                "info",
+                "工程清单未指定章节，跳过通用 Routing，改由结构化表格章节发现决定检索范围。",
+            )
 
         # 工程清单属于多表格结构化数据，即使路由判定为全局搜索，也不能只把少量向量命中片段交给模型。
         # 这里从当前文档自身的表格分块发现候选章节，章节名称完全来自数据库原文。
@@ -230,29 +376,56 @@ def _extract_and_format(
                     f"工程清单路由未锁定章节，已根据文档表格结构补充候选章节: {discovered_chapters}",
                 )
                 
-        log_msg = f"调用工具: 正在使用 '{search_keywords}' (模式: {context_mode}) 执行 RAG 检索..."
-        if section_title:
-            log_msg = f"调用工具: 正在限定章节 {section_title} 中使用 '{search_keywords}' (模式: {context_mode}) 执行 RAG 检索..."
-        emit_agent_log("tool_call", log_msg)
-
-        # 1. 精细化 RAG 检索 (使用分词多路召回与指定的 context_mode)
-        # top_k 设为 5，平衡上下文大小与检索召回率
-        context = rag_service.search_bidding_document(
-            document_id=document_id,
-            query=search_keywords,
-            section_title=section_title,
-            top_k=5,
-            context_mode=context_mode,
-            query_mode="split"
+        context = ""
+        should_use_direct_table_context = (
+            direct_table_context
+            and prefer_full_chapter
+            and bypass_routing_for_table_chapters
+            and not has_explicit_section
         )
+        context = ""
+        if should_use_direct_table_context:
+            context = _load_engineering_table_context(
+                document_id=document_id,
+                section_title=section_title,
+                tenant_id=tenant_id,
+            )
+            if context:
+                emit_agent_log(
+                    "info",
+                    "工程清单已使用数据库直接读取的候选表格上下文，跳过向量相似度检索。",
+                )
+
+        if not context:
+            log_msg = f"调用工具: 正在使用 '{search_keywords}' (模式: {context_mode}) 执行 RAG 检索..."
+            if section_title:
+                log_msg = f"调用工具: 正在限定章节 {section_title} 中使用 '{search_keywords}' (模式: {context_mode}) 执行 RAG 检索..."
+            emit_agent_log("tool_call", log_msg)
+
+            # 普通提取或直接表格读取无结果时，保留现有 RAG 作为安全兜底。
+            context = rag_service.search_bidding_document(
+                document_id=document_id,
+                query=search_keywords,
+                section_title=section_title,
+                top_k=5,
+                context_mode=context_mode,
+                query_mode="split"
+            )
 
         # 工程清单直接使用 RAG 的 chapter 模式结果：向量命中任意分块后，
         # 由 RAG 按数据库中的 section_title 收集该章节的全部原文分块。
         # 不能在这里再次调用基于模糊标题的整章查询，否则会把“响应表”等
         # 标题包含相同关键词的模板分块误当成目标章节，覆盖正确的向量召回结果。
-        if prefer_full_chapter and context_mode == "chapter":
+        if should_use_direct_table_context and context:
             logger.info(
-                "工程清单使用数据库 section_title 章节召回结果：文档ID={}，章节限定={}，上下文字符数={}。",
+                "工程清单使用数据库直接表格上下文：文档ID={}，章节限定={}，上下文字符数={}。",
+                document_id,
+                section_title,
+                len(context),
+            )
+        elif prefer_full_chapter and context_mode == "chapter":
+            logger.info(
+                "工程清单使用 RAG 章节召回结果：文档ID={}，章节限定={}，上下文字符数={}。",
                 document_id,
                 section_title,
                 len(context or ""),
@@ -364,6 +537,8 @@ def extract_engineering_info(document_id: str, search_keywords: str = "主要设
         section_title,
         context_mode="chapter",
         prefer_full_chapter=True,
+        bypass_routing_for_table_chapters=True,
+        direct_table_context=True,
     )
 
 @tool

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import { apiFetch } from '../utils/api';
+import { useDialog } from '../components/DialogProvider';
 import { UploadBox } from '../components/UploadBox';
 import { CostTable } from '../components/CostTable';
 import { TimelineCard } from '../components/dashboard/TimelineCard';
@@ -10,8 +11,13 @@ import type { WorkerStatus, SupervisorDecision, TerminalMessage } from '../compo
 import { EvaluationCard } from '../components/dashboard/EvaluationCard';
 import { QualificationCard } from '../components/dashboard/QualificationCard';
 import { FinancialCard } from '../components/dashboard/FinancialCard';
+import {
+  clear_active_document_id,
+  set_active_document_id,
+} from '../utils/documentIdentity';
 
 export function AnalysisDashboard() {
+  const { alert } = useDialog();
   const { id } = useParams<{ id: string }>();
   const [terminalMessages, setTerminalMessages] = useState<any[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -35,11 +41,9 @@ export function AnalysisDashboard() {
   useEffect(() => {
     // 1. 如果 URL 中包含明确的文档 ID，优先同步并广播
     if (id && id !== 'new') {
-      localStorage.setItem('bidding_document_id', id);
-      window.dispatchEvent(new Event('bidding_document_changed'));
+      set_active_document_id(id);
     } else if (id === 'new') {
-      localStorage.removeItem('bidding_document_id');
-      window.dispatchEvent(new Event('bidding_document_changed'));
+      clear_active_document_id();
     }
 
     const targetDocId = (id && id !== 'new') ? id : localStorage.getItem('bidding_document_id');
@@ -50,16 +54,23 @@ export function AnalysisDashboard() {
     const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
 
     apiFetch(`${baseUrl}/api/v1/documents/${targetDocId}/result`)
-      .then(res => res.json())
+      .then(async res => {
+        const resJson = await res.json();
+        if (!res.ok) {
+          if (res.status === 403 || res.status === 404) {
+            // 任务 ID、旧租户文档或已删除文档不能继续作为当前文档使用。
+            clear_active_document_id(targetDocId);
+          }
+          throw new Error(`恢复历史数据失败：HTTP ${res.status}`);
+        }
+        return resJson;
+      })
       .then(resJson => {
         const docData = resJson?.data || resJson;
         if (docData && (docData.document_id || docData.id)) {
           setResult(docData);
           const realDocId = docData.document_id || docData.id;
-          if (realDocId && realDocId !== localStorage.getItem('bidding_document_id')) {
-            localStorage.setItem('bidding_document_id', realDocId);
-            window.dispatchEvent(new Event('bidding_document_changed'));
-          }
+          set_active_document_id(realDocId);
         }
       })
       .catch(err => {
@@ -106,9 +117,8 @@ export function AnalysisDashboard() {
   const handleAnalysisSuccess = (res: any) => {
     setIsEquipmentOnly(false);
     setResult(res);
-    if (res.document_id) {
-      localStorage.setItem('bidding_document_id', res.document_id);
-      window.dispatchEvent(new Event('bidding_document_changed'));
+    if (res?.document_id) {
+      set_active_document_id(res.document_id);
       autoDownloadDraft(res.document_id);
     }
     setTerminalMessages(prev => [
@@ -172,7 +182,10 @@ export function AnalysisDashboard() {
     const targetDocId = activeDocId || (id && id !== 'new' ? id : null) || localStorage.getItem('bidding_document_id');
     if (!targetDocId) {
       setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: '❌ 重新提取失败: 未找到有效文档，请先上传并解析标书文件。' }]);
-      alert("未找到有效文档ID，请先上传并解析标书文件。");
+      await alert('未找到有效文档ID，请先上传并解析标书文件。', {
+        title: '无法重新提取',
+        intent: 'warning',
+      });
       return false;
     }
 
@@ -204,6 +217,20 @@ export function AnalysisDashboard() {
                 draft_path: json.data?.draft_path,
                 bid_doc_outline: json.data?.bid_doc_outline || prev?.parsed_metadata?.bid_doc_outline
               }
+            }));
+          } else if (domain === 'strategy_qual' || domain === 'qualifications_analysis' || domain === 'qual_analysis') {
+            setResult((prev: any) => ({
+              ...prev,
+              qualifications_analysis: json.data?.qualifications_analysis || json.data,
+              analysis_status: json.data?.analysis_status || prev?.analysis_status,
+              overall_status: 'completed'
+            }));
+          } else if (domain === 'strategy_risk' || domain === 'risks_analysis' || domain === 'risk_analysis') {
+            setResult((prev: any) => ({
+              ...prev,
+              risks_analysis: json.data?.risks_analysis || json.data,
+              analysis_status: json.data?.analysis_status || prev?.analysis_status,
+              overall_status: 'completed'
             }));
           } else {
             if (domain === 'engineering') {
@@ -287,6 +314,7 @@ export function AnalysisDashboard() {
         initialTaskId={id === 'new' ? null : id}
         onSupervisorUpdate={handleSupervisorUpdate}
         onWorkerStatusChange={handleWorkerStatusChange}
+        onReextract={handleReextract}
       />
 
       {isLoadingHistory && (

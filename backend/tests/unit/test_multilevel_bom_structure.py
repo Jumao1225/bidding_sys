@@ -437,3 +437,147 @@ def test_structural_bom_nodes_should_not_count_as_unmatched_items():
 
     assert total_cost == 200.0
     assert unmatched == 0
+
+
+def test_rollup_should_not_attach_same_named_parent_across_source_tables():
+    """来源表格不同且名称相同时，不应跨表回挂父子关系。"""
+    processed, total_cost, _ = rollup_hierarchical_cost_items([
+        {
+            "name": "系统项",
+            "qty": 1.0,
+            "unit": "项",
+            "ref_price": 100.0,
+            "match_quality": "精准匹配",
+            "source_table_index": 0,
+        },
+        {
+            "name": "明细项",
+            "parent_item": "系统项",
+            "root_item": "系统项",
+            "qty": 1.0,
+            "unit": "项",
+            "ref_price": 20.0,
+            "source_table_index": 1,
+        },
+    ])
+
+    assert processed[0]["subtotal"] == 100.0
+    assert processed[1]["parent_item"] == "系统项"
+    assert total_cost == 120.0
+
+
+def test_rollup_external_bom_should_restore_parent_across_page_fragments():
+    """表格外分区下同一清单跨分页后，仍应恢复真实 BOM 父子关系。"""
+    processed, total_cost, _ = rollup_hierarchical_cost_items([
+        {
+            "name": "外部分区主项",
+            "parent_item": None,
+            "root_item": "外部分区主项",
+            "tree_level": 1,
+            "qty": 1.0,
+            "unit": "套",
+            "ref_price": 100.0,
+            "source_table_index": 0,
+            "grouping_mode": "external",
+            "section_name": "外部分区",
+        },
+        {
+            "name": "跨页子项",
+            "parent_item": "外部分区主项",
+            "root_item": "外部分区主项",
+            "tree_level": 2,
+            "qty": 1.0,
+            "unit": "台",
+            "ref_price": 30.0,
+            "source_table_index": 1,
+            "grouping_mode": "external",
+            "section_name": "外部分区",
+        },
+    ])
+
+    assert processed[0]["subtotal"] == 30.0
+    assert processed[0]["match_quality"] == "成套汇总"
+    assert processed[1]["subtotal"] == 30.0
+    assert total_cost == 30.0
+
+
+def test_rollup_stable_node_ids_should_attach_same_named_items_to_explicit_parent():
+    """人工维护的稳定父子 ID 应优先于同名回溯，避免节点串挂。"""
+    processed, total_cost, _ = rollup_hierarchical_cost_items([
+        {
+            "node_id": "root-a",
+            "name": "重复设备",
+            "qty": 1.0,
+            "unit": "套",
+            "ref_price": 100.0,
+            "match_quality": "精准匹配",
+            "source_table_index": 0,
+        },
+        {
+            "node_id": "root-b",
+            "name": "重复设备",
+            "qty": 1.0,
+            "unit": "套",
+            "ref_price": 200.0,
+            "match_quality": "精准匹配",
+            "source_table_index": 0,
+        },
+        {
+            "node_id": "child-b",
+            "parent_node_id": "root-b",
+            "name": "重复子项",
+            "qty": 1.0,
+            "unit": "件",
+            "ref_price": 30.0,
+            "source_table_index": 0,
+        },
+    ])
+
+    assert processed[0]["subtotal"] == 100.0
+    assert processed[1]["subtotal"] == 30.0
+    assert processed[2]["parent_item"] == "重复设备"
+    assert total_cost == 130.0
+
+
+def test_rollup_explicit_parent_id_should_override_source_scope_and_avoid_name_substring_parent():
+    """人工指定“光伏”父项时，即使跨来源表，也不能回退挂到名称包含“光伏”的设备下。"""
+    processed, _, _ = rollup_hierarchical_cost_items([
+        {
+            "node_id": "root-photovoltaic",
+            "name": "光伏",
+            "parent_node_id": None,
+            "root_item": "光伏",
+            "tree_level": 1,
+            "qty": 1.0,
+            "unit": "项",
+            "ref_price": 0.0,
+            "source_table_index": 0,
+        },
+        {
+            "node_id": "photovoltaic-inlet",
+            "name": "10kV光伏进线柜",
+            "parent_node_id": "root-photovoltaic",
+            "parent_item": "光伏",
+            "root_item": "光伏",
+            "tree_level": 2,
+            "qty": 1.0,
+            "unit": "面",
+            "ref_price": 100.0,
+            "source_table_index": 0,
+        },
+        {
+            "node_id": "reactive-inlet",
+            "name": "10kV无功装置补偿进线柜",
+            "parent_node_id": "root-photovoltaic",
+            "parent_item": "光伏",
+            "root_item": "光伏",
+            "tree_level": 2,
+            "qty": 1.0,
+            "unit": "面",
+            "ref_price": 200.0,
+            "source_table_index": 1,
+        },
+    ])
+
+    assert processed[2]["parent_node_id"] == "root-photovoltaic"
+    assert processed[2]["parent_item"] == "光伏"

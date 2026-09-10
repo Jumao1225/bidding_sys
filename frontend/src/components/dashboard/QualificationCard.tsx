@@ -1,4 +1,4 @@
-import React from 'react';
+import { format_analysis_value } from '../../utils/displayValue';
 
 interface QualificationProps {
   qualification?: {
@@ -70,15 +70,15 @@ export function QualificationCard({ qualification = {}, onReextract, isRetrying 
             {mandatory_qualifications.map((q, idx) => (
               <li key={`mq-${idx}`} className="flex gap-2 text-sm text-slate-700 bg-rose-50/50 p-3 rounded-xl border border-rose-100/50">
                 <span className="text-rose-500 shrink-0">🚫</span>
-                <span className="font-medium leading-relaxed">{q}</span>
+                <span className="font-medium leading-relaxed">{format_analysis_value(q)}</span>
               </li>
             ))}
             {mandatoryPersonnel.map((p, idx) => (
               <li key={`mp-${idx}`} className="flex gap-2 text-sm text-slate-700 bg-rose-50/50 p-3 rounded-xl border border-rose-100/50">
                 <span className="text-rose-500 shrink-0">👤</span>
                 <div>
-                  <span className="font-bold text-slate-800">{p.role}</span>: 需具备 <span className="font-bold text-rose-600">{p.cert_name}</span> ({p.count}人)
-                  {p.other_requirements && <div className="text-xs text-slate-500 mt-1">{p.other_requirements}</div>}
+                  <span className="font-bold text-slate-800">{format_analysis_value(p.role)}</span>: 需具备 <span className="font-bold text-rose-600">{format_analysis_value(p.cert_name)}</span> ({format_analysis_value(p.count)}人)
+                  {p.other_requirements && <div className="text-xs text-slate-500 mt-1">{format_analysis_value(p.other_requirements)}</div>}
                 </div>
               </li>
             ))}
@@ -86,13 +86,13 @@ export function QualificationCard({ qualification = {}, onReextract, isRetrying 
               <li key={`perf-${idx}`} className="flex gap-2 text-sm text-slate-700 bg-rose-50/50 p-3 rounded-xl border border-rose-100/50">
                 <span className="text-rose-500 shrink-0">🏆</span>
                 <div>
-                  <div className="font-bold text-slate-800 mb-2">历史业绩要求 ({perf.required_count}个)</div>
+                  <div className="font-bold text-slate-800 mb-2">历史业绩要求 ({format_analysis_value(perf.required_count)}个)</div>
                   <div className="flex flex-wrap gap-2 mb-2">
-                    {perf.time_frame_years && <span className="text-xs bg-white px-2.5 py-1 rounded-md border border-rose-200 text-rose-600 shadow-sm font-bold">近{perf.time_frame_years}年</span>}
-                    {perf.min_amount_wuyuan && <span className="text-xs bg-white px-2.5 py-1 rounded-md border border-rose-200 text-rose-600 shadow-sm font-bold">≥{perf.min_amount_wuyuan}万</span>}
-                    {perf.keyword_or_domain && <span className="text-xs bg-white px-2.5 py-1 rounded-md border border-rose-200 text-rose-600 shadow-sm font-bold">{perf.keyword_or_domain}</span>}
+                    {perf.time_frame_years && <span className="text-xs bg-white px-2.5 py-1 rounded-md border border-rose-200 text-rose-600 shadow-sm font-bold">近{format_analysis_value(perf.time_frame_years)}年</span>}
+                    {perf.min_amount_wuyuan && <span className="text-xs bg-white px-2.5 py-1 rounded-md border border-rose-200 text-rose-600 shadow-sm font-bold">≥{format_analysis_value(perf.min_amount_wuyuan)}万</span>}
+                    {perf.keyword_or_domain && <span className="text-xs bg-white px-2.5 py-1 rounded-md border border-rose-200 text-rose-600 shadow-sm font-bold">{format_analysis_value(perf.keyword_or_domain)}</span>}
                   </div>
-                  <div className="text-xs text-slate-500 leading-relaxed">{perf.description}</div>
+                  <div className="text-xs text-slate-500 leading-relaxed">{format_analysis_value(perf.description)}</div>
                 </div>
               </li>
             ))}
@@ -123,7 +123,7 @@ export function QualificationCard({ qualification = {}, onReextract, isRetrying 
                   <div className="text-xs font-bold text-red-600 mb-2">无效投标/否决投标条款 (针对单家投标人)</div>
                   <ul className="list-disc pl-4 space-y-1">
                     {invalid_bid_clauses.map((clause, idx) => (
-                      <li key={`inv-${idx}`} className="text-sm text-red-800 leading-relaxed">{clause}</li>
+                      <li key={`inv-${idx}`} className="text-sm text-red-800 leading-relaxed">{format_analysis_value(clause)}</li>
                     ))}
                   </ul>
                 </div>
@@ -133,7 +133,7 @@ export function QualificationCard({ qualification = {}, onReextract, isRetrying 
                   <div className="text-xs font-bold text-orange-600 mb-2">项目废标条款 (导致整个招标失败)</div>
                   <ul className="list-disc pl-4 space-y-1">
                     {project_annulment_clauses.map((clause, idx) => (
-                      <li key={`ann-${idx}`} className="text-sm text-orange-800 leading-relaxed">{clause}</li>
+                      <li key={`ann-${idx}`} className="text-sm text-orange-800 leading-relaxed">{format_analysis_value(clause)}</li>
                     ))}
                   </ul>
                 </div>
@@ -156,20 +156,20 @@ export function QualificationCard({ qualification = {}, onReextract, isRetrying 
               {bonus_qualifications.map((q, idx) => (
                 <li key={`bq-${idx}`} className="flex gap-2 text-sm text-slate-700 bg-emerald-50/50 p-3 rounded-xl border border-emerald-100/50">
                   <span className="text-emerald-500 shrink-0">✨</span>
-                  <span className="leading-relaxed">{q}</span>
+                <span className="leading-relaxed">{format_analysis_value(q)}</span>
                 </li>
               ))}
               {system_certifications.map((cert, idx) => (
                 <li key={`cert-${idx}`} className="flex gap-2 text-sm text-slate-700 bg-blue-50/50 p-3 rounded-xl border border-blue-100/50">
                   <span className="text-blue-500 shrink-0">🔖</span>
-                  <span className="font-medium">体系认证: {cert}</span>
+                  <span className="font-medium">体系认证: {format_analysis_value(cert)}</span>
                 </li>
               ))}
               {bonusPersonnel.map((p, idx) => (
                 <li key={`bp-${idx}`} className="flex gap-2 text-sm text-slate-700 bg-emerald-50/50 p-3 rounded-xl border border-emerald-100/50">
                   <span className="text-emerald-500 shrink-0">👤</span>
                   <div>
-                    <span className="font-bold text-slate-800">{p.role}</span>: <span className="font-bold text-emerald-700">{p.cert_name}</span> ({p.count}人)
+                    <span className="font-bold text-slate-800">{format_analysis_value(p.role)}</span>: <span className="font-bold text-emerald-700">{format_analysis_value(p.cert_name)}</span> ({format_analysis_value(p.count)}人)
                   </div>
                 </li>
               ))}

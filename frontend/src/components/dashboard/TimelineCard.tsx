@@ -1,4 +1,4 @@
-import React from 'react';
+import { format_analysis_value } from '../../utils/displayValue';
 
 interface TimelineProps {
   timeline?: {
@@ -51,18 +51,19 @@ export function TimelineCard({ timeline = {}, onReextract, isRetrying = false }:
           
           {/* 动态渲染时间节点 */}
           {tender_milestones.map((milestone, idx) => {
-            const milestoneName = milestone.name || milestone.milestone_name;
-            const deadline = milestone.deadline || milestone.time_description;
-            const isHighRisk = milestoneName?.includes('开标') || milestoneName?.includes('截止');
+            const milestone_name = format_analysis_value(milestone.name || milestone.milestone_name);
+            const deadline = format_analysis_value(milestone.deadline || milestone.time_description);
+            const description = format_analysis_value(milestone.description || milestone.action_required);
+            const isHighRisk = milestone_name.includes('开标') || milestone_name.includes('截止');
             return (
               <div key={idx} className="relative pl-6">
                 <div className={`absolute -left-[9px] top-1.5 w-4 h-4 rounded-full bg-white border-2 ${isHighRisk ? 'border-rose-500 shadow-[0_0_8px_rgba(225,29,72,0.4)]' : 'border-blue-400'}`}></div>
-                <p className="text-xs text-slate-500 font-bold uppercase tracking-wider mb-0.5">{milestoneName}</p>
+                <p className="text-xs text-slate-500 font-bold uppercase tracking-wider mb-0.5">{milestone_name}</p>
                 <p className={`text-sm font-black ${isHighRisk ? 'text-rose-600' : 'text-slate-800'}`}>
                   {deadline || '未提取到明确时间'}
                 </p>
-                {(milestone.description || milestone.action_required) && (
-                  <p className="text-[11px] text-slate-500 mt-1 leading-relaxed bg-slate-50 p-1.5 rounded inline-block border border-slate-100">{milestone.description || milestone.action_required}</p>
+                {description && (
+                  <p className="text-[11px] text-slate-500 mt-1 leading-relaxed bg-slate-50 p-1.5 rounded inline-block border border-slate-100">{description}</p>
                 )}
               </div>
             );
@@ -84,15 +85,15 @@ export function TimelineCard({ timeline = {}, onReextract, isRetrying = false }:
               {acquisition_info?.method && (
                 <div className="mb-2">
                   <span className="text-xs text-slate-400 font-bold mr-2">标书领购:</span>
-                  <span className="text-xs text-slate-600">{acquisition_info.method} {acquisition_info.price ? `(¥${acquisition_info.price})` : ''}</span>
+                  <span className="text-xs text-slate-600">{format_analysis_value(acquisition_info.method)} {acquisition_info.price ? `(¥${format_analysis_value(acquisition_info.price)})` : ''}</span>
                 </div>
               )}
               {document_requirements && (
                 <div>
                   <span className="text-xs text-slate-400 font-bold mr-2">装订/份数:</span>
-                  <span className="text-xs text-slate-600">正本 {document_requirements.original_copies || document_requirements.original_count || 1}，副本 {document_requirements.duplicate_copies || document_requirements.copy_count || 0}</span>
+                  <span className="text-xs text-slate-600">正本 {format_analysis_value(document_requirements.original_copies || document_requirements.original_count || 1)}，副本 {format_analysis_value(document_requirements.duplicate_copies || document_requirements.copy_count || 0)}</span>
                   {(document_requirements.seal_requirements || document_requirements.sealing_requirements) && (
-                    <div className="text-[10px] text-slate-400 mt-1 line-clamp-2">{document_requirements.seal_requirements || document_requirements.sealing_requirements}</div>
+                    <div className="text-[10px] text-slate-400 mt-1 line-clamp-2">{format_analysis_value(document_requirements.seal_requirements || document_requirements.sealing_requirements)}</div>
                   )}
                 </div>
               )}

@@ -10,6 +10,11 @@ import { SmartDocViewer } from './SmartDocViewer';
 import { motion } from 'framer-motion';
 import { Group, Panel, Separator } from 'react-resizable-panels';
 import { Virtuoso } from 'react-virtuoso';
+import {
+  clear_active_document_id,
+  set_active_document_id,
+} from '../utils/documentIdentity';
+import { format_analysis_value } from '../utils/displayValue';
 
 export interface UploadBoxProps {
   onTerminalMessage?: (msg: { id: string, type: 'info' | 'tool_call' | 'success' | 'error', content: string }) => void;
@@ -19,6 +24,7 @@ export interface UploadBoxProps {
   initialTaskId?: string | null;
   onSupervisorUpdate?: (decision: any) => void;
   onWorkerStatusChange?: (worker: string, status: string, summary?: string, documentId?: string) => void;
+  onReextract?: (domain: string) => void;
 }
 
 interface AnalysisDocumentReference {
@@ -46,12 +52,14 @@ const HighlightText = React.memo(({ text, resultData, targetQuote }: { text: str
     const list: any[] = [];
     if (resultData?.qualifications_analysis?.items) {
       resultData.qualifications_analysis.items.forEach((item: any) => {
-        if (item.exact_quote) list.push({ quote: item.exact_quote, type: item.status, obj: item });
+        const quote = format_analysis_value(item.exact_quote);
+        if (quote) list.push({ quote, type: item.status, obj: item });
       });
     }
     if (resultData?.risks_analysis) {
       resultData.risks_analysis.forEach((risk: any) => {
-        if (risk.exact_quote) list.push({ quote: risk.exact_quote, type: risk.severity, obj: risk });
+        const quote = format_analysis_value(risk.exact_quote);
+        if (quote) list.push({ quote, type: risk.severity, obj: risk });
       });
     }
     return list;
@@ -109,7 +117,7 @@ const HighlightText = React.memo(({ text, resultData, targetQuote }: { text: str
       const activeClass = isSelected ? 'ring-4 ring-blue-500 ring-offset-2 scale-105 shadow-xl font-extrabold animate-pulse' : '';
 
       nodes.push(
-        <mark key={`mark-${i}`} className={`${colorClass} ${activeClass} px-1.5 py-0.5 rounded cursor-help hover:ring-2 hover:ring-offset-1 transition-all duration-300`} title={h.obj.reason || h.obj.description}>
+        <mark key={`mark-${i}`} className={`${colorClass} ${activeClass} px-1.5 py-0.5 rounded cursor-help hover:ring-2 hover:ring-offset-1 transition-all duration-300`} title={format_analysis_value(h.obj.reason) || format_analysis_value(h.obj.description)}>
           {pText.substring(h.start, h.end)}
         </mark>
       );
@@ -132,7 +140,7 @@ const HighlightText = React.memo(({ text, resultData, targetQuote }: { text: str
   );
 });
 
-export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingChange, initialResult = null, initialTaskId = null, onSupervisorUpdate, onWorkerStatusChange }: UploadBoxProps = {}) {
+export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingChange, initialResult = null, initialTaskId = null, onSupervisorUpdate, onWorkerStatusChange, onReextract }: UploadBoxProps = {}) {
   const [isDragging, setIsDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [isAnalyzing, setIsAnalyzingInternal] = useState(false);
@@ -155,6 +163,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
   const [taskId, setTaskId] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [analysisError, setAnalysisError] = useState<AnalysisErrorInfo | null>(null);
+  const event_source_ref = useRef<EventSource | null>(null);
   
   // 视图与布局状态 (从 localStorage 初始化)
   const [viewMode, setViewMode] = useState<'text' | 'original'>(() => 
@@ -169,13 +178,31 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [targetQuote, setTargetQuote] = useState<string | null>(null);
   const [zoomLevel, setZoomLevel] = useState<number>(100);
+  const qualificationStatus = result?.analysis_status?.strategy_qual?.status;
+  const riskStatus = result?.analysis_status?.strategy_risk?.status;
+  const hasQualificationResult = Boolean(
+    result?.qualifications_analysis &&
+    (Object.prototype.hasOwnProperty.call(result.qualifications_analysis, 'match_score') ||
+      Object.prototype.hasOwnProperty.call(result.qualifications_analysis, 'items'))
+  );
+  const qualificationAnalysisIncomplete = !qualificationStatus && !hasQualificationResult;
+  const riskAnalysisIncomplete = !riskStatus && !(result?.risks_analysis?.length > 0);
+
+  useEffect(() => {
+    return () => {
+      // 页面离开时主动关闭连接，避免后台 SSE 继续触发已卸载组件的状态更新。
+      const event_source = event_source_ref.current;
+      event_source_ref.current = null;
+      event_source?.close();
+    };
+  }, []);
 
   const handleZoomIn = () => setZoomLevel(prev => Math.min(prev + 15, 200));
   const handleZoomOut = () => setZoomLevel(prev => Math.max(prev - 15, 50));
   const handleZoomReset = () => setZoomLevel(100);
 
   const handleCardClick = (exactQuote?: string, fallbackText?: string) => {
-    const quoteToUse = exactQuote || fallbackText;
+    const quoteToUse = format_analysis_value(exactQuote) || format_analysis_value(fallbackText);
     if (!quoteToUse) return;
     
     setTargetQuote(quoteToUse);
@@ -307,6 +334,8 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     if (!file) return;
 
     setAnalysisError(null);
+    event_source_ref.current?.close();
+    event_source_ref.current = null;
     setIsAnalyzing(true);
     if (onAnalyzingChange) onAnalyzingChange(true);
     setProgress(0);
@@ -358,12 +387,13 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
         setFileName(file.name);
         setStatusText("任务已提交，排队中...");
 
-        // 立刻持久化最新解析的 document_id，保证切换页面再切回时能恢复解析状态与结果
-        localStorage.setItem('bidding_document_id', taskId);
-        window.dispatchEvent(new Event('bidding_document_changed'));
+        // task_id 仅用于订阅 SSE 和预览上传中的原文件，不能冒充数据库 document_id。
+        clear_active_document_id();
+        console.info('[文档解析] 任务已提交，等待后台返回真实 document_id:', taskId);
         
         // 开启 SSE 监听
         const eventSource = new EventSource(`${baseUrl}/api/v1/sse/progress/${taskId}`);
+        event_source_ref.current = eventSource;
         
         eventSource.onmessage = (event) => {
           try {
@@ -374,7 +404,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
             if (msgData.agent_log) {
               const log = msgData.agent_log;
               if (log.document_id) {
-                localStorage.setItem('bidding_document_id', log.document_id);
+                set_active_document_id(log.document_id);
               }
               if (log.type === 'embedding_progress') {
                 setEmbeddingInfo({
@@ -416,17 +446,21 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
               }
             }
             if (msgData.progress === 100) {
+              // 先解除引用再关闭连接，避免浏览器对正常 EOF 触发 onerror 后再次提示失败。
+              if (event_source_ref.current === eventSource) {
+                event_source_ref.current = null;
+              }
+              eventSource.close();
               if (msgData.result && !msgData.result.error) {
                 setResult(msgData.result);
                 // 持久化 document_id，供 ChatPanel 聊天接口使用
                 if (msgData.result.document_id) {
-                  localStorage.setItem('bidding_document_id', msgData.result.document_id);
+                  set_active_document_id(msgData.result.document_id);
                 }
                 if (onAnalysisSuccess) onAnalysisSuccess(msgData.result);
               } else if (msgData.result && msgData.result.error) {
                 show_analysis_error(msgData.result.error, 'task');
               }
-              eventSource.close();
               setTimeout(() => setIsAnalyzing(false), 500); // 延迟关闭以展示 100% 状态
             }
           } catch (e) {
@@ -435,7 +469,13 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
         };
 
         eventSource.onerror = (error) => {
+          // 任务完成或连接已被新任务/页面卸载替换时，不再把正常关闭当作失败。
+          if (event_source_ref.current !== eventSource) {
+            eventSource.close();
+            return;
+          }
           console.error("EventSource failed:", error);
+          event_source_ref.current = null;
           eventSource.close();
           setIsAnalyzing(false);
           show_analysis_error(error, 'connection');
@@ -462,9 +502,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
     localStorage.removeItem('bidding_analysis_result');
     localStorage.removeItem('bidding_task_id');
     localStorage.removeItem('bidding_file_name');
-    localStorage.removeItem('bidding_document_id');
-    // 触发全局事件通知 ChatPanel 刷新状态
-    window.dispatchEvent(new Event('bidding_document_changed'));
+    clear_active_document_id();
     if (onAnalysisSuccess) onAnalysisSuccess(null);
   };
 
@@ -586,7 +624,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
           </div>
           <div>
             <h2 className="text-xl font-bold text-slate-800 tracking-tight">招标文件智能解析</h2>
-            <p className="text-sm text-slate-500">v2.4 Agentic Flow</p>
+            <p className="text-sm text-slate-500">仅上传招标文件</p>
           </div>
         </div>
         
@@ -752,13 +790,21 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                 className={`flex-1 py-3 px-4 font-bold text-sm transition-all rounded-xl ${activeTab === 'qual' ? 'text-blue-700 bg-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'}`}
                 onClick={() => setActiveTab('qual')}
               >
-                🎯 履约盘点 <span className="ml-1 px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full text-xs">{result.qualifications_analysis?.match_score || 0}分</span>
+                🎯 履约盘点 <span className="ml-1 px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full text-xs">
+                  {qualificationStatus === 'failed'
+                    ? '失败'
+                    : qualificationAnalysisIncomplete
+                      ? '未完成'
+                      : `${format_analysis_value(result.qualifications_analysis?.match_score) || 0}分`}
+                </span>
               </button>
               <button 
                 className={`flex-1 py-3 px-4 font-bold text-sm transition-all rounded-xl ${activeTab === 'risk' ? 'text-blue-700 bg-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'}`}
                 onClick={() => setActiveTab('risk')}
               >
-                ⚠️ 风险提示 <span className="ml-1 px-2 py-0.5 bg-rose-100 text-rose-700 rounded-full text-xs">{result.risks_analysis?.length || 0}</span>
+                ⚠️ 风险提示 <span className="ml-1 px-2 py-0.5 bg-rose-100 text-rose-700 rounded-full text-xs">
+                  {riskStatus === 'failed' ? '失败' : riskStatus === 'running' ? '分析中' : result.risks_analysis?.length || 0}
+                </span>
               </button>
             </div>
             
@@ -773,7 +819,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                       title="点击跳转左侧原文出处定位"
                     >
                       <div className="flex justify-between items-start mb-3">
-                        <h4 className="font-bold text-slate-800 leading-tight pr-4 flex-1">{item.requirement}</h4>
+                        <h4 className="font-bold text-slate-800 leading-tight pr-4 flex-1">{format_analysis_value(item.requirement)}</h4>
                         <div className="flex items-center gap-2 shrink-0">
                           <span className="text-[10px] text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full font-bold opacity-0 group-hover/card:opacity-100 transition-opacity shadow-xs">🎯 定位原文</span>
                           <span className={`px-3 py-1 text-xs rounded-full font-bold shadow-sm ${
@@ -781,19 +827,35 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                             item.status === '努力可做到' ? 'bg-orange-100 text-orange-700 border border-orange-200' :
                             'bg-green-100 text-green-700 border border-green-200'
                           }`}>
-                            {item.status}
+                            {format_analysis_value(item.status)}
                           </span>
                         </div>
                       </div>
                       <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
-                        <p className="text-sm text-slate-600"><span className="font-bold text-slate-700 mr-2">🤖 AI 分析:</span>{item.reason}</p>
+                        <p className="text-sm text-slate-600"><span className="font-bold text-slate-700 mr-2">🤖 AI 分析:</span>{format_analysis_value(item.reason)}</p>
                       </div>
                     </div>
                   ))}
                   {(!result.qualifications_analysis?.items || result.qualifications_analysis.items.length === 0) && (
                     <div className="flex flex-col items-center justify-center h-48 text-slate-400">
-                      <span className="text-4xl mb-3">✨</span>
-                      <p>未发现明确资质要求</p>
+                      {qualificationStatus === 'failed' ? (
+                        <>
+                          <span className="text-4xl mb-3">⚠️</span>
+                          <p className="text-rose-600 font-medium">履约盘点分析失败，不能据此判断“无要求”</p>
+                          {onReextract && <button className="mt-3 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold hover:bg-blue-700" onClick={() => onReextract('strategy_qual')}>重新分析履约盘点</button>}
+                        </>
+                      ) : qualificationAnalysisIncomplete ? (
+                        <>
+                          <span className="text-4xl mb-3">⏳</span>
+                          <p>履约盘点尚未完成</p>
+                          {onReextract && <button className="mt-3 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold hover:bg-blue-700" onClick={() => onReextract('strategy_qual')}>开始履约盘点</button>}
+                        </>
+                      ) : (
+                        <>
+                          <span className="text-4xl mb-3">✨</span>
+                          <p>未发现明确资质要求</p>
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
@@ -818,7 +880,7 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                         }`}></div>
                       <div className="flex justify-between items-start mb-3 pl-2">
                         <div className="flex items-center space-x-2">
-                          <span className="font-bold text-slate-800">{risk.risk_type}</span>
+                          <span className="font-bold text-slate-800">{format_analysis_value(risk.risk_type)}</span>
                         </div>
                         <div className="flex items-center gap-2">
                           <span className="text-[10px] text-rose-600 bg-rose-50 px-2 py-0.5 rounded-full font-bold opacity-0 group-hover/card:opacity-100 transition-opacity shadow-xs">📍 定位原文</span>
@@ -827,19 +889,40 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                             risk.severity === '中' ? 'bg-orange-100 text-orange-700 border border-orange-200' :
                             'bg-blue-100 text-blue-700 border border-blue-200'
                           }`}>
-                            {risk.severity}风险
+                            {format_analysis_value(risk.severity)}风险
                           </span>
                         </div>
                       </div>
                       <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 ml-2">
-                        <p className="text-sm text-slate-600"><span className="font-bold text-slate-700 mr-2">⚠️ 描述:</span>{risk.description}</p>
+                        <p className="text-sm text-slate-600"><span className="font-bold text-slate-700 mr-2">⚠️ 描述:</span>{format_analysis_value(risk.description)}</p>
                       </div>
                     </div>
                   ))}
                   {(!result.risks_analysis || result.risks_analysis.length === 0) && (
                     <div className="flex flex-col items-center justify-center h-48 text-slate-400">
-                      <span className="text-4xl mb-3">🛡️</span>
-                      <p>未发现明显风险条款</p>
+                      {riskStatus === 'failed' ? (
+                        <>
+                          <span className="text-4xl mb-3">⚠️</span>
+                          <p className="text-rose-600 font-medium">风险分析失败，不能据此判断“无风险”</p>
+                          {onReextract && <button className="mt-3 px-4 py-2 rounded-lg bg-rose-600 text-white text-sm font-bold hover:bg-rose-700" onClick={() => onReextract('strategy_risk')}>重新分析风险提示</button>}
+                        </>
+                      ) : riskStatus === 'running' ? (
+                        <>
+                          <span className="text-4xl mb-3">⏳</span>
+                          <p>风险提示分析中</p>
+                        </>
+                      ) : riskAnalysisIncomplete ? (
+                        <>
+                          <span className="text-4xl mb-3">⏳</span>
+                          <p>风险提示尚未完成</p>
+                          {onReextract && <button className="mt-3 px-4 py-2 rounded-lg bg-rose-600 text-white text-sm font-bold hover:bg-rose-700" onClick={() => onReextract('strategy_risk')}>开始风险分析</button>}
+                        </>
+                      ) : (
+                        <>
+                          <span className="text-4xl mb-3">🛡️</span>
+                          <p>未发现明显风险条款</p>
+                        </>
+                      )}
                     </div>
                   )}
                 </div>

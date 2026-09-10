@@ -1,12 +1,16 @@
 /**
  * 智能 BOM 成本测算表格导出工具 (bomExporter.ts)
  *
- * 支持将 BOM 成本测算清单分别导出为 Excel/CSV 表格与 Word (.docx) 文档。
+ * 支持将 BOM 成本测算清单分别导出为 Excel (.xlsx) 与 Word (.docx) 文档。
  * 文件命名自动关联当前招标文件名称，表尾包含规范的小写与人民币大写总价统计。
  */
 
 import { apiFetch, API_BASE_URL } from './api';
-import { numberToChineseRmb } from './rmbFormatter';
+import { normalizeMarkupText } from './textNormalizer';
+
+/** 原文表格的主分组模式，避免导出时把两种分组语义并行展开。 */
+export type BomGroupingMode = 'external' | 'internal' | 'none';
+type BomGroupingDisplayMode = BomGroupingMode | 'mixed';
 
 export interface BomExportItem {
   id?: string | number;
@@ -14,6 +18,10 @@ export interface BomExportItem {
   name?: string;
   item_name?: string;
   section_name?: string | null;
+  part_name?: string | null;
+  group_path?: string[] | null;
+  source_table_index?: number | null;
+  grouping_mode?: BomGroupingMode | string | null;
   spec_requirement?: string | null;
   key_parameters?: string[] | any;
   matched_name?: string | null;
@@ -46,6 +54,367 @@ export interface BomExportOptions {
   analysisSummary?: string;
 }
 
+export interface BomExportTreeRow {
+  kind: 'section' | 'group' | 'item';
+  item?: BomExportItem;
+  sectionName?: string;
+  groupName?: string;
+  hierarchyNumber?: string;
+  depth?: number;
+  isParent?: boolean;
+}
+
+/**
+ * 统一清洗表内 BOQ 分组路径，兼容模型返回的对象型路径节点。
+ */
+function normalizeGroupPath(value: unknown): string[] {
+  const values = Array.isArray(value) ? value : value === null || value === undefined ? [] : [value];
+  return values.flatMap((item) => {
+    const candidate = item && typeof item === 'object'
+      ? (item as { input?: unknown; value?: unknown; name?: unknown }).input
+        ?? (item as { value?: unknown }).value
+        ?? (item as { name?: unknown }).name
+      : item;
+    const text = exportText(candidate);
+    return text ? [text] : [];
+  });
+}
+
+/**
+ * 组合并去重表内分组路径，保留原始层级顺序，避免父节点与路径首节点重复展示。
+ */
+export function getBomGroupContext(item: Pick<BomExportItem, 'part_name' | 'group_path'>): string[] {
+  const partName = exportText(item.part_name);
+  const groupPath = normalizeGroupPath(item.group_path);
+  const values = partName ? [partName, ...groupPath] : groupPath;
+  return values.filter((value, index) => index === 0 || value !== values[index - 1]);
+}
+
+/**
+ * 读取表内分类上下文；该上下文只用于导出展示，不参与 BOM 父子汇总。
+ */
+function getGroupContext(item: BomExportItem): string[] {
+  return getBomGroupContext(item);
+}
+
+/** 只接受解析阶段约定的模式值，避免异常数据改变导出结构。 */
+function normalizeBomGroupingMode(value: unknown): BomGroupingMode | null {
+  const mode = exportText(value);
+  return mode === 'external' || mode === 'internal' || mode === 'none' ? mode : null;
+}
+
+/** 汇总导出输入的主模式；兼容没有 grouping_mode 的历史数据。 */
+export function resolveBomGroupingDisplayMode(items: BomExportItem[]): BomGroupingDisplayMode {
+  const modes = new Set<BomGroupingMode>();
+  const collect = (nodes: BomExportItem[]): void => {
+    nodes.forEach((item) => {
+      if (!item || typeof item !== 'object') return;
+      const explicitMode = normalizeBomGroupingMode(item.grouping_mode);
+      if (explicitMode) {
+        modes.add(explicitMode);
+      } else if (exportText(item.section_name)) {
+        modes.add('external');
+      } else if (getGroupContext(item).length) {
+        modes.add('internal');
+      }
+      if (Array.isArray(item.children)) collect(item.children as BomExportItem[]);
+    });
+  };
+  collect(items);
+  modes.delete('none');
+  if (modes.size === 0) return 'none';
+  if (modes.size === 1) return Array.from(modes)[0];
+  return 'mixed';
+}
+
+
+/**
+ * 按根项顺序补齐跨行或跨页解析造成的表内分组上下文断点。
+ */
+function buildRootGroupContexts(items: BomExportItem[], respectSections = true): string[][] {
+  const contexts: string[][] = [];
+  let activeContext: string[] = [];
+  let activePartName = '';
+  let previousSection: string | undefined;
+
+  items.forEach((item) => {
+    const sectionName = exportText(item.section_name);
+    if (respectSections && previousSection !== undefined && sectionName !== previousSection) {
+      activeContext = [];
+      activePartName = '';
+    }
+    previousSection = sectionName;
+
+    const explicitPartName = exportText(item.part_name);
+    const rawContext = getGroupContext(item);
+    let effectiveContext: string[];
+    if (explicitPartName) {
+      effectiveContext = rawContext.length ? rawContext : [explicitPartName];
+      activePartName = explicitPartName;
+    } else if (rawContext.length) {
+      effectiveContext = activePartName && rawContext[0] !== activePartName
+        ? getBomGroupContext({ part_name: activePartName, group_path: rawContext })
+        : rawContext;
+    } else {
+      effectiveContext = activeContext;
+    }
+
+    contexts.push(effectiveContext);
+    if (effectiveContext.length) activeContext = effectiveContext;
+  });
+
+  return contexts;
+}
+
+/**
+ * 读取节点所属的大分组键，仅使用明确的表内分组上下文，不从名称猜测分组。
+ */
+function getNumberingGroupKey(item: BomExportItem): string | undefined {
+  const groupContext = getGroupContext(item);
+  if (groupContext.length) return groupContext[0];
+  const children = Array.isArray(item.children) ? item.children : [];
+  for (const child of children) {
+    if (child && typeof child === 'object') {
+      const childGroupKey = getNumberingGroupKey(child as BomExportItem);
+      if (childGroupKey) return childGroupKey;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 生成表内大分组的根序号，让内部表内分组占用同级序号。
+ */
+function buildGroupedRootNumberPaths(
+  items: BomExportItem[],
+  rootGroupContexts: string[][],
+): { hasNumberingGroups: boolean; paths: Map<number, number[]> } {
+  const groupKeys = items.map((item, itemIndex) => (
+    rootGroupContexts[itemIndex]?.[0] || getNumberingGroupKey(item)
+  ));
+  if (!groupKeys.some(Boolean)) {
+    return { hasNumberingGroups: false, paths: new Map() };
+  }
+
+  const groupIndices = new Map<string | null, number>();
+  const ungroupedItemCounts = new Map<string | null, number>();
+  const siblingCounts = new Map<string, number>();
+  const groupNumberPaths = new Map<string, number[]>();
+  const paths = new Map<number, number[]>();
+
+  items.forEach((item, itemIndex) => {
+    const groupKey = groupKeys[itemIndex] || null;
+    if (!groupIndices.has(groupKey)) {
+      groupIndices.set(groupKey, groupIndices.size + 1);
+    }
+    const groupIndex = groupIndices.get(groupKey) as number;
+
+    const groupContext = rootGroupContexts[itemIndex] || [];
+    if (!groupContext.length) {
+      const nextItemCount = (ungroupedItemCounts.get(groupKey) || 0) + 1;
+      ungroupedItemCounts.set(groupKey, nextItemCount);
+      paths.set(itemIndex + 1, [groupIndex, nextItemCount]);
+      return;
+    }
+
+    for (let depth = 1; depth <= groupContext.length; depth += 1) {
+      const prefix = groupContext.slice(0, depth);
+      const prefixKey = prefix.join(' / ');
+      if (groupNumberPaths.has(prefixKey)) continue;
+      if (depth === 1) {
+        groupNumberPaths.set(prefixKey, [groupIndex]);
+        continue;
+      }
+      const parentKey = groupContext.slice(0, depth - 1).join(' / ');
+      const nextSiblingNumber = (siblingCounts.get(parentKey) || 0) + 1;
+      siblingCounts.set(parentKey, nextSiblingNumber);
+      groupNumberPaths.set(prefixKey, [
+        ...(groupNumberPaths.get(parentKey) || [groupIndex]),
+        nextSiblingNumber,
+      ]);
+    }
+
+    const contextKey = groupContext.join(' / ');
+    const nextItemNumber = (siblingCounts.get(contextKey) || 0) + 1;
+    siblingCounts.set(contextKey, nextItemNumber);
+    paths.set(itemIndex + 1, [
+      ...(groupNumberPaths.get(contextKey) || [groupIndex]),
+      nextItemNumber,
+    ]);
+  });
+
+  return { hasNumberingGroups: true, paths };
+}
+
+/**
+ * 统一清理导出单元格文本，避免独立调用导出工具时遗漏展示标记。
+ */
+function exportText(value: unknown, fallback = ''): string {
+  const normalized = normalizeMarkupText(value);
+  return String(normalized ?? fallback).trim();
+}
+
+/**
+ * 递归展开 BOM 树，统一保留所有父项、子项和分区切换信息。
+ */
+export function flattenBomExportItems(items: BomExportItem[] = []): BomExportTreeRow[] {
+  const groupingDisplayMode = resolveBomGroupingDisplayMode(items);
+  const useExternalSections = groupingDisplayMode === 'external';
+  const useInternalGroups = groupingDisplayMode === 'internal';
+  const nestedRows: Array<{
+    item: BomExportItem;
+    sectionName?: string;
+    hierarchyNumber: string;
+    rootOrdinal: number;
+    treePath: number[];
+    depth: number;
+    isParent: boolean;
+    groupContext: string[];
+  }> = [];
+
+  const visit = (
+    item: BomExportItem,
+    path: number[],
+    depth: number,
+    inheritedSection?: string,
+    inheritedGroupContext: string[] = [],
+    rootOrdinal = 0,
+    rootGroupContext?: string[],
+  ): void => {
+    const sectionName = useExternalSections
+      ? String(item.section_name || '').trim() || inheritedSection
+      : undefined;
+    const children = Array.isArray(item.children) ? item.children : [];
+    const groupContext = useInternalGroups
+      ? (rootGroupContext ?? getGroupContext(item))
+      : [];
+    nestedRows.push({
+      item,
+      sectionName,
+      hierarchyNumber: path.join('.'),
+      rootOrdinal,
+      treePath: path,
+      depth,
+      isParent: children.length > 0,
+      groupContext: groupContext.length ? groupContext : inheritedGroupContext,
+    });
+    children.forEach((child, childIndex) => {
+      if (child && typeof child === 'object') {
+        visit(
+          child as BomExportItem,
+          [...path, childIndex + 1],
+          depth + 1,
+          sectionName,
+          groupContext.length ? groupContext : inheritedGroupContext,
+          rootOrdinal,
+        );
+      }
+    });
+  };
+
+  const sectionNames = new Set(
+    (() => {
+      const names: string[] = [];
+      const collect = (nodes: BomExportItem[]): void => {
+        nodes.forEach((item) => {
+          if (useExternalSections) {
+            const sectionName = String(item.section_name || '').trim();
+            if (sectionName) names.push(sectionName);
+          }
+          if (Array.isArray(item.children)) collect(item.children as BomExportItem[]);
+        });
+      };
+      collect(items);
+      return names;
+    })(),
+  );
+  const showSectionHeaders = useExternalSections && sectionNames.size > 1;
+  const rootGroupContexts = useInternalGroups
+    ? buildRootGroupContexts(items, false)
+    : items.map(() => []);
+
+  const sectionRootIndices = new Map<string, number>();
+  let globalRootIndex = 0;
+  items.forEach((item, itemIndex) => {
+    if (!item || typeof item !== 'object') return;
+    let rootPath: number[];
+    if (showSectionHeaders) {
+      const sectionKey = String(item.section_name || '').trim() || '__no_section__';
+      const sectionItemIndex = (sectionRootIndices.get(sectionKey) || 0) + 1;
+      sectionRootIndices.set(sectionKey, sectionItemIndex);
+      rootPath = [sectionItemIndex];
+    } else {
+      globalRootIndex += 1;
+      rootPath = [globalRootIndex];
+    }
+    visit(
+      item,
+      rootPath,
+      0,
+      undefined,
+      [],
+      itemIndex + 1,
+      rootGroupContexts[itemIndex] || [],
+    );
+  });
+
+  const groupedRootPaths = buildGroupedRootNumberPaths(
+    items,
+    rootGroupContexts,
+  );
+  let currentRootOrdinal: number | undefined;
+  let currentRootBasePath: number[] | undefined;
+  let currentSection: string | undefined;
+  let currentGroup = '';
+  const rows: BomExportTreeRow[] = [];
+
+  nestedRows.forEach((row) => {
+    if (groupedRootPaths.hasNumberingGroups) {
+      if (row.rootOrdinal !== currentRootOrdinal) {
+        currentRootOrdinal = row.rootOrdinal;
+        currentRootBasePath = groupedRootPaths.paths.get(row.rootOrdinal);
+      }
+      if (currentRootBasePath) {
+        row.hierarchyNumber = [...currentRootBasePath, ...row.treePath.slice(1)].join('.');
+      }
+    }
+    if (showSectionHeaders && row.sectionName !== currentSection) {
+      rows.push({
+        kind: 'section',
+        sectionName: row.sectionName || '通用及其他分项',
+      });
+      currentSection = row.sectionName;
+      currentGroup = '';
+    }
+    const groupKey = row.groupContext.join(' / ');
+    if (groupKey && groupKey !== currentGroup) {
+      const numberParts = row.hierarchyNumber.split('.');
+      let commonDepth = 0;
+      while (
+        commonDepth < currentGroup.split(' / ').length
+        && commonDepth < row.groupContext.length
+        && currentGroup.split(' / ')[commonDepth] === row.groupContext[commonDepth]
+      ) {
+        commonDepth += 1;
+      }
+      for (let groupDepth = commonDepth; groupDepth < row.groupContext.length; groupDepth += 1) {
+        rows.push({
+          kind: 'group',
+          groupName: row.groupContext[groupDepth],
+          hierarchyNumber: groupedRootPaths.hasNumberingGroups
+            ? numberParts.slice(0, groupDepth + 1).join('.')
+            : undefined,
+        });
+      }
+      currentGroup = groupKey;
+    } else if (!groupKey) {
+      currentGroup = '';
+    }
+    rows.push({ kind: 'item', ...row });
+  });
+  return rows;
+}
+
 /**
  * 清理并提取纯粹的招标文件标题（去除 .pdf / .docx 等后缀）
  */
@@ -54,149 +423,6 @@ export function cleanDocumentTitle(title?: string | null): string {
   const trimmed = title.trim();
   if (!trimmed) return '招标文件';
   return trimmed.replace(/\.(pdf|docx|doc|xlsx|xls|txt)$/i, '').trim() || '招标文件';
-}
-
-/**
- * 转义 CSV 单元格内容（包含逗号、换行或双引号时包裹双引号，并对内部双引号进行转义）
- */
-function escapeCsvCell(val: unknown): string {
-  if (val === null || val === undefined) return '';
-  const str = String(val);
-  if (/[",\n\r]/.test(str)) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-}
-
-/**
- * 导出为 Excel / CSV (.csv) 表格
- */
-export function exportBomToCsv(options: BomExportOptions): void {
-  const {
-    documentTitle,
-    items = [],
-    totalCost = 0,
-    budgetLimit,
-    statusText,
-    analysisSummary
-  } = options;
-
-  const cleanTitle = cleanDocumentTitle(documentTitle);
-  const totalCostUpper = numberToChineseRmb(totalCost);
-  const nowStr = new Date().toLocaleString('zh-CN', { hour12: false });
-
-  const csvRows: string[] = [];
-
-  // 1. 顶部项目与测算信息
-  csvRows.push([escapeCsvCell('拟投入设备及 BOM 成本测算清单')].join(','));
-  csvRows.push([escapeCsvCell('关联招标文件'), escapeCsvCell(cleanTitle)].join(','));
-  csvRows.push([escapeCsvCell('导出时间'), escapeCsvCell(nowStr)].join(','));
-  if (budgetLimit) {
-    csvRows.push([escapeCsvCell('最高投标限价/预算'), escapeCsvCell(budgetLimit)].join(','));
-  }
-  if (statusText) {
-    csvRows.push([escapeCsvCell('预算控制状态'), escapeCsvCell(statusText)].join(','));
-  }
-  csvRows.push(''); // 空行分隔
-
-  // 2. 表头（严格对齐规范 9 列格式）
-  const headers = [
-    '序号',
-    '标的物名称',
-    '品牌、规格、型号',
-    '生产厂家',
-    '单位',
-    '数量',
-    '单价(元)',
-    '总价(元)',
-    '备注'
-  ];
-  csvRows.push(headers.map(escapeCsvCell).join(','));
-
-  // 3. 数据行
-  items.forEach((item, idx) => {
-    const name = item.name || item.item_name || '';
-    
-    // 品牌、规格、型号组合
-    const brand = String(item.matched_brand || item.brand || '').trim();
-    const model = String(item.matched_model || item.model || '').trim();
-    const brandSpecModelParts: string[] = [];
-    if (brand && model) {
-      brandSpecModelParts.push(`${brand} ${model}`);
-    } else if (brand) {
-      brandSpecModelParts.push(brand);
-    } else if (model) {
-      brandSpecModelParts.push(model);
-    } else {
-      brandSpecModelParts.push('--');
-    }
-    const brandSpecModelText = brandSpecModelParts.join(' / ');
-
-    const manufacturer = String(item.matched_manufacturer || item.manufacturer || '--').trim();
-    const unit = item.unit || '项';
-    const qty = item.qty !== undefined && item.qty !== null ? item.qty : (item.quantity ?? 1);
-    const price = item.ref_price !== undefined && item.ref_price !== null ? item.ref_price : (item.price ?? 0);
-    const subtotal = item.subtotal !== undefined && item.subtotal !== null ? item.subtotal : (Number(qty) * Number(price));
-
-    // 备注列：严格使用前端 BOM 清单的备注 (remark) 字段
-    const remarkText = String(item.remark || '').trim();
-
-    const row = [
-      idx + 1,
-      name,
-      brandSpecModelText,
-      manufacturer,
-      unit,
-      qty,
-      Number(price).toFixed(2),
-      Number(subtotal).toFixed(2),
-      remarkText
-    ];
-    csvRows.push(row.map(escapeCsvCell).join(','));
-  });
-
-  // 4. 表尾统计行（包含小写金额与人民币大写总价）
-  csvRows.push(''); // 空行分隔
-  csvRows.push([
-    escapeCsvCell('【合计】预估总成本（小写）'),
-    '',
-    '',
-    '',
-    '',
-    '',
-    '',
-    escapeCsvCell(`¥${Number(totalCost).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`),
-    escapeCsvCell(`人民币（大写）${totalCostUpper}`)
-  ].join(','));
-
-  if (budgetLimit) {
-    csvRows.push([
-      escapeCsvCell('【基准】最高投标限价/预算'),
-      escapeCsvCell(budgetLimit),
-      '',
-      escapeCsvCell('【状态】预算达标情况'),
-      escapeCsvCell(statusText || '正常')
-    ].join(','));
-  }
-
-  if (analysisSummary) {
-    csvRows.push([
-      escapeCsvCell('【专家评估指导意见】'),
-      escapeCsvCell(analysisSummary)
-    ].join(','));
-  }
-
-  // 5. UTF-8 BOM (\uFEFF) 构造 Blob 并触发下载
-  const csvContent = '\uFEFF' + csvRows.join('\r\n');
-  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `【BOM成本测算清单】${cleanTitle}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  window.URL.revokeObjectURL(url);
 }
 
 /**
@@ -332,4 +558,3 @@ export async function exportBomToXlsx(options: BomExportOptions): Promise<void> 
   a.remove();
   window.URL.revokeObjectURL(url);
 }
-

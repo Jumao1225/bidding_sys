@@ -1,19 +1,40 @@
 import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
+  Activity,
+  CheckCircle2,
   Check,
+  Clock3,
   Eye,
   EyeOff,
   FileCog,
   Info,
   KeyRound,
+  Loader2,
   ScanText,
   Save,
   Server,
+  XCircle,
 } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../../utils/api';
 
 const DRAFT_STORAGE_KEY = 'bidding_model_env_draft';
+type ModelType = 'llm' | 'mineru' | 'vlm';
+
+interface ModelTestConfig {
+  modelType: ModelType;
+  apiKeyKey: string;
+  apiBaseKey: string;
+  modelNameKey?: string;
+}
+
+interface ModelConnectivityTestResult {
+  model_type: ModelType;
+  model_name: string | null;
+  available: boolean;
+  latency_ms: number;
+  message: string;
+}
 
 interface ModelConfig {
   provider: string;
@@ -21,6 +42,7 @@ interface ModelConfig {
   accent: string;
   icon: typeof Server;
   fields: ModelFieldConfig[];
+  test: ModelTestConfig;
 }
 
 interface ModelFieldConfig {
@@ -49,6 +71,12 @@ const MODEL_CONFIGS: ModelConfig[] = [
     description: '负责招投标文件的结构化提取、评标分析与标书生成。',
     accent: 'from-blue-500 to-cyan-400',
     icon: Server,
+    test: {
+      modelType: 'llm',
+      apiKeyKey: 'OPENAI_API_KEY',
+      apiBaseKey: 'OPENAI_API_BASE',
+      modelNameKey: 'LLM_MODEL_NAME',
+    },
     fields: [
       { label: 'API Key', envKey: 'OPENAI_API_KEY', placeholder: '请输入 API Key', secret: true },
       { label: 'API 地址', envKey: 'OPENAI_API_BASE', placeholder: '请输入 API 地址' },
@@ -60,6 +88,11 @@ const MODEL_CONFIGS: ModelConfig[] = [
     description: '负责 PDF、扫描件和复杂版面的 OCR 与文档结构解析。',
     accent: 'from-amber-500 to-orange-400',
     icon: ScanText,
+    test: {
+      modelType: 'mineru',
+      apiKeyKey: 'MINERU_API_TOKEN',
+      apiBaseKey: 'MINERU_API_BASE_URL',
+    },
     fields: [
       { label: 'API Token', envKey: 'MINERU_API_TOKEN', placeholder: '请输入 MinerU API Token', secret: true },
       { label: 'API 地址', envKey: 'MINERU_API_BASE_URL', placeholder: '请输入 MinerU API 地址' },
@@ -70,6 +103,12 @@ const MODEL_CONFIGS: ModelConfig[] = [
     description: '负责图片、图纸和其他视觉内容的理解与信息提取。',
     accent: 'from-indigo-500 to-violet-400',
     icon: KeyRound,
+    test: {
+      modelType: 'vlm',
+      apiKeyKey: 'ALI_VLM_API_KEY',
+      apiBaseKey: 'ALI_VLM_API_BASE',
+      modelNameKey: 'ALI_VLM_MODEL_NAME',
+    },
     fields: [
       { label: 'API Key', envKey: 'ALI_VLM_API_KEY', placeholder: '请输入视觉模型 API Key', secret: true },
       { label: 'API 地址', envKey: 'ALI_VLM_API_BASE', placeholder: '请输入视觉模型 API 地址' },
@@ -134,7 +173,15 @@ export function EnvConfigPage() {
   const [isSaving, setIsSaving] = useState(false);
   const [tenants, setTenants] = useState<TenantOption[]>([]);
   const [targetTenantId, setTargetTenantId] = useState(isPlatformAdmin ? '' : (storedUser?.tenant_id ?? ''));
+  const [testResults, setTestResults] = useState<Partial<Record<ModelType, ModelConnectivityTestResult>>>({});
+  const [testingModelType, setTestingModelType] = useState<ModelType | null>(null);
   const changedCount = MODEL_KEYS.filter((key) => values[key] !== lastSavedValues[key]).length;
+
+  useEffect(() => {
+    // 切换租户后，旧租户的探测结果不再具有参考价值。
+    setTestResults({});
+    setTestingModelType(null);
+  }, [targetTenantId]);
 
   useEffect(() => {
     if (!isPlatformAdmin) return;
@@ -198,8 +245,72 @@ export function EnvConfigPage() {
 
   const updateValue = (key: string, value: string) => {
     setValues((currentValues) => ({ ...currentValues, [key]: value }));
+    // 任一配置变化都会使之前的探测结果失效，避免展示旧配置的状态。
+    setTestResults({});
     setNotice('');
     setError('');
+  };
+
+  const handleTestModel = async (config: ModelConfig) => {
+    const { test } = config;
+    const modelName = test.modelNameKey ? (values[test.modelNameKey] ?? '') : '';
+    const requestBody = {
+      model_type: test.modelType,
+      // MinerU 的 Token 复用 api_key 字段传输，后端不会持久化本次探测值。
+      api_key: values[test.apiKeyKey] ?? '',
+      api_base: values[test.apiBaseKey] ?? '',
+      model_name: modelName,
+    };
+
+    setTestingModelType(test.modelType);
+    setTestResults((currentResults) => ({ ...currentResults, [test.modelType]: undefined }));
+    setNotice('');
+    setError('');
+
+    try {
+      const query = `?tenant_id=${encodeURIComponent(targetTenantId)}`;
+      const response = await apiFetch(`${API_BASE_URL}/api/v1/admin/model-config/test${query}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+      const payload = await response.json().catch(() => ({})) as {
+        data?: ModelConnectivityTestResult;
+        detail?: string;
+      };
+
+      if (!response.ok || !payload.data) {
+        const result: ModelConnectivityTestResult = {
+          model_type: test.modelType,
+          model_name: modelName || null,
+          available: false,
+          latency_ms: 0,
+          message: payload.detail || '模型接口测试失败，请检查配置后重试',
+        };
+        setTestResults((currentResults) => ({ ...currentResults, [test.modelType]: result }));
+        console.warn('[模型配置] 模型接口测试失败。', { modelType: test.modelType, status: response.status });
+        return;
+      }
+
+      setTestResults((currentResults) => ({ ...currentResults, [test.modelType]: payload.data }));
+      console.info('[模型配置] 模型接口测试完成。', {
+        modelType: payload.data.model_type,
+        available: payload.data.available,
+        latencyMs: payload.data.latency_ms,
+      });
+    } catch (testError) {
+      const result: ModelConnectivityTestResult = {
+        model_type: test.modelType,
+        model_name: modelName || null,
+        available: false,
+        latency_ms: 0,
+        message: '模型接口测试请求失败，请确认后端服务已启动',
+      };
+      setTestResults((currentResults) => ({ ...currentResults, [test.modelType]: result }));
+      console.error('[模型配置] 模型接口测试请求异常。', testError);
+    } finally {
+      setTestingModelType((currentModelType) => currentModelType === test.modelType ? null : currentModelType);
+    }
   };
 
   const handleSaveBackend = async () => {
@@ -283,7 +394,18 @@ export function EnvConfigPage() {
 
         <div className="grid gap-6 xl:grid-cols-3">
           {MODEL_CONFIGS.map((config) => (
-            <ModelConfigCard key={config.provider} config={config} values={values} visibleSecrets={visibleSecrets} onChange={updateValue} onToggleSecret={(key) => setVisibleSecrets((current) => ({ ...current, [key]: !current[key] }))} />
+            <ModelConfigCard
+              key={config.provider}
+              config={config}
+              values={values}
+              visibleSecrets={visibleSecrets}
+              testResult={testResults[config.test.modelType]}
+              isTesting={testingModelType === config.test.modelType}
+              canTest={Boolean(targetTenantId)}
+              onChange={updateValue}
+              onTest={() => void handleTestModel(config)}
+              onToggleSecret={(key) => setVisibleSecrets((current) => ({ ...current, [key]: !current[key] }))}
+            />
           ))}
         </div>
 
@@ -306,11 +428,15 @@ interface ModelConfigCardProps {
   config: ModelConfig;
   values: Record<string, string>;
   visibleSecrets: Record<string, boolean>;
+  testResult?: ModelConnectivityTestResult;
+  isTesting: boolean;
+  canTest: boolean;
   onChange: (key: string, value: string) => void;
+  onTest: () => void;
   onToggleSecret: (key: string) => void;
 }
 
-function ModelConfigCard({ config, values, visibleSecrets, onChange, onToggleSecret }: ModelConfigCardProps) {
+function ModelConfigCard({ config, values, visibleSecrets, testResult, isTesting, canTest, onChange, onTest, onToggleSecret }: ModelConfigCardProps) {
   const Icon = config.icon;
   return (
     <section className="rounded-3xl border border-slate-200/60 bg-white/75 p-5 shadow-xl shadow-slate-200/20 backdrop-blur-xl transition-all hover:-translate-y-1 hover:shadow-indigo-100/50 md:p-6">
@@ -335,6 +461,37 @@ function ModelConfigCard({ config, values, visibleSecrets, onChange, onToggleSec
             onChange={(value) => onChange(field.envKey, value)}
           />
         ))}
+      </div>
+      <div className="mt-6 border-t border-slate-100 pt-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-slate-700">接口可用性</p>
+            <p className="mt-1 text-xs text-slate-400">使用当前表单值发送最小测试请求</p>
+          </div>
+          <button
+            type="button"
+            onClick={onTest}
+            disabled={!canTest || isTesting}
+            aria-label={`测试${config.provider}接口`}
+            className="inline-flex shrink-0 items-center rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-600 transition-colors hover:border-indigo-300 hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {isTesting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Activity className="mr-1.5 h-3.5 w-3.5" />}
+            {isTesting ? '测试中…' : '测试接口'}
+          </button>
+        </div>
+        {testResult && (
+          <div className={`mt-3 flex items-start gap-2 rounded-xl border px-3 py-2.5 text-xs ${testResult.available ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-rose-200 bg-rose-50 text-rose-700'}`} role="status">
+            {testResult.available ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /> : <XCircle className="mt-0.5 h-4 w-4 shrink-0" />}
+            <div className="min-w-0">
+              <p className="font-semibold">{testResult.available ? '接口可用' : '接口不可用'}</p>
+              <p className="mt-0.5 break-words leading-5">{testResult.message}</p>
+              {testResult.latency_ms > 0 && (
+                <p className="mt-1 inline-flex items-center gap-1 text-[11px] opacity-75"><Clock3 className="h-3 w-3" />响应耗时 {testResult.latency_ms}ms</p>
+              )}
+            </div>
+          </div>
+        )}
+        {!canTest && <p className="mt-3 text-xs text-amber-600">请选择配置租户后再测试模型接口。</p>}
       </div>
     </section>
   );

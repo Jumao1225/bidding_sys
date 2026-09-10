@@ -1,10 +1,12 @@
 import pytest
 from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 from app.agents.nodes.cost_agent import (
     cost_node,
     CostItem,
     CostAnalysisResult,
     find_local_price_reference,
+    _get_pending_custom_cost_items,
 )
 
 
@@ -98,6 +100,46 @@ def test_cost_item_zero_price_fallback():
     assert item.subtotal == 0.0
     assert item.match_quality == "未匹配"
 
+
+def test_get_pending_custom_cost_items_should_select_only_unpriced_new_items():
+    """批量匹配输入应只包含未定价手动新增项，排除已有价格和明确手动修改项。"""
+    document = SimpleNamespace(parsed_metadata={
+        "cost_analysis": {
+            "items": [
+                {
+                    "node_id": "custom-pending",
+                    "name": "待匹配新增项",
+                    "spec_requirement": "测试规格",
+                    "qty": 2,
+                    "unit": "台",
+                    "ref_price": 0,
+                    "match_quality": "手动添加",
+                    "is_custom_added": True,
+                },
+                {
+                    "node_id": "custom-priced",
+                    "name": "已有价格新增项",
+                    "ref_price": 100,
+                    "match_quality": "手动添加",
+                    "is_custom_added": True,
+                },
+                {
+                    "node_id": "custom-edited",
+                    "name": "手动修改新增项",
+                    "ref_price": 0,
+                    "match_quality": "手动修改",
+                    "is_custom_added": True,
+                },
+            ]
+        }
+    })
+
+    pending_items = _get_pending_custom_cost_items(document)
+
+    assert [item["node_id"] for item in pending_items] == ["custom-pending"]
+    assert pending_items[0]["item_name"] == "待匹配新增项"
+    assert pending_items[0]["quantity"] == 2
+
 @patch("app.agents.nodes.cost_agent.SessionLocal")
 @patch("app.agents.nodes.cost_agent.document_crud")
 @patch("app.agents.nodes.cost_agent.business_crud")
@@ -175,6 +217,71 @@ def test_cost_node_execution_should_succeed(
     assert mock_llm.generate_structured_output.call_args.kwargs["tenant_id"] == "tenant-123"
     mock_get_rag_context.assert_called_once_with("doc-123", "tenant-123")
     assert "采购清单：核心交换机 2台" in mock_llm.generate_structured_output.call_args.kwargs["prompt"]
+
+
+@patch("app.agents.nodes.cost_agent.SessionLocal")
+@patch("app.agents.nodes.cost_agent.document_crud")
+@patch("app.agents.nodes.cost_agent.business_crud")
+@patch("app.agents.nodes.cost_agent._get_cost_rag_context")
+@patch("app.agents.nodes.cost_agent.llm_service")
+def test_cost_node_should_include_unpriced_custom_item_in_batch_matching(
+    mock_llm, mock_get_rag_context, mock_business_crud, mock_document_crud, mock_session
+):
+    """成本 Agent 应将未定价手动新增项加入批量匹配输入并保留稳定节点 ID。"""
+    mock_db = MagicMock()
+    mock_session.return_value = mock_db
+    mock_db.query.return_value.filter.return_value.first.return_value = None
+
+    mock_doc = MagicMock()
+    mock_doc.project_id = None
+    mock_doc.parsed_metadata = {
+        "cost_analysis": {
+            "items": [
+                {
+                    "node_id": "custom-breaker",
+                    "name": "手动补充断路器",
+                    "spec_requirement": "630A",
+                    "qty": 2,
+                    "unit": "台",
+                    "ref_price": 0,
+                    "match_quality": "手动添加",
+                    "is_custom_added": True,
+                }
+            ]
+        }
+    }
+    mock_document_crud.get_document_by_id.return_value = mock_doc
+    mock_business_crud.get_all_price_references.return_value = []
+
+    mock_llm.generate_structured_output.return_value = CostAnalysisResult(
+        items=[
+            CostItem(
+                name="手动补充断路器",
+                qty=2,
+                unit="台",
+                matched_name="630A断路器",
+                matched_brand="测试品牌",
+                ref_price=1200,
+                subtotal=2400,
+                match_quality="精准匹配",
+            )
+        ],
+        analysis_summary="新增项匹配正常",
+    )
+
+    result = cost_node({
+        "document_id": "doc-custom",
+        "user_id": "user-123",
+        "tenant_id": "tenant-123",
+    })
+
+    cost_items = result["cost_analysis"]["items"]
+    assert len(cost_items) == 1
+    assert cost_items[0]["node_id"] == "custom-breaker"
+    assert cost_items[0]["ref_price"] == 1200
+    assert result["cost_analysis"]["total_cost"] == 2400
+    assert "手动补充断路器" in mock_llm.generate_structured_output.call_args.kwargs["prompt"]
+    mock_get_rag_context.assert_not_called()
 
 @patch("app.agents.nodes.cost_agent.SessionLocal")
 @patch("app.agents.nodes.cost_agent.document_crud")

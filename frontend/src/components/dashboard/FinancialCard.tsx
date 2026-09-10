@@ -1,4 +1,4 @@
-import React from 'react';
+import { format_analysis_value } from '../../utils/displayValue';
 
 interface FinancialProps {
   financial?: {
@@ -32,8 +32,9 @@ export function FinancialCard({ financial = {}, onReextract, isRetrying = false 
   const advance_payment_ratio = financial.advance_payment_ratio;
   const payment_milestones = financial.payment_milestones || [];
 
-  const formatMoney = (amount?: number) => {
+  const formatMoney = (amount?: unknown) => {
     if (amount === undefined || amount === null) return '--';
+    if (typeof amount !== 'number') return format_analysis_value(amount);
     // 招投标业务对金额精度要求极高，废除“万”单位的四舍五入，统一精确到“元”
     return `${amount.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}元`;
   };
@@ -80,10 +81,10 @@ export function FinancialCard({ financial = {}, onReextract, isRetrying = false 
           <div className="bg-slate-50 rounded-xl border border-slate-200 p-4 space-y-3">
             <div className="grid grid-cols-2 gap-4 text-sm">
               {contract_price_type && (
-                <div><span className="text-slate-400 mr-2">计价方式:</span><span className="font-bold text-slate-700">{contract_price_type}</span></div>
+                <div><span className="text-slate-400 mr-2">计价方式:</span><span className="font-bold text-slate-700">{format_analysis_value(contract_price_type)}</span></div>
               )}
               {tax_rate_requirement && (
-                <div><span className="text-slate-400 mr-2">税率要求:</span><span className="font-bold text-slate-700">{tax_rate_requirement}</span></div>
+                <div><span className="text-slate-400 mr-2">税率要求:</span><span className="font-bold text-slate-700">{format_analysis_value(tax_rate_requirement)}</span></div>
               )}
             </div>
             {provisional_sum && (
@@ -111,10 +112,10 @@ export function FinancialCard({ financial = {}, onReextract, isRetrying = false 
             <div className="space-y-2">
               {payment_milestones.map((m, idx) => (
                 <div key={idx} className="flex gap-3 text-sm text-slate-700 bg-blue-50/30 p-3 rounded-xl border border-blue-100/50">
-                  <div className="font-bold text-blue-600 shrink-0 w-12 text-right">{m.percentage}%</div>
+                  <div className="font-bold text-blue-600 shrink-0 w-12 text-right">{format_analysis_value(m.percentage)}%</div>
                   <div>
-                    <div className="font-bold text-slate-800 mb-0.5">{m.stage} {m.invoice_required ? <span className="text-[10px] bg-slate-200 text-slate-500 px-1 rounded ml-1">需发票</span> : ''}</div>
-                    <div className="text-xs text-slate-500 leading-relaxed">{m.condition}</div>
+                    <div className="font-bold text-slate-800 mb-0.5">{format_analysis_value(m.stage)} {m.invoice_required ? <span className="text-[10px] bg-slate-200 text-slate-500 px-1 rounded ml-1">需发票</span> : ''}</div>
+                    <div className="text-xs text-slate-500 leading-relaxed">{format_analysis_value(m.condition)}</div>
                   </div>
                 </div>
               ))}
@@ -136,9 +137,9 @@ export function FinancialCard({ financial = {}, onReextract, isRetrying = false 
               ].map((bond, idx) => bond.data && (
                 <div key={idx} className="bg-amber-50/50 p-3 rounded-xl border border-amber-100/50 flex flex-col">
                   <div className="text-xs font-bold text-amber-700 mb-1">{bond.title}</div>
-                  <div className="font-bold text-slate-800 text-sm mb-1">{bond.data.calculated_amount ? formatMoney(bond.data.calculated_amount) : bond.data.amount_description}</div>
+                  <div className="font-bold text-slate-800 text-sm mb-1">{bond.data.calculated_amount ? formatMoney(bond.data.calculated_amount) : format_analysis_value(bond.data.amount_description)}</div>
                   {bond.data.acceptable_forms && bond.data.acceptable_forms.length > 0 && (
-                    <div className="text-[10px] text-slate-500 mt-auto">{bond.data.acceptable_forms.join('/')}</div>
+                    <div className="text-[10px] text-slate-500 mt-auto">{format_analysis_value(bond.data.acceptable_forms)}</div>
                   )}
                 </div>
               ))}

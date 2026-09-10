@@ -6,7 +6,9 @@
 - GET /fill-bid-format/{document_id}/worker-logs            — 查取 Worker Agent 履历
 - GET /fill-bid-format/{document_id}/audit-report           — Agent 填报审计报告
 - GET /agent-fill-bid-format/{document_id}/download        — 下载 ReAct Agent 填报结果
-- GET|POST /extract-bid-format/{document_id}              — 提取《投标文件格式》原始模板
+- GET|POST /extract-bid-format/{document_id}              — 兼容旧调用：重新提取并下载原始模板
+- POST /reextract-bid-format/{document_id}                — 重新提取并刷新原始模板缓存
+- GET /download-bid-format-template/{document_id}         — 下载缓存模板，无缓存时先提取
 - GET|POST /fill-bid-format/{document_id}                 — 纯净导出（不自动填报）
 - POST /agent-fill-bid-format/{document_id}                — BidFillerAgent (ReAct) 填报
 """
@@ -14,12 +16,13 @@
 import os
 import io
 import json
+import re
 import time
 import tempfile
 import uuid
 import urllib.parse
-from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Response
+from typing import Optional, Dict, Any, List
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
@@ -29,11 +32,167 @@ from loguru import logger
 from app.api import deps
 from app.db.models.user import User
 from app.schemas.bid_filler_schema import BidFillRequest, RegenerateChapterRequest, RegenerateChapterResponse
+from app.schemas.bid_template import (
+    BidTemplateBindingRequest,
+    BidTemplateBindingResponse,
+    BidTemplateResponse,
+)
+from app.schemas.response.common import ResponseModel, success_response
 from app.services.bid_format_extractor_service import bid_format_extractor_service
+from app.services.bid_template_service import bid_template_service
+from app.services.cost_service import resolve_cost_total
+from app.services.llm_service import ModelUnavailableError
 
 router = APIRouter()
 
 FIRST_BID_FILL_DURATION_KEY = "first_bid_fill_duration_ms"
+
+
+@router.post("/templates/upload", response_model=ResponseModel[BidTemplateResponse])
+def upload_bid_template(
+    file: UploadFile = File(...),
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    """上传租户自己的空白 DOCX 模板，供后续绑定招标文档使用。"""
+    try:
+        template = bid_template_service.upload_template(
+            db=db,
+            file=file,
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+        )
+        return success_response(data=template, message="模板上传成功")
+    except ValueError as validation_error:
+        logger.warning("外部投标模板上传校验失败: filename={}, error={}", file.filename, validation_error)
+        raise HTTPException(status_code=400, detail=str(validation_error)) from validation_error
+    except Exception as upload_error:
+        logger.exception("外部投标模板上传失败: filename={}, error={}", file.filename, upload_error)
+        raise HTTPException(status_code=500, detail="模板上传失败") from upload_error
+
+
+@router.get("/templates", response_model=ResponseModel[List[BidTemplateResponse]])
+def list_bid_templates(
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    """获取当前租户可用的外部 DOCX 模板。"""
+    try:
+        templates = bid_template_service.list_templates(db=db, tenant_id=current_user.tenant_id)
+        return success_response(data=templates)
+    except Exception as list_error:
+        logger.exception("查询外部投标模板失败: tenant_id={}, error={}", current_user.tenant_id, list_error)
+        raise HTTPException(status_code=500, detail="查询模板列表失败") from list_error
+
+
+@router.post(
+    "/template-bindings/{document_id}",
+    response_model=ResponseModel[BidTemplateBindingResponse],
+)
+def bind_bid_template(
+    document_id: str,
+    request_body: BidTemplateBindingRequest,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    """将已上传的外部空白模板绑定到一份招标文档。"""
+    try:
+        binding = bid_template_service.bind_template(
+            db=db,
+            document_id=document_id,
+            template_id=request_body.template_id,
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+            note=request_body.note,
+        )
+        return success_response(data=binding, message="模板绑定成功")
+    except LookupError as bind_lookup_error:
+        logger.warning(
+            "外部投标模板绑定对象不存在或无权访问: document_id={}, template_id={}, error={}",
+            document_id,
+            request_body.template_id,
+            bind_lookup_error,
+        )
+        raise HTTPException(status_code=404, detail=str(bind_lookup_error)) from bind_lookup_error
+    except FileNotFoundError as template_file_error:
+        logger.warning("外部投标模板物理文件缺失: template_id={}, error={}", request_body.template_id, template_file_error)
+        raise HTTPException(status_code=409, detail=str(template_file_error)) from template_file_error
+    except ValueError as bind_error:
+        logger.warning("外部投标模板绑定失败: document_id={}, error={}", document_id, bind_error)
+        raise HTTPException(status_code=400, detail=str(bind_error)) from bind_error
+    except Exception as unexpected_error:
+        logger.exception(
+            "外部投标模板绑定发生未预期异常: document_id={}, template_id={}, error={}",
+            document_id,
+            request_body.template_id,
+            unexpected_error,
+        )
+        raise HTTPException(status_code=500, detail="模板绑定失败") from unexpected_error
+
+
+@router.delete(
+    "/template-bindings/{document_id}",
+    response_model=ResponseModel[Optional[BidTemplateBindingResponse]],
+)
+def unbind_bid_template(
+    document_id: str,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    """解除当前招标文档的外部模板绑定，后续恢复使用招标文件原格式。"""
+    try:
+        binding = bid_template_service.unbind_template(
+            db=db,
+            document_id=document_id,
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+        )
+        message = "模板解除绑定成功，后续将使用招标文件原格式" if binding else "当前文档未绑定模板"
+        return success_response(data=binding, message=message)
+    except LookupError as unbind_lookup_error:
+        logger.warning(
+            "解除外部投标模板绑定对象不存在或无权访问: document_id={}, error={}",
+            document_id,
+            unbind_lookup_error,
+        )
+        raise HTTPException(status_code=404, detail=str(unbind_lookup_error)) from unbind_lookup_error
+    except ValueError as unbind_error:
+        logger.warning("解除外部投标模板绑定失败: document_id={}, error={}", document_id, unbind_error)
+        raise HTTPException(status_code=400, detail=str(unbind_error)) from unbind_error
+    except Exception as unexpected_error:
+        logger.exception(
+            "解除外部投标模板绑定发生未预期异常: document_id={}, error={}",
+            document_id,
+            unexpected_error,
+        )
+        raise HTTPException(status_code=500, detail="解除模板绑定失败") from unexpected_error
+
+
+@router.get(
+    "/template-bindings/{document_id}",
+    response_model=ResponseModel[Optional[BidTemplateBindingResponse]],
+)
+def get_bid_template_binding(
+    document_id: str,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    """查询当前招标文档的外部模板绑定，未绑定时返回空数据。"""
+    try:
+        binding = bid_template_service.get_binding(
+            db=db,
+            document_id=document_id,
+            tenant_id=current_user.tenant_id,
+        )
+        return success_response(data=binding)
+    except Exception as binding_query_error:
+        logger.exception(
+            "查询外部投标模板绑定失败: document_id={}, tenant_id={}, error={}",
+            document_id,
+            current_user.tenant_id,
+            binding_query_error,
+        )
+        raise HTTPException(status_code=500, detail="查询模板绑定失败") from binding_query_error
 
 
 def _get_first_bid_fill_duration_ms(db: Session, document_id: str) -> int:
@@ -46,6 +205,16 @@ def _get_first_bid_fill_duration_ms(db: Session, document_id: str) -> int:
     if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool) and duration_ms > 0:
         return int(duration_ms)
     return 0
+
+
+def _extract_manual_chapters_from_logs(logs: list) -> list[dict]:
+    """从最新审计日志中读取人工撰写章节，供页面和 SSE 复用。"""
+    for log in logs:
+        outputs = getattr(log, "outputs", None) or {}
+        manual_chapters = outputs.get("manual_chapters") if isinstance(outputs, dict) else None
+        if isinstance(manual_chapters, list):
+            return [item for item in manual_chapters if isinstance(item, dict)]
+    return []
 
 
 def _restore_profile_slots_after_chapter_reset(
@@ -91,6 +260,63 @@ def _restore_profile_slots_after_chapter_reset(
             restore_error,
         )
         return 0
+
+
+def _verify_pricing_table_writeback(
+    docx_path: str,
+    chapter_title: str,
+    proposals: List[Dict[str, Any]],
+) -> tuple[bool, str]:
+    """回读报价表，确认完整矩阵已经扩写到 Word 数据区。"""
+    matrix_proposals = []
+    for proposal in proposals or []:
+        if str(proposal.get("type", "")).strip() != "table_rows":
+            continue
+        raw_value = proposal.get("proposed_text")
+        if raw_value is None:
+            raw_value = proposal.get("value", "")
+        try:
+            matrix = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+        except json.JSONDecodeError:
+            continue
+        if isinstance(matrix, list) and matrix and all(isinstance(row, list) for row in matrix):
+            matrix_proposals.append((proposal, matrix))
+
+    if not matrix_proposals:
+        return False, "未找到有效的报价表二维矩阵提案"
+
+    from docx import Document
+    from app.utils.table_utils import detect_table_header_rows, get_chapter_specific_table_indices
+
+    if not docx_path or not os.path.exists(docx_path):
+        return False, "报价表回读文件不存在"
+
+    document = Document(docx_path)
+    table_indices = get_chapter_specific_table_indices(document, chapter_title)
+    if not table_indices:
+        return False, "报价表回读时未找到目标章节表格"
+
+    for proposal, matrix in matrix_proposals:
+        path_match = re.search(r"^/body/tbl\[(\d+)\]$", str(proposal.get("path", "")).strip())
+        table_index = int(path_match.group(1)) - 1 if path_match else table_indices[0]
+        if table_index < 0 or table_index >= len(document.tables):
+            return False, f"报价表回读路径越界: {proposal.get('path', '')}"
+
+        table = document.tables[table_index]
+        header_rows = detect_table_header_rows(table)
+        expected_rows = len(matrix)
+        if len(table.rows) < header_rows + expected_rows:
+            return False, (
+                f"报价表扩写行数不足: expected_data_rows={expected_rows}, "
+                f"actual_rows={len(table.rows) - header_rows}"
+            )
+
+        for row_index in range(header_rows, header_rows + expected_rows):
+            row_text = "".join(str(cell.text or "").strip() for cell in table.rows[row_index].cells)
+            if not row_text:
+                return False, f"报价表数据行为空: row={row_index + 1}"
+
+    return True, f"已回读校验 {len(matrix_proposals)} 个矩阵提案"
 
 
 def _query_first_bid_fill_duration_ms(document_id: str) -> int:
@@ -173,6 +399,40 @@ def _get_bid_fill_pipeline_state(logs: list) -> Dict[str, Any]:
             "pipeline_message": "后台填报、终审和最终 Word 发布流程已完成",
             "is_completed": True,
         }
+
+    # 模型连接失败时，优先返回稳定的业务提示，避免前端只能看到笼统的流程异常。
+    failure_messages: list[str] = []
+    error_message = getattr(latest_terminal, "error_message", None)
+    if isinstance(error_message, str) and error_message.strip():
+        failure_messages.append(error_message.strip())
+    outputs = getattr(latest_terminal, "outputs", None)
+    if isinstance(outputs, dict):
+        for key in ("error", "error_message", "summary"):
+            value = outputs.get(key)
+            if isinstance(value, str) and value.strip():
+                failure_messages.append(value.strip())
+
+    normalized_failure = " ".join(failure_messages).lower()
+    if (
+        "模型不可用" in normalized_failure
+        or "模型服务不可用" in normalized_failure
+        or "model unavailable" in normalized_failure
+        or (
+            "model service" in normalized_failure
+            and "connection" in normalized_failure
+        )
+    ) and (
+        "连接失败" in normalized_failure
+        or "服务连接" in normalized_failure
+        or "connection" in normalized_failure
+        or "disconnected" in normalized_failure
+    ):
+        return {
+            "pipeline_status": "failed",
+            "pipeline_message": "模型服务不可用：模型服务连接失败，请检查模型地址、网络或服务状态",
+            "is_completed": True,
+        }
+
     return {
         "pipeline_status": "failed",
         "pipeline_message": "后台填报流程异常结束，请查看审计日志",
@@ -352,6 +612,7 @@ def get_bid_fill_worker_logs(
                     "completion_tokens": log.completion_tokens or 0,
                     "summary": out.get("summary", "已完成填报分析与写盘。"),
                     "proposals_count": out.get("proposals_count", 0),
+                    "written_count": out.get("written_count"),
                     "proposals": out.get("proposals", []),
                     "tools_used": out.get("tools_used", inp.get("tools_used", [])),
                     "thought_steps": out.get("thought_steps", []),
@@ -365,10 +626,13 @@ def get_bid_fill_worker_logs(
                 total_wall_time_ms = delta_ms
 
         pipeline_state = _get_bid_fill_pipeline_state(logs)
+        manual_chapters = _extract_manual_chapters_from_logs(logs)
         return {
             "document_id": document_id,
             "total_workers_count": len(worker_items),
             "worker_items": worker_items,
+            "manual_chapters": manual_chapters,
+            "manual_pending_count": len(manual_chapters),
             "total_wall_time_ms": total_wall_time_ms,
             "first_bid_fill_duration_ms": first_bid_fill_duration_ms,
             "total_worker_time_ms": total_worker_time_ms,
@@ -380,100 +644,110 @@ def get_bid_fill_worker_logs(
             "document_id": document_id,
             "total_workers_count": 0,
             "worker_items": [],
+            "manual_chapters": [],
+            "manual_pending_count": 0,
             "total_wall_time_ms": 0,
             "first_bid_fill_duration_ms": 0,
             "total_worker_time_ms": 0
         }
 
 
+def _build_bid_fill_stream_payload(document_id: str) -> tuple[str, bool]:
+    """在线程池内查询、组装并序列化 SSE 快照，避免大日志占用事件循环。"""
+    logs = _query_bid_fill_logs(document_id)
+    worker_items = []
+    seen_chapters = set()
+
+    first_bid_fill_duration_ms = _query_first_bid_fill_duration_ms(document_id)
+    total_wall_time_ms = first_bid_fill_duration_ms
+    min_created_at = None
+    max_created_at = None
+
+    for log in logs:
+        if log.created_at:
+            if min_created_at is None or log.created_at < min_created_at:
+                min_created_at = log.created_at
+            if max_created_at is None or log.created_at > max_created_at:
+                max_created_at = log.created_at
+
+        if total_wall_time_ms == 0 and log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
+            total_wall_time_ms = max(total_wall_time_ms, log.execution_time_ms)
+
+        if log.action_type in ("llm_call_worker", "llm_call_supervisor", "chapter_execution") or (log.node_name and (log.node_name.startswith("BidFillerWorker") or "Supervisor" in log.node_name)):
+            inp = log.inputs or {}
+            out = log.outputs or {}
+            is_supervisor = (log.node_name and "Supervisor" in log.node_name) or log.action_type == "llm_call_supervisor"
+            ch_title = "Supervisor 总控调度" if is_supervisor else (inp.get("chapter_title") or (log.node_name.replace("BidFillerWorker-", "") if log.node_name else "未知章节"))
+
+            if ch_title in seen_chapters:
+                continue
+            seen_chapters.add(ch_title)
+
+            status_val = log.status or "success"
+
+            worker_items.append({
+                "id": str(log.id),
+                "node_name": "Supervisor-总控调度" if is_supervisor else (log.node_name or f"BidFillerWorker-{ch_title}"),
+                "chapter_title": ch_title,
+                "category": "supervisor_master" if is_supervisor else inp.get("category", "needs_fill"),
+                "status": status_val,
+                "execution_time_ms": log.execution_time_ms or 0,
+                "total_tokens": log.total_tokens or ((log.prompt_tokens or 0) + (log.completion_tokens or 0)),
+                "prompt_tokens": log.prompt_tokens or 0,
+                "completion_tokens": log.completion_tokens or 0,
+                "summary": out.get("summary", "已完成填报分析与写盘。"),
+                "proposals_count": out.get("proposals_count", 0),
+                "written_count": out.get("written_count"),
+                "proposals": out.get("proposals", []),
+                "tools_used": out.get("tools_used", inp.get("tools_used", [])),
+                "thought_steps": out.get("thought_steps", []),
+                "created_at": log.created_at.strftime("%Y-%m-%d %H:%M:%S") if log.created_at else None,
+            })
+
+    total_worker_time_ms = sum(w.get("execution_time_ms", 0) for w in worker_items)
+    if total_wall_time_ms == 0 and min_created_at and max_created_at:
+        delta_ms = int((max_created_at - min_created_at).total_seconds() * 1000)
+        if delta_ms > 0:
+            total_wall_time_ms = delta_ms
+
+    pipeline_state = _get_bid_fill_pipeline_state(logs)
+    manual_chapters = _extract_manual_chapters_from_logs(logs)
+    payload = {
+        "document_id": document_id,
+        "worker_items": worker_items,
+        "manual_chapters": manual_chapters,
+        "manual_pending_count": len(manual_chapters),
+        # 只有后台最终 Supervisor 终态才能结束 SSE，不能用中间 Worker 成功状态代替。
+        "is_completed": pipeline_state["is_completed"],
+        "pipeline_status": pipeline_state["pipeline_status"],
+        "pipeline_message": pipeline_state["pipeline_message"],
+        "total_wall_time_ms": total_wall_time_ms,
+        "first_bid_fill_duration_ms": first_bid_fill_duration_ms,
+        "total_worker_time_ms": total_worker_time_ms,
+        "timestamp": time.time(),
+    }
+    return json.dumps(payload, ensure_ascii=False), bool(pipeline_state["is_completed"])
+
+
 @router.get("/fill-bid-format/{document_id}/stream-logs")
 async def stream_bid_fill_worker_logs(document_id: str):
-    """
-    通过 SSE (Server-Sent Events) 实时推流获取 BidFillerWorker 全套 Agent 节点运行履历与 CoT 思维链
-    """
+    """通过 SSE 实时推流获取 BidFillerWorker 全套 Agent 节点运行履历。"""
     if not document_id:
         raise HTTPException(status_code=400, detail="未提供有效的 document_id 参数")
 
     async def log_event_generator():
         import asyncio
-        import time
 
         last_json = None
         same_count = 0
 
         while True:
             try:
-                # 数据库查询放入线程池，确保 SSE 轮询不会占用 FastAPI 主事件循环。
-                logs = await run_in_threadpool(_query_bid_fill_logs, document_id)
-
-                worker_items = []
-                seen_chapters = set()
-
-                first_bid_fill_duration_ms = await run_in_threadpool(_query_first_bid_fill_duration_ms, document_id)
-                total_wall_time_ms = first_bid_fill_duration_ms
-                min_created_at = None
-                max_created_at = None
-
-                for log in logs:
-                    if log.created_at:
-                        if min_created_at is None or log.created_at < min_created_at:
-                            min_created_at = log.created_at
-                        if max_created_at is None or log.created_at > max_created_at:
-                            max_created_at = log.created_at
-
-                    if total_wall_time_ms == 0 and log.status == "master_completed" and log.execution_time_ms and log.execution_time_ms > 0:
-                        total_wall_time_ms = max(total_wall_time_ms, log.execution_time_ms)
-
-                    if log.action_type in ("llm_call_worker", "llm_call_supervisor", "chapter_execution") or (log.node_name and (log.node_name.startswith("BidFillerWorker") or "Supervisor" in log.node_name)):
-                        inp = log.inputs or {}
-                        out = log.outputs or {}
-                        is_supervisor = (log.node_name and "Supervisor" in log.node_name) or log.action_type == "llm_call_supervisor"
-                        ch_title = "Supervisor 总控调度" if is_supervisor else (inp.get("chapter_title") or (log.node_name.replace("BidFillerWorker-", "") if log.node_name else "未知章节"))
-
-                        if ch_title in seen_chapters:
-                            continue
-                        seen_chapters.add(ch_title)
-
-                        status_val = log.status or "success"
-
-                        worker_items.append({
-                            "id": str(log.id),
-                            "node_name": "Supervisor-总控调度" if is_supervisor else (log.node_name or f"BidFillerWorker-{ch_title}"),
-                            "chapter_title": ch_title,
-                            "category": "supervisor_master" if is_supervisor else inp.get("category", "needs_fill"),
-                            "status": status_val,
-                            "execution_time_ms": log.execution_time_ms or 0,
-                            "total_tokens": log.total_tokens or ((log.prompt_tokens or 0) + (log.completion_tokens or 0)),
-                            "prompt_tokens": log.prompt_tokens or 0,
-                            "completion_tokens": log.completion_tokens or 0,
-                            "summary": out.get("summary", "已完成填报分析与写盘。"),
-                            "proposals_count": out.get("proposals_count", 0),
-                            "proposals": out.get("proposals", []),
-                            "tools_used": out.get("tools_used", inp.get("tools_used", [])),
-                            "thought_steps": out.get("thought_steps", []),
-                            "created_at": log.created_at.strftime("%Y-%m-%d %H:%M:%S") if log.created_at else None
-                        })
-
-                total_worker_time_ms = sum(w.get("execution_time_ms", 0) for w in worker_items)
-                if total_wall_time_ms == 0 and min_created_at and max_created_at:
-                    delta_ms = int((max_created_at - min_created_at).total_seconds() * 1000)
-                    if delta_ms > 0:
-                        total_wall_time_ms = delta_ms
-
-                pipeline_state = _get_bid_fill_pipeline_state(logs)
-                payload = {
-                    "document_id": document_id,
-                    "worker_items": worker_items,
-                    # 只有后台最终 Supervisor 终态才能结束 SSE，不能用中间 Worker 成功状态代替。
-                    "is_completed": pipeline_state["is_completed"],
-                    "pipeline_status": pipeline_state["pipeline_status"],
-                    "pipeline_message": pipeline_state["pipeline_message"],
-                    "total_wall_time_ms": total_wall_time_ms,
-                    "first_bid_fill_duration_ms": first_bid_fill_duration_ms,
-                    "total_worker_time_ms": total_worker_time_ms,
-                    "timestamp": time.time()
-                }
-                payload_str = json.dumps(payload, ensure_ascii=False)
+                # 查询、组装和 JSON 序列化全部在线程池执行，避免大日志阻塞其他页面请求。
+                payload_str, is_completed = await run_in_threadpool(
+                    _build_bid_fill_stream_payload,
+                    document_id,
+                )
 
                 if payload_str != last_json:
                     last_json = payload_str
@@ -483,23 +757,21 @@ async def stream_bid_fill_worker_logs(document_id: str):
                     same_count += 1
                     yield f": ping {int(time.time())}\n\n"
 
-                if pipeline_state["is_completed"] and same_count >= 5:
+                if is_completed and same_count >= 5:
                     break
-
-            except Exception as e:
-                logger.error(f"SSE 推流日志生成异常: {e}")
+            except Exception as stream_error:
+                logger.error(f"SSE 推流日志生成异常: {stream_error}")
 
             await asyncio.sleep(1.0)
 
-    from fastapi.responses import StreamingResponse
     return StreamingResponse(
         log_event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "Connection": "keep-alive"
-        }
+            "Connection": "keep-alive",
+        },
     )
 
 
@@ -590,7 +862,7 @@ async def regenerate_single_chapter(
         logger.warning(f"写入微调初始状态日志异常: {log_init_err}")
 
     try:
-        from app.agents.bid_filler_workers import run_chapter_worker
+        from app.agents.bid_filler_workers import _is_pricing_chapter, run_chapter_worker
         from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
         from app.utils.table_utils import extract_chapter_dom_structure
 
@@ -601,7 +873,10 @@ async def regenerate_single_chapter(
         if os.path.exists(template_docx_path) and os.path.exists(working_docx_path):
             reset_chapter_to_template(working_docx_path, template_docx_path, chapter_title)
 
-        template_source_path = template_docx_path if os.path.exists(template_docx_path) else working_docx_path
+        # 章节重置后，工作副本中的目标章节已为模板纯净状态，且绝对段落与表格索引
+        # 与当前文档拓扑（包含前面章节插入的图片与段落）100% 一致。
+        # 优先从工作副本提取章节 DOM 视野，确保 Worker 生成的物理路径与写盘坐标系绝对对齐。
+        template_source_path = working_docx_path if os.path.exists(working_docx_path) else template_docx_path
         target_tbl_summary = extract_docx_tables_summary(template_source_path, chapter_title)
         
         # 组装纯净模板提示（如为表格章节，突出表头定义与全量重写要求）
@@ -609,8 +884,8 @@ async def regenerate_single_chapter(
             chapter_pure_context = f"【本章节专属表格表头定义】\n{target_tbl_summary}\n（请根据招标文件原文及企业数据库全量检索数据，生成完整 2D 矩阵全量覆写）"
         else:
             chapter_pure_context = extract_chapter_dom_structure(template_source_path, chapter_title)
-            if not chapter_pure_context and template_source_path != working_docx_path:
-                chapter_pure_context = extract_chapter_dom_structure(working_docx_path, chapter_title)
+            if not chapter_pure_context and template_source_path != template_docx_path and os.path.exists(template_docx_path):
+                chapter_pure_context = extract_chapter_dom_structure(template_docx_path, chapter_title)
             if not chapter_pure_context:
                 chapter_pure_context = f"【目标章节】: {chapter_title}"
 
@@ -671,15 +946,21 @@ async def regenerate_single_chapter(
                     prefetched_metadata["delivery_period"] = period_str
 
             from app.db.models.ai_analysis import CostEstimate
+            from app.db.models.project import Document
             cost_items = db.query(CostEstimate).filter(CostEstimate.document_id == document_id).all()
-            if cost_items:
-                total_val = sum(getattr(it, "calculated_total", 0.0) or 0.0 for it in cost_items)
-                if total_val > 0:
-                    prefetched_metadata["total_price_str"] = f"{total_val:,.2f} 元"
-                    try:
-                        prefetched_metadata["total_price_words"] = number_to_chinese_rmb(float(total_val))
-                    except Exception:
-                        pass
+            cost_document = db.query(Document).filter(Document.id == document_id).first()
+            stored_cost_analysis = (
+                (cost_document.parsed_metadata or {}).get("cost_analysis", {})
+                if cost_document and isinstance(cost_document.parsed_metadata, dict)
+                else {}
+            )
+            total_val = resolve_cost_total(stored_cost_analysis, cost_items)
+            if total_val > 0:
+                prefetched_metadata["total_price_str"] = f"{total_val:,.2f} 元"
+                try:
+                    prefetched_metadata["total_price_words"] = number_to_chinese_rmb(float(total_val))
+                except (TypeError, ValueError):
+                    logger.warning("微调接口成本总额转人民币大写失败：{}", total_val)
 
             prefetched_metadata["quality_standard"] = "合格，完全符合国家及行业现行有关标准、规范要求"
         except Exception as e_meta:
@@ -710,25 +991,62 @@ async def regenerate_single_chapter(
             repair_instructions="",
             prefetched_metadata=prefetched_metadata,
             tenant_id=t_id,
+            profile_id=request_body.profile_id,
         )
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         proposals = worker_res.get("proposals", [])
         status = worker_res.get("status", "success")
         summary = worker_res.get("summary", "单章节微调已完成。")
+        is_pricing_request = _is_pricing_chapter(chapter_title, effective_mapping_hint)
+        write_count = 0
+        writeback_verified = not is_pricing_request
 
         # 4. 原位刷盘
         if os.path.exists(working_docx_path):
             try:
                 write_count = fill_docx_proposals_in_dom(working_docx_path, proposals) if proposals else 0
+                if is_pricing_request:
+                    if status == "success" and write_count > 0:
+                        writeback_verified, verify_message = _verify_pricing_table_writeback(
+                            working_docx_path,
+                            chapter_title,
+                            proposals,
+                        )
+                        if not writeback_verified:
+                            status = "failed"
+                            summary = f"报价表写盘回读校验失败：{verify_message}"
+                            logger.error(f"❌ {summary}")
+                        else:
+                            logger.info(f"✅ 报价表确定性闭环完成: {verify_message}")
+                    else:
+                        status = "failed"
+                        summary = "报价 Worker 未产生可写入的有效提案，未保存章节结果。"
+                        logger.error(f"❌ {summary}")
+
                 logger.info(f"✅ 单章节微调原位写盘完成，写入 {write_count} 处修改")
-                # 同步到 result 文件
-                import shutil
-                shutil.copyfile(working_docx_path, result_docx_path)
-                draft_path = os.path.join(drafts_dir, f"draft_{document_id}.docx")
-                shutil.copyfile(working_docx_path, draft_path)
+                # 只有确定性闭环通过后才同步到结果文件，避免把重置后的空模板覆盖正式草稿。
+                should_persist_result = (
+                    status == "success"
+                    and (not is_pricing_request or writeback_verified)
+                )
+                if should_persist_result:
+                    import shutil
+                    shutil.copyfile(working_docx_path, result_docx_path)
+                    draft_path = os.path.join(drafts_dir, f"draft_{document_id}.docx")
+                    shutil.copyfile(working_docx_path, draft_path)
+                else:
+                    logger.warning(
+                        f"⚠️ 单章节微调未通过结果保存条件: status={status}, "
+                        f"pricing={is_pricing_request}, verified={writeback_verified}"
+                    )
             except Exception as write_err:
+                status = "failed"
+                summary = f"单章节微调写盘或回读异常：{write_err}"
                 logger.error(f"单章节微调写盘异常: {write_err}")
+
+        if is_pricing_request and status != "success":
+            raise HTTPException(status_code=422, detail=summary)
 
         # 5. 查询最新的 audit log 条目
         from app.db.models.audit import AgentAuditLog
@@ -755,6 +1073,20 @@ async def regenerate_single_chapter(
         if latest_log:
             inp = latest_log.inputs or {}
             out = latest_log.outputs or {}
+            # 将本次 DOM 写盘后的逐条状态回写审计日志，避免前端把“提案成功”误显示成“物理写盘成功”。
+            updated_outputs = dict(out)
+            updated_outputs["proposals"] = proposals
+            updated_outputs["proposals_count"] = len(proposals)
+            updated_outputs["written_count"] = write_count
+            latest_log.outputs = updated_outputs
+            try:
+                db.commit()
+                out = updated_outputs
+            except Exception as audit_error:
+                db.rollback()
+                logger.exception(f"单章节写盘结果回写审计日志失败: {audit_error}")
+                # 数据库回写失败不影响已生成的 Word 文件，接口仍使用本次内存结果返回。
+                out = updated_outputs
             worker_item = {
                 "id": str(latest_log.id),
                 "node_name": latest_log.node_name or f"BidFillerWorker-{chapter_title}",
@@ -767,6 +1099,7 @@ async def regenerate_single_chapter(
                 "completion_tokens": latest_log.completion_tokens or 0,
                 "summary": out.get("summary", summary),
                 "proposals_count": out.get("proposals_count", len(proposals)),
+                "written_count": out.get("written_count", write_count),
                 "proposals": out.get("proposals", proposals),
                 "tools_used": out.get("tools_used", inp.get("tools_used", [])),
                 "thought_steps": out.get("thought_steps", []),
@@ -779,11 +1112,14 @@ async def regenerate_single_chapter(
             status=status,
             summary=summary,
             proposals_count=len(proposals),
+            written_count=write_count,
             execution_time_ms=elapsed_ms,
             total_tokens=worker_item.get("total_tokens", 0) if worker_item else 0,
             worker_item=worker_item
         )
 
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception(f"❌ 单章节微调失败: {exc}")
         raise HTTPException(status_code=500, detail=f"单章节重新生成失败: {str(exc)}")
@@ -810,20 +1146,20 @@ async def get_bid_fill_audit_report(
     """
     from app.schemas.bid_filler_schema import CompanyProfile
     from app.agents.bid_filler_agent import bid_filler_agent
-    from app.services.bid_format_filler_service import bid_format_filler_service
-
-    template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
+    template_bytes, filename, _ = await run_in_threadpool(
+        bid_format_extractor_service.extract_and_export_bid_format,
         db=db,
         doc_id=document_id,
-        user_id=current_user.id if hasattr(current_user, 'id') else None,
-        tenant_id=current_user.tenant_id if hasattr(current_user, 'tenant_id') else None
+        user_id=current_user.id if hasattr(current_user, "id") else None,
+        tenant_id=current_user.tenant_id if hasattr(current_user, "tenant_id") else None,
     )
 
     if not template_bytes:
         raise HTTPException(status_code=404, detail="未找到该文档的模版信息")
 
     # Agent 自行通过 OfficeCLI 阅读 Word 文档发现需要填写的位置
-    _, audit_report, _ = bid_filler_agent.process_filling_tasks(
+    _, audit_report, _ = await run_in_threadpool(
+        bid_filler_agent.process_filling_tasks,
         db=db,
         document_id=document_id,
         profile=CompanyProfile(),
@@ -835,93 +1171,60 @@ async def get_bid_fill_audit_report(
 
     # 融合直查数据库得到的子 Agent 思考全过程履历
     try:
-        worker_logs = get_bid_fill_worker_logs(document_id=document_id, db=db, current_user=current_user)
+        worker_logs = await run_in_threadpool(
+            get_bid_fill_worker_logs,
+            document_id=document_id,
+            db=db,
+            current_user=current_user,
+        )
         res_dict["worker_items"] = worker_logs.get("worker_items", [])
         res_dict["total_workers_count"] = worker_logs.get("total_workers_count", 0)
+        res_dict["manual_chapters"] = worker_logs.get("manual_chapters", [])
+        res_dict["manual_pending_count"] = worker_logs.get("manual_pending_count", 0)
     except Exception as exc:
         logger.warning(f"获取 Worker 审计日志融合失败: {exc}")
         res_dict["worker_items"] = []
         res_dict["total_workers_count"] = 0
+        res_dict["manual_chapters"] = []
+        res_dict["manual_pending_count"] = 0
 
     return res_dict
 
 
-@router.get("/human-fill-bid-format/{document_id}/download",
-    deprecated=True,
-    description="已废弃，请使用 /agent-fill-bid-format/{document_id}/download")
-async def download_human_filled_bid_format(
+def _has_non_empty_result_file(result_path: str) -> bool:
+    """判断标书撰写结果文件是否已经生成且不是空文件。"""
+    try:
+        return os.path.isfile(result_path) and os.path.getsize(result_path) > 0
+    except OSError as file_error:
+        logger.warning(f"检查标书撰写结果文件失败: path={result_path}, error={file_error}")
+        return False
+
+
+def _read_agent_result_file(
+    result_path: str,
     document_id: str,
-    db: Session = Depends(deps.get_db),
-    current_user: User = Depends(deps.get_current_active_user)
-):
-    """
-    获取拟人化 Agent 自动填报完成后的 Word (.docx) 文档二进制流。
-    """
-    if not document_id:
-        raise HTTPException(status_code=400, detail="未提供有效的 document_id 参数")
+    user_id: Optional[str],
+    tenant_id: Optional[str],
+) -> tuple[bytes, str]:
+    """在线程池内读取已生成的 Word 文件及原始文件名。"""
+    with open(result_path, "rb") as result_file:
+        filled_bytes = result_file.read()
 
-    logger.info(f"收到拟人化 Agent 标书填报 Word 下载请求: doc_id={document_id}")
+    # 下载文件名需要查询原始文档，使用独立会话避免跨线程复用请求会话。
+    from app.db.session import SessionLocal
 
-    drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
-    result_path = os.path.join(drafts_dir, f"human_fill_result_{document_id[:8]}.docx")
-    if os.path.exists(result_path):
-        logger.info(f"   📄 命中 trigger 端点已生成的结果文件: {result_path}")
-        with open(result_path, "rb") as f:
-            filled_bytes = f.read()
+    read_db = SessionLocal()
+    try:
         _, raw_filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
-            db=db, doc_id=document_id,
-            user_id=current_user.id if hasattr(current_user, 'id') else None,
-            tenant_id=current_user.tenant_id if hasattr(current_user, 'tenant_id') else None
+            db=read_db,
+            doc_id=document_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
         )
-        out_filename = f"【已填报】{raw_filename or '投标文件格式.docx'}"
-        return Response(
-            content=filled_bytes,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(out_filename)}",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
+    finally:
+        read_db.close()
 
-    template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
-        db=db,
-        doc_id=document_id,
-        user_id=current_user.id if hasattr(current_user, 'id') else None,
-        tenant_id=current_user.tenant_id if hasattr(current_user, 'tenant_id') else None
-    )
-
-    if not template_bytes:
-        raise HTTPException(status_code=500, detail="未找到该文档的模版信息")
-
-    from app.schemas.bid_filler_schema import CompanyProfile
-    from app.agents.bid_filler_agent import bid_filler_agent
-
-    _, audit_report, filled_bytes = bid_filler_agent.process_filling_tasks(
-        db=db,
-        document_id=document_id,
-        profile=CompanyProfile(),
-        detected_placeholders=[],
-        original_docx=template_bytes,
-    )
-
-    if not filled_bytes:
-        raise HTTPException(status_code=500, detail="BidFillerAgent 填报 Word 生成失败")
-
-    drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
-    os.makedirs(drafts_dir, exist_ok=True)
-    result_path = os.path.join(drafts_dir, f"human_fill_result_{document_id[:8]}.docx")
-    with open(result_path, "wb") as f:
-        f.write(filled_bytes)
-
-    out_filename = f"【已填报】{filename}"
-    return Response(
-        content=filled_bytes,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(out_filename)}",
-            "Access-Control-Expose-Headers": "Content-Disposition"
-        }
-    )
+    return filled_bytes, f"【ReActAgent智能填报】{raw_filename or '投标文件格式.docx'}"
 
 
 @router.get("/agent-fill-bid-format/{document_id}/download")
@@ -940,57 +1243,26 @@ async def download_agent_filled_bid_format(
 
     drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
     result_path = os.path.join(drafts_dir, f"agent_fill_result_{document_id[:8]}.docx")
-    if os.path.exists(result_path):
-        logger.info(f"   📄 命中 trigger 端点已生成的结果文件: {result_path}")
-        with open(result_path, "rb") as f:
-            filled_bytes = f.read()
-        _, raw_filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
-            db=db, doc_id=document_id,
-            user_id=current_user.id if hasattr(current_user, 'id') else None,
-            tenant_id=current_user.tenant_id if hasattr(current_user, 'tenant_id') else None
-        )
-        out_filename = f"【ReActAgent智能填报】{raw_filename or '投标文件格式.docx'}"
-        return Response(
-            content=filled_bytes,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(out_filename)}",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
+    if not _has_non_empty_result_file(result_path):
+        logger.warning(f"拦截未完成标书下载，不自动启动撰写任务: document_id={document_id}")
+        raise HTTPException(
+            status_code=409,
+            detail="尚未生成已填写标书，请先填写标书后再下载。",
         )
 
-    template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
-        db=db,
-        doc_id=document_id,
-        user_id=current_user.id if hasattr(current_user, 'id') else None,
-        tenant_id=current_user.tenant_id if hasattr(current_user, 'tenant_id') else None
-    )
-    if not template_bytes:
-        raise HTTPException(status_code=500, detail="未提取到《投标文件格式》模板")
-
-    from app.schemas.bid_filler_schema import CompanyProfile
-    from app.agents.bid_filler_agent import bid_filler_agent
-    from app.services.bid_format_filler_service import bid_format_filler_service
-
-    replacement_map, audit_report, filled_bytes = bid_filler_agent.process_filling_tasks(
-        db=db,
-        document_id=document_id,
-        profile=CompanyProfile(),
-        detected_placeholders=[],
-        original_docx=template_bytes,
-    )
-
-    if not filled_bytes:
-        filled_bytes = bid_format_filler_service.fill_docx_with_audit_trail(
-            docx_bytes=template_bytes,
-            replacement_map=replacement_map,
-            audit_items=audit_report.audit_items if audit_report else []
+    logger.info(f"   📄 命中已生成的结果文件: {result_path}")
+    try:
+        filled_bytes, out_filename = await run_in_threadpool(
+            _read_agent_result_file,
+            result_path,
+            document_id,
+            current_user.id if hasattr(current_user, "id") else None,
+            current_user.tenant_id if hasattr(current_user, "tenant_id") else None,
         )
+    except Exception as download_error:
+        logger.exception(f"读取 ReActAgent 结果文件失败: {download_error}")
+        raise HTTPException(status_code=500, detail="读取已生成的标书 Word 文件失败") from download_error
 
-    if not filled_bytes:
-        raise HTTPException(status_code=500, detail="BidFillerAgent 填报 Word 生成失败")
-
-    out_filename = f"【ReActAgent智能填报】{filename}"
     return Response(
         content=filled_bytes,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1026,7 +1298,8 @@ async def extract_and_download_bid_format(
             db=db,
             doc_id=document_id,
             user_id=current_user.id if hasattr(current_user, 'id') else None,
-            tenant_id=current_user.tenant_id if hasattr(current_user, 'tenant_id') else None
+            tenant_id=current_user.tenant_id if hasattr(current_user, 'tenant_id') else None,
+            force_reextract=True,
         )
 
         if not docx_bytes:
@@ -1048,12 +1321,101 @@ async def extract_and_download_bid_format(
 
     except HTTPException:
         raise
+    except ModelUnavailableError as model_error:
+        logger.warning("投标文件格式提取所需模型不可用: doc_id={}, error={}", document_id, model_error)
+        raise HTTPException(status_code=503, detail=str(model_error)) from model_error
     except FileNotFoundError as e:
         logger.warning(f"提取文件未找到: {str(e)}")
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.exception(f"提取并导出投标文件格式发生未预期的异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"提取生成失败: {str(e)}")
+
+
+@router.get("/download-bid-format-template/{document_id}")
+async def download_bid_format_template(
+    document_id: str,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    """下载原格式投标文件模板；没有缓存时先执行一次提取。"""
+    if not document_id:
+        raise HTTPException(status_code=400, detail="未提供有效的 document_id 参数")
+
+    logger.info("收到投标文件模板下载请求: doc_id={}, user_id={}", document_id, current_user.id)
+    try:
+        docx_bytes, filename, mode = await run_in_threadpool(
+            bid_format_extractor_service.extract_and_export_bid_format,
+            db=db,
+            doc_id=document_id,
+            user_id=current_user.id if hasattr(current_user, "id") else None,
+            tenant_id=current_user.tenant_id if hasattr(current_user, "tenant_id") else None,
+            force_reextract=False,
+        )
+        if not docx_bytes:
+            raise HTTPException(status_code=500, detail="未提取到有效的投标文件模板")
+
+        encoded_filename = urllib.parse.quote(filename)
+        return Response(
+            content=docx_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+                "X-Extraction-Mode": mode,
+                "Access-Control-Expose-Headers": "Content-Disposition, X-Extraction-Mode",
+            },
+        )
+    except HTTPException:
+        raise
+    except ModelUnavailableError as model_error:
+        logger.warning("投标文件模板下载所需模型不可用: doc_id={}, error={}", document_id, model_error)
+        raise HTTPException(status_code=503, detail=str(model_error)) from model_error
+    except FileNotFoundError as file_error:
+        logger.warning("投标文件模板下载原文件未找到: doc_id={}, error={}", document_id, file_error)
+        raise HTTPException(status_code=404, detail=str(file_error)) from file_error
+    except Exception as download_error:
+        logger.exception("下载投标文件模板发生未预期异常: doc_id={}, error={}", document_id, download_error)
+        raise HTTPException(status_code=500, detail=f"投标文件模板下载失败: {download_error}") from download_error
+
+
+@router.post("/reextract-bid-format/{document_id}")
+async def reextract_bid_format_template(
+    document_id: str,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    """重新提取并刷新投标文件模板缓存，但不直接触发文件下载。"""
+    if not document_id:
+        raise HTTPException(status_code=400, detail="未提供有效的 document_id 参数")
+
+    logger.info("收到投标文件模板重新提取请求: doc_id={}, user_id={}", document_id, current_user.id)
+    try:
+        template_bytes, filename, mode = await run_in_threadpool(
+            bid_format_extractor_service.extract_and_export_bid_format,
+            db=db,
+            doc_id=document_id,
+            user_id=current_user.id if hasattr(current_user, "id") else None,
+            tenant_id=current_user.tenant_id if hasattr(current_user, "tenant_id") else None,
+            force_reextract=True,
+        )
+        if not template_bytes:
+            raise HTTPException(status_code=500, detail="未生成有效的投标文件模板")
+
+        return success_response(
+            data={"filename": filename, "extraction_mode": mode},
+            message="投标文件模板重新提取成功",
+        )
+    except HTTPException:
+        raise
+    except ModelUnavailableError as model_error:
+        logger.warning("投标文件模板重新提取所需模型不可用: doc_id={}, error={}", document_id, model_error)
+        raise HTTPException(status_code=503, detail=str(model_error)) from model_error
+    except FileNotFoundError as file_error:
+        logger.warning("投标文件模板重新提取原文件未找到: doc_id={}, error={}", document_id, file_error)
+        raise HTTPException(status_code=404, detail=str(file_error)) from file_error
+    except Exception as extract_error:
+        logger.exception("重新提取投标文件模板发生未预期异常: doc_id={}, error={}", document_id, extract_error)
+        raise HTTPException(status_code=500, detail=f"投标文件模板重新提取失败: {extract_error}") from extract_error
 
 
 @router.get("/fill-bid-format/{document_id}")
@@ -1101,85 +1463,12 @@ async def fill_and_download_bid_format(
 
     except HTTPException:
         raise
+    except ModelUnavailableError as model_error:
+        logger.warning("投标文件格式导出所需模型不可用: doc_id={}, error={}", document_id, model_error)
+        raise HTTPException(status_code=503, detail=str(model_error)) from model_error
     except Exception as e:
         logger.exception(f"导出投标文件格式发生未预期异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"投标文件格式导出失败: {str(e)}")
-
-
-@router.post("/human-fill-bid-format/{document_id}",
-    deprecated=True,
-    description="已废弃，内部已委托给方案 C BidFillerAgent 处理")
-async def trigger_human_like_bid_filling(
-    document_id: str,
-    request_body: Optional[BidFillRequest] = None,
-    db: Session = Depends(deps.get_db),
-    current_user: User = Depends(deps.get_current_active_user)
-):
-    """
-    【已废弃】内部已委托给方案 C BidFillerAgent（LangGraph ReAct Agent）。
-    """
-    if not document_id:
-        raise HTTPException(status_code=400, detail="未提供有效的 document_id 参数")
-
-    logger.info(f"收到标书自动填报请求（→ 内部委托方案 C BidFillerAgent）: doc_id={document_id}")
-
-    template_bytes, filename, _ = await run_in_threadpool(
-        bid_format_extractor_service.extract_and_export_bid_format,
-        db=db,
-        doc_id=document_id,
-        user_id=current_user.id if hasattr(current_user, 'id') else None,
-        tenant_id=current_user.tenant_id if hasattr(current_user, 'tenant_id') else None
-    )
-
-    if not template_bytes:
-        raise HTTPException(status_code=500, detail="未找到该文档的模版信息")
-
-    from app.schemas.bid_filler_schema import CompanyProfile
-    from app.agents.bid_filler_agent import bid_filler_agent
-
-    custom_instructions = None
-    category_hints = None
-    if request_body:
-        custom_instructions = request_body.custom_instructions
-        category_hints = request_body.category_hints
-
-    drafts_dir = os.path.join(os.getcwd(), "uploads", "drafts")
-    old_result = os.path.join(drafts_dir, f"human_fill_result_{document_id[:8]}.docx")
-    if os.path.exists(old_result):
-        try:
-            os.remove(old_result)
-        except PermissionError:
-            pass
-
-    _, audit_report, filled_bytes = await run_in_threadpool(
-        bid_filler_agent.process_filling_tasks,
-        db=db,
-        document_id=document_id,
-        profile=CompanyProfile(),
-        detected_placeholders=[],
-        original_docx=template_bytes,
-        custom_instructions=custom_instructions,
-        category_hints=category_hints,
-    )
-
-    working_path = os.path.join(drafts_dir, f"bid_fill_{document_id[:8]}.docx")
-    result_path = os.path.join(drafts_dir, f"human_fill_result_{document_id[:8]}.docx")
-    if os.path.exists(working_path):
-        try:
-            if os.path.exists(result_path):
-                os.remove(result_path)
-            os.rename(working_path, result_path)
-        except (PermissionError, OSError):
-            if filled_bytes:
-                with open(result_path, "wb") as f:
-                    f.write(filled_bytes)
-
-    return {
-        "document_id": document_id,
-        "backend": "BidFillerAgent (方案 C — LangGraph ReAct Agent)",
-        "audit_report": audit_report.model_dump() if audit_report else None,
-        "summary": "BidFillerAgent 已完成全自主标书撰写",
-    }
 
 
 def _run_agent_bid_filling_in_background(
@@ -1189,6 +1478,7 @@ def _run_agent_bid_filling_in_background(
     custom_instructions: Optional[str] = None,
     category_hints: Optional[dict] = None,
     profile_id: Optional[str] = None,
+    template_id: Optional[str] = None,
 ):
     """后台工作线程：执行长耗时的 BidFillerAgent 多 Agent 标书撰写与落盘"""
     from app.core.context import current_user_id, current_tenant_id, current_task_id
@@ -1208,7 +1498,7 @@ def _run_agent_bid_filling_in_background(
     bg_start_t = _bg_time.time()
     try:
         template_bytes, filename, _ = bid_format_extractor_service.extract_and_export_bid_format(
-            db=db, doc_id=document_id, user_id=None, tenant_id=None
+            db=db, doc_id=document_id, user_id=None, tenant_id=None, template_id=template_id
         )
         if not template_bytes:
             logger.error(f"后台任务提取《投标文件格式》模板失败: doc_id={document_id}")
@@ -1261,6 +1551,10 @@ def _run_agent_bid_filling_in_background(
             _persist_first_bid_fill_duration(db, document_id, total_wall_ms)
             try:
                 from app.db.models.audit import AgentAuditLog
+                manual_chapters_payload = [
+                    item.model_dump() if hasattr(item, "model_dump") else item.dict()
+                    for item in (audit_report.manual_chapters if audit_report else [])
+                ]
                 final_sup_log = AgentAuditLog(
                     task_id=document_id,
                     tenant_id=t_id,
@@ -1270,7 +1564,11 @@ def _run_agent_bid_filling_in_background(
                     status="master_completed",
                     execution_time_ms=total_wall_ms,
                     inputs={"document_id": document_id, "chapter_title": "Supervisor-总控调度", "wall_time_ms": total_wall_ms},
-                    outputs={"summary": f"✨ AI 团队自主撰写与原位写盘已全量收官！全流程耗时 {total_wall_ms / 1000:.1f} 秒。所有章节卡片均已更新。"}
+                    outputs={
+                        "summary": f"✨ AI 团队自主撰写与原位写盘已全量收官！全流程耗时 {total_wall_ms / 1000:.1f} 秒。所有章节卡片均已更新。",
+                        "manual_chapters": manual_chapters_payload,
+                        "manual_pending_count": len(manual_chapters_payload),
+                    }
                 )
                 db.add(final_sup_log)
                 db.commit()
@@ -1306,6 +1604,75 @@ def _run_agent_bid_filling_in_background(
         db.close()
 
 
+def _dispatch_agent_bid_filling(
+    document_id: str,
+    user_id: str,
+    tenant_id: str,
+    custom_instructions: Optional[str],
+    category_hints: Optional[dict],
+    profile_id: Optional[str],
+    template_id: Optional[str],
+    db: Session,
+) -> tuple[Optional[int], str]:
+    """在线程池内完成标书撰写任务的同步调度，避免阻塞 FastAPI 事件循环。"""
+    from app.services.bid_fill_task_service import bid_fill_task_service, start_bid_fill_process
+
+    reservation, reservation_status = bid_fill_task_service.acquire(document_id)
+    if reservation is None:
+        return None, reservation_status
+
+    try:
+        # 清理该文档上一次的填报审计日志，并立即注入全局起始 in_progress 记录。
+        try:
+            from app.db.models.audit import AgentAuditLog
+            from sqlalchemy import cast, String
+
+            db.query(AgentAuditLog).filter(
+                or_(
+                    AgentAuditLog.task_id == document_id,
+                    cast(AgentAuditLog.inputs, String).like(f"%{document_id}%"),
+                )
+            ).delete(synchronize_session=False)
+
+            init_log = AgentAuditLog(
+                task_id=document_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                node_name="Supervisor-总控调度",
+                action_type="llm_call_supervisor",
+                status="in_progress",
+                inputs={
+                    "document_id": document_id,
+                    "chapter_title": "Supervisor-总控调度",
+                    "msg": "准备启动新一轮 Agent 全自主起草...",
+                },
+                outputs={"summary": "正在初始化 Agent 专家团队与指令解析..."},
+            )
+            db.add(init_log)
+            db.commit()
+            logger.info(f"成功清理旧日志并写入初始 in_progress 状态记录，doc_id={document_id}")
+        except Exception as cleanup_error:
+            # 历史审计日志清理失败不应阻止新任务启动，但必须回滚并记录原因。
+            logger.warning(f"清理旧 AuditLog 异常: {cleanup_error}")
+            db.rollback()
+
+        process_id = start_bid_fill_process(
+            document_id=document_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            custom_instructions=custom_instructions,
+            category_hints=category_hints,
+            reservation_data=reservation.to_payload(),
+            profile_id=profile_id,
+            template_id=template_id,
+        )
+        return process_id, reservation_status
+    except Exception:
+        # 子进程启动失败时释放已预留槽位，避免后续任务永久收到容量已满。
+        bid_fill_task_service.release(reservation)
+        raise
+
+
 @router.post("/agent-fill-bid-format/{document_id}")
 async def trigger_agent_bid_filling(
     document_id: str,
@@ -1320,7 +1687,11 @@ async def trigger_agent_bid_filling(
     if not document_id:
         raise HTTPException(status_code=400, detail="未提供有效的 document_id 参数")
 
-    logger.info(f"🤖 收到 BidFillerAgent ReAct 自动填报请求: doc_id={document_id}")
+    logger.info(
+        "🤖 收到 BidFillerAgent ReAct 自动填报请求: doc_id={}, profile_id={}",
+        document_id,
+        request_body.profile_id if request_body else None,
+    )
 
     u_id = current_user.id if (current_user and hasattr(current_user, 'id')) else "default-user"
     t_id = current_user.tenant_id if (current_user and hasattr(current_user, 'tenant_id')) else "default-tenant"
@@ -1328,15 +1699,31 @@ async def trigger_agent_bid_filling(
     custom_instructions = None
     category_hints = None
     profile_id = None
+    template_id = None
     if request_body:
         custom_instructions = request_body.custom_instructions
         category_hints = request_body.category_hints
         profile_id = request_body.profile_id
+        template_id = request_body.template_id
 
-    from app.services.bid_fill_task_service import bid_fill_task_service
+    try:
+        # Redis、数据库和 Windows 子进程启动都是同步操作，统一移出事件循环。
+        process_id, reservation_status = await run_in_threadpool(
+            _dispatch_agent_bid_filling,
+            document_id,
+            u_id,
+            t_id,
+            custom_instructions,
+            category_hints,
+            profile_id,
+            template_id,
+            db,
+        )
+    except Exception as dispatch_error:
+        logger.exception(f"启动独立标书撰写进程失败: document_id={document_id}, error={dispatch_error}")
+        raise HTTPException(status_code=503, detail="标书撰写进程启动失败，请稍后重试") from dispatch_error
 
-    reservation, reservation_status = bid_fill_task_service.acquire(document_id)
-    if reservation is None:
+    if process_id is None:
         reservation_messages = {
             "document_running": "该标书正在撰写中，请勿重复提交",
             "capacity_reached": "当前已有标书撰写任务正在执行，请稍后重试",
@@ -1347,51 +1734,6 @@ async def trigger_agent_bid_filling(
             status_code=status_code,
             detail=reservation_messages[reservation_status],
         )
-
-    # 清理该文档上一次的填报审计日志，并立即注入全局起始 in_progress 记录
-    try:
-        from app.db.models.audit import AgentAuditLog
-        from sqlalchemy import cast, String
-        db.query(AgentAuditLog).filter(
-            or_(
-                AgentAuditLog.task_id == document_id,
-                cast(AgentAuditLog.inputs, String).like(f"%{document_id}%")
-            )
-        ).delete(synchronize_session=False)
-
-        init_log = AgentAuditLog(
-            task_id=document_id,
-            tenant_id=t_id,
-            user_id=u_id,
-            node_name="Supervisor-总控调度",
-            action_type="llm_call_supervisor",
-            status="in_progress",
-            inputs={"document_id": document_id, "chapter_title": "Supervisor-总控调度", "msg": "准备启动新一轮 Agent 全自主起草..."},
-            outputs={"summary": "正在初始化 Agent 专家团队与指令解析..."}
-        )
-        db.add(init_log)
-        db.commit()
-        logger.info(f"成功清理旧日志并写入初始 in_progress 状态记录，doc_id={document_id}")
-    except Exception as del_err:
-        logger.warning(f"清理旧 AuditLog 异常: {del_err}")
-        db.rollback()
-
-    try:
-        from app.services.bid_fill_task_service import start_bid_fill_process
-
-        process_id = start_bid_fill_process(
-            document_id=document_id,
-            user_id=u_id,
-            tenant_id=t_id,
-            custom_instructions=custom_instructions,
-            category_hints=category_hints,
-            reservation_data=reservation.to_payload(),
-            profile_id=profile_id,
-        )
-    except Exception as dispatch_error:
-        bid_fill_task_service.release(reservation)
-        logger.exception(f"启动独立标书撰写进程失败: document_id={document_id}, error={dispatch_error}")
-        raise HTTPException(status_code=503, detail="标书撰写进程启动失败，请稍后重试")
 
     return {
         "document_id": document_id,

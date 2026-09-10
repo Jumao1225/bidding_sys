@@ -28,7 +28,7 @@ load_dotenv(os.path.join(project_root, ".env"))
 
 # Import the Base and all models for autogenerate
 from app.db.models.base import Base
-from app.db.models import ai_analysis, business, project
+from app.db.models import ai_analysis, bid_template, business, chat, project
 
 target_metadata = Base.metadata
 

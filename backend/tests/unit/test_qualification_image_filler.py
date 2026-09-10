@@ -21,7 +21,11 @@ from app.agents.tools.bid_db_tools import (
 from app.agents.tools.office_cli_agent_tools import officecli_insert_image_tool
 from app.agents.tools.writer_tools import get_company_qualifications_tool
 from app.agents.bid_filler_agent import fill_docx_proposals_in_dom
-from app.agents.bid_filler_workers import _build_worker_tools, build_worker_prompt
+from app.agents.bid_filler_workers import (
+    _build_worker_tools,
+    _normalize_proposal_item,
+    build_worker_prompt,
+)
 
 
 @pytest.fixture
@@ -269,6 +273,76 @@ def test_image_anchor_should_tolerate_dynamic_suffix_difference():
             "caption": "核心能力等级乙级",
         },
     ) is True
+
+
+def test_image_proposal_should_normalize_path_and_keep_caption():
+    """图片提案中的路径后缀说明应被拆分，避免把说明误当作文件路径。"""
+    image_path = r"D:\\Myproject\\bidding_sys\\backend\\uploads\\qualifications\\certificate.png"
+
+    normalized = _normalize_proposal_item({
+        "path": "/body/p[2]",
+        "proposed_text": f"{image_path}（营业执照）",
+        "type": "image",
+    })
+
+    assert normalized is not None
+    assert normalized["proposed_text"] == image_path
+    assert normalized["value"] == image_path
+    assert normalized["caption"] == "营业执照"
+
+
+def test_same_requirement_should_embed_all_distinct_images():
+    """同一资格条款下的多张不同证书图片都必须实际嵌入 Word。"""
+    image_paths = []
+    docx_path = ""
+    try:
+        image_files = [
+            ("business_license.png", (180, 80, 80)),
+            ("qualification_certificate.png", (80, 120, 180)),
+        ]
+        for filename, color in image_files:
+            with tempfile.NamedTemporaryFile(suffix=f"_{filename}", delete=False) as tf:
+                image_path = tf.name
+            Image.new("RGB", (120, 80), color=color).save(image_path)
+            image_paths.append(image_path)
+
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+            docx_path = tf.name
+        anchor_text = "8. 本项目的特定资格要求："
+        requirement_text = "需满足以下要求：提供营业执照及电力施工企业资质材料。"
+        doc = Document()
+        doc.add_paragraph(anchor_text)
+        doc.add_paragraph(requirement_text)
+        doc.save(docx_path)
+
+        proposals = [
+            {
+                "path": "/body/p[1]",
+                "proposed_text": f"{image_paths[0]}（营业执照）",
+                "value": f"{image_paths[0]}（营业执照）",
+                "type": "image",
+                "anchor_text": anchor_text,
+                "caption": "营业执照",
+            },
+            {
+                "path": "/body/p[1]",
+                "proposed_text": image_paths[1],
+                "value": image_paths[1],
+                "type": "image",
+                "anchor_text": anchor_text,
+                "caption": "电力施工企业资质",
+            },
+        ]
+
+        assert fill_docx_proposals_in_dom(docx_path, proposals) == 2
+        assert len(Document(docx_path).inline_shapes) == 2
+        assert all(item.get("write_status") == "written" for item in proposals)
+    finally:
+        if docx_path and os.path.exists(docx_path):
+            os.remove(docx_path)
+        for image_path in image_paths:
+            if os.path.exists(image_path):
+                os.remove(image_path)
 
 
 def test_text_requirement_image_embedding(temp_qualification_image):

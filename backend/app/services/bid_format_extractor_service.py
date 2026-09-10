@@ -10,9 +10,14 @@ import os
 import re
 import io
 import copy
-from typing import Tuple, Optional, List
+import json
+import zipfile
+import uuid
+from typing import Tuple, Optional, List, Dict, Any
 from loguru import logger
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from pydantic import ValidationError
 from docx import Document
 from docx.oxml import parse_xml
 from docx.oxml.ns import nsdecls
@@ -21,11 +26,12 @@ from docx.shared import RGBColor, Pt, Inches
 from app.db.crud.document import document_crud
 from app.services.extractor_service import ExtractorService
 from app.services.docx_exporter_service import docx_exporter_service
-from app.services.llm_service import LLMService
+from app.services.llm_service import LLMService, ModelUnavailableError
 from app.schemas.bid_generator import (
     BidFormatStructure,
     BidFormatSection,
-    ContentTypeEnum
+    ContentTypeEnum,
+    BidFormatLocatorResult,
 )
 
 
@@ -33,6 +39,9 @@ class BidFormatExtractorService:
     """
     投标文件格式提取与导出核心业务服务
     """
+
+    # 结构选择器或大模型兜底策略发生变化时，旧缓存必须自动失效，避免继续返回历史错误切片。
+    _DOCX_TEMPLATE_SELECTOR_VERSION = "dom-structure-v3-llm-fulltext"
 
     def __init__(self):
         self.extractor_service = ExtractorService()
@@ -67,12 +76,160 @@ class BidFormatExtractorService:
             "格式附件",
         )
 
+    def _get_bid_format_cache_paths(self, doc_id: str) -> Tuple[str, str]:
+        """
+        获取文档原格式模板缓存及其元数据文件路径。
+
+        缓存使用文档 ID 隔离，避免不同文档之间复用错误的 Word 模板；元数据用于
+        校验原始招标文件是否已经发生变化。
+        """
+        safe_doc_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(doc_id or "")) or "unknown"
+        cache_dir = os.path.join(os.getcwd(), "uploads", "bid_format_cache")
+        return (
+            os.path.join(cache_dir, f"{safe_doc_id}.docx"),
+            os.path.join(cache_dir, f"{safe_doc_id}.json"),
+        )
+
+    @staticmethod
+    def _build_source_fingerprint(file_path: str) -> Dict[str, Any]:
+        """构建原始文件指纹，用于判断已缓存模板是否仍然有效。"""
+        file_stat = os.stat(file_path)
+        return {
+            "file_path": os.path.abspath(file_path),
+            "file_size": file_stat.st_size,
+            "file_mtime_ns": file_stat.st_mtime_ns,
+        }
+
+    def _read_cached_bid_format_template(
+        self,
+        doc_id: str,
+        source_file_path: str,
+    ) -> Optional[Tuple[bytes, str]]:
+        """
+        读取此前已经提取的原格式模板。
+
+        缓存只在原始文件路径、大小和修改时间都一致时命中；外部绑定模板不写入该
+        缓存，因此调用方可以在本方法前优先处理外部模板。
+        """
+        cache_path, metadata_path = self._get_bid_format_cache_paths(doc_id)
+        if not os.path.isfile(cache_path) or not os.path.isfile(metadata_path):
+            return None
+
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+            expected_fingerprint = self._build_source_fingerprint(source_file_path)
+            if metadata.get("source_fingerprint") != expected_fingerprint:
+                logger.info("原格式模板缓存已过期，准备重新提取: doc_id={}", doc_id)
+                return None
+            if metadata.get("selector_version") != self._DOCX_TEMPLATE_SELECTOR_VERSION:
+                logger.info("原格式模板缓存选择策略已变化，准备重新提取: doc_id={}", doc_id)
+                return None
+
+            with open(cache_path, "rb") as cache_file:
+                cached_bytes = cache_file.read()
+            if not cached_bytes:
+                logger.warning("原格式模板缓存为空，准备重新提取: doc_id={}", doc_id)
+                return None
+
+            # 用 python-docx 做一次轻量完整性校验，避免把损坏缓存交给 Agent。
+            Document(io.BytesIO(cached_bytes))
+            source_mode = str(metadata.get("source_mode") or "native_docx")
+            logger.info(
+                "命中原格式模板缓存: doc_id={}, bytes={}, source_mode={}",
+                doc_id,
+                len(cached_bytes),
+                source_mode,
+            )
+            return cached_bytes, f"cached_{source_mode}"
+        except Exception as cache_error:
+            logger.exception(
+                "读取原格式模板缓存失败，将重新提取: doc_id={}, path={}, error={}",
+                doc_id,
+                cache_path,
+                cache_error,
+            )
+            return None
+
+    def _write_cached_bid_format_template(
+        self,
+        doc_id: str,
+        source_file_path: str,
+        docx_bytes: bytes,
+        source_mode: str,
+    ) -> None:
+        """以原子替换方式保存原格式模板，供后续 Agent 进程直接复用。"""
+        if not docx_bytes:
+            return
+
+        cache_path, metadata_path = self._get_bid_format_cache_paths(doc_id)
+        cache_dir = os.path.dirname(cache_path)
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_temp_path = f"{cache_path}.{uuid.uuid4().hex}.tmp"
+        metadata_temp_path = f"{metadata_path}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(cache_temp_path, "wb") as cache_file:
+                cache_file.write(docx_bytes)
+            os.replace(cache_temp_path, cache_path)
+
+            metadata = {
+                "source_fingerprint": self._build_source_fingerprint(source_file_path),
+                "source_mode": source_mode,
+                "selector_version": self._DOCX_TEMPLATE_SELECTOR_VERSION,
+            }
+            with open(metadata_temp_path, "w", encoding="utf-8") as metadata_file:
+                json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
+            os.replace(metadata_temp_path, metadata_path)
+            logger.info(
+                "已缓存原格式 Word 模板: doc_id={}, path={}, source_mode={}",
+                doc_id,
+                cache_path,
+                source_mode,
+            )
+        finally:
+            for temporary_path in (cache_temp_path, metadata_temp_path):
+                if os.path.exists(temporary_path):
+                    try:
+                        os.remove(temporary_path)
+                    except OSError as cleanup_error:
+                        logger.warning(
+                            "清理原格式模板缓存临时文件失败: path={}, error={}",
+                            temporary_path,
+                            cleanup_error,
+                        )
+
+    def _cache_extracted_template(
+        self,
+        doc_id: str,
+        source_file_path: str,
+        docx_bytes: bytes,
+        filename: str,
+        mode: str,
+    ) -> Tuple[bytes, str, str]:
+        """缓存提取结果但不影响当前请求返回，缓存失败时保留当前业务结果。"""
+        try:
+            self._write_cached_bid_format_template(
+                doc_id=doc_id,
+                source_file_path=source_file_path,
+                docx_bytes=docx_bytes,
+                source_mode=mode,
+            )
+        except Exception as cache_error:
+            logger.exception(
+                "保存原格式模板缓存失败，但不影响本次导出: doc_id={}, error={}",
+                doc_id,
+                cache_error,
+            )
+        return docx_bytes, filename, mode
+
     def extract_and_export_bid_format(
         self, 
         db: Session, 
         doc_id: str,
         user_id: Optional[str] = None,
-        tenant_id: Optional[str] = None
+        tenant_id: Optional[str] = None,
+        template_id: Optional[str] = None,
+        force_reextract: bool = False,
     ) -> Tuple[bytes, str, str]:
         """
         全流程处理方法：根据 doc_id 获取文件类型并执行切片提取与 Word 导出。
@@ -81,6 +238,8 @@ class BidFormatExtractorService:
         :param doc_id: 文档 ID
         :param user_id: 用户 ID (可选)
         :param tenant_id: 租户 ID (可选)
+        :param template_id: 指定外部空白模板 ID；不传则读取该文档当前绑定的模板
+        :param force_reextract: 是否跳过已缓存的原格式模板并重新提取
         :return: (docx_bytes, filename, extraction_mode)
         """
         # 1. 检索文档记录
@@ -99,20 +258,128 @@ class BidFormatExtractorService:
         base_name = os.path.splitext(os.path.basename(doc_obj.filename))[0]
         export_filename = f"{base_name}_投标文件格式模板.docx"
 
+        # 外部模板一旦绑定到招标文档，所有提取/填报入口默认复用该模板。
+        # 这样前端不必在每个后续请求中重复传递模板标识，同时保留显式 template_id 的覆盖能力。
+        try:
+            from app.services.bid_template_service import bid_template_service
+
+            bound_template = (
+                bid_template_service.get_template(db, template_id, effective_tenant_id)
+                if template_id
+                else bid_template_service.get_bound_template(db, doc_id, effective_tenant_id)
+            )
+        except SQLAlchemyError as template_query_error:
+            db.rollback()
+            if template_id:
+                logger.exception(
+                    "读取指定外部投标模板失败: template_id={}, document_id={}, error={}",
+                    template_id,
+                    doc_id,
+                    template_query_error,
+                )
+                raise FileNotFoundError("外部模板记录不可用，请确认数据库迁移已完成") from template_query_error
+            logger.warning(
+                "读取文档绑定模板失败，继续使用传统招标文件切片流程: document_id={}, error={}",
+                doc_id,
+                template_query_error,
+            )
+            bound_template = None
+
+        if template_id and bound_template is None:
+            raise FileNotFoundError("指定的外部模板不存在、已停用或无权访问")
+        if bound_template is not None:
+            external_template_path = str(bound_template.file_path or "")
+            if not os.path.isfile(external_template_path):
+                raise FileNotFoundError("绑定的外部模板文件不存在，请重新上传")
+            try:
+                with open(external_template_path, "rb") as external_template_file:
+                    external_template_bytes = external_template_file.read()
+                Document(io.BytesIO(external_template_bytes))
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile) as template_file_error:
+                logger.exception(
+                    "读取绑定外部模板失败: template_id={}, path={}, error={}",
+                    bound_template.id,
+                    external_template_path,
+                    template_file_error,
+                )
+                raise FileNotFoundError("绑定的外部模板损坏，请重新上传") from template_file_error
+            logger.info(
+                "使用绑定的外部 DOCX 模板: document_id={}, template_id={}, bytes={}",
+                doc_id,
+                bound_template.id,
+                len(external_template_bytes),
+            )
+            return external_template_bytes, export_filename, "bound_external_template"
+
+        # 外部模板优先级最高；普通下载优先复用已提取缓存，明确重新提取时跳过缓存。
+        if force_reextract:
+            logger.info("收到重新提取投标文件模板请求，跳过原格式模板缓存: doc_id={}", doc_id)
+        else:
+            cached_template = self._read_cached_bid_format_template(doc_id, file_path)
+            if cached_template:
+                cached_bytes, cached_mode = cached_template
+                return cached_bytes, export_filename, cached_mode
+
         # 2. 判断文件类型，优先使用原生 DOCX 切片模式
         if file_ext in ['.docx', '.doc']:
+            target_docx_path = file_path
             try:
-                target_docx_path = file_path
                 if file_ext == '.doc':
                     logger.info(f"原生文件为 .doc，尝试使用 LibreOffice 转换为 .docx: {file_path}")
                     target_docx_path = self.extractor_service.convert_doc_to_docx(file_path)
+            except Exception as conversion_error:
+                logger.exception(
+                    "Word 文件转换失败，无法继续执行原生结构切片或大模型章节定位: {}",
+                    conversion_error,
+                )
+                target_docx_path = ""
 
-                docx_bytes = self._slice_docx_natively(target_docx_path)
-                if docx_bytes:
-                    logger.info(f"原生 Word 切片成功！文件大小: {len(docx_bytes)} 字节")
-                    return docx_bytes, export_filename, "native_docx"
-            except Exception as e:
-                logger.warning(f"原生 Word 切片未命中或执行异常，回退至 LLM 重建模式: {str(e)}")
+            if target_docx_path:
+                try:
+                    docx_bytes = self._slice_docx_natively(target_docx_path)
+                    if docx_bytes:
+                        logger.info(f"原生 Word 切片成功！文件大小: {len(docx_bytes)} 字节")
+                        return self._cache_extracted_template(
+                            doc_id, file_path, docx_bytes, export_filename, "native_docx"
+                        )
+                except Exception as native_extract_error:
+                    logger.exception(
+                        "原生 Word DOM 切片执行异常，继续尝试大模型章节定位: {}",
+                        native_extract_error,
+                    )
+
+                try:
+                    logger.info("原生 Word 结构定位未命中，交由大模型从既有标题候选中定位")
+                    located_docx_bytes = self._slice_docx_with_llm_locator(
+                        target_docx_path,
+                        tenant_id=effective_tenant_id,
+                    )
+                    if located_docx_bytes:
+                        logger.info(
+                            "大模型定位 Word 章节成功，已使用原始 DOM 切片，文件大小: {} 字节",
+                            len(located_docx_bytes),
+                        )
+                        return self._cache_extracted_template(
+                            doc_id,
+                            file_path,
+                            located_docx_bytes,
+                            export_filename,
+                            "llm_located_native_docx",
+                        )
+                except Exception as locator_error:
+                    logger.exception(
+                        "大模型 Word 章节定位执行异常: {}",
+                        locator_error,
+                    )
+
+            # Word 定位失败时不生成基础模板，避免把与原文件无关的内容伪装成提取结果。
+            if not target_docx_path:
+                raise RuntimeError(
+                    "Word 文件无法转换为 DOCX，未能执行原生结构切片或大模型章节定位"
+                )
+            raise RuntimeError(
+                "未能通过原生 Word 结构或大模型章节定位投标文件格式，未生成基础模板"
+            )
 
         # 3. 回退模式 / PDF 模式：利用 ExtractorService 与 LLM 重建标准 Word
         logger.info(f"使用 LLM 结构化提取模式处理文件: {file_path}")
@@ -121,7 +388,7 @@ class BidFormatExtractorService:
             doc_obj,
             tenant_id=effective_tenant_id,
         )
-        return docx_bytes, export_filename, mode
+        return self._cache_extracted_template(doc_id, file_path, docx_bytes, export_filename, mode)
 
     def _is_toc_line(self, text: str, element=None) -> bool:
         """
@@ -230,10 +497,15 @@ class BidFormatExtractorService:
                     candidate_starts.append(item['index'])
                     logger.info(f"发现正文候选起始位置: line {item['index']} -> '{txt[:40]}'")
 
-        if candidate_starts:
-            # 锁定正文起始位置
+        if len(candidate_starts) == 1:
             start_index = candidate_starts[0]
             logger.info(f"锁定投标文件格式正文起始位置: line {start_index}")
+        elif candidate_starts:
+            logger.info(
+                "发现多个非目录投标格式候选，交由大模型章节定位: candidates={}",
+                candidate_starts,
+            )
+            return None
         else:
             logger.warning("未能在原生 Word 中匹配到非目录的'投标文件格式'正文起始位置")
             return None
@@ -294,6 +566,256 @@ class BidFormatExtractorService:
         output.seek(0)
         return output.getvalue()
 
+    def _export_docx_elements(
+        self,
+        doc: Any,
+        body: Any,
+        target_elements: List[Any],
+    ) -> Optional[bytes]:
+        """
+        将选定的原始 Word body 节点导出为 DOCX 字节流。
+
+        该方法只做 DOM 保留与格式颜色统一，不生成或改写正文内容。
+        """
+        if not target_elements:
+            return None
+
+        # 清空 body 中的非切片节点，但保留 sectPr 等文档级节点。
+        for child in list(body):
+            if child not in target_elements and child.tag.endswith(("p", "tbl")):
+                body.remove(child)
+
+        # 延续原有输出规则，将保留片段中的文字统一为黑色。
+        black_color = RGBColor(0, 0, 0)
+        for paragraph in doc.paragraphs:
+            for run in paragraph.runs:
+                run.font.color.rgb = black_color
+
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        for run in paragraph.runs:
+                            run.font.color.rgb = black_color
+
+        output = io.BytesIO()
+        doc.save(output)
+        output.seek(0)
+        return output.getvalue()
+
+    def _extract_docx_heading_candidates(self, docx_path: str) -> List[Dict[str, Any]]:
+        """
+        复用现有 DocxParser 标题提取结果，并补充目录标记和正文上下文。
+
+        body_index 是原始 XML body 节点索引，后续只允许在这些候选节点之间做切片，
+        防止大模型自行编造标题或正文边界。
+        """
+        docx_parser = self.extractor_service._get_docx_parser()
+        parser_candidates = docx_parser.extract_heading_candidates(docx_path)
+        document = Document(docx_path)
+        body_children = list(document._body._element)
+        candidates: List[Dict[str, Any]] = []
+
+        for parser_candidate in parser_candidates:
+            body_index = int(parser_candidate["body_index"])
+            if body_index < 0 or body_index >= len(body_children):
+                logger.warning(
+                    "忽略超出 Word body 范围的标题候选: file={}, body_index={}",
+                    docx_path,
+                    body_index,
+                )
+                continue
+
+            element = body_children[body_index]
+            title = str(parser_candidate.get("title") or "").strip()
+            context_parts: List[str] = []
+            for next_element in body_children[body_index + 1:]:
+                next_text = "".join(next_element.itertext()).strip()
+                if not next_text:
+                    continue
+                context_parts.append(next_text[:300])
+                if len(context_parts) >= 6:
+                    break
+
+            normalized_title = self.extractor_service._normalize_title_for_matching(title)
+            candidates.append(
+                {
+                    **parser_candidate,
+                    "normalized_title": normalized_title,
+                    "is_toc": self._is_toc_line(title, element),
+                    "context_after": " | ".join(context_parts)[:1200],
+                }
+            )
+
+        logger.info(
+            "Word 标题候选增强完成: file={}, total={}, usable={}",
+            docx_path,
+            len(candidates),
+            sum(1 for candidate in candidates if not candidate["is_toc"]),
+        )
+        return candidates
+
+    def _locate_docx_format_chapter_with_llm(
+        self,
+        docx_path: str,
+        tenant_id: Optional[str] = None,
+    ) -> Optional[Tuple[int, Optional[int]]]:
+        """
+        让大模型仅从既有标题候选中选择投标文件格式章节的起止节点。
+
+        返回原始 body 节点索引；任何未验证的标题、正文或边界都不会被采用。
+        """
+        if not self.llm_service.is_configured_for_tenant(tenant_id):
+            logger.warning("Word 章节定位所需模型不可用：租户未完成模型配置: {}", tenant_id)
+            raise ModelUnavailableError("模型不可用：尚未配置有效的模型服务")
+
+        candidates = self._extract_docx_heading_candidates(docx_path)
+        usable_candidates = [candidate for candidate in candidates if not candidate["is_toc"]]
+        if not usable_candidates:
+            logger.warning("Word 中没有可供大模型判断的非目录标题候选: {}", docx_path)
+            return None
+
+        candidate_payload = [
+            {
+                "candidate_id": candidate["candidate_id"],
+                "title": candidate["title"],
+                "normalized_title": candidate["normalized_title"],
+                "heading_level": candidate["heading_level"],
+                "candidate_kind": candidate["candidate_kind"],
+                "context_after": candidate["context_after"],
+            }
+            for candidate in usable_candidates
+        ]
+        prompt = f"""
+你是招标文件 Word 章节定位器。你的唯一任务是从下方候选标题中定位“投标文件格式、应答文件格式、响应文件格式、投标文件组成或格式及附件”正文大章。
+
+严格规则：
+1. 只能返回候选列表中已经存在的 candidate_id，禁止编造标题、正文或索引。
+2. 必须排除目录候选；起始标题可以使用不同表述，例如带书名号、括号或“编制要求”的标题。
+3. start_candidate_id 选择格式章节标题本身；end_candidate_id 选择其后的下一个同级或更高层级主章节标题，不属于格式章节的附件标题不能作为结束点。
+4. 如果没有明确证据，matched=false，两个 ID 返回 null，confidence 返回 0。
+5. 只有在标题或其后上下文出现投标函、报价、授权、法定代表人、偏离表、承诺书、资格审查、商务响应、技术响应、格式附件等线索时，才可以判定为 matched=true。
+
+只返回 JSON：
+{{
+  "matched": true,
+  "start_candidate_id": "候选 ID 或 null",
+  "end_candidate_id": "候选 ID 或 null",
+  "confidence": 0.0,
+  "reason": "简要依据"
+}}
+
+候选标题列表：
+{json.dumps(candidate_payload, ensure_ascii=False)}
+""".strip()
+
+        try:
+            raw_result = self.llm_service.generate_structured_json(
+                prompt,
+                temperature=0.0,
+                tenant_id=tenant_id,
+            )
+            locator_result = BidFormatLocatorResult.model_validate(raw_result)
+        except ModelUnavailableError:
+            raise
+        except (ValidationError, ValueError, TypeError) as locator_error:
+            logger.warning("大模型 Word 章节定位结果无效，放弃定位: {}", locator_error)
+            return None
+        except Exception as llm_error:
+            logger.exception("调用大模型定位 Word 章节失败，模型不可用: {}", llm_error)
+            raise ModelUnavailableError(
+                "模型不可用：模型服务连接失败，请检查模型地址、网络或服务状态"
+            ) from llm_error
+
+        if not locator_result.matched or locator_result.confidence < 0.85:
+            logger.warning(
+                "大模型未提供足够可信的 Word 章节定位结果: matched={}, confidence={}, reason={}",
+                locator_result.matched,
+                locator_result.confidence,
+                locator_result.reason,
+            )
+            return None
+
+        candidate_map = {candidate["candidate_id"]: candidate for candidate in usable_candidates}
+        start_candidate = candidate_map.get(locator_result.start_candidate_id or "")
+        end_candidate = (
+            candidate_map.get(locator_result.end_candidate_id or "")
+            if locator_result.end_candidate_id
+            else None
+        )
+        if start_candidate is None:
+            logger.warning("大模型返回的起始标题不在候选列表中: {}", locator_result.start_candidate_id)
+            return None
+
+        start_index = int(start_candidate["body_index"])
+        end_index = int(end_candidate["body_index"]) if end_candidate else None
+        if end_index is not None and end_index <= start_index:
+            logger.warning(
+                "大模型返回的章节边界顺序无效: start={}, end={}",
+                start_index,
+                end_index,
+            )
+            return None
+
+        evidence_text = " ".join(
+            [
+                str(start_candidate.get("title") or ""),
+                str(start_candidate.get("context_after") or ""),
+            ]
+        )
+        if not any(marker in evidence_text for marker in self.format_body_markers):
+            logger.warning("大模型定位结果缺少投标格式正文证据，放弃原始切片: {}", evidence_text[:200])
+            return None
+
+        logger.info(
+            "大模型锁定 Word 投标格式章节: start={}, end={}, confidence={}, reason={}",
+            start_candidate["title"],
+            end_candidate["title"] if end_candidate else "文档末尾",
+            locator_result.confidence,
+            locator_result.reason,
+        )
+        return start_index, end_index
+
+    def _slice_docx_with_llm_locator(
+        self,
+        docx_path: str,
+        tenant_id: Optional[str] = None,
+    ) -> Optional[bytes]:
+        """
+        根据大模型选出的候选节点，在原始 Word DOM 中执行无损切片。
+        """
+        located_range = self._locate_docx_format_chapter_with_llm(docx_path, tenant_id=tenant_id)
+        if located_range is None:
+            return None
+
+        start_index, end_index = located_range
+        document = Document(docx_path)
+        body = document._body._element
+        children = list(body)
+        if start_index < 0 or start_index >= len(children):
+            logger.warning("大模型定位的起始 body 索引越界: {}", start_index)
+            return None
+
+        exclusive_end = end_index if end_index is not None else len(children)
+        if exclusive_end <= start_index or exclusive_end > len(children):
+            logger.warning("大模型定位的结束 body 索引无效: {}", exclusive_end)
+            return None
+
+        target_elements = children[start_index:exclusive_end]
+        while target_elements:
+            first_text = "".join(target_elements[0].itertext()).strip()
+            if self._is_toc_line(first_text, target_elements[0]):
+                logger.info("自动剪除大模型切片头部目录节点: {}", first_text[:50])
+                target_elements.pop(0)
+            else:
+                break
+
+        if not target_elements:
+            return None
+
+        logger.info("大模型定位后使用原始 Word DOM 切片，元素数量={}", len(target_elements))
+        return self._export_docx_elements(document, body, target_elements)
+
     def _extract_with_llm_and_rebuild(
         self,
         db: Session,
@@ -304,7 +826,7 @@ class BidFormatExtractorService:
         LLM 提取模式：结合 ExtractorService 与 LLM 提取文本，并用 DocxExporterService 渲染 Word。
 
         :param tenant_id: 调用方显式传入的租户 ID；未传入时回退使用文档所属租户。
-        :return: (docx_bytes, actual_mode) 其中 actual_mode 为 "llm_rebuilt" 或 "fallback_template"
+        :return: (docx_bytes, actual_mode)，成功时 actual_mode 为 "llm_rebuilt"
         """
         # 显式保留租户上下文，避免线程池调用时 ContextVar 丢失而回退到全局模型配置。
         effective_tenant_id = tenant_id or getattr(doc_obj, "tenant_id", None)
@@ -326,16 +848,30 @@ class BidFormatExtractorService:
             logger.info(f"从数据库切片提取文本完成 (共 {len(chunks) if chunks else 0} 个切片, 文本总长度: {len(doc_text)} 字符)")
 
         if not doc_text.strip():
-            logger.warning("⚠️ [投标文件格式提取] 文档未提取到任何有效文本，使用备用基础模板数据构建")
-            structure = self._build_fallback_structure(doc_obj.filename)
-            return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
+            logger.error("⚠️ [投标文件格式提取] 文档未提取到任何有效文本，无法交由大模型定位目标章节")
+            raise ValueError("原始招标文件未提取到有效文本，无法执行投标文件格式提取")
 
         # 正则快速定位文本范围
         target_text = self._slice_text_by_keywords(doc_text)
+        is_full_text_fallback = not target_text.strip()
         if not target_text.strip():
-            logger.warning("⚠️ [投标文件格式提取] 未截取到目标章节，跳过 LLM 调用并使用托底模板")
-            structure = self._build_fallback_structure(doc_obj.filename)
-            return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
+            # 规则定位只是缩小大模型搜索范围，不能作为是否调用大模型的硬门槛。
+            target_text = doc_text
+            logger.warning(
+                "⚠️ [投标文件格式提取] 规则未定位到目标章节，将全文交由大模型自行定位: text_length={}",
+                len(doc_text),
+            )
+
+        if is_full_text_fallback:
+            source_scope_instruction = (
+                "规则定位未命中，当前待分析文本为原始文档全文。请先在全文中自行定位投标文件格式相关正文大章，"
+                "再仅提取该章节及其格式附件，不得把其他章节内容混入结果。"
+            )
+        else:
+            source_scope_instruction = (
+                "系统已通过规则定位出目标格式章节范围。请仅在该范围内提取内容，"
+                "不得引入范围外的其他章节。"
+            )
 
         # 构建 Prompt 引导 LLM 输出结构化数据
         prompt = f"""你是一名资深招投标专家。请分析以下招标文件中的“投标文件格式/响应格式”部分文本，严格依据原文提取出完整的格式附件目录与样张模版。
@@ -345,7 +881,8 @@ class BidFormatExtractorService:
 2. 提取文本中出现的全部格式附件标题（如各类格式、附件、声明、承诺、样张等，严格以原文实际标题为准）。
 3. 原文中的表格（无论以 Markdown 表格还是 HTML <table> 形式出现）必须完整保留其行列表格结构（转换为标准 Markdown 表格输出），原文中的填空下划线 `______` 必须完整保留。
 4. 必须将原文中每个格式附件的完整正文、填空要素和表格内容原原本本提取并放入 `body_markdown`，严禁输出“原文未提供样张”等概括性文字。
-5. 系统已将【待分析文本】严格截取在原文识别出的目标格式章节标题至下一独立大章之间，章节编号和标题以原文为准，禁止引入评审办法、收费标准、资格要求或合同附件等章节内容。
+5. {source_scope_instruction}
+6. 如果全文中确实没有投标文件格式相关正文，返回空的 `sections`，不要用常识补写模板内容。
 
 【待分析文本】:
 {target_text[:40000]}
@@ -383,28 +920,35 @@ class BidFormatExtractorService:
                     }
                 structure = BidFormatStructure(**parsed_json)
                 if not structure.sections:
-                    logger.warning("⚠️ [投标文件格式提取] LLM 提取出的 sections 为空，自动降级至托底基础结构")
-                    structure = self._build_fallback_structure(doc_obj.filename)
-                    return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
+                    logger.warning("⚠️ [投标文件格式提取] 大模型未在原文中定位到可用的投标文件格式章节")
+                    raise ValueError("大模型未在原文中定位到可用的投标文件格式章节")
                 else:
                     section_names = [s.section_title for s in structure.sections]
                     logger.info(f"✅ [投标文件格式提取] LLM 结构化提取成功！共提取出 {len(structure.sections)} 个格式附件: {section_names}")
                     return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "llm_rebuilt"
             else:
-                logger.warning("⚠️ [投标文件格式提取] LLM 服务未配置，使用托底基础结构构建")
-                structure = self._build_fallback_structure(doc_obj.filename)
-                return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
+                logger.warning("⚠️ [投标文件格式提取] LLM 服务未配置，模型不可用")
+                raise ModelUnavailableError("模型不可用：尚未配置有效的模型服务")
+        except ModelUnavailableError:
+            raise
+        except (ValidationError, ValueError, TypeError) as result_error:
+            logger.exception(
+                "❌ [投标文件格式提取] 大模型返回结果无法作为有效模板使用: {}",
+                result_error,
+            )
+            raise ValueError(f"大模型未能生成有效的投标文件格式模板: {result_error}") from result_error
         except Exception as e:
-            logger.exception(f"❌ [投标文件格式提取] LLM 提取或解析过程发生异常: {str(e)}，正在触发托底基础结构降级构建")
-            structure = self._build_fallback_structure(doc_obj.filename)
-            return docx_exporter_service.export_bid_format_to_docx_bytes(structure), "fallback_template"
+            logger.exception(f"❌ [投标文件格式提取] LLM 提取或解析过程发生异常: {str(e)}")
+            raise ModelUnavailableError(
+                "模型不可用：模型服务调用失败，请检查模型地址、网络或服务状态"
+            ) from e
 
     def _slice_text_by_keywords(self, full_text: str) -> str:
         """
         在纯文本中截取“投标文件格式/应答文件格式”章节。
 
         先从所有同名标题中选择最像正文的候选项，再截取至下一个独立大章。
-        未定位到目标章节时返回空字符串，禁止把整份招标文件交给 LLM 猜测。
+        未定位到目标章节时返回空字符串，由上层将全文交给 LLM 自行定位。
         """
         if not full_text or not full_text.strip():
             logger.warning("⚠️ [投标文件格式提取] 输入文本为空，无法定位目标章节")
@@ -417,7 +961,7 @@ class BidFormatExtractorService:
             if any(pattern.search(line.strip()) for pattern in self.chapter_start_patterns)
         ]
         if not candidate_indices:
-            logger.warning("⚠️ [投标文件格式提取] 未定位到“投标文件格式/应答文件格式”标题，跳过 LLM 调用")
+            logger.warning("⚠️ [投标文件格式提取] 未定位到目标章节标题，交由上层将全文交给 LLM 定位")
             return ""
 
         # 优先使用目录中出现的章节身份（如“第九章”），再到正文查找同一章节，章节编号由原文动态决定。
@@ -435,7 +979,9 @@ class BidFormatExtractorService:
 
         start_idx = max(candidate_indices, key=lambda index: self._score_text_chapter_candidate(lines, index))
         if self._is_toc_line(lines[start_idx]):
-            logger.warning(f"⚠️ [投标文件格式提取] 目标标题仅命中目录行: '{lines[start_idx].strip()}'，跳过 LLM 调用")
+            logger.warning(
+                f"⚠️ [投标文件格式提取] 目标标题仅命中目录行: '{lines[start_idx].strip()}'，交由上层将全文交给 LLM 定位"
+            )
             return ""
 
         end_idx = len(lines)
