@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ModelConfigUpdate(BaseModel):
-    """平台级模型运行配置更新请求。"""
+    """租户级模型运行配置更新请求。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -19,7 +19,7 @@ class ModelConfigUpdate(BaseModel):
 
 
 class ModelConfigResponse(BaseModel):
-    """当前生效的模型运行配置。"""
+    """当前租户生效的模型运行配置。"""
 
     tenant_id: str = Field(description="配置所属租户ID")
     values: Dict[str, str] = Field(default_factory=dict, description="模型配置键值")

@@ -120,13 +120,19 @@ const MODEL_CONFIGS: ModelConfig[] = [
 const MODEL_KEYS = MODEL_CONFIGS.flatMap((config) => config.fields.map((field) => field.envKey));
 
 const DEFAULT_VALUES: Record<string, string> = {
-  LLM_MODEL_NAME: 'gpt-4o',
   MINERU_API_BASE_URL: 'https://mineru.net/api/v4',
-  ALI_VLM_API_BASE: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-  ALI_VLM_MODEL_NAME: 'qwen-vl-plus',
-  LOCAL_VLM_API_BASE: 'http://127.0.0.1:8083/v1',
-  LOCAL_VLM_MODEL_NAME: 'minimax-m3-mxfp8',
 };
+
+const REQUIRED_CONFIG_GROUPS = [
+  {
+    label: '招投标文件处理语言模型',
+    keys: ['OPENAI_API_KEY', 'OPENAI_API_BASE', 'LLM_MODEL_NAME'],
+  },
+  {
+    label: '视觉模型',
+    keys: ['ALI_VLM_API_KEY', 'ALI_VLM_API_BASE', 'ALI_VLM_MODEL_NAME'],
+  },
+] as const;
 
 function readStoredUser(): StoredUser | null {
   try {
@@ -176,6 +182,9 @@ export function EnvConfigPage() {
   const [testResults, setTestResults] = useState<Partial<Record<ModelType, ModelConnectivityTestResult>>>({});
   const [testingModelType, setTestingModelType] = useState<ModelType | null>(null);
   const changedCount = MODEL_KEYS.filter((key) => values[key] !== lastSavedValues[key]).length;
+  const missingConfigGroups = REQUIRED_CONFIG_GROUPS.filter((group) =>
+    group.keys.some((key) => !(values[key] ?? '').trim()),
+  );
 
   useEffect(() => {
     // 切换租户后，旧租户的探测结果不再具有参考价值。
@@ -389,6 +398,15 @@ export function EnvConfigPage() {
           <div className={`mb-6 flex items-center gap-3 rounded-2xl border px-4 py-3 text-sm ${error ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'}`}>
             {error ? <AlertTriangle className="h-4 w-4 shrink-0" /> : <Check className="h-4 w-4 shrink-0" />}
             <span>{error || notice}</span>
+          </div>
+        )}
+
+        {targetTenantId && missingConfigGroups.length > 0 && !error && (
+          <div className="mb-6 flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>
+              当前租户尚未配置：{missingConfigGroups.map((group) => group.label).join('、')}。请填写后点击“保存到后端”；MinerU 暂时可以继续使用默认配置。
+            </span>
           </div>
         )}
 

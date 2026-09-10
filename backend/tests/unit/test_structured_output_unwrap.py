@@ -18,8 +18,12 @@ def test_root_key_unwrapping(monkeypatch):
         }
     }
     
-    monkeypatch.setattr(service, "generate_structured_json", lambda prompt, temperature=0.1: fake_wrapped_dict)
-    monkeypatch.setattr(service, "is_configured", True)
+    monkeypatch.setattr(
+        service,
+        "generate_structured_json",
+        lambda prompt, temperature=0.1, **kwargs: fake_wrapped_dict,
+    )
+    monkeypatch.setattr(service, "_ensure_llm_configured", lambda tenant_id=None: None)
     
     result = service.generate_structured_output("dummy prompt", SampleSchema)
     assert result.title == "测试项目"
@@ -36,8 +40,12 @@ def test_single_key_unwrapping(monkeypatch):
         }
     }
     
-    monkeypatch.setattr(service, "generate_structured_json", lambda prompt, temperature=0.1: fake_single_key_dict)
-    monkeypatch.setattr(service, "is_configured", True)
+    monkeypatch.setattr(
+        service,
+        "generate_structured_json",
+        lambda prompt, temperature=0.1, **kwargs: fake_single_key_dict,
+    )
+    monkeypatch.setattr(service, "_ensure_llm_configured", lambda tenant_id=None: None)
     
     result = service.generate_structured_output("dummy prompt", SampleSchema)
     assert result.title == "单节点测试"

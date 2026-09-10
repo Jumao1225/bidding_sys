@@ -7,7 +7,8 @@ from app.services.rag_service import rag_service
 from app.services.analysis_result_service import persist_worker_analysis_result
 from app.core.audit_decorator import audit_node
 import logging
-
+import typing
+from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,67 @@ def analyze_qualifications_node(state: BiddingState) -> dict:
         }
 
 
+def select_target_qualification_chapters(
+    outline: list[str],
+    tenant_id: typing.Optional[str] = None,
+) -> list[str]:
+    """
+    智能选择可能包含投标人资质、资格要求、业绩加分、人员门槛及实质性否决项的核心章节。
+    内置双重保障：优先通过轻量 LLM 进行意图决策；若 LLM 异常或返回空，通过高精关键词规则引擎自动兜底。
+    """
+    if not outline:
+        return []
+
+    # 规则引擎备用列表（高召回率兜底，命中常含有资格、评审、须知的核心章节）
+    rule_keywords = ["公告", "须知", "资格", "资质", "要求", "评标", "评分", "评审", "审查", "门槛", "前附表"]
+    rule_matched = [
+        title for title in outline
+        if any(kw in title for kw in rule_keywords)
+    ]
+
+    outline_str = "\n".join([f"- {t}" for t in outline])
+    prompt = f"""你是一位资深投标经理。以下是招标文件的章节目录大纲：
+{outline_str}
+
+请从中挑选出最可能包含【投标人资格门槛、企业资质许可证、体系认证、历史业绩要求、核心人员要求、实质性否决/废标条款】的 1 ~ 3 个核心目标章节名称。
+注意：
+1. 严格从上述目录大纲中挑选完全一致的章节名称。
+2. 绝对不要挑选与资格无关的纯技术参数规格、施工组织设计、合同法务格式范本、空白表格等章节。
+
+请输出合法 JSON，格式如下：
+{{"selected_chapters": ["挑选的章节名称1", "挑选的章节名称2"]}}
+"""
+    try:
+        res = llm_service.generate_structured_json(
+            prompt,
+            temperature=0.0,
+            tenant_id=tenant_id,
+            max_output_tokens=1024,
+        )
+        if isinstance(res, dict) and isinstance(res.get("selected_chapters"), list):
+            raw_selected = res["selected_chapters"]
+            valid_selected = []
+            for c in raw_selected:
+                c_str = str(c).strip()
+                # 精确或包含匹配大纲章节
+                matched = [t for t in outline if c_str in t or t in c_str]
+                if matched:
+                    valid_selected.extend(matched)
+                elif c_str in outline:
+                    valid_selected.append(c_str)
+            # 去重
+            deduped = list(dict.fromkeys(valid_selected))
+            if deduped:
+                logger.info(f"LLM 成功选定资质分析目标章节: {deduped}")
+                return deduped
+    except Exception as e:
+        logger.warning(f"LLM 选章决策发生异常，将无缝切换为关键词规则引擎兜底: {e}")
+
+    # 兜底：若 LLM 决策失败或未命中任何有效章节，自动切换为规则引擎匹配结果
+    logger.info(f"触发关键词规则引擎兜底，命中目标章节: {rule_matched}")
+    return rule_matched
+
+
 def _analyze_qualifications_node(state: BiddingState) -> dict:
     """
     将招标文件文本和公司已有资质发给大模型，进行三级评估。
@@ -67,6 +129,7 @@ def _analyze_qualifications_node(state: BiddingState) -> dict:
 
     from app.worker.tasks import emit_agent_log
     from app.agents.tools.writer_tools import get_company_qualifications_tool
+    from app.agents.tools.bid_scorer_tools import get_bid_document_outline
 
     emit_agent_log("info", "启动资质盘点专家...", extra={"type": "worker_start", "worker": "strategy_qual"})
 
@@ -105,10 +168,34 @@ def _analyze_qualifications_node(state: BiddingState) -> dict:
     finally:
         db.close()
         
-    # [RAG 兜底] 全量章节拉取，防止 Master Agent 遗漏 (开启严格模式，关闭重写发散)
-    rag_text = rag_service.search_bidding_document(
-        document_id, "投标人资格要求 资质 业绩 人员 许可证", top_k=3, disable_expansion=True
-    )
+    # [两阶段智能选章与定向检索]
+    # 第一级与第二级兜底：提取目录大纲，由 LLM 挑选核心章节（若异常由规则引擎自动兜底）
+    outline = get_bid_document_outline(document_id, tenant_id=tenant_id)
+    selected_chapters = select_target_qualification_chapters(outline, tenant_id=tenant_id)
+
+    # 第三级兜底：若选定目标章节则限定范围定向检索；若未命中则退化为全篇检索
+    # 核心优化：使用 context_mode="window" 与 top_k=2，聚焦命中段落及临近滑窗，避免 chapter 模式全章切片（万字以上）导致长思考链超时
+    if selected_chapters:
+        logger.info(f"履约盘点执行定向章节检索: {selected_chapters}")
+        rag_text = rag_service.search_bidding_document(
+            document_id,
+            "投标人资格要求 资质 业绩 人员 许可证",
+            section_title=selected_chapters,
+            top_k=2,
+            context_mode="window",
+            disable_expansion=True,
+            tenant_id=tenant_id,
+        )
+    else:
+        logger.info("未获取到有效章节大纲或未命中目标章节，退化为全局检索")
+        rag_text = rag_service.search_bidding_document(
+            document_id,
+            "投标人资格要求 资质 业绩 人员 许可证",
+            top_k=2,
+            context_mode="window",
+            disable_expansion=True,
+            tenant_id=tenant_id,
+        )
     
     logger.info(f"--- Strategy Agent [履约盘点] ---")
     logger.info(f"Master Agent 提取的结构化资格要求: \n{hard_quals_str}")
@@ -121,16 +208,17 @@ def _analyze_qualifications_node(state: BiddingState) -> dict:
     【已提取的结构化资格要求】:
     {hard_quals_str}
     
-    【补充检索的原文章节 (可能包含遗漏的资格要求)】:
+    【补充检索的原文章节 (包含关键资格条文)】:
     {rag_text}
     
     【我公司客观条件与资质中心数据库记录】:
     {company_quals_combined}
     
     【任务要求与资质比对规则】:
-    1. **全面盘点**：请结合【已提取的结构化资格要求】和【补充检索的原文章节】，提取并盘点**所有的**投标人资格要求（包括但不限于：企业基本资质、体系认证、特定行业资质许可证、安全许可、财务要求、同类业绩要求、核心人员等）。
+    1. **提炼核心关键要求**：重点聚焦于招标文件中的关键硬性门槛与评审加分项（提炼 8~15 项核心条件，合并通用法定常识如合法注册、无行贿犯罪记录等，避免过度发散）。
     2. **精确资质对比（极其重要）**：必须死死盯住【资质中心数据库记录】中的所有证书清单！只要资质中心库中包含相符或覆盖的证书（具备同类或更高级别资质），请判定状态为 "可以做到"，并在 reason 中写明我公司具备的具体证书名称和等级！绝对禁止视而不见而误判为 "资质中心未查到" 或 "缺失"！
     3. 如果资质中心库与我方资料中确实完全没有提到某项要求，才将其判定为 "做不到" 或 "努力可做到"，并在理由中明确指出缺少该证书。
+    4. **评估简明扼要**：reason 请控制在 30 字以内，简短陈述我方具备对应资质或缺少哪项资质。
     
     请输出 JSON 格式，包含:
     - match_score: 整体匹配度评估分 (0-100)
@@ -141,7 +229,46 @@ def _analyze_qualifications_node(state: BiddingState) -> dict:
       - reason: 评估原因或行动建议（如"我公司资质中心已具备[某证书全称]，满足要求。"）
     """
     
-    res = llm_service.generate_structured_json(prompt, temperature=0.0, tenant_id=tenant_id)
+    # 第四级兜底：正常执行定向原文深度比对；若遇偶发网络断连/502，自动触发轻量降级比对
+    try:
+        res = llm_service.generate_structured_json(
+            prompt,
+            temperature=0.0,
+            tenant_id=tenant_id,
+            skip_retry=True,
+        )
+    except Exception as llm_error:
+        logger.warning(f"带定向原文的资质深度比对发生异常 ({llm_error})，立即启动第四级轻量降级兜底比对...")
+        fallback_prompt = f"""
+        你是一位资深的投标经理，需要从**投标方视角**全面盘点招标文件中的所有资格、资质、业绩和人员要求。
+        请基于总控智能体已经提取的结构化要求，以及“我公司客观条件与资质中心数据库记录”进行能力评估。
+        
+        【已提取的结构化资格要求】:
+        {hard_quals_str}
+        
+        【我公司客观条件与资质中心数据库记录】:
+        {company_quals_combined}
+        
+        【任务要求与资质比对规则】:
+        1. **提炼核心关键要求**：重点聚焦于结构化要求中的关键硬性门槛与评审加分项（提炼 8~12 项核心条件，合并通用法定常识如合法注册、无行贿犯罪记录等，避免过度发散）。
+        2. **精确资质对比（极其重要）**：必须死死盯住【资质中心数据库记录】中的所有证书清单！只要资质中心库中包含相符或覆盖的证书（具备同类或更高级别资质），请判定状态为 "可以做到"，并在 reason 中写明我公司具备的具体证书名称和等级！绝对禁止视而不见而误判为 "资质中心未查到" 或 "缺失"！
+        3. 如果资质中心库与我方资料中确实完全没有提到某项要求，才将其判定为 "做不到" 或 "努力可做到"，并在理由中明确指出缺少该证书。
+        4. **评估简明扼要**：reason 请控制在 30 字以内，简短陈述我方具备对应资质或缺少哪项资质。
+        
+        请输出 JSON 格式，包含:
+        - match_score: 整体匹配度评估分 (0-100)
+        - items: 数组，包含每个要求的评估：
+          - requirement: 招标要求简述（如“[某资质证书名称与等级要求]”、“[某类项目业绩要求]”等）
+          - exact_quote: 结构化要求中的对应原句
+          - status: 必须是以下三种之一："可以做到", "努力可做到", "做不到"
+          - reason: 评估原因或行动建议（如"我公司资质中心已具备[某证书全称]，满足要求。"）
+        """
+        res = llm_service.generate_structured_json(
+            fallback_prompt,
+            temperature=0.0,
+            tenant_id=tenant_id,
+        )
+        logger.info(f"第四级轻量降级兜底比对成功执行，产出 {len(res.get('items', []))} 项评估条目")
 
     # 资质结果在 Worker 成功后立即保存，避免后续风险或成本 Worker 失败导致结果丢失。
     persist_worker_analysis_result(

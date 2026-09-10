@@ -65,8 +65,12 @@ class ChatContextManager:
         session: ChatSession,
         system_prompt: str,
         question: str,
+        provider: Optional[str] = None,
     ) -> list[BaseMessage]:
         """读取最新摘要和增量消息，构造当前 LangGraph Agent 的输入。"""
+        normalized_provider = str(provider or "").strip().lower()
+        # 未显式传 provider 时保留旧行为；生产 ChatAgent 会显式传入当前 provider。
+        restore_reasoning = provider is None or normalized_provider == "deepseek"
         checkpoint = chat_session_service.get_latest_checkpoint(db, session)
         after_sequence = checkpoint.upto_sequence if checkpoint and checkpoint.strategy == "summary" else 0
         persisted_messages = chat_session_service.list_messages(db, session, after_sequence=after_sequence)
@@ -92,9 +96,12 @@ class ChatContextManager:
                 if not isinstance(provider_payload, dict):
                     provider_payload = {}
                 reasoning_content = provider_payload.get("reasoning_content")
-                if reasoning_content:
+                if reasoning_content and restore_reasoning:
                     # DeepSeek 思考模式在后续工具请求中要求带回 reasoning_content；没有该字段时不构造空字段。
                     additional_kwargs["reasoning_content"] = reasoning_content
+                elif reasoning_content and normalized_provider == "glm":
+                    # GLM 默认清理历史思考字段，避免把其他模型或不完整的推理字段带入当前请求。
+                    logger.debug("已跳过 GLM 历史 reasoning_content：session_id={}", getattr(session, "id", ""))
                 messages.append(AIMessage(content=message.content, additional_kwargs=additional_kwargs))
             elif message.role == "tool":
                 messages.append(

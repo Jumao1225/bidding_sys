@@ -32,6 +32,12 @@ const MODEL_UNAVAILABLE_PATTERNS = [
   '模型权限',
 ];
 
+const MODEL_CONFIG_MISSING_PATTERNS = [
+  '尚未配置完整',
+  '请前往“模型配置”填写',
+  '请前往模型配置填写',
+];
+
 /**
  * 从不同接口错误结构中提取文本，避免 UI 层依赖某一种后端响应格式。
  */
@@ -76,6 +82,15 @@ export function build_analysis_error_info(
       message: '系统已自动重试多次，但上游 AI 服务仍未响应。',
       suggestion: '请检查“模型配置”中的 API 地址、密钥和模型可用性，或稍后重新解析。',
       code: 'UPSTREAM_RETRY_EXHAUSTED',
+    };
+  }
+
+  if (MODEL_CONFIG_MISSING_PATTERNS.some((pattern) => normalized_message.includes(pattern))) {
+    return {
+      title: '模型配置未完成',
+      message: '当前租户尚未配置完整的模型参数。',
+      suggestion: '请联系租户管理员前往“模型配置”填写对应的 API Key、API 地址和模型名称。',
+      code: 'MODEL_CONFIG_MISSING',
     };
   }
 

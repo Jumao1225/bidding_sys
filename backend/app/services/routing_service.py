@@ -1,4 +1,5 @@
-from typing import List, Optional
+import re
+from typing import Iterable, List, Optional
 from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -6,6 +7,13 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.db.crud.document import document_crud
 from app.services.llm_service import llm_service
+from app.utils.section_title import (
+    normalize_section_title,
+    section_title_stem,
+)
+
+
+_TOC_MARKER_PATTERN = re.compile(r"^\s*(?:[-*+]\s+|#{1,6}\s*)")
 
 class RoutingDecision(BaseModel):
     is_global_search: bool = Field(
@@ -16,6 +24,79 @@ class RoutingDecision(BaseModel):
         default_factory=list,
         description="最有可能包含答案的章节名称列表。必须是从大纲中精确提取的字符串。如果 is_global_search 为 True，此字段应返回空列表。"
     )
+
+
+def _extract_toc_candidates(toc: object) -> list[str]:
+    """从目录树文本中提取节点文本，只移除列表或 Markdown 结构标记。"""
+    if isinstance(toc, (list, tuple)):
+        raw_lines: Iterable[object] = toc
+    else:
+        raw_lines = str(toc or "").splitlines()
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw_line in raw_lines:
+        candidate = _TOC_MARKER_PATTERN.sub("", str(raw_line)).strip()
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+    return candidates
+
+
+def _canonicalize_target_chapters(
+    decision: RoutingDecision,
+    toc: object,
+) -> RoutingDecision:
+    """把模型路由结果映射为目录树中的原文节点，禁止返回目录外的改写标题。"""
+    if decision.is_global_search:
+        return RoutingDecision(is_global_search=True, target_chapters=[])
+
+    toc_candidates = _extract_toc_candidates(toc)
+    if not toc_candidates:
+        return RoutingDecision(is_global_search=True, target_chapters=[])
+
+    exact_candidates: dict[str, str] = {}
+    stem_candidates: dict[str, list[str]] = {}
+    for candidate in toc_candidates:
+        normalized_candidate = normalize_section_title(candidate)
+        candidate_stem = section_title_stem(candidate)
+        if normalized_candidate:
+            exact_candidates.setdefault(normalized_candidate, candidate)
+        if candidate_stem:
+            stem_candidates.setdefault(candidate_stem, []).append(candidate)
+
+    canonical_titles: list[str] = []
+    seen_titles: set[str] = set()
+    for raw_title in decision.target_chapters:
+        matched_titles: list[str] = []
+        raw_normalized = normalize_section_title(raw_title)
+        raw_stem = section_title_stem(raw_title)
+        if raw_normalized in exact_candidates:
+            matched_titles = [exact_candidates[raw_normalized]]
+        else:
+            matched_titles = list(dict.fromkeys(stem_candidates.get(raw_stem, [])))
+
+        if not matched_titles:
+            logger.warning(
+                "RoutingService: 丢弃目录树之外的路由章节返回值: {}",
+                raw_title,
+            )
+            continue
+        if len(matched_titles) > 1:
+            logger.warning(
+                "RoutingService: 路由标题对应多个目录节点，保留全部兼容节点：{}",
+                raw_title,
+            )
+        for matched_title in matched_titles:
+            if matched_title not in seen_titles:
+                canonical_titles.append(matched_title)
+                seen_titles.add(matched_title)
+
+    if not canonical_titles:
+        logger.warning("RoutingService: 局部路由未映射到任何目录节点，降级为全局检索。")
+        return RoutingDecision(is_global_search=True, target_chapters=[])
+
+    return RoutingDecision(is_global_search=False, target_chapters=canonical_titles)
 
 class RoutingService:
     """
@@ -52,7 +133,7 @@ class RoutingService:
             parsed_metadata = document.parsed_metadata or {}
             toc_str = parsed_metadata.get("table_of_contents", "")
             
-            if not toc_str or len(toc_str.strip()) < 10:
+            if not _extract_toc_candidates(toc_str):
                 logger.info(f"RoutingService: 文档 {document_id} 无有效大纲(TOC)，触发降级全量搜索。")
                 return RoutingDecision(is_global_search=True, target_chapters=[])
                 
@@ -66,14 +147,15 @@ class RoutingService:
 "{query}"
 
 【任务】
-请分析用户的查询关键词，首先判断该查询是属于“局部知识”还是“全局知识”。
-1. 局部知识：查询词非常集中、指向明确（例如“评标办法”、“评分权重”、“打分标准”），往往在某一个或两个特定章节中。你需要设定 is_global_search = False，并在 target_chapters 中返回这些章节的精确名称。
-2. 全局知识：查询词非常分散，或者属于跨章节的宏观信息（例如“财务资金”可能横跨《投标邀请》的预算和《合同条款》的付款方式，“资质合规”可能横跨公告和须知）。此时，你必须设定 is_global_search = True，并将 target_chapters 设为空列表。
+请分析用户的查询关键词，判断该查询属于“局部知识”还是“全局知识”。
+1. 局部知识：查询词指向明确的局部章节。设定 is_global_search = False，并从目录树中选择最相关的节点。
+2. 全局知识：查询词覆盖范围不明确或可能跨越多个章节。设定 is_global_search = True，并将 target_chapters 设为空列表。
 
-要求：
-- 宁可全局搜索，绝不可为了精确而遗漏重要章节（例如第一章的公告/邀请通常包含核心门槛和财务金额）。如果不确定，请判定为全局搜索。
-- 只要判断为 is_global_search = True，系统就会进行全文检索。
-- 返回的章节名称（如果有）必须与大纲中的文字**完全一致**。
+【返回约束】
+- target_chapters 中的每一项必须逐字复制目录树中的节点文本。
+- 不得改写、翻译、缩写、删除或新增章节序号，不得添加任何前缀或后缀。
+- 不得返回目录树中不存在的章节名称。
+- 如果无法从目录树中确定局部节点，使用全局检索。
 """
             
             logger.info(f"RoutingService: 正在对意图 '{query}' 执行全局/局部智能路由分析...")
@@ -84,9 +166,15 @@ class RoutingService:
                 tenant_id=effective_tenant_id,
             )
             
-            logger.info(f"RoutingService: 意图 '{query}' 路由决策 -> 全局搜索: {decision.is_global_search}, 目标章节: {decision.target_chapters}")
-            
-            return decision
+            canonical_decision = _canonicalize_target_chapters(decision, toc_str)
+            logger.info(
+                "RoutingService: 意图 '%s' 路由决策 -> 全局搜索: %s, 目录节点: %s",
+                query,
+                canonical_decision.is_global_search,
+                canonical_decision.target_chapters,
+            )
+
+            return canonical_decision
             
         except Exception as e:
             logger.exception(f"RoutingService 发生异常，降级为全量搜索: {str(e)}")

@@ -1,32 +1,15 @@
-import logging
-import re
 import typing
-import unicodedata
+from pathlib import Path
+from loguru import logger
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
-from app.db.models.project import DocChunk
+from app.db.models.project import Document, DocChunk
 from app.services.llm_service import llm_service
-
-logger = logging.getLogger(__name__)
-
-
-def _normalize_section_title(value: object) -> str:
-    """统一章节标题格式，用于数据库字段的精确语义比对。"""
-    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
-    normalized = re.sub(r"^[#*`~\s　]+", "", normalized)
-    return re.sub(r"[\s　]+", "", normalized).strip()
-
-
-def _section_title_stem(value: object) -> str:
-    """去除章节序号前缀，保留局部标题正文用于精确语义比对。"""
-    stem = _normalize_section_title(value)
-    prefix_pattern = r"^(?:第[一二三四五六七八九十百零\d]+[章节部分篇]|[一二三四五六七八九十百零\d]+[、.])"
-    while True:
-        stripped = re.sub(prefix_pattern, "", stem, count=1)
-        if stripped == stem:
-            return stem
-        stem = stripped
-
+from app.utils.section_title import (
+    normalize_section_title as _normalize_section_title,
+    section_title_match_keys,
+    section_title_stem as _section_title_stem,
+)
 
 def _resolve_exact_section_titles(
     db: Session,
@@ -39,10 +22,7 @@ def _resolve_exact_section_titles(
     requested_norms = {
         title_key
         for title in requested_titles
-        for title_key in {
-            _normalize_section_title(title),
-            _section_title_stem(title),
-        }
+        for title_key in section_title_match_keys(title)
         if title_key
     }
     if not requested_norms:
@@ -58,14 +38,91 @@ def _resolve_exact_section_titles(
     matched_titles: list[str] = []
     seen_titles: set[str] = set()
     for (stored_title,) in query.distinct().all():
-        stored_keys = {
-            _normalize_section_title(stored_title),
-            _section_title_stem(stored_title),
-        }
+        stored_keys = section_title_match_keys(stored_title)
         if stored_keys.intersection(requested_norms) and stored_title not in seen_titles:
             matched_titles.append(stored_title)
             seen_titles.add(stored_title)
     return matched_titles
+
+
+def _has_substantive_section_chunks(chunks: typing.Iterable[object]) -> bool:
+    """判断已匹配的历史分块是否包含标题之外的正文内容。"""
+    for chunk in chunks:
+        content = str(getattr(chunk, "content", "") or "").strip()
+        stored_title = str(getattr(chunk, "section_title", "") or "").strip()
+        if not content:
+            continue
+        if _normalize_section_title(content) != _normalize_section_title(stored_title):
+            return True
+    return False
+
+
+def _select_source_chapters(
+    chapters: typing.Iterable[dict],
+    requested_titles: typing.Union[str, list[str]],
+) -> list[dict]:
+    """按标题全称或历史序号兼容键，从解析后的原文章节中选择正文。"""
+    requested = requested_titles if isinstance(requested_titles, list) else [requested_titles]
+    requested_keys = {
+        key
+        for title in requested
+        for key in section_title_match_keys(title)
+        if key
+    }
+    if not requested_keys:
+        return []
+
+    selected: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for chapter in chapters:
+        title = str(chapter.get("title") or "").strip()
+        section_path = str(chapter.get("section_path") or title).strip()
+        content = str(chapter.get("text") or "").strip()
+        chapter_keys = section_title_match_keys(title) | section_title_match_keys(section_path)
+        if not content or not chapter_keys.intersection(requested_keys):
+            continue
+
+        identity = (_normalize_section_title(title), _normalize_section_title(section_path))
+        if identity not in seen:
+            selected.append(chapter)
+            seen.add(identity)
+    return selected
+
+
+def _format_source_chapters(chapters: typing.Iterable[dict]) -> str:
+    """将原文章节转换为与数据库检索一致的上下文格式。"""
+    results: list[str] = []
+    for index, chapter in enumerate(chapters, 1):
+        heading = str(chapter.get("section_path") or chapter.get("title") or "正文").strip()
+        page_num = chapter.get("page_start") or "未知"
+        content = str(chapter.get("text") or "").strip()
+        if not content:
+            continue
+        results.append(
+            f"【检索结果 {index}】(来源章节: {heading}, 第 {page_num} 页)\n内容: {content}"
+        )
+    return "\n\n".join(results)
+
+
+def _format_full_source_chapters(chapters: typing.Iterable[dict]) -> str:
+    """将原文章节转换为整章原文工具的返回格式。"""
+    chapter_list = list(chapters)
+    section_names = list(
+        dict.fromkeys(
+            str(chapter.get("section_path") or chapter.get("title") or "正文")
+            for chapter in chapter_list
+        )
+    )
+    merged_content = "\n\n".join(
+        str(chapter.get("text") or "").strip()
+        for chapter in chapter_list
+        if str(chapter.get("text") or "").strip()
+    )
+    return (
+        f"=== 章节【{', '.join(section_names)}】完整原文 "
+        "(来源：解析原文) ===\n\n"
+        + merged_content
+    )
 
 def merge_overlapping_text(text1: str, text2: str, max_overlap: int = 400) -> str:
     """Find the longest suffix of text1 that matches a prefix of text2."""
@@ -80,6 +137,64 @@ def merge_overlapping_text(text1: str, text2: str, max_overlap: int = 400) -> st
             return text1 + text2[i:]
     return text1 + "\n\n" + text2
 class RAGService:
+    def _load_source_chapters(
+        self,
+        document_id: str,
+        section_title: typing.Union[str, list],
+        tenant_id: typing.Optional[str] = None,
+    ) -> list[dict]:
+        """读取当前文档的解析原文，兼容历史分块缺失章节根节点的情况。"""
+        source_db: Session = SessionLocal()
+        try:
+            document_query = source_db.query(Document).filter(Document.id == document_id)
+            if tenant_id:
+                document_query = document_query.filter(Document.tenant_id == tenant_id)
+            document = document_query.first()
+            if not document:
+                logger.warning("RAG 原文回源未找到文档：文档ID={}", document_id)
+                return []
+
+            parsed_metadata = document.parsed_metadata or {}
+            source_path_value = parsed_metadata.get("md_file_path")
+            if not source_path_value:
+                logger.warning("RAG 原文回源缺少原文路径：文档ID={}", document_id)
+                return []
+
+            source_path = Path(str(source_path_value))
+            if not source_path.is_file():
+                logger.warning(
+                    "RAG 原文回源路径不存在：文档ID={}，路径={}",
+                    document_id,
+                    source_path,
+                )
+                return []
+
+            markdown_text = source_path.read_text(encoding="utf-8")
+            doc_type = "bid" if str(parsed_metadata.get("doc_type", "")).lower() == "bid" else "general"
+            from app.services.extractor_service import extractor_service
+
+            chapters = extractor_service._group_markdown_text_by_chapter(
+                markdown_text,
+                doc_type=doc_type,
+            )
+            selected_chapters = _select_source_chapters(chapters, section_title)
+            if selected_chapters:
+                logger.info(
+                    "RAG 已从解析原文回源章节：文档ID={}，章节={}，匹配章节数={}",
+                    document_id,
+                    section_title,
+                    len(selected_chapters),
+                )
+            return selected_chapters
+        except (OSError, UnicodeError):
+            logger.exception("RAG 读取解析原文失败：文档ID={}", document_id)
+            return []
+        except Exception:
+            logger.exception("RAG 解析原文章节失败：文档ID={}", document_id)
+            return []
+        finally:
+            source_db.close()
+
     def search_bidding_document(
         self,
         document_id: str,
@@ -95,7 +210,7 @@ class RAGService:
         根据 query，在指定的 document_id 中进行向量检索与关键字混合检索。
         支持限定 section_title 章节检索与高精度重定向过滤。
         """
-        logger.info(f"RAG Service 正在执行检索, 原始 query: {query}, 限定章节: {section_title}")
+        logger.info("RAG Service 正在执行检索，原始 query: {}，限定章节: {}", query, section_title)
         
         try:
             # 安全类型转换防御：确保 top_k 为合法整数
@@ -110,15 +225,10 @@ class RAGService:
                 expanded_queries = list(dict.fromkeys([q.strip() for q in query.split() if q.strip()]))
                 if not expanded_queries:
                     expanded_queries = [query]
-                logger.info(f"RAG Service 使用 split 模式，分词结果: {expanded_queries}")
+                logger.info("RAG Service 使用 split 模式，分词结果: {}", expanded_queries)
             else:
                 expanded_queries = [query]
-                logger.info(f"RAG Service 使用 combined 模式，原始 query: {query}")
-            
-            # 2. 生成多路向量
-            query_embeddings = llm_service.generate_embeddings(expanded_queries)
-            if not query_embeddings:
-                return "检索失败：无法生成查询向量"
+                logger.info("RAG Service 使用 combined 模式，原始 query: {}", query)
             
             db: Session = SessionLocal()
             try:
@@ -152,16 +262,64 @@ class RAGService:
                         tenant_id=tenant_id,
                     )
                     if exact_section_titles:
-                        base_query = base_query.filter(
-                            DocChunk.section_title.in_(exact_section_titles)
-                        )
+                        matched_chunks = [
+                            chunk
+                            for chunk in chunk_list
+                            if chunk.section_title in exact_section_titles
+                            and (chunk.chunk_index or 0) > 0
+                            and chunk.content_type != "toc_block"
+                        ]
+                        if _has_substantive_section_chunks(matched_chunks):
+                            base_query = base_query.filter(
+                                DocChunk.section_title.in_(exact_section_titles)
+                            )
+                        else:
+                            source_chapters = self._load_source_chapters(
+                                document_id,
+                                section_title,
+                                tenant_id=tenant_id,
+                            )
+                            source_context = _format_source_chapters(source_chapters)
+                            if source_context:
+                                logger.info(
+                                    "RAG 历史分块仅命中标题，已使用解析原文完整章节：文档ID={}，章节={}",
+                                    document_id,
+                                    section_title,
+                                )
+                                return source_context
+                            base_query = base_query.filter(
+                                DocChunk.section_title.in_(exact_section_titles)
+                            )
+                            logger.warning(
+                                "RAG 章节分块仅包含标题且原文回源不可用，继续使用存量分块：文档ID={}，章节={}",
+                                document_id,
+                                section_title,
+                            )
                     else:
+                        source_chapters = self._load_source_chapters(
+                            document_id,
+                            section_title,
+                            tenant_id=tenant_id,
+                        )
+                        source_context = _format_source_chapters(source_chapters)
+                        if source_context:
+                            logger.info(
+                                "RAG 章节标题未命中存量分块，已使用解析原文完整章节：文档ID={}，章节={}",
+                                document_id,
+                                section_title,
+                            )
+                            return source_context
                         section_filter_fallback = True
                         logger.warning(
-                            "RAG 章节限定未找到精确 section_title，降级为当前文档向量召回：文档ID=%s，章节=%s",
+                            "RAG 章节限定未找到精确 section_title，降级为当前文档向量召回：文档ID={}，章节={}",
                             document_id,
                             section_title,
                         )
+
+                # 章节回源失败后才生成向量，避免历史切片不完整时扩大召回范围。
+                query_embeddings = llm_service.generate_embeddings(expanded_queries)
+                if not query_embeddings:
+                    return "检索失败：无法生成查询向量"
 
                 # 3. 向量检索 (Vector Search)
                 import math
@@ -195,7 +353,7 @@ class RAGService:
                             hit_chunk_ids.add(c.id)
                 elif section_filter_fallback:
                     logger.info(
-                        "RAG 章节限定降级时保留向量命中，跳过泛关键词扩散：文档ID=%s，命中分块=%d",
+                        "RAG 章节限定降级时保留向量命中，跳过泛关键词扩散：文档ID={}，命中分块={}",
                         document_id,
                         len(hit_chunk_ids),
                     )
@@ -288,7 +446,11 @@ class RAGService:
                     results[i] = res.replace("【检索结果】", f"【检索结果 {i+1}】")
                 
                 final_result = "\n\n".join(results)
-                logger.info(f"RAG 高级检索成功，综合召回 {len(sorted_results)} 个连贯片段，合并去重叠后产生 {len(results)} 个连续块。")
+                logger.info(
+                    "RAG 高级检索成功，综合召回 {} 个连贯片段，合并去重叠后产生 {} 个连续块。",
+                    len(sorted_results),
+                    len(results),
+                )
                 return final_result
                 
             finally:
@@ -338,7 +500,7 @@ class RAGService:
             finally:
                 db.close()
         except Exception as e:
-            logger.warning(f"获取 RAG 来源切片失败，降级返回空列表: {str(e)}")
+            logger.warning("获取 RAG 来源切片失败，降级返回空列表: {}", str(e))
             return []
 
     def get_full_chapter_text(self, document_id: str, chapter_name: str) -> str:
@@ -355,8 +517,16 @@ class RAGService:
         try:
             matched_titles = _resolve_exact_section_titles(db, document_id, clean_name)
             if not matched_titles:
+                source_chapters = self._load_source_chapters(document_id, clean_name)
+                if source_chapters:
+                    logger.info(
+                        "RAGService: 数据库未命中章节，已从解析原文返回完整章节：章节={}，文档ID={}",
+                        clean_name,
+                        document_id,
+                    )
+                    return _format_full_source_chapters(source_chapters)
                 logger.info(
-                    "RAGService: section_title 精确匹配不到章节 '%s'（文档ID: %s）",
+                    "RAGService: section_title 精确匹配不到章节 '{}'（文档ID: {}）",
                     clean_name,
                     document_id,
                 )
@@ -372,13 +542,29 @@ class RAGService:
                 .all()
             )
 
+            if not isinstance(chunks, (list, tuple)):
+                chunks = []
+
             if not chunks:
+                source_chapters = self._load_source_chapters(document_id, clean_name)
+                if source_chapters:
+                    return _format_full_source_chapters(source_chapters)
                 logger.info(
-                    "RAGService: section_title 已解析但没有可用分块：章节=%s，文档ID=%s",
+                    "RAGService: section_title 已解析但没有可用分块：章节={}，文档ID={}",
                     clean_name,
                     document_id,
                 )
                 return f"未能在文档中检索到章节名称匹配 '{chapter_name}' 的任何段落。"
+
+            if not _has_substantive_section_chunks(chunks):
+                source_chapters = self._load_source_chapters(document_id, clean_name)
+                if source_chapters:
+                    logger.info(
+                        "RAGService: 存量分块仅包含章节标题，已返回解析原文：章节={}，文档ID={}",
+                        clean_name,
+                        document_id,
+                    )
+                    return _format_full_source_chapters(source_chapters)
 
             matched_sections = list(dict.fromkeys([c.section_title for c in chunks if c.section_title]))
             content_blocks = [c.content for c in chunks if c.content]
@@ -387,7 +573,7 @@ class RAGService:
             hdr = f"=== 章节【{', '.join(matched_sections)}】完整原文 (共 {len(chunks)} 个段落) ===\n\n"
             return hdr + merged_content
         except Exception as e:
-            logger.exception(f"获取整章原文发生异常 ({chapter_name}): {e}")
+            logger.exception("获取整章原文发生异常 ({})", chapter_name)
             return f"获取整章原文发生异常: {str(e)}"
         finally:
             db.close()

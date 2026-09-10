@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +12,91 @@ def test_get_model_config_should_return_only_supported_runtime_keys():
 
     assert set(values) == set(MODEL_CONFIG_KEYS)
     assert all(isinstance(value, str) for value in values.values())
+
+
+def test_get_effective_model_config_should_only_fallback_mineru_to_global_defaults():
+    """读取租户配置时，LLM 和视觉模型不得回退到全局值，MinerU 可以回退。"""
+    service = ModelConfigService()
+    tenant_config = SimpleNamespace(
+        OPENAI_API_KEY="tenant-llm-key",
+        OPENAI_API_BASE="https://tenant-llm.example/v1",
+        LLM_MODEL_NAME="tenant-llm",
+        MINERU_API_TOKEN="",
+        MINERU_API_BASE_URL="",
+        ALI_VLM_API_KEY="tenant-vlm-key",
+        ALI_VLM_API_BASE="https://tenant-vlm.example/v1",
+        ALI_VLM_MODEL_NAME="tenant-vlm",
+    )
+    global_values = {key: f"global-{key.lower()}" for key in MODEL_CONFIG_KEYS}
+    fake_db = type(
+        "FakeDb",
+        (),
+        {
+            "query": lambda self, *_args: self,
+            "filter": lambda self, *_args: self,
+            "first": lambda self: tenant_config,
+        },
+    )()
+    fake_session = type(
+        "FakeSession",
+        (),
+        {
+            "__enter__": lambda self: fake_db,
+            "__exit__": lambda self, *_args: None,
+        },
+    )()
+
+    with patch("app.services.model_config_service.SessionLocal", return_value=fake_session), patch.object(
+        service, "_get_global_values", return_value=global_values
+    ):
+        values = service.get_effective_values("tenant-a")
+
+    assert values["OPENAI_API_KEY"] == "tenant-llm-key"
+    assert values["ALI_VLM_API_KEY"] == "tenant-vlm-key"
+    assert values["MINERU_API_TOKEN"] == global_values["MINERU_API_TOKEN"]
+    assert values["MINERU_API_BASE_URL"] == global_values["MINERU_API_BASE_URL"]
+
+
+def test_get_effective_model_config_should_not_use_global_llm_or_vlm_when_tenant_record_missing():
+    """租户没有模型配置记录时，LLM 和视觉模型应保持空值并要求用户配置。"""
+    service = ModelConfigService()
+    global_values = {key: f"global-{key.lower()}" for key in MODEL_CONFIG_KEYS}
+    fake_db = type(
+        "FakeDb",
+        (),
+        {
+            "query": lambda self, *_args: self,
+            "filter": lambda self, *_args: self,
+            "first": lambda self: None,
+        },
+    )()
+    fake_session = type(
+        "FakeSession",
+        (),
+        {
+            "__enter__": lambda self: fake_db,
+            "__exit__": lambda self, *_args: None,
+        },
+    )()
+
+    with patch("app.services.model_config_service.SessionLocal", return_value=fake_session), patch.object(
+        service, "_get_global_values", return_value=global_values
+    ):
+        values = service.get_effective_values("tenant-a")
+
+    assert values["OPENAI_API_KEY"] == ""
+    assert values["OPENAI_API_BASE"] == ""
+    assert values["LLM_MODEL_NAME"] == ""
+    assert values["ALI_VLM_API_KEY"] == ""
+    assert values["ALI_VLM_API_BASE"] == ""
+    assert values["ALI_VLM_MODEL_NAME"] == ""
+    assert values["MINERU_API_TOKEN"] == global_values["MINERU_API_TOKEN"]
+
+
+def test_get_tenant_model_config_should_reject_missing_tenant_id():
+    """读取租户模型配置时必须提供租户 ID，禁止无归属读取。"""
+    with pytest.raises(ValueError, match="tenant_id 不能为空"):
+        ModelConfigService().get_tenant_values("")
 
 
 def test_update_model_config_should_save_tenant_values_without_logging_secrets():

@@ -137,10 +137,7 @@ async def test_reextract_strategy_risk_should_return_saved_result():
         "risks_analysis": [{"risk_type": "商务", "severity": "中"}],
         "analysis_status": {"strategy_risk": {"status": "completed", "attempts": 1}},
     }
-    fake_lock = MagicMock()
-    fake_lock.acquire.return_value = True
     fake_redis = MagicMock()
-    fake_redis.lock.return_value = fake_lock
     fake_risk_result = {
         "risks_analysis": [{"risk_type": "商务", "severity": "中"}],
         "worker_summaries": [{"worker": "strategy_risk", "status": "success"}],
@@ -158,14 +155,14 @@ async def test_reextract_strategy_risk_should_return_saved_result():
         res_json = res.json()
         assert res_json["code"] == 200
         assert res_json["data"]["risks_analysis"][0]["severity"] == "中"
-        fake_lock.release.assert_called_once()
+        fake_redis.lock.assert_not_called()
     finally:
         app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
-async def test_reextract_strategy_qual_conflict_should_return_409_and_not_release_unacquired_lock():
-    """测试履约盘点加锁冲突时返回 409，且禁止在 finally 中释放未获得的锁"""
+async def test_reextract_strategy_qual_should_ignore_existing_redis_lock_and_continue():
+    """测试已有同任务 Redis 锁时仍允许重新执行履约盘点"""
     mock_user = MagicMock()
     mock_user.id = "user-test-999"
     mock_user.tenant_id = "tenant-test-888"
@@ -174,30 +171,29 @@ async def test_reextract_strategy_qual_conflict_should_return_409_and_not_releas
     mock_doc = MagicMock()
     mock_doc.parsed_metadata = {}
 
-    fake_lock = MagicMock()
-    # 模拟加锁冲突失败
-    fake_lock.acquire.return_value = False
     fake_redis = MagicMock()
-    fake_redis.lock.return_value = fake_lock
+    fake_qual_result = {
+        "worker_summaries": [{"worker": "strategy_qual", "status": "success"}],
+    }
 
     try:
         transport = httpx.ASGITransport(app=app)
         with patch("app.db.crud.document.document_crud.get_document_by_id", return_value=mock_doc), \
+             patch("app.agents.nodes.strategy_agent.analyze_qualifications_node", return_value=fake_qual_result), \
              patch("app.worker.tasks.redis_client", fake_redis):
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
                 res = await ac.post("/api/v1/analysis/doc-123/reextract/strategy_qual")
 
-        assert res.status_code == 409
-        assert "履约盘点正在执行" in res.json()["detail"]
-        # 核心断言：未获取到锁时绝不能调用 release()，避免触发 LockError
-        fake_lock.release.assert_not_called()
+        assert res.status_code == 200
+        assert res.json()["code"] == 200
+        fake_redis.lock.assert_not_called()
     finally:
         app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
-async def test_reextract_strategy_qual_success_should_acquire_and_release_lock():
-    """测试履约盘点成功执行后应正常释放锁"""
+async def test_reextract_strategy_qual_success_should_not_create_redis_lock():
+    """测试履约盘点成功执行时不再创建 Redis 并发锁"""
     mock_user = MagicMock()
     mock_user.id = "user-test-999"
     mock_user.tenant_id = "tenant-test-888"
@@ -208,10 +204,7 @@ async def test_reextract_strategy_qual_success_should_acquire_and_release_lock()
         "qualifications_analysis": {"is_qualified": True},
         "analysis_status": {"strategy_qual": {"status": "completed", "attempts": 1}},
     }
-    fake_lock = MagicMock()
-    fake_lock.acquire.return_value = True
     fake_redis = MagicMock()
-    fake_redis.lock.return_value = fake_lock
     fake_qual_result = {
         "worker_summaries": [{"worker": "strategy_qual", "status": "success"}],
     }
@@ -228,6 +221,6 @@ async def test_reextract_strategy_qual_success_should_acquire_and_release_lock()
         res_json = res.json()
         assert res_json["code"] == 200
         assert res_json["data"]["qualifications_analysis"]["is_qualified"] is True
-        fake_lock.release.assert_called_once()
+        fake_redis.lock.assert_not_called()
     finally:
         app.dependency_overrides.clear()

@@ -79,6 +79,7 @@ def analyze_bidding_doc(task_id: str, file_path: str, filename: str, company_qua
     
     from app.db.session import SessionLocal
     from app.db.models.project import Project, Document, DocChunk
+    from app.services.extractor_service import EXTRACTOR_SCHEMA_VERSION
     
     db = SessionLocal()
     doc_id = None
@@ -109,9 +110,33 @@ def analyze_bidding_doc(task_id: str, file_path: str, filename: str, company_qua
                 exact_match_doc = d
                 break
 
-        if exact_match_doc and exact_match_doc.parse_status == "completed":
+        cached_parser_version = (
+            (exact_match_doc.parsed_metadata or {}).get("parser_version")
+            if exact_match_doc
+            else None
+        )
+        if (
+            exact_match_doc
+            and exact_match_doc.parse_status == "completed"
+            and cached_parser_version == EXTRACTOR_SCHEMA_VERSION
+        ):
             doc_id = exact_match_doc.id
             publish_progress(task_id, "检测到完全相同的文件缓存，跳过解析...", 20)
+        elif exact_match_doc and exact_match_doc.parse_status == "completed":
+            doc_id = exact_match_doc.id
+            exact_match_doc.file_path = file_path
+            exact_match_doc.parse_status = "pending"
+            refreshed_metadata = dict(exact_match_doc.parsed_metadata or {})
+            refreshed_metadata["file_hash"] = file_hash
+            exact_match_doc.parsed_metadata = refreshed_metadata
+            db.commit()
+            logger.info(
+                "检测到同内容文档的解析版本过期，触发章节结构重建：文档ID={}，旧版本={}，新版本={}",
+                doc_id,
+                cached_parser_version,
+                EXTRACTOR_SCHEMA_VERSION,
+            )
+            publish_progress(task_id, "检测到旧版解析缓存，正在重建章节目录与切片...", 20)
         else:
             if exact_match_doc:
                 # 只有当哈希完全一样但状态是 pending/failed 时，才删掉这条半成品记录重试

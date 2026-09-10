@@ -340,6 +340,7 @@ class ChatAgent:
                     session=session,
                     system_prompt=system_prompt,
                     question=question,
+                    provider=capabilities.provider,
                 )
             else:
                 # 兼容未接入会话服务的内部调用，生产 API 会始终使用 session_id。

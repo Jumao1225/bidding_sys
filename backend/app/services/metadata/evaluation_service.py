@@ -1,8 +1,15 @@
+import re
+from typing import Any, Optional
+
+from loguru import logger
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
 
 from .base import BaseMetadataService
 from app.db.models.metadata import EvaluationMetadata
+
+
+MAX_EVALUATION_METHOD_LENGTH = 32
+_EVALUATION_METHOD_SEPARATOR = re.compile(r"[\r\n:：,，;；。！？!?（(]")
 
 class ScoreDetail(BaseModel):
     """动态评分项（递归或列表结构，适配任意评分表）"""
@@ -39,7 +46,30 @@ class EvaluationSchema(BaseModel):
         description="提取到的售后服务及硬性约束条款（如：{'质保期': '3年', '维修响应': '4小时', '培训服务': '免费培训3人', '罚则': '每超时1天扣0.5%'}）。如果不涉及具体数值或要求，请强制丢弃或置为空字典 {}。"
     )
 
-    reasoning: Optional[str] = Field(None, description="CoT 推导过程（不落库）")
+
+
+def _normalize_evaluation_method(value: Any) -> str:
+    """将模型可能返回的长篇评标说明规范为可展示的短方法名称。"""
+    if value is None:
+        return ""
+
+    method_text = str(value).strip()
+    if not method_text:
+        return ""
+
+    # 评标方法后常跟冒号、括号或解释句，标题字段只保留方法名称本身。
+    method_name = _EVALUATION_METHOD_SEPARATOR.split(method_text, maxsplit=1)[0].strip()
+    normalized_method = method_name or method_text
+    if len(normalized_method) > MAX_EVALUATION_METHOD_LENGTH:
+        original_length = len(normalized_method)
+        normalized_method = normalized_method[:MAX_EVALUATION_METHOD_LENGTH].rstrip()
+        logger.warning(
+            "评标方法字段过长，已截断为 {} 个字符: original_length={}",
+            MAX_EVALUATION_METHOD_LENGTH,
+            original_length,
+        )
+
+    return normalized_method
 
 class EvaluationService(BaseMetadataService):
     def __init__(self):
@@ -62,11 +92,21 @@ class EvaluationService(BaseMetadataService):
 4. **无视排版，注重语义**：原文本可能极度碎片化或缺乏规整表格，请基于资深评标经验，跨越段落和格式障碍，精准还原评分全貌。
 5. **售后服务及约束剥离 (`hard_service_requirements`)**：仔细寻找任何涉及“售后服务”、“维护保养”、“培训服务”、“响应时间”、“质保期/缺陷责任期”、“罚款/违约金”的具体要求。无论这些要求是否在评分表里，都必须将它们强制抽离并以字典形式（如 `{"质保期": "3年", "维修响应": "4小时内到达现场"}`）独立写入。注意：严格防范“假大空”废话，提取的内容必须是具备具体数值边界或明确动作指向的硬性要求（如“必须提供原厂质保函”、“具备本地化团队”）。如果原文仅仅是“售后态度好”、“质量可靠”等无具体支撑的主观描述，请强制丢弃。严禁利用常识推断补充！
 
-请务必先在 `reasoning` 字段中写下你通盘梳理整个评分体系的逻辑脉络，然后再输出结构化 JSON。
+6. **输出边界**：`evaluation_method` 只填写简短的评标方法名称，不要附加评分公式、权重说明或解释段落。禁止输出 `reasoning`、`analysis`、`思维链` 等额外推理字段；只返回 Schema 中定义的业务字段。
 如果不包含某项内容，对应字段置空或返回空列表。绝不可主观推断或编造原文不存在的计分项。
 """
-        res = self.extract(context, EvaluationSchema, system_prompt, document_id, tenant_id=tenant_id)
+        # 先暂不落库，确保短字段规范化后再保存，避免长评标说明进入数据库。
+        res = self.extract(
+            context,
+            EvaluationSchema,
+            system_prompt,
+            document_id,
+            tenant_id=tenant_id,
+            persist=False,
+        )
         if res:
+            # 先规范短字段，再执行基类落库，避免异常长文本进入标题徽章和数据库字段。
+            res.evaluation_method = _normalize_evaluation_method(res.evaluation_method)
             if not res.evaluation_method:
                 res.evaluation_method = "综合评分法"
             if not res.total_score:
@@ -75,6 +115,16 @@ class EvaluationService(BaseMetadataService):
                 res.weight_distribution = {}
             if res.score_tree is None:
                 res.score_tree = []
+
+            if self.db_model_cls and document_id:
+                try:
+                    self._save_to_db(document_id, res)
+                except Exception as db_err:
+                    logger.warning(
+                        "结构化评标数据提取成功，但落盘数据库失败: document_id={}, error={}",
+                        document_id,
+                        db_err,
+                    )
         return res
 
 evaluation_service = EvaluationService()

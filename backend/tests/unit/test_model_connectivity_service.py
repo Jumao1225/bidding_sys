@@ -35,6 +35,28 @@ def test_test_llm_model_should_return_available_when_chat_completion_succeeds():
     assert post_mock.call_args.kwargs["headers"]["Authorization"] == "Bearer llm-key"
 
 
+def test_test_glm_model_should_probe_json_mode_and_disable_thinking():
+    """GLM 连通性测试应覆盖业务实际使用的 JSON Mode，并显式关闭思考。"""
+    response = _mock_response(200, {"choices": [{"message": {"content": '{"status":"ok"}'}}]})
+
+    with patch(
+        "app.services.model_connectivity_service.requests.post",
+        return_value=response,
+    ) as post_mock:
+        result = ModelConnectivityService().test(
+            model_type="llm",
+            api_key="glm-key",
+            api_base="https://open.bigmodel.cn/api/paas/v4",
+            model_name="GLM-5.3-Flash",
+        )
+
+    payload = post_mock.call_args.kwargs["json"]
+    assert result["available"] is True
+    assert payload["max_tokens"] == 8
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["thinking"] == {"type": "disabled"}
+
+
 def test_test_vlm_model_should_use_openai_compatible_chat_endpoint():
     """视觉模型应复用兼容 Chat Completions 接口完成文本探测。"""
     response = _mock_response(200, {"choices": [{"message": {"content": "连接成功"}}]})

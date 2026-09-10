@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 MAX_CHUNK_SIZE: int = 1200
 CHUNK_OVERLAP: int = 200
 
+# 解析结果结构发生变化时递增，避免同哈希文件继续复用旧章节切片。
+EXTRACTOR_SCHEMA_VERSION: str = "chapter-tree-v1"
+
 MAJOR_CHAPTER_PATTERNS: List[re.Pattern] = [
     re.compile(r'^\s*[*#]*\s*(第[一二三四五六七八九十百零\d]+[章部分篇]\s*.*)'),
     re.compile(r'^\s*[*#]*\s*(附[件录表][一二三四五六七八九十\dA-Za-z]+.*)'),

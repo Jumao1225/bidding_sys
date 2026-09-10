@@ -227,9 +227,6 @@ async def reextract_domain(
         token_task = current_task_id.set(document_id)
         token_user = current_user_id.set(current_user.id)
         token_tenant = current_tenant_id.set(current_user.tenant_id)
-        analysis_lock = None
-        lock_acquired = False
-        
         from fastapi.concurrency import run_in_threadpool
 
         try:
@@ -302,15 +299,6 @@ async def reextract_domain(
 
             if domain in ("strategy_qual", "qualifications_analysis", "qual_analysis"):
                 from app.agents.nodes.strategy_agent import analyze_qualifications_node
-                from app.worker.tasks import redis_client
-
-                analysis_lock = redis_client.lock(
-                    f"analysis:worker:{document_id}:strategy_qual",
-                    timeout=900,
-                )
-                if not analysis_lock.acquire(blocking=False):
-                    raise HTTPException(status_code=409, detail="履约盘点正在执行，请勿重复提交")
-                lock_acquired = True
 
                 state = {
                     "document_id": document_id,
@@ -342,15 +330,6 @@ async def reextract_domain(
 
             if domain in ("strategy_risk", "risks_analysis", "risk_analysis"):
                 from app.agents.nodes.strategy_agent import identify_risks_node
-                from app.worker.tasks import redis_client
-
-                analysis_lock = redis_client.lock(
-                    f"analysis:worker:{document_id}:strategy_risk",
-                    timeout=900,
-                )
-                if not analysis_lock.acquire(blocking=False):
-                    raise HTTPException(status_code=409, detail="风险提示正在执行，请勿重复提交")
-                lock_acquired = True
 
                 state = {
                     "document_id": document_id,
@@ -417,11 +396,6 @@ async def reextract_domain(
                 logger.error(f"重新提取 {domain} 失败或无权限: {res_str}")
                 raise HTTPException(status_code=500, detail=f"重新提取失败: {res_str}")
         finally:
-            if analysis_lock is not None and lock_acquired:
-                try:
-                    analysis_lock.release()
-                except Exception:
-                    logger.exception("释放分析专项锁失败: domain={}, document_id={}", domain, document_id)
             current_task_id.reset(token_task)
             current_user_id.reset(token_user)
             current_tenant_id.reset(token_tenant)

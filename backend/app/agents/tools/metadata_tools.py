@@ -583,7 +583,7 @@ def extract_evaluation_info(document_id: str, search_keywords: str = "评标办�
             query="评标办法 评分权重 商务分 技术分 价格分",
             section_title=section_title,
             top_k=5,
-            context_mode="window",
+            context_mode="chapter",
             query_mode="split"
         )
         

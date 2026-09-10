@@ -1,13 +1,11 @@
-import logging
 from typing import Dict, Any
+from loguru import logger
 from sqlalchemy.orm import Session
 from app.agents.state import BiddingState
-from app.services.extractor_service import extractor_service
+from app.services.extractor_service import EXTRACTOR_SCHEMA_VERSION, extractor_service
 from app.services.llm_service import llm_service
 from app.db.session import SessionLocal
 from app.db.models.project import Document, DocChunk
-
-logger = logging.getLogger(__name__)
 
 def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
     """
@@ -34,17 +32,25 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
         file_path = document.file_path
         logger.info(f"开始处理文档: {file_path}")
 
-        # 如果文件状态已完成（通过文件哈希匹配复用），需确切判定数据库切片不为空
+        # 只有解析版本一致且切片完整时才能复用，避免旧章节结构继续污染检索。
         if document.parse_status == "completed":
             chunk_count = db.query(DocChunk).filter(DocChunk.document_id == document.id).count()
-            if chunk_count > 0:
+            cached_version = (document.parsed_metadata or {}).get("parser_version")
+            if chunk_count > 0 and cached_version == EXTRACTOR_SCHEMA_VERSION:
                 logger.info("文档既往状态完备，复用既有的知识体系结构。")
                 emit_agent_log("info", "匹配同名完整文档缓存中，直接启用智能模型网络！")
                 return {"status": "parser_completed"}
+            if chunk_count > 0:
+                logger.info(
+                    "文档解析版本已变化，重新生成章节切片：文档ID={}，旧版本={}，新版本={}",
+                    document.id,
+                    cached_version,
+                    EXTRACTOR_SCHEMA_VERSION,
+                )
             else:
                 logger.warning("⚠️ 此文档虽标记完成但实体切片数为 0（疑遭直接手清），重置为重构阶段进入实效切割！")
-                document.parse_status = "parsing"
-                db.commit()
+            document.parse_status = "parsing"
+            db.commit()
 
         # 2. 解析和切片（先解析，成功后再清理旧数据，避免解析失败导致数据全丢）
         import os
@@ -86,6 +92,7 @@ def parser_worker_node(state: BiddingState) -> Dict[str, Any]:
         # 强制触发 SQLAlchemy JSON 列更新
         new_meta = dict(document.parsed_metadata)
         new_meta["table_of_contents"] = toc_str
+        new_meta["parser_version"] = EXTRACTOR_SCHEMA_VERSION
 
         # 提取 output.md 原始落盘路径（由 extractor_service.parse_with_mineru 注入 metadata）
         # 存入 parsed_metadata 供 tasks.py 读取原始无切割全文，避免前端展示带 Overlap 重叠的 Chunk 拼接文本

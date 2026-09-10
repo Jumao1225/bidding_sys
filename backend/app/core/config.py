@@ -44,9 +44,23 @@ class Settings(BaseSettings):
     LLM_MODEL_NAME: str = os.getenv("LLM_MODEL_NAME", "gpt-4o")
 
     # 所有 LLM 模型共用的输出上限；调用层传入 max_output_tokens 时可单独覆盖。
-    LLM_MAX_OUTPUT_TOKENS: int = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "50000"))
+    LLM_MAX_OUTPUT_TOKENS: int = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "100000"))
+    # LLM 单次 HTTP 请求最长等待时间，默认 15 分钟，适配长上下文模型生成场景。
+    LLM_REQUEST_TIMEOUT_SECONDS: float = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "900"))
     # BOM 等结构化提取默认关闭思考模式，避免 reasoning token 挤占 JSON 输出空间。
     DEEPSEEK_THINKING_ENABLED: bool = os.getenv("DEEPSEEK_THINKING_ENABLED", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    # GLM 聊天场景默认保留模型思考能力；结构化 JSON 调用由服务层单独关闭思考，保护 JSON 输出预算。
+    GLM_THINKING_ENABLED: bool = os.getenv("GLM_THINKING_ENABLED", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    # 切换或继续 GLM 会话时默认清理历史思考字段，避免跨轮次携带不完整的 reasoning_content。
+    GLM_CLEAR_THINKING: bool = os.getenv("GLM_CLEAR_THINKING", "true").lower() in (
         "true",
         "1",
         "yes",
@@ -90,7 +104,7 @@ class Settings(BaseSettings):
     # Multi-Agent 标书起草长流程开关 (false: 开启; true: 跳过)
     SKIP_BID_FILLER: bool = os.getenv("SKIP_BID_FILLER", "false").lower() in ("true", "1", "yes")
     # 标书撰写由独立子进程执行，默认允许两份不同标书并行，仍由文档锁阻止同文档重复写入。
-    BID_FILL_MAX_CONCURRENCY: int = int(os.getenv("BID_FILL_MAX_CONCURRENCY", 2))
+    BID_FILL_MAX_CONCURRENCY: int = int(os.getenv("BID_FILL_MAX_CONCURRENCY",10))
     BID_FILL_LOCK_TTL_SECONDS: int = int(os.getenv("BID_FILL_LOCK_TTL_SECONDS", 14400))
 
 

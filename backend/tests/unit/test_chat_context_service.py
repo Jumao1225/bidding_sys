@@ -59,6 +59,36 @@ def test_build_messages_should_restore_summary_and_incremental_messages() -> Non
     list_messages.assert_called_once_with(SimpleNamespace(), session, after_sequence=2)
 
 
+def test_build_messages_should_drop_reasoning_fields_for_glm_provider() -> None:
+    """模型切换到 GLM 时，不应把历史 DeepSeek 推理字段带入当前请求。"""
+    persisted_messages = [
+        SimpleNamespace(
+            role="assistant",
+            content="上一轮回答",
+            provider_payload_json={"reasoning_content": "历史推理内容"},
+        )
+    ]
+    session = SimpleNamespace(id="session-glm")
+
+    with patch(
+        "app.services.chat_context_service.chat_session_service.get_latest_checkpoint",
+        return_value=None,
+    ), patch(
+        "app.services.chat_context_service.chat_session_service.list_messages",
+        return_value=persisted_messages,
+    ):
+        messages = ChatContextManager.build_messages(
+            db=SimpleNamespace(),
+            session=session,
+            system_prompt="你是招投标助手",
+            question="继续分析",
+            provider="glm",
+        )
+
+    assert messages[1].content == "上一轮回答"
+    assert messages[1].additional_kwargs == {}
+
+
 def test_maybe_compact_should_keep_recent_messages_outside_summary(monkeypatch) -> None:
     """边界场景：触发压缩时应保留配置数量的最近消息。"""
     monkeypatch.setattr("app.services.chat_context_service.settings.CHAT_CONTEXT_SUMMARY_TRIGGER_TOKENS", 1)

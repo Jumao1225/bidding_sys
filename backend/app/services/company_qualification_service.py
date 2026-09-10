@@ -142,15 +142,34 @@ class CompanyQualificationService:
             logger.error(f"读取图片文件失败: {e}")
             raise HTTPException(status_code=500, detail="读取图片文件失败")
 
-        from app.services.model_config_service import model_config_service
+        from app.services.model_config_service import VLM_MODEL_CONFIG_KEYS, model_config_service
         runtime_values = model_config_service.get_effective_values(tenant_id)
         provider = settings.VLM_PROVIDER
         api_base = runtime_values["ALI_VLM_API_BASE"]
         api_key = runtime_values["ALI_VLM_API_KEY"]
         model_name = runtime_values["ALI_VLM_MODEL_NAME"]
 
-        if not api_key:
-            raise HTTPException(status_code=500, detail=f"未配置 {provider} 的 VLM API_KEY")
+        missing_keys = [
+            key for key in VLM_MODEL_CONFIG_KEYS
+            if not str(runtime_values.get(key, "") or "").strip()
+        ]
+        if missing_keys:
+            missing_labels = {
+                "ALI_VLM_API_KEY": "API Key",
+                "ALI_VLM_API_BASE": "API 地址",
+                "ALI_VLM_MODEL_NAME": "模型名称",
+            }
+            missing_text = "、".join(missing_labels[key] for key in missing_keys)
+            logger.warning(
+                "租户 {} 尚未配置完整的 {} 视觉模型参数，缺少: {}",
+                tenant_id,
+                provider,
+                missing_text,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"当前租户尚未配置完整的视觉模型，请前往“模型配置”填写 {missing_text}",
+            )
 
         client = OpenAI(base_url=api_base, api_key=api_key)
 

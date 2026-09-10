@@ -7,6 +7,8 @@ from uuid import uuid4
 import requests
 from loguru import logger
 
+from app.services.model_capabilities import resolve_model_capabilities
+
 
 ModelType = Literal["llm", "mineru", "vlm"]
 
@@ -83,6 +85,21 @@ class ModelConnectivityService:
 
         started_at = perf_counter()
         try:
+            capabilities = resolve_model_capabilities(model_name=model_name, base_url=api_base)
+            probe_payload: dict[str, Any] = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": "请仅回复：连接成功"}],
+                "temperature": 0,
+                "max_tokens": 8,
+            }
+            if capabilities.provider in {"deepseek", "glm"}:
+                # 国内模型同时验证 JSON Mode 和显式关闭思考，避免“普通文本可用但业务结构化调用失败”。
+                probe_payload["messages"] = [
+                    {"role": "user", "content": '请仅返回 JSON：{"status":"ok"}'}
+                ]
+                probe_payload["response_format"] = {"type": "json_object"}
+                probe_payload["thinking"] = {"type": "disabled"}
+
             response = requests.post(
                 f"{api_base}/chat/completions",
                 headers={
@@ -90,12 +107,7 @@ class ModelConnectivityService:
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                 },
-                json={
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": "请仅回复：连接成功"}],
-                    "temperature": 0,
-                    "max_tokens": 8,
-                },
+                json=probe_payload,
                 timeout=self._REQUEST_TIMEOUT,
             )
         except requests.Timeout:
