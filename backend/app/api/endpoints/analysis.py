@@ -228,6 +228,7 @@ async def reextract_domain(
         token_user = current_user_id.set(current_user.id)
         token_tenant = current_tenant_id.set(current_user.tenant_id)
         analysis_lock = None
+        lock_acquired = False
         
         from fastapi.concurrency import run_in_threadpool
 
@@ -309,6 +310,7 @@ async def reextract_domain(
                 )
                 if not analysis_lock.acquire(blocking=False):
                     raise HTTPException(status_code=409, detail="履约盘点正在执行，请勿重复提交")
+                lock_acquired = True
 
                 state = {
                     "document_id": document_id,
@@ -348,6 +350,7 @@ async def reextract_domain(
                 )
                 if not analysis_lock.acquire(blocking=False):
                     raise HTTPException(status_code=409, detail="风险提示正在执行，请勿重复提交")
+                lock_acquired = True
 
                 state = {
                     "document_id": document_id,
@@ -414,7 +417,7 @@ async def reextract_domain(
                 logger.error(f"重新提取 {domain} 失败或无权限: {res_str}")
                 raise HTTPException(status_code=500, detail=f"重新提取失败: {res_str}")
         finally:
-            if analysis_lock is not None:
+            if analysis_lock is not None and lock_acquired:
                 try:
                     analysis_lock.release()
                 except Exception:

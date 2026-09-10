@@ -101,6 +101,7 @@ interface CostItemNode {
   isLockedByParent?: boolean;
   isLockedByChildren?: boolean;
   hasModifiedChildren?: boolean;
+  hasPricedChildren?: boolean;
   raw_ref_price?: number;
   raw_brand?: string;
   raw_model?: string;
@@ -1683,22 +1684,47 @@ export function CostTable({
 
     traverseAndClean(rootNodes, 1);
 
-    // 3.5 标记父子互斥状态与锁（isLockedByParent, hasModifiedChildren, isLockedByChildren）
-    const markMutualExclusion = (node: CostItemNode, parentModified: boolean) => {
-      const isSelfParentModified = Boolean(node.is_parent_modified || node.pricing_mode === 'parent');
-      node.isLockedByParent = parentModified;
+    // 3.5 标记父子互斥状态与锁（isLockedByParent, hasModifiedChildren, isLockedByChildren, hasPricedChildren）
+    const markMutualExclusion = (node: CostItemNode, parentLockedByAncestor: boolean) => {
+      const hasChildren = Boolean(node.children && node.children.length > 0);
+      node.isLockedByParent = parentLockedByAncestor;
 
-      if (node.children && node.children.length > 0) {
+      if (hasChildren && node.children) {
+        // 检查名下所有子项是否有价格或被手动修改
+        let anyChildHasPrice = false;
         let anyChildModified = false;
+
         node.children.forEach(child => {
-          markMutualExclusion(child, parentModified || isSelfParentModified);
-          if (child.is_child_modified || child.is_custom_added || child.hasModifiedChildren || (child.match_quality === '手动修改' && !child.is_parent_modified)) {
+          const childSubtotal = Number(child.subtotal) || 0;
+          const childPrice = Number(child.ref_price) || 0;
+          if (childSubtotal > 0 || childPrice > 0) {
+            anyChildHasPrice = true;
+          }
+          if (child.is_child_modified || (child.match_quality === '手动修改' && !child.is_parent_modified)) {
             anyChildModified = true;
           }
         });
+
+        // 判断当前成套设备自身是否处于成套统价模式：
+        // 1. 用户手动直接修改了父项价格 (is_parent_modified || pricing_mode === 'parent')
+        // 2. 或者父项自身有单价，且名下所有子项目前均未录入有效金额（此时保持父项统价有效）
+        const isSelfCustomParent = Boolean(
+          (node.is_parent_modified || node.pricing_mode === 'parent') && Number(node.ref_price) > 0
+        );
+        const isSelfDefaultParentPrice = Boolean(
+          node.pricing_mode !== 'children' && Number(node.ref_price) > 0 && !anyChildHasPrice
+        );
+        const isParentDominant = !parentLockedByAncestor && (isSelfCustomParent || isSelfDefaultParentPrice);
+
+        // 如果父项处于成套统价主导状态，名下所有子项均被母项统价锁定
+        node.children.forEach(child => {
+          markMutualExclusion(child, parentLockedByAncestor || isParentDominant);
+        });
+
+        node.hasPricedChildren = anyChildHasPrice;
         node.hasModifiedChildren = anyChildModified;
-        // 若下属子项被修改/添加，则父项直接修改被锁定（由子项自底向上汇总驱动）
-        node.isLockedByChildren = anyChildModified;
+        // 若下属子项已有有效金额，成套价格必须由子项汇总驱动，父项直接修改被互斥锁定
+        node.isLockedByChildren = anyChildHasPrice;
       }
     };
 
@@ -1719,11 +1745,17 @@ export function CostTable({
 
         // 判断当前父节点自身是否正在被直接行内编辑
         const isSelfEditing = editingIndex === node.originalIndex;
-        const isParentModified = Boolean(node.is_parent_modified || node.pricing_mode === 'parent');
+        // 生效的父项自定义统价：自身设定了统价，且【未被上级祖先统价锁定】
+        const isParentModified = Boolean((node.is_parent_modified || node.pricing_mode === 'parent') && !node.isLockedByParent);
         const directChildCount = node.children.length;
         const missingCount = Math.max(0, directChildCount - childrenWithPriceCount);
 
-        if (isSelfEditing) {
+        if (node.isLockedByParent) {
+          // 已被上级成套父项统价锁定，自身金额已统入上级成套价，不对外独立输出小计
+          node.subtotal = 0;
+          node.isRollupPrice = false;
+          node.isPartialRollup = false;
+        } else if (isSelfEditing) {
           // 用户当前正直接编辑该母项单价
           const safeQty = editQty > 0 ? editQty : 1;
           node.subtotal = Number((safeQty * editPrice).toFixed(2));
@@ -1751,7 +1783,7 @@ export function CostTable({
           node.rollupChildCount = childrenWithPriceCount;
           node.missingChildPriceCount = missingCount;
           node.match_quality = '成套汇总';
-        } else if (node.ref_price > 0 && node.match_quality !== '未匹配' && node.match_quality !== '成套汇总') {
+        } else if (node.pricing_mode !== 'children' && node.ref_price > 0 && node.match_quality !== '未匹配' && node.match_quality !== '成套汇总') {
           // 子项无金额，母项自身有打包统价
           const safeQty = node.qty && node.qty > 0 ? Number(node.qty) : 1;
           node.subtotal = Number((safeQty * (node.ref_price || 0)).toFixed(2));
@@ -1759,6 +1791,7 @@ export function CostTable({
           node.isPartialRollup = false;
         } else {
           node.subtotal = 0;
+          node.ref_price = 0;
           node.isRollupPrice = false;
           node.isPartialRollup = false;
         }
@@ -1766,6 +1799,12 @@ export function CostTable({
         return node.subtotal || 0;
       } else {
         // 叶子节点
+        if (node.isLockedByParent) {
+          // 已被上级成套父项统价锁定，金额已统入母项，对外小计规整为 0
+          node.subtotal = 0;
+          node.isRollupPrice = false;
+          return 0;
+        }
         const safeQty = node.qty && node.qty > 0 ? Number(node.qty) : 1;
         const safePrice = node.ref_price && node.ref_price > 0 ? Number(node.ref_price) : 0;
         node.subtotal = Number((safeQty * safePrice).toFixed(2));
@@ -1786,7 +1825,7 @@ export function CostTable({
 
   // 清理删除或重新提取后已经不存在的勾选项，避免批量操作误引用旧行。
   useEffect(() => {
-    const validKeys = new Set(flattenCostTreeNodes(treeData).map((node) => node.key));
+    const validKeys = new Set<React.Key>(flattenCostTreeNodes(treeData).map((node) => node.key));
     setSelectedNodeKeys((currentKeys) => currentKeys.filter((key) => validKeys.has(key)));
   }, [treeData]);
 
@@ -1960,6 +1999,10 @@ export function CostTable({
 
   // 开启行内编辑模式
   const handleStartEdit = (record: CostItemNode) => {
+    if (record.isLockedByParent) {
+      message.warning(`该项所属的成套设备「${record.parent_item || '上级父项'}」已启用父项自定义定价，下属内容已全部锁定。如需修改，请先在上方重置父项。`, 4);
+      return;
+    }
     if (record.isParent) {
       if (record.isLockedByChildren) {
         message.warning(`成套设备「${record.name}」已修改下属子项，当前价格由子项自动汇总。如需直接修改父项，请先点击「重置子项」。`, 4);
@@ -1968,11 +2011,6 @@ export function CostTable({
       // 若该母项当前未展开，自动为用户展开下属子项方便查看
       if (!expandedRowKeys.includes(record.key)) {
         setExpandedRowKeys(prev => Array.from(new Set([...prev, record.key])));
-      }
-    } else {
-      if (record.isLockedByParent) {
-        message.warning(`该子项所属的成套设备「${record.parent_item || '父项'}」已启用父项自定义定价，子项已锁定。如需修改子项，请先点击「重置父项」。`, 4);
-        return;
       }
     }
     setEditingKey(record.key);
@@ -2254,6 +2292,62 @@ export function CostTable({
     message.success(`已重置成套设备「${record.name}」，已恢复初始状态并解锁下属子项修改与添加！`, 4);
   };
 
+  // 清空成套设备自身价格，解除对名下所有子项的锁定，进入子项汇总定价模式
+  const handleClearParentPrice = (record: CostItemNode) => {
+    const updatedItems = [...items];
+    const targetIdx = record.originalIndex;
+    if (targetIdx < 0 || targetIdx >= updatedItems.length) return;
+
+    const targetItem = { ...updatedItems[targetIdx] };
+    targetItem.ref_price = 0;
+    targetItem.subtotal = 0;
+    targetItem.is_parent_modified = false;
+    targetItem.pricing_mode = 'children';
+    targetItem.match_quality = '成套汇总';
+
+    updatedItems[targetIdx] = targetItem;
+    setItems(updatedItems);
+    if (editingIndex === targetIdx) {
+      handleCancelEdit();
+    }
+    saveCostAnalysis(updatedItems);
+    message.success(`已清空成套设备「${record.name}」的价格，已解锁名下全部 ${record.childCount || 1} 个子项的修改价格功能！`, 4);
+  };
+
+  // 清空成套设备名下所有子项的价格，重新解锁直接修改父项成套总价
+  const handleClearChildrenPrices = (record: CostItemNode) => {
+    const targetIdx = record.originalIndex;
+    if (targetIdx < 0 || targetIdx >= items.length) return;
+
+    const childIndices = getCostResetChildIndices(items, targetIdx);
+    if (childIndices.length === 0) return;
+
+    const updatedItems = items.map((item, index) => {
+      if (childIndices.includes(index)) {
+        return {
+          ...item,
+          ref_price: 0,
+          subtotal: 0,
+          is_child_modified: false,
+          match_quality: '未匹配',
+        };
+      }
+      if (index === targetIdx) {
+        return {
+          ...item,
+          is_parent_modified: false,
+          pricing_mode: 'children',
+        };
+      }
+      return item;
+    });
+
+    setItems(updatedItems);
+    handleCancelEdit();
+    saveCostAnalysis(updatedItems);
+    message.success(`已清空名下全部 ${childIndices.length} 个子项的价格，已重新解锁成套设备「${record.name}」直接统价权限！`, 4);
+  };
+
   // 重置子项：恢复原始提取子项的基线数据，保留手动新增项，并解锁父项直接修改
   const handleResetChildren = (record: CostItemNode) => {
     const parentName = record.name;
@@ -2474,8 +2568,8 @@ export function CostTable({
     anchorRecord: CostItemNode,
     mode: 'child' | 'sibling',
   ) => {
-    if (parentRecord?.is_parent_modified || parentRecord?.pricing_mode === 'parent') {
-      message.warning(`成套设备「${parentRecord.name}」已启用父项自定义定价。如需新增或移动子项，请先重置父项。`, 4);
+    if (parentRecord?.is_parent_modified || parentRecord?.pricing_mode === 'parent' || parentRecord?.isLockedByParent) {
+      message.warning(`成套设备「${parentRecord.name}」已启用或属于父项统价锁定范围。如需新增或移动子项，请先重置对应父项。`, 4);
       return;
     }
     setAddNodeMode(mode);
@@ -2948,8 +3042,9 @@ export function CostTable({
         const isEditing = editingKey === record.key;
         const keyParams = Array.isArray(record.key_parameters) ? record.key_parameters : [];
         const isManual = record.match_quality === '手动添加' || record.is_custom_added;
-        const isManualEdit = record.match_quality === '手动修改' || record.is_child_modified;
-        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
+        const isManualEdit = record.match_quality === '手动修改';
+        // 生效的父项自定义统价：自身必须是成套父项，且【未被更上层祖先统价锁定】
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent') && !record.isLockedByParent;
         const level = record.tree_level || 1;
         const visibleGroupingMode = inferCostItemGroupingMode(record);
         const internalGroupDisplayText = getCostInternalGroupDisplayText(record, selectedPart);
@@ -3202,7 +3297,7 @@ export function CostTable({
         const currentRefPrice = isEditing ? editPrice : (record.ref_price ? Number(record.ref_price) : 0);
         const isUnmatched = currentRefPrice <= 0 || (record.match_quality === '未匹配' && !record.isRollupPrice && !record.is_parent_modified);
         const isManual = record.match_quality === '手动添加';
-        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent') && !record.isLockedByParent;
 
         if (isEditing) {
           return (
@@ -3264,6 +3359,32 @@ export function CostTable({
                 <div className="flex flex-wrap gap-1 text-[11px] mt-1">
                   {displayBrand && <span className="bg-purple-50 text-purple-700 px-2 py-0.5 rounded-md font-medium border border-purple-100">品牌: {displayBrand}</span>}
                   {displayModel && <span className="bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-md font-medium border border-indigo-100">型号: {displayModel}</span>}
+                  {displayMfg && <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md font-medium">厂商: {displayMfg}</span>}
+                </div>
+              )}
+            </div>
+          );
+        }
+
+        if (record.isLockedByParent && record.isParent) {
+          const displayBrand = record.matched_brand || record.brand;
+          const displayModel = record.matched_model || record.model;
+          const displayMfg = record.matched_manufacturer || record.manufacturer;
+
+          return (
+            <div className="space-y-1.5 text-xs py-1">
+              <div className="font-bold text-slate-800 flex items-center gap-1.5">
+                <span className="text-slate-500 font-bold">🔒</span>
+                <span className="text-sm text-slate-900 font-bold">{record.name} (已统入上级成套价)</span>
+              </div>
+              <div className="text-[11px] bg-slate-50 text-slate-600 p-2.5 rounded-xl border border-slate-200 leading-relaxed font-medium shadow-2xs">
+                <span className="font-bold block mb-0.5 text-slate-700">🔒 统价锁定说明：</span>
+                上级成套设备已启用统一总价，当前成套分项及下属部件均已纳入上级统价范围，无需单独计价。
+              </div>
+              {(displayBrand || displayModel || displayMfg) && (
+                <div className="flex flex-wrap gap-1 text-[11px] mt-1">
+                  {displayBrand && <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md font-medium">品牌: {displayBrand}</span>}
+                  {displayModel && <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md font-medium">型号: {displayModel}</span>}
                   {displayMfg && <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md font-medium">厂商: {displayMfg}</span>}
                 </div>
               )}
@@ -3388,8 +3509,8 @@ export function CostTable({
         const isExact = record.match_quality === '精准匹配';
         const isManual = record.match_quality === '手动添加';
         const isManualEdit = record.match_quality === '手动修改';
-        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
-        const isRollup = (record.isRollupPrice || record.match_quality === '成套汇总' || record.match_quality === '子项汇总') && !isParentCustom;
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent') && !record.isLockedByParent;
+        const isRollup = (record.isRollupPrice || record.match_quality === '成套汇总' || record.match_quality === '子项汇总') && !isParentCustom && !record.isLockedByParent;
         const note = record.comparison_note || '';
         const isSpecDiff = note.includes("规格不同") || note.includes("量纲不一") || note.includes("差异") || note.includes("仅参考") || note.includes("不一致") || note.includes("偏离");
         const currentRefPrice = isEditing ? editPrice : (record.ref_price ? Number(record.ref_price) : 0);
@@ -3397,6 +3518,9 @@ export function CostTable({
 
         if (isEditing) {
           return <Tag color="processing">修改中</Tag>;
+        }
+        if (record.isLockedByParent) {
+          return <Tag color="default" className="text-slate-500 bg-slate-100 border-slate-300 font-medium">已统入父项</Tag>;
         }
         if (isParentCustom) {
           return <Tag color="purple" className="font-bold border-purple-300">父项自定义</Tag>;
@@ -3500,7 +3624,7 @@ export function CostTable({
       render: (_: any, record: CostItemNode) => {
         const isEditing = editingKey === record.key;
         const currentRefPrice = isEditing ? editPrice : (record.ref_price ? Number(record.ref_price) : 0);
-        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent') && !record.isLockedByParent;
 
         if (isEditing) {
           return (
@@ -3521,6 +3645,17 @@ export function CostTable({
                   <span>自定义成套单价</span>
                 </span>
               )}
+            </div>
+          );
+        }
+
+        if (record.isLockedByParent) {
+          return (
+            <div className="flex flex-col items-end">
+              <span className="text-slate-400 font-normal text-xs">{currentRefPrice > 0 ? `¥${currentRefPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '--'}</span>
+              <span className="text-[10px] text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200 mt-0.5 font-normal">
+                已统入父项价
+              </span>
             </div>
           );
         }
@@ -3557,17 +3692,6 @@ export function CostTable({
           );
         }
 
-        if (record.isLockedByParent) {
-          return (
-            <div className="flex flex-col items-end">
-              <span className="text-slate-400 font-normal text-xs">{currentRefPrice > 0 ? `¥${currentRefPrice.toLocaleString()}` : '--'}</span>
-              <span className="text-[10px] text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200 mt-0.5 font-normal">
-                已统入父项价
-              </span>
-            </div>
-          );
-        }
-
         if (currentRefPrice > 0) {
           return <span className="font-bold text-slate-700">¥{currentRefPrice.toLocaleString()}</span>;
         }
@@ -3595,7 +3719,18 @@ export function CostTable({
         const currentQty = isEditing ? editQty : (record.qty !== null && record.qty !== undefined ? Number(record.qty) : 1);
         const currentRefPrice = isEditing ? editPrice : (record.ref_price ? Number(record.ref_price) : 0);
         const itemSubtotal = record.subtotal !== undefined ? record.subtotal : currentQty * currentRefPrice;
-        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent');
+        const isParentCustom = record.isParent && (record.is_parent_modified || record.pricing_mode === 'parent') && !record.isLockedByParent;
+
+        if (record.isLockedByParent) {
+          return (
+            <div className="flex flex-col items-end">
+              <span className="text-slate-400 font-normal text-xs">--</span>
+              <span className="text-[10px] text-slate-400 bg-slate-100 px-1.5 py-0.2 rounded border border-slate-200 mt-0.5 font-normal">
+                已统入父项
+              </span>
+            </div>
+          );
+        }
 
         if (itemSubtotal > 0) {
           if (record.isParent) {
@@ -3621,7 +3756,7 @@ export function CostTable({
             );
           }
           return (
-            <span className={`font-bold whitespace-nowrap ${record.isLockedByParent ? 'text-slate-400' : 'text-blue-600'}`}>
+            <span className="font-bold whitespace-nowrap text-blue-600">
               ¥{itemSubtotal.toLocaleString()}
             </span>
           );
@@ -3702,12 +3837,27 @@ export function CostTable({
         if (record.isParent) {
           const isParentModified = Boolean(record.is_parent_modified || record.pricing_mode === 'parent');
           const hasModifiedChildren = Boolean(record.hasModifiedChildren);
+          const isLockedByParent = Boolean(record.isLockedByParent);
+          // 名下子项是否有实际价格（由子项自底向上驱动）
+          const hasPricedChildren = Boolean(record.hasPricedChildren || (record.subtotal && record.subtotal > 0 && record.isRollupPrice));
+          // 父项自身是否有有效独立统价（非子项汇总计算得出）
+          const hasParentSelfPrice = Boolean(Number(record.ref_price) > 0 && !record.isRollupPrice);
+          const childCount = record.childCount || 1;
 
           return (
             <div className="flex flex-nowrap items-center justify-center gap-0.5 whitespace-nowrap">
               {/* 添加子项按钮 */}
-              {isParentModified ? (
-                <Tooltip title="父项已启用自定义定价，子项已锁定。如需添加子项，请先重置父项">
+              {isLockedByParent ? (
+                <Tooltip title="所属成套设备已启用父项自定义统价，下属分项已锁定。如需添加子项，请先重置上级父项">
+                  <Button
+                    type="text"
+                    size="small"
+                    disabled
+                    icon={<PlusCircleOutlined className="text-slate-300 cursor-not-allowed" />}
+                  />
+                </Tooltip>
+              ) : hasParentSelfPrice ? (
+                <Tooltip title="当前成套设备已设定统价，子项已锁定。如需添加子项，请先清空父项价格">
                   <Button
                     type="text"
                     size="small"
@@ -3762,9 +3912,18 @@ export function CostTable({
                 </Tooltip>
               )}
 
-              {/* 编辑父项按钮 */}
-              {hasModifiedChildren ? (
-                <Tooltip title="下属子项已修改，成套价格由子项自动汇总。如需直接修改父项，请先点击「重置子项」">
+              {/* 编辑父项按钮：若子项已有价格汇总，父项被互斥锁定，禁止直接修改 */}
+              {isLockedByParent ? (
+                <Tooltip title="所属成套设备已启用父项自定义定价，子项已锁定。如需修改，请先重置上级父项">
+                  <Button
+                    type="text"
+                    size="small"
+                    disabled
+                    icon={<EditOutlined className="text-slate-300 cursor-not-allowed" />}
+                  />
+                </Tooltip>
+              ) : hasPricedChildren ? (
+                <Tooltip title={`当前成套价格由名下全部 ${childCount} 个子项汇总自动计算，禁止直接修改父项。如需直接指定成套统价，请先点击「清空子项价格」`}>
                   <Button
                     type="text"
                     size="small"
@@ -3773,24 +3932,24 @@ export function CostTable({
                   />
                 </Tooltip>
               ) : (
-                <Tooltip title={isParentModified ? "修改成套设备价格与属性" : "直接修改成套设备价格（保存后将锁定子项）"}>
+                <Tooltip title="直接修改成套设备价格（保存后将作为成套统价，并锁定下属全部子项）">
                   <Button
                     type="text"
                     size="small"
-                    icon={<EditOutlined className={isParentModified ? "text-purple-600 hover:text-purple-800" : "text-indigo-500 hover:text-indigo-700"} />}
+                    icon={<EditOutlined className={hasParentSelfPrice ? "text-purple-600 hover:text-purple-800" : "text-indigo-500 hover:text-indigo-700"} />}
                     onClick={() => handleStartEdit(record)}
                   />
                 </Tooltip>
               )}
 
-              {/* 重置父项按钮（仅在父项已修改时显示） */}
-              {isParentModified && (
-                <Tooltip title="重置父项自定义修改，恢复初始对标价格并解锁子项">
+              {/* 清空父项价格按钮：成套设备自身有独立价格且未被上级锁定时显示，点击后清空父项价格并解锁所有子项 */}
+              {hasParentSelfPrice && !isLockedByParent && (
+                <Tooltip title={`清空成套设备价格，解除锁定并解锁名下全部 ${childCount} 个子项的修改价格功能`}>
                   <Popconfirm
-                    title="确定重置父项？"
-                    description="将恢复父项初始数据，并解锁下属子项修改与添加权限。"
-                    onConfirm={() => handleResetParent(record)}
-                    okText="确定重置"
+                    title={`确定清空成套设备「${record.name}」的价格？`}
+                    description={`将清空此父项独立定价，解除对名下全部 ${childCount} 个子项的锁定，允许分别修改子项价格，成套总价将由子项自动汇总得出。`}
+                    onConfirm={() => handleClearParentPrice(record)}
+                    okText="确定清空并解锁"
                     cancelText="取消"
                   >
                     <Button
@@ -3802,14 +3961,14 @@ export function CostTable({
                 </Tooltip>
               )}
 
-              {/* 重置子项按钮（仅在子项被修改时显示） */}
-              {hasModifiedChildren && (
-                <Tooltip title="恢复原始子项，保留手动新增项并解锁父项直接修改">
+              {/* 清空子项价格按钮：当子项中有价格时显示，点击后清空名下所有子项价格，重新解锁成套设备直接统价 */}
+              {hasPricedChildren && !isLockedByParent && (
+                <Tooltip title={`清空名下全部 ${childCount} 个子项的价格，重新解锁成套设备直接统价`}>
                   <Popconfirm
-                    title="确定重置所有子项？"
-                    description="将恢复原始子项的初始对标清单、价格和修改状态，保留手动新增子项及其价格，并解锁父项直接修改。"
-                    onConfirm={() => handleResetChildren(record)}
-                    okText="确定重置"
+                    title={`确定清空「${record.name}」名下全部 ${childCount} 个子项的价格？`}
+                    description={`将清空名下全部 ${childCount} 个子项的价格（恢复为未定价），重新解锁成套设备直接修改价格的权限。`}
+                    onConfirm={() => handleClearChildrenPrices(record)}
+                    okText="确定清空子项"
                     cancelText="取消"
                   >
                     <Button
@@ -3888,7 +4047,7 @@ export function CostTable({
               </Tooltip>
             )}
             {isLockedByParent ? (
-              <Tooltip title="所属成套设备已启用父项自定义定价，子项已锁定。如需修改子项，请先在上方重置父项">
+              <Tooltip title="所属成套设备已启用父项直接定价，下属所有子项已锁定。如需修改子项价格，请先在上方成套设备点击「清空父项价格」">
                 <Button
                   type="text"
                   size="small"
@@ -4024,25 +4183,25 @@ const costTableScrollWidth = getCostTableScrollWidth(
               {onReextractEquipment && (
                 <button
                   onClick={(e) => { e.stopPropagation(); onReextractEquipment(); }}
-                  disabled={isBusy}
+                  disabled={isBusy || isExtractingEquipment}
                   className="inline-flex items-center gap-1.5 px-2 py-1 ml-1 text-xs font-semibold text-blue-600 hover:text-blue-700 hover:bg-blue-50 rounded-md transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
                   aria-label="重新提取设备清单"
                   title="重新读取原文并提取设备清单，完成后等待手动进行价格匹配"
                 >
-                  <FileSearchOutlined />
-                  <span>重新提取设备清单</span>
+                  <FileSearchOutlined className={isExtractingEquipment ? 'animate-spin text-blue-600' : ''} />
+                  <span>{isExtractingEquipment ? '正在提取设备清单...' : '重新提取设备清单'}</span>
                 </button>
               )}
               {onReextract && (
                 <button 
                   onClick={(e) => { e.stopPropagation(); onReextract(); }}
-                  disabled={isBusy}
+                  disabled={isBusy || isRetrying}
                   className="inline-flex items-center gap-1.5 px-2 py-1 ml-1 text-xs font-semibold text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
                   aria-label="重新匹配 BOM 清单"
                   title="重新匹配 BOM 清单，并重新计算参考单价与成本"
                 >
-                  <ReloadOutlined className="text-sm" />
-                  <span>重新匹配 BOM 清单</span>
+                  <ReloadOutlined className={`text-sm ${isRetrying ? 'animate-spin text-blue-600' : ''}`} />
+                  <span>{isRetrying ? '正在重新匹配 BOM 清单...' : '重新匹配 BOM 清单'}</span>
                 </button>
               )}
               {hasCostData && (

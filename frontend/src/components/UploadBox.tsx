@@ -25,6 +25,9 @@ export interface UploadBoxProps {
   onSupervisorUpdate?: (decision: any) => void;
   onWorkerStatusChange?: (worker: string, status: string, summary?: string, documentId?: string) => void;
   onReextract?: (domain: string) => void;
+  retryingDomain?: string | null;
+  activeTab?: 'qual' | 'risk';
+  onTabChange?: (tab: 'qual' | 'risk') => void;
 }
 
 interface AnalysisDocumentReference {
@@ -140,7 +143,19 @@ const HighlightText = React.memo(({ text, resultData, targetQuote }: { text: str
   );
 });
 
-export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingChange, initialResult = null, initialTaskId = null, onSupervisorUpdate, onWorkerStatusChange, onReextract }: UploadBoxProps = {}) {
+export function UploadBox({ 
+  onTerminalMessage, 
+  onAnalysisSuccess, 
+  onAnalyzingChange, 
+  initialResult = null, 
+  initialTaskId = null, 
+  onSupervisorUpdate, 
+  onWorkerStatusChange, 
+  onReextract, 
+  retryingDomain = null,
+  activeTab: controlledActiveTab,
+  onTabChange
+}: UploadBoxProps = {}) {
   const [isDragging, setIsDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [isAnalyzing, setIsAnalyzingInternal] = useState(false);
@@ -169,9 +184,16 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
   const [viewMode, setViewMode] = useState<'text' | 'original'>(() => 
     (localStorage.getItem('bidding_view_mode') as 'text'|'original') || 'original'
   );
-  const [activeTab, setActiveTab] = useState<'qual' | 'risk'>(() => 
+  const [internalActiveTab, setInternalActiveTab] = useState<'qual' | 'risk'>(() => 
     (localStorage.getItem('bidding_active_tab') as 'qual'|'risk') || 'qual'
   );
+  const activeTab = controlledActiveTab !== undefined ? controlledActiveTab : internalActiveTab;
+  const setActiveTab = (tab: 'qual' | 'risk') => {
+    setInternalActiveTab(tab);
+    localStorage.setItem('bidding_active_tab', tab);
+    if (onTabChange) onTabChange(tab);
+  };
+  const [riskSeverityFilter, setRiskSeverityFilter] = useState<'ALL' | '高' | '中' | '低'>('ALL');
   const [splitRatio, setSplitRatio] = useState(() => 
     Number(localStorage.getItem('bidding_split_ratio')) || 60
   ); 
@@ -180,6 +202,9 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
   const [zoomLevel, setZoomLevel] = useState<number>(100);
   const qualificationStatus = result?.analysis_status?.strategy_qual?.status;
   const riskStatus = result?.analysis_status?.strategy_risk?.status;
+  const isQualRetrying = retryingDomain === 'strategy_qual' || retryingDomain === 'qualifications_analysis' || retryingDomain === 'qual_analysis' || qualificationStatus === 'running';
+  const isRiskRetrying = retryingDomain === 'strategy_risk' || retryingDomain === 'risks_analysis' || retryingDomain === 'risk_analysis' || riskStatus === 'running';
+  const isCurrentTabRetrying = activeTab === 'qual' ? isQualRetrying : isRiskRetrying;
   const hasQualificationResult = Boolean(
     result?.qualifications_analysis &&
     (Object.prototype.hasOwnProperty.call(result.qualifications_analysis, 'match_score') ||
@@ -187,6 +212,38 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
   );
   const qualificationAnalysisIncomplete = !qualificationStatus && !hasQualificationResult;
   const riskAnalysisIncomplete = !riskStatus && !(result?.risks_analysis?.length > 0);
+
+  const allRisks: any[] = useMemo(() => result?.risks_analysis || [], [result?.risks_analysis]);
+  const highRisks = useMemo(() => allRisks.filter((r: any) => r.severity === '高'), [allRisks]);
+  const midRisks = useMemo(() => allRisks.filter((r: any) => r.severity === '中'), [allRisks]);
+  const lowRisks = useMemo(() => allRisks.filter((r: any) => r.severity === '低' || (!r.severity && r.severity !== '高' && r.severity !== '中')), [allRisks]);
+
+  const filteredRisks = useMemo(() => {
+    if (riskSeverityFilter === '高') return highRisks;
+    if (riskSeverityFilter === '中') return midRisks;
+    if (riskSeverityFilter === '低') return lowRisks;
+    return [...allRisks].sort((a: any, b: any) => {
+      const order: Record<string, number> = { '高': 0, '中': 1, '低': 2 };
+      return (order[a.severity] ?? 3) - (order[b.severity] ?? 3);
+    });
+  }, [allRisks, highRisks, midRisks, lowRisks, riskSeverityFilter]);
+
+  const getRiskTypeBadge = (type: string) => {
+    const t = (type || '').trim();
+    if (t.includes('废标')) {
+      return { icon: '🚫', label: '程序性废标', color: 'bg-red-100 text-red-700 border-red-200' };
+    }
+    if (t.includes('壁垒') || t.includes('围标') || t.includes('技术')) {
+      return { icon: '🛡️', label: '技术壁垒', color: 'bg-purple-100 text-purple-700 border-purple-200' };
+    }
+    if (t.includes('法务') || t.includes('法律') || t.includes('合同')) {
+      return { icon: '⚖️', label: '法务合规', color: 'bg-indigo-100 text-indigo-700 border-indigo-200' };
+    }
+    if (t.includes('财务') || t.includes('资金') || t.includes('支付')) {
+      return { icon: '💰', label: '财务风险', color: 'bg-amber-100 text-amber-700 border-amber-200' };
+    }
+    return { icon: '💼', label: t || '商务风险', color: 'bg-slate-100 text-slate-700 border-slate-200' };
+  };
 
   useEffect(() => {
     return () => {
@@ -785,13 +842,26 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                 {/* 右侧分析结论区 */}
                 <Panel defaultSize={100 - splitRatio} minSize={20}>
                   <div className="flex flex-col h-full border border-slate-200 rounded-2xl overflow-hidden bg-white shadow-sm transition-all hover:shadow-md">
-            <div className="bg-slate-50 flex border-b border-slate-200 p-1 gap-1">
+            <div className="bg-slate-50 flex border-b border-slate-200 p-1 gap-1 items-center">
               <button 
-                className={`flex-1 py-3 px-4 font-bold text-sm transition-all rounded-xl ${activeTab === 'qual' ? 'text-blue-700 bg-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'}`}
+                className={`flex-1 py-3 px-4 font-bold text-sm transition-all rounded-xl relative ${activeTab === 'qual' ? 'text-blue-700 bg-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'}`}
                 onClick={() => setActiveTab('qual')}
               >
-                🎯 履约盘点 <span className="ml-1 px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full text-xs">
-                  {qualificationStatus === 'failed'
+                🎯 履约盘点 <span className={`ml-1 px-2 py-0.5 rounded-full text-xs transition-all ${
+                  isQualRetrying
+                    ? 'bg-blue-600 text-white font-bold animate-pulse shadow-xs'
+                    : qualificationStatus === 'failed'
+                      ? 'bg-rose-100 text-rose-700'
+                      : qualificationAnalysisIncomplete
+                        ? 'bg-amber-100 text-amber-700'
+                        : 'bg-blue-100 text-blue-700'
+                }`}>
+                  {isQualRetrying ? (
+                    <span className="inline-flex items-center gap-1">
+                      <span className="animate-spin text-[10px]">⚙️</span>
+                      <span>分析中...</span>
+                    </span>
+                  ) : qualificationStatus === 'failed'
                     ? '失败'
                     : qualificationAnalysisIncomplete
                       ? '未完成'
@@ -799,16 +869,65 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                 </span>
               </button>
               <button 
-                className={`flex-1 py-3 px-4 font-bold text-sm transition-all rounded-xl ${activeTab === 'risk' ? 'text-blue-700 bg-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'}`}
+                className={`flex-1 py-3 px-4 font-bold text-sm transition-all rounded-xl relative ${activeTab === 'risk' ? 'text-rose-700 bg-white shadow-sm' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'}`}
                 onClick={() => setActiveTab('risk')}
               >
-                ⚠️ 风险提示 <span className="ml-1 px-2 py-0.5 bg-rose-100 text-rose-700 rounded-full text-xs">
-                  {riskStatus === 'failed' ? '失败' : riskStatus === 'running' ? '分析中' : result.risks_analysis?.length || 0}
+                ⚠️ 风险提示 <span className={`ml-1 px-2 py-0.5 rounded-full text-xs transition-all ${
+                  isRiskRetrying
+                    ? 'bg-rose-600 text-white font-bold animate-pulse shadow-xs'
+                    : riskStatus === 'failed'
+                      ? 'bg-rose-100 text-rose-700'
+                      : 'bg-rose-100 text-rose-700'
+                }`}>
+                  {isRiskRetrying ? (
+                    <span className="inline-flex items-center gap-1">
+                      <span className="animate-spin text-[10px]">⚙️</span>
+                      <span>分析中...</span>
+                    </span>
+                  ) : riskStatus === 'failed'
+                    ? '失败'
+                    : result.risks_analysis?.length || 0}
                 </span>
               </button>
+              {onReextract && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (activeTab === 'qual') onReextract('strategy_qual');
+                    else onReextract('strategy_risk');
+                  }}
+                  disabled={isQualRetrying || isRiskRetrying}
+                  className="p-2 mr-1 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all disabled:opacity-40 disabled:cursor-not-allowed group shrink-0"
+                  title={`重新分析当前${activeTab === 'qual' ? '履约盘点' : '风险提示'}`}
+                >
+                  <svg 
+                    className={`w-4 h-4 transition-transform duration-500 ${isCurrentTabRetrying ? 'animate-spin text-blue-600' : 'group-hover:rotate-180'}`} 
+                    fill="none" 
+                    stroke="currentColor" 
+                    viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                </button>
+              )}
             </div>
             
-            <div className="p-6 overflow-y-auto flex-1 bg-slate-50/50 custom-scrollbar">
+            <div className="p-6 overflow-y-auto flex-1 bg-slate-50/50 custom-scrollbar relative">
+              {isCurrentTabRetrying && (
+                <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-white/75 backdrop-blur-[2px] rounded-xl animate-fade-in pointer-events-auto">
+                  <div className="relative mb-3">
+                    <div className="w-12 h-12 rounded-full border-3 border-blue-100 border-t-blue-600 animate-spin"></div>
+                    <div className="absolute inset-0 flex items-center justify-center text-base">
+                      {activeTab === 'qual' ? '🎯' : '⚠️'}
+                    </div>
+                  </div>
+                  <p className="text-slate-800 font-bold text-sm tracking-wide animate-pulse">
+                    {activeTab === 'qual' ? '正在智能重构资质匹配与能力盘点...' : '正在全篇深度扫描投标风险条款...'}
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">AI 专家正在比对标书细则并生成最新结果，请稍候</p>
+                </div>
+              )}
+
               {activeTab === 'qual' && (
                 <div className="space-y-4 animate-fade-in">
                   {result.qualifications_analysis?.items?.map((item: any, idx: number) => (
@@ -842,13 +961,31 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
                         <>
                           <span className="text-4xl mb-3">⚠️</span>
                           <p className="text-rose-600 font-medium">履约盘点分析失败，不能据此判断“无要求”</p>
-                          {onReextract && <button className="mt-3 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold hover:bg-blue-700" onClick={() => onReextract('strategy_qual')}>重新分析履约盘点</button>}
+                          {onReextract && (
+                            <button 
+                              disabled={isQualRetrying}
+                              className="mt-3 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2 transition-all shadow-sm active:scale-95"
+                              onClick={() => onReextract('strategy_qual')}
+                            >
+                              {isQualRetrying && <span className="animate-spin text-xs">⚙️</span>}
+                              <span>{isQualRetrying ? '履约盘点分析中...' : '重新分析履约盘点'}</span>
+                            </button>
+                          )}
                         </>
-                      ) : qualificationAnalysisIncomplete ? (
+                      ) : (isQualRetrying || qualificationAnalysisIncomplete) ? (
                         <>
                           <span className="text-4xl mb-3">⏳</span>
-                          <p>履约盘点尚未完成</p>
-                          {onReextract && <button className="mt-3 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold hover:bg-blue-700" onClick={() => onReextract('strategy_qual')}>开始履约盘点</button>}
+                          <p className="text-slate-600 font-medium">{isQualRetrying ? '履约盘点正在深度分析中...' : '履约盘点尚未完成'}</p>
+                          {onReextract && (
+                            <button 
+                              disabled={isQualRetrying}
+                              className="mt-3 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2 transition-all shadow-sm active:scale-95"
+                              onClick={() => onReextract('strategy_qual')}
+                            >
+                              {isQualRetrying && <span className="animate-spin text-xs">⚙️</span>}
+                              <span>{isQualRetrying ? '正在启动专家分析...' : '开始履约盘点'}</span>
+                            </button>
+                          )}
                         </>
                       ) : (
                         <>
@@ -863,59 +1000,159 @@ export function UploadBox({ onTerminalMessage, onAnalysisSuccess, onAnalyzingCha
 
               {activeTab === 'risk' && (
                 <div className="space-y-4 animate-fade-in">
-                  {[...(result.risks_analysis || [])].sort((a: any, b: any) => {
-                    const order: Record<string, number> = { '高': 0, '中': 1, '低': 2 };
-                    return (order[a.severity] ?? 3) - (order[b.severity] ?? 3);
-                  }).map((risk: any, idx: number) => (
-                    <div 
-                      key={idx} 
-                      onClick={() => handleCardClick(risk.exact_quote, risk.description)}
-                      className="p-5 rounded-xl border border-rose-100 bg-white shadow-sm hover:shadow-md hover:border-rose-400 hover:bg-rose-50/20 cursor-pointer transition-all active:scale-[0.99] group/card relative overflow-hidden"
-                      title="点击跳转左侧原文出处定位"
-                    >
-                      <div className={`absolute left-0 top-0 bottom-0 w-1 ${
-                          risk.severity === '高' ? 'bg-rose-500' :
-                          risk.severity === '中' ? 'bg-orange-400' :
+                  {/* 风险级别过滤栏与数量统计胶囊 */}
+                  {allRisks.length > 0 && (
+                    <div className="flex items-center justify-between gap-2 p-2 bg-white rounded-xl border border-slate-200 shadow-xs mb-3">
+                      <div className="flex items-center gap-1.5 overflow-x-auto text-xs font-bold">
+                        <button
+                          type="button"
+                          onClick={() => setRiskSeverityFilter('ALL')}
+                          className={`px-3 py-1.5 rounded-lg transition-all ${
+                            riskSeverityFilter === 'ALL'
+                              ? 'bg-slate-800 text-white shadow-xs'
+                              : 'text-slate-500 hover:bg-slate-100'
+                          }`}
+                        >
+                          全部 ({allRisks.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setRiskSeverityFilter('高')}
+                          className={`px-3 py-1.5 rounded-lg transition-all flex items-center gap-1 ${
+                            riskSeverityFilter === '高'
+                              ? 'bg-rose-600 text-white shadow-xs shadow-rose-200'
+                              : 'text-rose-600 hover:bg-rose-50'
+                          }`}
+                        >
+                          <span className="w-1.5 h-1.5 rounded-full bg-rose-500 inline-block animate-pulse"></span>
+                          高危 ({highRisks.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setRiskSeverityFilter('中')}
+                          className={`px-3 py-1.5 rounded-lg transition-all ${
+                            riskSeverityFilter === '中'
+                              ? 'bg-amber-600 text-white shadow-xs shadow-amber-200'
+                              : 'text-amber-600 hover:bg-amber-50'
+                          }`}
+                        >
+                          中度 ({midRisks.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setRiskSeverityFilter('低')}
+                          className={`px-3 py-1.5 rounded-lg transition-all ${
+                            riskSeverityFilter === '低'
+                              ? 'bg-blue-600 text-white shadow-xs shadow-blue-200'
+                              : 'text-blue-600 hover:bg-blue-50'
+                          }`}
+                        >
+                          轻度 ({lowRisks.length})
+                        </button>
+                      </div>
+                      <span className="text-[11px] text-slate-400 font-medium hidden sm:inline">
+                        🎯 点击卡片可高亮原文
+                      </span>
+                    </div>
+                  )}
+
+                  {filteredRisks.map((risk: any, idx: number) => {
+                    const typeBadge = getRiskTypeBadge(risk.risk_type);
+                    const isHigh = risk.severity === '高';
+                    return (
+                      <div 
+                        key={idx} 
+                        onClick={() => handleCardClick(risk.exact_quote, risk.description)}
+                        className={`p-5 rounded-2xl border bg-white shadow-xs hover:shadow-md cursor-pointer transition-all duration-300 hover:-translate-y-0.5 active:scale-[0.99] group/card relative overflow-hidden ${
+                          isHigh 
+                            ? 'border-rose-200 hover:border-rose-400 hover:shadow-rose-100/50' 
+                            : 'border-slate-200 hover:border-blue-400'
+                        }`}
+                        title="点击跳转左侧原文出处定位"
+                      >
+                        <div className={`absolute left-0 top-0 bottom-0 w-1.5 ${
+                          risk.severity === '高' ? 'bg-gradient-to-b from-rose-500 to-red-600' :
+                          risk.severity === '中' ? 'bg-amber-400' :
                           'bg-blue-400'
                         }`}></div>
-                      <div className="flex justify-between items-start mb-3 pl-2">
-                        <div className="flex items-center space-x-2">
-                          <span className="font-bold text-slate-800">{format_analysis_value(risk.risk_type)}</span>
+
+                        <div className="flex justify-between items-start mb-2.5 pl-2">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold border ${typeBadge.color}`}>
+                              <span>{typeBadge.icon}</span>
+                              <span>{typeBadge.label}</span>
+                            </span>
+                            {risk.exact_quote && (
+                              <span className="text-[11px] text-slate-400 font-medium truncate max-w-[240px]">
+                                {format_analysis_value(risk.risk_type)}
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="text-[10px] text-rose-600 bg-rose-50 px-2 py-0.5 rounded-full font-bold opacity-0 group-hover/card:opacity-100 transition-opacity shadow-xs">
+                              📍 定位原文
+                            </span>
+                            <span className={`px-2.5 py-0.5 text-xs rounded-full font-bold shadow-xs border ${
+                              risk.severity === '高' ? 'bg-rose-50 text-rose-700 border-rose-200 font-extrabold' :
+                              risk.severity === '中' ? 'bg-amber-50 text-amber-700 border-amber-200' :
+                              'bg-blue-50 text-blue-700 border-blue-200'
+                            }`}>
+                              {format_analysis_value(risk.severity)}风险
+                            </span>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-[10px] text-rose-600 bg-rose-50 px-2 py-0.5 rounded-full font-bold opacity-0 group-hover/card:opacity-100 transition-opacity shadow-xs">📍 定位原文</span>
-                          <span className={`px-3 py-1 text-xs rounded-full font-bold shadow-sm ${
-                            risk.severity === '高' ? 'bg-rose-100 text-rose-700 border border-rose-200' :
-                            risk.severity === '中' ? 'bg-orange-100 text-orange-700 border border-orange-200' :
-                            'bg-blue-100 text-blue-700 border border-blue-200'
-                          }`}>
-                            {format_analysis_value(risk.severity)}风险
-                          </span>
+
+                        {/* 标书原句条款引用展示区 */}
+                        {risk.exact_quote && (
+                          <div className="mb-2.5 ml-2 p-3 bg-rose-50/40 rounded-xl border border-rose-100/80 text-xs text-slate-800 leading-relaxed font-serif relative group-hover/card:bg-rose-50/70 transition-colors">
+                            <div className="flex items-start gap-1.5">
+                              <span className="text-rose-600 font-sans font-bold text-xs shrink-0">📜 标书原句:</span>
+                              <span className="italic text-slate-700">“{format_analysis_value(risk.exact_quote)}”</span>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* 专家深度解读 */}
+                        <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 ml-2">
+                          <p className="text-sm text-slate-600 leading-normal">
+                            <span className="font-bold text-slate-700 mr-2">⚠️ 描述:</span>
+                            {format_analysis_value(risk.description)}
+                          </p>
                         </div>
                       </div>
-                      <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 ml-2">
-                        <p className="text-sm text-slate-600"><span className="font-bold text-slate-700 mr-2">⚠️ 描述:</span>{format_analysis_value(risk.description)}</p>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                   {(!result.risks_analysis || result.risks_analysis.length === 0) && (
                     <div className="flex flex-col items-center justify-center h-48 text-slate-400">
                       {riskStatus === 'failed' ? (
                         <>
                           <span className="text-4xl mb-3">⚠️</span>
                           <p className="text-rose-600 font-medium">风险分析失败，不能据此判断“无风险”</p>
-                          {onReextract && <button className="mt-3 px-4 py-2 rounded-lg bg-rose-600 text-white text-sm font-bold hover:bg-rose-700" onClick={() => onReextract('strategy_risk')}>重新分析风险提示</button>}
+                          {onReextract && (
+                            <button 
+                              disabled={isRiskRetrying}
+                              className="mt-3 px-4 py-2 rounded-lg bg-rose-600 text-white text-sm font-bold hover:bg-rose-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2 transition-all shadow-sm active:scale-95"
+                              onClick={() => onReextract('strategy_risk')}
+                            >
+                              {isRiskRetrying && <span className="animate-spin text-xs">⚙️</span>}
+                              <span>{isRiskRetrying ? '风险分析进行中...' : '重新分析风险提示'}</span>
+                            </button>
+                          )}
                         </>
-                      ) : riskStatus === 'running' ? (
+                      ) : (isRiskRetrying || riskStatus === 'running' || riskAnalysisIncomplete) ? (
                         <>
                           <span className="text-4xl mb-3">⏳</span>
-                          <p>风险提示分析中</p>
-                        </>
-                      ) : riskAnalysisIncomplete ? (
-                        <>
-                          <span className="text-4xl mb-3">⏳</span>
-                          <p>风险提示尚未完成</p>
-                          {onReextract && <button className="mt-3 px-4 py-2 rounded-lg bg-rose-600 text-white text-sm font-bold hover:bg-rose-700" onClick={() => onReextract('strategy_risk')}>开始风险分析</button>}
+                          <p className="text-slate-600 font-medium">{isRiskRetrying || riskStatus === 'running' ? '风险提示分析中...' : '风险提示尚未完成'}</p>
+                          {onReextract && (
+                            <button 
+                              disabled={isRiskRetrying}
+                              className="mt-3 px-4 py-2 rounded-lg bg-rose-600 text-white text-sm font-bold hover:bg-rose-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2 transition-all shadow-sm active:scale-95"
+                              onClick={() => onReextract('strategy_risk')}
+                            >
+                              {isRiskRetrying && <span className="animate-spin text-xs">⚙️</span>}
+                              <span>{isRiskRetrying ? '正在排查风险条款...' : '开始风险分析'}</span>
+                            </button>
+                          )}
                         </>
                       ) : (
                         <>

@@ -264,7 +264,26 @@ def rollup_hierarchical_cost_items(items: List[Dict[str, Any]]) -> Tuple[List[Di
     for r in root_nodes:
         _rollup(r)
 
-    # 4. 统计预估总成本（严格以顶层根节点 subtotal 求和）与未匹配数
+    # 4. 自顶向下级联传递成套统价锁定状态（Parent Dominance）
+    def _apply_parent_lock(node: dict, locked_by_ancestor: bool = False) -> None:
+        """自顶向下标记被上级统价锁定的后代节点，并归零其独立小计。"""
+        node["is_locked_by_parent"] = locked_by_ancestor
+        is_parent_modified = bool(node.get("is_parent_modified")) or node.get("pricing_mode") == "parent"
+        curr_price = float(node.get("ref_price") or 0.0)
+
+        # 若已被上级锁定，小计归零，防止外部脏累加
+        if locked_by_ancestor:
+            node["subtotal"] = 0.0
+
+        # 当前节点是否有子项且自身启用了成套统价
+        child_locked = locked_by_ancestor or (bool(node["_children"]) and is_parent_modified and curr_price > 0)
+        for child in node["_children"]:
+            _apply_parent_lock(child, child_locked)
+
+    for r in root_nodes:
+        _apply_parent_lock(r, False)
+
+    # 5. 统计预估总成本（严格以顶层根节点 subtotal 求和）与未匹配数
     total_cost = round(sum(r["subtotal"] for r in root_nodes), 2)
     unmatched_count = 0
 
@@ -273,11 +292,12 @@ def rollup_hierarchical_cost_items(items: List[Dict[str, Any]]) -> Tuple[List[Di
         node.pop("_children", None)
         node.pop("_parent", None)
         node.pop("_orig_idx", None)
-        # 结构节点仅用于还原 BOM 层级，不应被统计为未匹配报价项。
+        # 结构节点或已被上级成套统价锁定的节点，不应被统计为未匹配报价项
         is_structural_node = bool(node.get("is_structural")) or (
             node.get("qty") is None and not str(node.get("unit") or "").strip()
         )
-        if float(node.get("ref_price") or 0.0) <= 0 and not is_structural_node:
+        is_locked = bool(node.get("is_locked_by_parent"))
+        if float(node.get("ref_price") or 0.0) <= 0 and not is_structural_node and not is_locked:
             unmatched_count += 1
             if not node.get("match_quality"):
                 node["match_quality"] = "未匹配"

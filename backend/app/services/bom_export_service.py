@@ -46,6 +46,7 @@ class _BomExportRow:
     is_section_header: bool = False
     group_name: Optional[str] = None
     is_group_header: bool = False
+    is_locked_by_parent: bool = False
 
 
 def _normalize_export_text(value: Any) -> str:
@@ -542,6 +543,7 @@ def _collect_export_rows(items: Sequence[Any]) -> List[_BomExportRow]:
         inherited_section: Optional[str],
         inherited_group_context: tuple[str, ...] = tuple(),
         root_group_context: Optional[tuple[str, ...]] = None,
+        parent_locked: bool = False,
     ) -> None:
         nonlocal current_section, current_group, source_item_code_count
         section_name = (
@@ -594,6 +596,18 @@ def _collect_export_rows(items: Sequence[Any]) -> List[_BomExportRow]:
                     )
                 current_group = group_context
 
+        # 计算当前节点是否被祖先锁定，以及是否需要向下锁定子节点
+        is_custom_parent = bool(
+            node.item.get("is_parent_modified") or node.item.get("pricing_mode") == "parent"
+        )
+        curr_price = float(
+            node.item.get("ref_price")
+            if node.item.get("ref_price") is not None
+            else node.item.get("price") or 0.0
+        )
+        is_locked = parent_locked or bool(node.item.get("is_locked_by_parent"))
+        next_parent_locked = is_locked or (bool(node.children) and is_custom_parent and curr_price > 0)
+
         nested_rows.append(
             {
                 "item": node.item,
@@ -612,6 +626,7 @@ def _collect_export_rows(items: Sequence[Any]) -> List[_BomExportRow]:
                 hierarchy_number=nested_rows[-1]["hierarchyNumber"],
                 depth=depth,
                 is_parent=bool(node.children),
+                is_locked_by_parent=is_locked,
             )
         )
         if _normalize_export_text(node.item.get("item_code")):
@@ -623,6 +638,7 @@ def _collect_export_rows(items: Sequence[Any]) -> List[_BomExportRow]:
                 depth + 1,
                 section_name or inherited_section if use_external_sections else None,
                 group_context,
+                parent_locked=next_parent_locked,
             )
 
     for root_index, (root, root_number_path) in enumerate(zip(roots, root_number_paths)):
@@ -633,6 +649,7 @@ def _collect_export_rows(items: Sequence[Any]) -> List[_BomExportRow]:
             None,
             tuple(),
             root_group_contexts[root_index],
+            parent_locked=False,
         )
 
     _repair_duplicate_item_codes(
@@ -658,15 +675,19 @@ def _collect_export_rows(items: Sequence[Any]) -> List[_BomExportRow]:
 
 
 def _calculate_export_total(rows: Sequence[_BomExportRow]) -> float:
-    """计算未显式传入总价时的金额，避免父项汇总与子项重复计费。"""
+    """计算未显式传入总价时的金额，杜绝父子节点及多级统价双重计费。"""
     total = 0.0
     for row in rows:
         if row.is_section_header or row.is_group_header or not row.item:
+            continue
+        # 若已被上级成套统价锁定，其费用已包含在祖先统价中，直接跳过，杜绝双重计费
+        if row.is_locked_by_parent:
             continue
         item = row.item
         is_parent_custom = bool(
             item.get("is_parent_modified") or item.get("pricing_mode") == "parent"
         )
+        # 若是普通汇总父项（未设独立统价），其金额由下级子项汇总累加，父项自身跳过
         if row.is_parent and not is_parent_custom:
             continue
         quantity = _normalize_quantity(
@@ -931,6 +952,13 @@ def generate_bom_docx(
 
         # 备注列：严格使用前端 BOM 清单的备注 (remark) 字段
         remark_text = _normalize_export_text(item.get("remark"))
+        if export_row.is_locked_by_parent:
+            display_price = "--"
+            display_subtotal = "--"
+            remark_text = f"{remark_text} (已统入成套价)" if remark_text else "已统入成套价"
+        else:
+            display_price = f"{price_val:,.2f}" if price_val > 0 else "--"
+            display_subtotal = f"{subtotal_val:,.2f}" if subtotal_val > 0 else "0.00"
 
         is_parent = export_row.is_parent
         bg_color = "F8FAFC" if r_idx % 2 == 1 else "FFFFFF"
@@ -944,8 +972,8 @@ def generate_bom_docx(
             (manufacturer, WD_ALIGN_PARAGRAPH.LEFT),
             (unit, WD_ALIGN_PARAGRAPH.CENTER),
             (f"{qty_val:g}", WD_ALIGN_PARAGRAPH.CENTER),
-            (f"{price_val:,.2f}" if price_val > 0 else "--", WD_ALIGN_PARAGRAPH.RIGHT),
-            (f"{subtotal_val:,.2f}" if subtotal_val > 0 else "0.00", WD_ALIGN_PARAGRAPH.RIGHT),
+            (display_price, WD_ALIGN_PARAGRAPH.RIGHT),
+            (display_subtotal, WD_ALIGN_PARAGRAPH.RIGHT),
             (remark_text, WD_ALIGN_PARAGRAPH.LEFT),
         ]
 
@@ -1243,6 +1271,13 @@ def generate_bom_xlsx(
 
         # 备注列：严格使用前端 BOM 清单的备注 (remark) 字段
         remark_text = _normalize_export_text(item.get("remark"))
+        if export_row.is_locked_by_parent:
+            display_price = "--"
+            display_subtotal = "--"
+            remark_text = f"{remark_text} (已统入成套价)" if remark_text else "已统入成套价"
+        else:
+            display_price = price_val
+            display_subtotal = subtotal_val
 
         # 写入 9 列数据
         c1 = ws.cell(row=current_row, column=1, value=export_row.hierarchy_number)
@@ -1251,8 +1286,8 @@ def generate_bom_xlsx(
         c4 = ws.cell(row=current_row, column=4, value=manufacturer)
         c5 = ws.cell(row=current_row, column=5, value=unit)
         c6 = ws.cell(row=current_row, column=6, value=qty_val)
-        c7 = ws.cell(row=current_row, column=7, value=price_val)
-        c8 = ws.cell(row=current_row, column=8, value=subtotal_val)
+        c7 = ws.cell(row=current_row, column=7, value=display_price)
+        c8 = ws.cell(row=current_row, column=8, value=display_subtotal)
         c9 = ws.cell(row=current_row, column=9, value=remark_text)
 
         # 格式与对齐
@@ -1262,14 +1297,16 @@ def generate_bom_xlsx(
         c4.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
         c5.alignment = Alignment(horizontal='center', vertical='center')
         c6.alignment = Alignment(horizontal='center', vertical='center')
-        c7.alignment = Alignment(horizontal='right', vertical='center')
-        c8.alignment = Alignment(horizontal='right', vertical='center')
+        c7.alignment = Alignment(horizontal='center' if display_price == "--" else 'right', vertical='center')
+        c8.alignment = Alignment(horizontal='center' if display_subtotal == "--" else 'right', vertical='center')
         c9.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
 
         c6.number_format = '#,##0' if isinstance(qty_val, int) else '#,##0.##########'
         # 表头已经标注“元”，金额单元格只保留数字，避免重复显示人民币符号。
-        c7.number_format = '#,##0.00'
-        c8.number_format = '#,##0.00'
+        if isinstance(display_price, (int, float)):
+            c7.number_format = '#,##0.00'
+        if isinstance(display_subtotal, (int, float)):
+            c8.number_format = '#,##0.00'
 
         is_zebra = (idx % 2 == 1)
         for c in (c1, c2, c3, c4, c5, c6, c7, c8, c9):

@@ -193,7 +193,25 @@ export function AnalysisDashboard() {
     // 成本核算专项接口的实际用途是重新匹配 BOM 清单，避免继续使用“重新提取”造成误解。
     const operationLabel = domain === 'cost_estimation' || domain === 'cost'
       ? '重新匹配 BOM 清单'
-      : `重新提取专项领域: ${domain}`;
+      : domain.includes('qual')
+        ? '重新分析履约资质盘点'
+        : domain.includes('risk')
+          ? '重新分析风险提示'
+          : `重新提取专项领域: ${domain}`;
+
+    // 同步更新 Supervisor 拓扑图 Worker 状态，激活齿轮旋转与呼吸蓝光动效
+    const matchedWorkerName = domain.includes('qual') ? 'strategy_qual'
+      : domain.includes('risk') ? 'strategy_risk'
+      : (domain.includes('cost') || domain === 'engineering') ? 'cost_estimation'
+      : domain === 'master_agent' ? 'master_agent'
+      : null;
+
+    if (matchedWorkerName) {
+      setWorkerStatuses(prev => prev.map(w =>
+        w.name === matchedWorkerName ? { ...w, status: 'running', summary: `正在${operationLabel}...` } : w
+      ));
+    }
+
     setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'info', content: `正在${operationLabel} ...` }]);
     try {
       const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
@@ -250,20 +268,50 @@ export function AnalysisDashboard() {
               ? '标书起草'
               : domain;
           setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'success', content: `✅ ${successLabel}${domain === 'cost_estimation' || domain === 'cost' ? '成功！' : '领域重新提取/计算成功！'}` }]);
+          
+          if (matchedWorkerName) {
+            setWorkerStatuses(prev => prev.map(w =>
+              w.name === matchedWorkerName ? { ...w, status: 'success', summary: `${operationLabel}完成` } : w
+            ));
+          }
           return true;
         } else {
           const errMsg = json.data?.error || json.message || '系统错误';
           setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: ${errMsg}` }]);
+          if (matchedWorkerName) {
+            setWorkerStatuses(prev => prev.map(w =>
+              w.name === matchedWorkerName ? { ...w, status: 'failed', summary: `${operationLabel}失败: ${errMsg}` } : w
+            ));
+          }
           return false;
         }
+      } else if (res.status === 409) {
+        const json = await res.json().catch(() => ({ detail: '专项分析任务正在执行中，请勿重复提交' }));
+        const tipMsg = json.detail || '专项分析任务正在执行中，请稍候查看结果';
+        setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'info', content: `⏳ 提示: ${tipMsg}` }]);
+        await alert(tipMsg, {
+          title: '任务正在执行',
+          intent: 'info',
+        });
+        return false;
       } else {
         const json = await res.json().catch(() => ({ detail: `网络服务异常 (${res.status})` }));
         const errMsg = json.detail || json.message || `网络服务异常 (${res.status})`;
         setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取失败: ${errMsg}` }]);
+        if (matchedWorkerName) {
+          setWorkerStatuses(prev => prev.map(w =>
+            w.name === matchedWorkerName ? { ...w, status: 'failed', summary: `${operationLabel}失败` } : w
+          ));
+        }
         return false;
       }
     } catch (err: any) {
       setTerminalMessages(prev => [...prev, { id: Date.now().toString(), type: 'error', content: `❌ ${domain} 提取网络错误: ${err.message}` }]);
+      if (matchedWorkerName) {
+        setWorkerStatuses(prev => prev.map(w =>
+          w.name === matchedWorkerName ? { ...w, status: 'failed', summary: `${operationLabel}网络异常` } : w
+        ));
+      }
       return false;
     } finally {
       setRetryingDomain(null);
@@ -282,8 +330,15 @@ export function AnalysisDashboard() {
   const qual = result?.metadata?.qualification || {};
   const fin = result?.metadata?.financial || {};
 
+  const [dashboardActiveTab, setDashboardActiveTab] = useState<'qual' | 'risk'>('qual');
+  const uploadBoxSectionRef = useRef<HTMLDivElement>(null);
+
   const risks = result?.risks_analysis || [];
   const highRiskCount = risks.filter((r: any) => r.severity === '高').length;
+  const midRiskCount = risks.filter((r: any) => r.severity === '中').length;
+  const lowRiskCount = risks.filter((r: any) => r.severity === '低' || (!r.severity && r.severity !== '高' && r.severity !== '中')).length;
+  const isRiskRetrying = retryingDomain === 'strategy_risk' || retryingDomain === 'risks_analysis' || retryingDomain === 'risk_analysis';
+  const isQualRetrying = retryingDomain === 'strategy_qual' || retryingDomain === 'qualifications_analysis' || retryingDomain === 'qual_analysis';
 
   const qualItems = result?.qualifications_analysis?.items || [];
   let matchScore = 100;
@@ -306,16 +361,21 @@ export function AnalysisDashboard() {
     <div className="w-full space-y-10 animate-fade-in-up delay-100 pb-20">
 
       {/* 文本阅读与履约盘点/风险提示区域 */}
-      <UploadBox
-        onTerminalMessage={handleTerminalMessage}
-        onAnalysisSuccess={handleAnalysisSuccess}
-        onAnalyzingChange={handleAnalyzingChange}
-        initialResult={result}
-        initialTaskId={id === 'new' ? null : id}
-        onSupervisorUpdate={handleSupervisorUpdate}
-        onWorkerStatusChange={handleWorkerStatusChange}
-        onReextract={handleReextract}
-      />
+      <div ref={uploadBoxSectionRef}>
+        <UploadBox
+          onTerminalMessage={handleTerminalMessage}
+          onAnalysisSuccess={handleAnalysisSuccess}
+          onAnalyzingChange={handleAnalyzingChange}
+          initialResult={result}
+          initialTaskId={id === 'new' ? null : id}
+          onSupervisorUpdate={handleSupervisorUpdate}
+          onWorkerStatusChange={handleWorkerStatusChange}
+          onReextract={handleReextract}
+          retryingDomain={retryingDomain}
+          activeTab={dashboardActiveTab}
+          onTabChange={setDashboardActiveTab}
+        />
+      </div>
 
       {isLoadingHistory && (
         <div className="bg-white/80 backdrop-blur-md p-10 rounded-3xl shadow-sm border border-slate-100 flex flex-col items-center justify-center min-h-[300px]">
@@ -332,26 +392,131 @@ export function AnalysisDashboard() {
       />
 
       {/* KPI Cards */}
-      <div className="grid grid-cols-2 gap-8">
-        <div className="bg-white/80 backdrop-blur-sm p-8 rounded-3xl shadow-sm border border-rose-100 relative overflow-hidden group hover:shadow-md transition-all">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div 
+          onClick={() => {
+            setDashboardActiveTab('risk');
+            uploadBoxSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }}
+          className={`bg-white/80 backdrop-blur-sm p-8 rounded-3xl shadow-sm border border-rose-100 relative overflow-hidden group hover:shadow-md hover:border-rose-300 transition-all cursor-pointer ${
+            isRiskRetrying ? 'ring-2 ring-rose-400 ring-offset-2' : ''
+          }`}
+          title="点击定位并查看详细风险条款"
+        >
           <div className="absolute top-0 right-0 w-32 h-32 bg-rose-500/10 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-110 transition-transform duration-500"></div>
           <div className="relative z-10">
-            <div className="flex items-center gap-3 mb-2">
-              <span className="p-2 bg-rose-100 text-rose-600 rounded-lg">⚠️</span>
-              <div className="text-slate-500 font-bold tracking-wide">发现高危风险项</div>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-3">
+                <span className="p-2 bg-rose-100 text-rose-600 rounded-lg">⚠️</span>
+                <div className="text-slate-500 font-bold tracking-wide">发现高危风险项</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleReextract('strategy_risk');
+                  }}
+                  disabled={isRiskRetrying}
+                  className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed group/btn"
+                  title="重新分析风险提示"
+                >
+                  <svg 
+                    className={`w-4 h-4 ${isRiskRetrying ? 'animate-spin text-rose-600' : 'group-hover/btn:rotate-180 transition-transform duration-500'}`} 
+                    fill="none" 
+                    stroke="currentColor" 
+                    viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                </button>
+                <span className="text-[10px] text-rose-600 bg-rose-50 px-2 py-0.5 rounded-full font-bold opacity-0 group-hover:opacity-100 transition-opacity">
+                  查看列表 ↗
+                </span>
+              </div>
             </div>
-            <div className="text-5xl font-extrabold text-rose-600 mt-4">{result ? highRiskCount : '-'}<span className="text-xl text-rose-400 font-medium ml-2">处</span></div>
+
+            <div className="flex items-baseline gap-3 mt-4">
+              {isRiskRetrying ? (
+                <div className="flex items-center gap-2 text-rose-600 text-2xl font-black animate-pulse py-2">
+                  <span className="animate-spin text-xl">⚙️</span>
+                  <span>风控深度排查中...</span>
+                </div>
+              ) : (
+                <>
+                  <div className="text-5xl font-extrabold text-rose-600">
+                    {result ? highRiskCount : '-'}
+                    <span className="text-xl text-rose-400 font-medium ml-2">处</span>
+                  </div>
+                  {result && (
+                    <div className="text-xs text-slate-400 font-medium ml-auto flex items-center gap-2">
+                      <span className="bg-rose-50 text-rose-700 px-2 py-0.5 rounded-full font-bold">高危 {highRiskCount}</span>
+                      <span className="bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full font-bold">中度 {midRiskCount}</span>
+                      <span className="bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full font-bold">轻度 {lowRiskCount}</span>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           </div>
         </div>
 
-        <div className="bg-white/80 backdrop-blur-sm p-8 rounded-3xl shadow-sm border border-emerald-100 relative overflow-hidden group hover:shadow-md transition-all">
+        <div 
+          onClick={() => {
+            setDashboardActiveTab('qual');
+            uploadBoxSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }}
+          className={`bg-white/80 backdrop-blur-sm p-8 rounded-3xl shadow-sm border border-emerald-100 relative overflow-hidden group hover:shadow-md hover:border-emerald-300 transition-all cursor-pointer ${
+            isQualRetrying ? 'ring-2 ring-emerald-400 ring-offset-2' : ''
+          }`}
+          title="点击定位并查看详细履约盘点"
+        >
           <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/10 rounded-full blur-2xl -mr-10 -mt-10 group-hover:scale-110 transition-transform duration-500"></div>
           <div className="relative z-10">
-            <div className="flex items-center gap-3 mb-2">
-              <span className="p-2 bg-emerald-100 text-emerald-600 rounded-lg">✅</span>
-              <div className="text-slate-500 font-bold tracking-wide">资质综合匹配度 (预估)</div>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-3">
+                <span className="p-2 bg-emerald-100 text-emerald-600 rounded-lg">✅</span>
+                <div className="text-slate-500 font-bold tracking-wide">资质综合匹配度 (预估)</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleReextract('strategy_qual');
+                  }}
+                  disabled={isQualRetrying}
+                  className="p-1.5 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed group/btn"
+                  title="重新分析履约资质盘点"
+                >
+                  <svg 
+                    className={`w-4 h-4 ${isQualRetrying ? 'animate-spin text-emerald-600' : 'group-hover/btn:rotate-180 transition-transform duration-500'}`} 
+                    fill="none" 
+                    stroke="currentColor" 
+                    viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                </button>
+                <span className="text-[10px] text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full font-bold opacity-0 group-hover:opacity-100 transition-opacity">
+                  查看盘点 ↗
+                </span>
+              </div>
             </div>
-            <div className="text-5xl font-extrabold text-emerald-500 mt-4">{result ? matchScore : '-'}<span className="text-3xl text-emerald-400 font-medium">%</span></div>
+
+            <div className="mt-4">
+              {isQualRetrying ? (
+                <div className="flex items-center gap-2 text-emerald-600 text-2xl font-black animate-pulse py-2">
+                  <span className="animate-spin text-xl">⚙️</span>
+                  <span>资质模型深度核算中...</span>
+                </div>
+              ) : (
+                <div className="text-5xl font-extrabold text-emerald-500">
+                  {result ? matchScore : '-'}
+                  <span className="text-3xl text-emerald-400 font-medium">%</span>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
